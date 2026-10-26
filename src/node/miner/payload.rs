@@ -1,4 +1,9 @@
-use super::build_diagnostics::{AttemptKind, AttemptObservation, BuildWorkObservation, SkipReason};
+use super::{
+    build_diagnostics::{
+        AttemptKind, AttemptObservation, BuildWorkObservation, SelectionStage, SkipReason,
+    },
+    state_read_diagnostics::ObservedStateDb,
+};
 use crate::{
     chainspec::BscChainSpec,
     consensus::{
@@ -623,10 +628,11 @@ where
 
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
         let state = StateProviderDatabase::new(&state_provider);
-        let mut db = State::builder()
-            .with_database(cached_reads.as_db_mut(state))
-            .with_bundle_update()
-            .build();
+        let (state, read_phase) =
+            ObservedStateDb::new(&mut cached_reads, state, kind, self.ctx.is_inturn);
+        let state = state
+            .with_prewarm_snapshot(parent_hash, crate::shared::miner_prewarm_snapshot(parent_hash));
+        let mut db = State::builder().with_database(state).with_bundle_update().build();
 
         // Sinks transport current_validators / turn_length from the builder (which is consumed by
         // `finish`) back to this layer so they can be written to cache after
@@ -770,8 +776,10 @@ where
         let exec_start = std::time::Instant::now();
         // Everything before `exec_start` is treated as "prepare" time for this payload attempt.
         let prepare_duration = exec_start.duration_since(build_start);
+        read_phase.selection();
         work.execution_started(exec_start);
         loop {
+            work.selection_stage(SelectionStage::Control);
             let iteration_started = std::time::Instant::now();
             if cancel.is_cancelled() ||
                 build_control
@@ -780,7 +788,9 @@ where
             {
                 break;
             }
+            work.selection_stage(SelectionStage::Iterator);
             let Some(pool_tx) = best_tx_list.next() else { break };
+            work.selection_stage(SelectionStage::Precheck);
             work.scanned += 1;
 
             // filter out blacklisted transactions before executing.
@@ -959,7 +969,10 @@ where
                 );
             }
 
-            let gas_used = match builder.execute_transaction(tx.clone()) {
+            work.selection_stage(SelectionStage::Execute);
+            let execution_result = builder.execute_transaction(tx.clone());
+            work.selection_stage(SelectionStage::Postprocess);
+            let gas_used = match execution_result {
                 Ok(gas_used) => gas_used,
                 Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
                     error,
@@ -1068,7 +1081,9 @@ where
                 sidecars_map.insert(*tx.hash(), sidecar);
             }
         }
+        work.selection_stage(SelectionStage::Control);
         let exec_duration = exec_start.elapsed();
+        read_phase.finish();
         if let Some(control) = &build_control {
             let now = std::time::Instant::now();
             let reason = if cancel.is_cancelled() {
@@ -1126,7 +1141,8 @@ where
             block_access_list: _,
         } = builder.finish(&state_provider, None)?;
 
-        if let Some(control) = build_control.as_ref().filter(|control| control.allows_late_finish()) {
+        if let Some(control) = build_control.as_ref().filter(|control| control.allows_late_finish())
+        {
             let overrun = std::time::Instant::now().saturating_duration_since(control.finish_until);
             if !overrun.is_zero() {
                 // Completed local candidates, not canonical blocks or accepted submissions.
@@ -1279,14 +1295,16 @@ where
         let state_root_precomputed_sink = Arc::new(Mutex::new(None));
         metrics::counter!("bsc_miner_empty_root_builds_total",
             "path" => if trie_handle.lock().unwrap().is_some() { "sparse" } else { "sync" })
-            .increment(1);
+        .increment(1);
 
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
         let state = StateProviderDatabase::new(&state_provider);
-        let mut db = State::builder()
-            .with_database(cached_reads.as_db_mut(state))
-            .with_bundle_update()
-            .build();
+        let (state, read_phase) =
+            ObservedStateDb::new(&mut cached_reads, state, AttemptKind::Empty, self.ctx.is_inturn);
+        let parent_hash = parent_header.hash_slow();
+        let state = state
+            .with_prewarm_snapshot(parent_hash, crate::shared::miner_prewarm_snapshot(parent_hash));
+        let mut db = State::builder().with_database(state).with_bundle_update().build();
 
         // Sinks for empty-payload builds (same delayed-seal mechanism as normal builds).
         let validator_cache_sink: ValidatorCacheSink = Arc::new(Mutex::new(None));
@@ -1353,6 +1371,7 @@ where
         })?;
         let exec_duration = exec_start.elapsed();
 
+        read_phase.finish();
         // No user transactions - only system transactions will be added by finish()
         let total_fees = U256::ZERO;
         let cumulative_gas_used = 0;
@@ -1650,7 +1669,8 @@ where
                 self.mining_ctx.parent_header.number() + 1,
                 self.trace_id,
                 if self.mining_ctx.is_inturn { "inturn" } else { "outofturn" },
-                self.mining_ctx.parent_snapshot
+                self.mining_ctx
+                    .parent_snapshot
                     .last_block_in_one_turn(self.mining_ctx.parent_header.number() + 1),
                 self.mining_ctx.end_mining_timestamp_ms as i128 - now_ms as i128,
                 std::time::Duration::from_millis(STATE_ROOT_WAIT_MARGIN_MS),
@@ -1697,9 +1717,8 @@ where
                     AttemptObservation::new(AttemptKind::Speculative, self.mining_ctx.is_inturn);
                 self.join_handle.spawn(async move {
                     observation.start();
-                    let mut result = builder
-                        .build_payload_observed(build_args, AttemptKind::Speculative)
-                        .await;
+                    let mut result =
+                        builder.build_payload_observed(build_args, AttemptKind::Speculative).await;
                     observation.finish(result.as_mut().ok(), cancel.is_cancelled());
                     result
                 });
@@ -2253,9 +2272,8 @@ where
                 return Ok(());
             }
             let outcome = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(wait_for_late_candidate(
-                    &mut self.join_handle, &mut self.abort_rx,
-                ))
+                tokio::runtime::Handle::current()
+                    .block_on(wait_for_late_candidate(&mut self.join_handle, &mut self.abort_rx))
             });
             match outcome {
                 Ok(Some(payload)) => {
@@ -2385,14 +2403,16 @@ where
         // Phase 2: collect better candidates until deadline.
         while !self.join_handle.is_empty() {
             if skip_redundant_empty_fallback(
-                self.potential_payloads.iter().any(|payload| payload.build_kind != BuildKind::EmptyFallback),
+                self.potential_payloads
+                    .iter()
+                    .any(|payload| payload.build_kind != BuildKind::EmptyFallback),
                 &self.join_handle,
                 empty_fallback.as_ref(),
             ) {
                 // Per job, not a canonical empty-block counter. No wait for fallback teardown.
                 metrics::counter!("bsc_miner_empty_fallback_wait_skipped_total",
                     "turn" => if self.mining_ctx.is_inturn { "inturn" } else { "outofturn" })
-                    .increment(1);
+                .increment(1);
                 break;
             }
             let now_ms = std::time::SystemTime::now()

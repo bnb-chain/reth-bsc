@@ -102,6 +102,9 @@ where
         // Mirrors reth's `BasicEngineValidatorBuilder`, whose pool adapter is crate-private.
         if txpool_prewarming {
             inner = inner.with_txpool_prewarming(PoolPrewarmSource(ctx.node.pool().clone()));
+            if let Some(read) = inner.txpool_prewarm_snapshot_provider() {
+                crate::shared::set_miner_prewarm_snapshot_provider(read);
+            }
         }
 
         Ok(BscEngineValidatorWithEvidence {

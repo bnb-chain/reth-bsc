@@ -148,6 +148,7 @@ where
     pub(super) rewards_metrics: BscRewardsMetrics,
     /// Deferred error from commit_transaction (e.g. hertz patch), returned from finish().
     pub(super) deferred_error: Option<BlockExecutionError>,
+    execution_diagnostics: crate::node::miner::state_read_diagnostics::ExecutionObservation,
 }
 
 impl<'a, EVM, Spec, R: ReceiptBuilder> BscBlockExecutor<'a, EVM, Spec, R>
@@ -193,7 +194,12 @@ where
 
         let parlia = Arc::new(Parlia::new(Arc::new(spec.clone()), 200));
         let spec_clone = spec.clone();
+        let execution_diagnostics =
+            crate::node::miner::state_read_diagnostics::ExecutionObservation::new(
+                ctx.finish_diagnostics,
+            );
         Self {
+            execution_diagnostics,
             spec,
             evm,
             gas_used: 0,
@@ -730,154 +736,161 @@ where
         &mut self,
         tx: impl ExecutableTx<Self>,
     ) -> Result<BscTxResult<E::HaltReason>, BlockExecutionError> {
-        use alloy_evm::RecoveredTx as _;
+        let started = self.execution_diagnostics.start();
+        let result = (|| {
+            use alloy_evm::RecoveredTx as _;
 
-        let (tx_env, recovered) = tx.into_parts();
-        let signer = *recovered.signer();
-        let tx_signed: TransactionSigned = recovered.tx().clone();
-        let tx_type = tx_signed.tx_type();
+            let (tx_env, recovered) = tx.into_parts();
+            let signer = *recovered.signer();
+            let tx_signed: TransactionSigned = recovered.tx().clone();
+            let tx_type = tx_signed.tx_type();
 
-        // Detect system transactions: skip EVM execution, accumulate for later.
-        let is_system = is_system_transaction(&tx_signed, signer, self.evm.block().beneficiary());
+            // Detect system transactions: skip EVM execution, accumulate for later.
+            let is_system =
+                is_system_transaction(&tx_signed, signer, self.evm.block().beneficiary());
 
-        let lane_type =
-            self.lane.clone().classify(self, is_system, &tx_signed).map_err(lane_reject)?;
+            let lane_type =
+                self.lane.clone().classify(self, is_system, &tx_signed).map_err(lane_reject)?;
 
-        if is_system {
-            self.system_txs.push(tx_signed.clone());
-            let dummy = ResultAndState {
-                result: ExecutionResult::Success {
-                    reason: SuccessReason::Stop,
-                    gas: ResultGas::default(),
-                    logs: vec![],
-                    output: Output::Call(Bytes::new()),
-                },
-                state: Default::default(),
+            if is_system {
+                self.system_txs.push(tx_signed.clone());
+                let dummy = ResultAndState {
+                    result: ExecutionResult::Success {
+                        reason: SuccessReason::Stop,
+                        gas: ResultGas::default(),
+                        logs: vec![],
+                        output: Output::Call(Bytes::new()),
+                    },
+                    state: Default::default(),
+                };
+                return Ok(BscTxResult {
+                    inner: dummy,
+                    blob_gas_used: 0,
+                    tx_type,
+                    tx: tx_signed,
+                    is_system: true,
+                    lane_type,
+                });
+            }
+
+            // From Cancun, system transactions must be at the end of the block.
+            if self.ctx.mode == BscExecutionMode::Import &&
+                !self.system_txs.is_empty() &&
+                BscHardforks::is_cancun_active_at_timestamp(
+                    &self.spec,
+                    self.evm.block().number().to::<u64>(),
+                    self.evm.block().timestamp().to::<u64>(),
+                )
+            {
+                return Err(BscBlockExecutionError::Validation(
+                    BscBlockValidationError::UnexpectedNormalTx,
+                )
+                .into());
+            }
+
+            // Nano consensus rule: a blacklisted sender or recipient makes the block invalid.
+            if self.spec.is_nano_active_at_block(self.evm.block().number().to::<u64>()) &&
+                blacklist::check_tx_basic_blacklist(signer, tx_signed.to())
+            {
+                return Err(BlockValidationError::InvalidTx {
+                    hash: tx_signed.trie_hash(),
+                    error: Box::new(BlacklistedAddressError()),
+                }
+                .into());
+            }
+
+            // The Hertz patches replay historical state fixes, so they only apply to a block that
+            // already exists.
+            if self.ctx.mode == BscExecutionMode::Import {
+                self.hertz_patch_manager.patch_before_tx(&tx_signed, self.evm.db_mut())?;
+            }
+
+            let block_available_gas = self.evm.block().gas_limit() - self.gas_used;
+            let tx_gas_limit = tx_signed.gas_limit();
+            if tx_gas_limit > block_available_gas {
+                return Err(BlockValidationError::TransactionGasLimitMoreThanAvailableBlockGas {
+                    transaction_gas_limit: tx_gas_limit,
+                    block_available_gas,
+                }
+                .into());
+            }
+
+            let tx_hash = tx_signed.trie_hash();
+            let block_number = self.evm.block().number().to::<u64>();
+            let timestamp = self.evm.block().timestamp().to::<u64>();
+            let spec =
+                revm_spec_by_timestamp_and_block_number(self.spec.clone(), timestamp, block_number);
+            let (to, selector, input_len) = {
+                let to = tx_signed.to();
+                let input = tx_signed.input();
+                let selector = if input.len() >= 4 { Some(hex::encode(&input[..4])) } else { None };
+                (to, selector, input.len())
             };
-            return Ok(BscTxResult {
-                inner: dummy,
-                blob_gas_used: 0,
+
+            // Greedy merge checks admission before execution. Mining checks it here and returns
+            // InvalidTx so the pool loop skips this sender instead of aborting the build.
+            if self.ctx.mode == BscExecutionMode::Mining &&
+                self.lane.on() &&
+                !self.lane_admits(&tx_signed, lane_type, self.producer_shared_gas())
+            {
+                return Err(BlockValidationError::InvalidTx {
+                    hash: tx_hash,
+                    error: Box::new(InvalidTransaction::CallerGasLimitMoreThanBlock),
+                }
+                .into());
+            }
+
+            precompiles::push_precompile_trace_context(
+                precompiles::PrecompileTraceContext::from_parts(
+                    block_number,
+                    spec,
+                    false,
+                    Some(tx_hash),
+                    to,
+                    selector,
+                    input_len,
+                ),
+            );
+            struct PrecompileTracePopGuard;
+            impl Drop for PrecompileTracePopGuard {
+                fn drop(&mut self) {
+                    precompiles::pop_precompile_trace_context();
+                }
+            }
+            let _precompile_trace_pop_guard = PrecompileTracePopGuard;
+
+            let blob_gas_used =
+                if BscHardforks::is_cancun_active_at_timestamp(&self.spec, block_number, timestamp)
+                {
+                    tx_signed.blob_gas_used().unwrap_or_default()
+                } else {
+                    0
+                };
+
+            let started = self.execution_diagnostics.start();
+            let result = self.evm.transact(tx_env);
+            self.execution_diagnostics.record(1, started);
+            let inner = result.map_err(|err| BlockExecutionError::evm(err, tx_hash))?;
+
+            Ok(BscTxResult {
+                inner,
+                blob_gas_used,
                 tx_type,
                 tx: tx_signed,
-                is_system: true,
+                is_system: false,
                 lane_type,
-            });
-        }
-
-        // From Cancun, system transactions must be at the end of the block.
-        if self.ctx.mode == BscExecutionMode::Import &&
-            !self.system_txs.is_empty() &&
-            BscHardforks::is_cancun_active_at_timestamp(
-                &self.spec,
-                self.evm.block().number().to::<u64>(),
-                self.evm.block().timestamp().to::<u64>(),
-            )
-        {
-            return Err(BscBlockExecutionError::Validation(
-                BscBlockValidationError::UnexpectedNormalTx,
-            )
-            .into());
-        }
-
-        // Nano consensus rule: a blacklisted sender or recipient makes the block invalid.
-        if self.spec.is_nano_active_at_block(self.evm.block().number().to::<u64>()) &&
-            blacklist::check_tx_basic_blacklist(signer, tx_signed.to())
-        {
-            return Err(BlockValidationError::InvalidTx {
-                hash: tx_signed.trie_hash(),
-                error: Box::new(BlacklistedAddressError()),
-            }
-            .into());
-        }
-
-        // The Hertz patches replay historical state fixes, so they only apply to a block that
-        // already exists.
-        if self.ctx.mode == BscExecutionMode::Import {
-            self.hertz_patch_manager.patch_before_tx(&tx_signed, self.evm.db_mut())?;
-        }
-
-        let block_available_gas = self.evm.block().gas_limit() - self.gas_used;
-        let tx_gas_limit = tx_signed.gas_limit();
-        if tx_gas_limit > block_available_gas {
-            return Err(BlockValidationError::TransactionGasLimitMoreThanAvailableBlockGas {
-                transaction_gas_limit: tx_gas_limit,
-                block_available_gas,
-            }
-            .into());
-        }
-
-        let tx_hash = tx_signed.trie_hash();
-        let block_number = self.evm.block().number().to::<u64>();
-        let timestamp = self.evm.block().timestamp().to::<u64>();
-        let spec =
-            revm_spec_by_timestamp_and_block_number(self.spec.clone(), timestamp, block_number);
-        let (to, selector, input_len) = {
-            let to = tx_signed.to();
-            let input = tx_signed.input();
-            let selector = if input.len() >= 4 { Some(hex::encode(&input[..4])) } else { None };
-            (to, selector, input.len())
-        };
-
-        // Greedy merge checks admission before execution. Mining checks it here and returns
-        // InvalidTx so the pool loop skips this sender instead of aborting the build.
-        if self.ctx.mode == BscExecutionMode::Mining
-            && self.lane.on()
-            && !self.lane_admits(&tx_signed, lane_type, self.producer_shared_gas())
-        {
-            return Err(BlockValidationError::InvalidTx {
-                hash: tx_hash,
-                error: Box::new(InvalidTransaction::CallerGasLimitMoreThanBlock),
-            }
-            .into());
-        }
-
-        precompiles::push_precompile_trace_context(
-            precompiles::PrecompileTraceContext::from_parts(
-                block_number,
-                spec,
-                false,
-                Some(tx_hash),
-                to,
-                selector,
-                input_len,
-            ),
-        );
-        struct PrecompileTracePopGuard;
-        impl Drop for PrecompileTracePopGuard {
-            fn drop(&mut self) {
-                precompiles::pop_precompile_trace_context();
-            }
-        }
-        let _precompile_trace_pop_guard = PrecompileTracePopGuard;
-
-        let blob_gas_used =
-            if BscHardforks::is_cancun_active_at_timestamp(&self.spec, block_number, timestamp) {
-                tx_signed.blob_gas_used().unwrap_or_default()
-            } else {
-                0
-            };
-
-        let inner =
-            self.evm.transact(tx_env).map_err(|err| BlockExecutionError::evm(err, tx_hash))?;
-
-        Ok(BscTxResult {
-            inner,
-            blob_gas_used,
-            tx_type,
-            tx: tx_signed,
-            is_system: false,
-            lane_type,
-        })
+            })
+        })();
+        self.execution_diagnostics.record(0, started);
+        result
     }
 
-    fn commit_transaction(
-        &mut self,
-        output: BscTxResult<E::HaltReason>,
-    ) -> GasOutput {
+    fn commit_transaction(&mut self, output: BscTxResult<E::HaltReason>) -> GasOutput {
         if output.is_system {
             return GasOutput::new(0);
         }
 
+        let started = self.execution_diagnostics.start();
         let ResultAndState { result, state } = output.inner;
 
         // NOTE(reth-v2.4.1): previously streamed post-tx state (excluding SYSTEM_ADDRESS) to the
@@ -909,6 +922,7 @@ where
             }
         }
 
+        self.execution_diagnostics.record(2, started);
         GasOutput::new(gas_used)
     }
 
@@ -1077,6 +1091,73 @@ mod tests {
     const VALIDATOR: Address = address!("0x2000000000000000000000000000000000000002");
     const SYSTEM_TX: (Address, Address) = (VALIDATOR, VALIDATOR_CONTRACT);
     const NORMAL_TX: (Address, Address) = (NORMAL, NORMAL);
+
+    #[test]
+    fn miner_observation_preserves_execution_gas_state_and_validation_error() {
+        use crate::node::miner::state_read_diagnostics::ExecutionObservation;
+        use metrics_exporter_prometheus::PrometheusBuilder;
+        use revm::Database;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let run = |enabled: bool| {
+            let spec = parse_genesis_json(
+                r#"{
+                "config": {"chainId": 714, "ramanujanBlock": 0},
+                "difficulty": "0x1", "gasLimit": "0x2625a00", "alloc": {}
+            }"#,
+            )
+            .unwrap();
+            let block = SealedBlock::seal_slow(BscBlock {
+                header: Header { number: 1, gas_limit: 40_000_000, ..Default::default() },
+                body: Default::default(),
+            });
+            let config = BscEvmConfig::bsc(spec);
+            let mut db = State::builder().with_database(InMemoryDB::default()).build();
+            let mut executor = config.executor_for_block(&mut db, &block).unwrap();
+            executor.execution_diagnostics =
+                ExecutionObservation::new(enabled.then_some(("regular", "inturn")));
+            let tx = TransactionSigned::new_unhashed(
+                Transaction::Legacy(TxLegacy {
+                    to: TxKind::Call(NORMAL),
+                    gas_limit: 21_000,
+                    ..Default::default()
+                }),
+                Signature::test_signature(),
+            );
+            let tx = Recovered::new_unchecked(tx, NORMAL);
+            let output = executor.execute_transaction_without_commit(tx.clone()).unwrap();
+            let gas = executor.commit_transaction(output).tx_gas_used();
+            let error = executor
+                .execute_transaction_without_commit(tx)
+                .err()
+                .expect("reused nonce must fail")
+                .to_string();
+            let receipts = executor.receipts.clone();
+            drop(executor);
+            let account = db.basic(NORMAL).unwrap();
+            (gas, error, receipts, account)
+        };
+        metrics::with_local_recorder(&recorder, || {
+            let baseline = run(false);
+            assert!(!handle.render().contains("bsc_build_diagnostics_transaction_stage"));
+            let observed = run(true);
+            assert_eq!(baseline, observed);
+            assert_eq!(observed.0, 21_000);
+            assert_eq!(observed.3.unwrap().nonce, 1);
+        });
+        let rendered = handle.render();
+        for (stage, count) in [("executor_prepare", 2), ("evm_transact", 2), ("receipt_commit", 1)]
+        {
+            assert!(
+                rendered.lines().any(|l| l
+                    .starts_with("bsc_build_diagnostics_transaction_stage_calls_total") &&
+                    l.contains(stage) &&
+                    l.ends_with(&format!(" {count}"))),
+                "{rendered}"
+            );
+        }
+    }
 
     #[test]
     fn block_interval_metric_preserves_milliseconds() {

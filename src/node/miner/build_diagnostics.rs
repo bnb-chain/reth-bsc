@@ -5,8 +5,8 @@ use alloy_consensus::BlockHeader;
 use reth_primitives_traits::BlockBody;
 use std::{
     sync::{
-        Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
     },
     time::{Duration, Instant},
 };
@@ -54,6 +54,17 @@ const SKIP_REASONS: [&str; 8] = [
     "blob_sidecar",
 ];
 
+/// Disjoint foreground phases within the user transaction loop.
+#[derive(Clone, Copy)]
+pub(crate) enum SelectionStage {
+    Control,
+    Iterator,
+    Precheck,
+    Execute,
+    Postprocess,
+}
+const SELECTION_STAGES: [&str; 5] = ["control", "iterator", "precheck", "execute", "postprocess"];
+
 /// Per-attempt wall-clock accounting, including failed/cancelled attempts via Drop.
 /// Only normal transaction-building attempts enter here; empty fallback bypasses this path.
 /// All histograms use seconds. `kind` and `turn` match AttemptObservation's labels; IDs are
@@ -76,6 +87,8 @@ pub(crate) struct BuildWorkObservation {
     skipped: [u64; 8],
     skipped_time: Duration,
     first_invalid_error: Option<String>,
+    selection_phase: Option<(SelectionStage, Instant)>,
+    selection_times: [Duration; 5],
 }
 impl BuildWorkObservation {
     pub(crate) fn new(
@@ -115,6 +128,8 @@ impl BuildWorkObservation {
             skipped: [0; 8],
             skipped_time: Duration::ZERO,
             first_invalid_error: None,
+            selection_phase: None,
+            selection_times: [Duration::ZERO; 5],
         }
     }
 
@@ -125,12 +140,25 @@ impl BuildWorkObservation {
 
     pub(crate) fn execution_started(&mut self, now: Instant) {
         self.executing = Some(now);
+        self.selection_phase = Some((SelectionStage::Control, now));
         if let Some(deadline) = self.transaction_deadline {
             // Remaining selection window at the actual loop entry, not configured reserve.
             // Expired windows record zero; attempts that never reach the loop have no sample.
             metrics::histogram!("bsc.build_diagnostics.execution_window_seconds", "kind" => self.kind, "turn" => self.turn)
                 .record(deadline.saturating_duration_since(now).as_secs_f64());
         }
+    }
+
+    fn close_selection_phase(&mut self, now: Instant) {
+        if let Some((stage, start)) = self.selection_phase.take() {
+            self.selection_times[stage as usize] += now.duration_since(start);
+        }
+    }
+
+    pub(crate) fn selection_stage(&mut self, stage: SelectionStage) {
+        let now = Instant::now();
+        self.close_selection_phase(now);
+        self.selection_phase = Some((stage, now));
     }
 
     pub(crate) fn skip(&mut self, reason: SkipReason, iteration_started: Instant) {
@@ -150,7 +178,9 @@ impl BuildWorkObservation {
     }
 
     pub(crate) fn selection_stopped(&mut self, reason: &'static str) {
-        self.stopped = Some(Instant::now());
+        let now = Instant::now();
+        self.close_selection_phase(now);
+        self.stopped = Some(now);
         self.reason = reason;
     }
 
@@ -172,6 +202,7 @@ fn claim_slow_log(last: &AtomicU64, now_ms: u64) -> bool {
 impl Drop for BuildWorkObservation {
     fn drop(&mut self) {
         let now = Instant::now();
+        self.close_selection_phase(now);
         if self.acquired.is_none() {
             metrics::gauge!("bsc.build_diagnostics.permit_waiters", "kind" => self.kind, "turn" => self.turn).decrement(1.0);
         }
@@ -192,6 +223,12 @@ impl Drop for BuildWorkObservation {
                 .record(prepare.as_secs_f64());
         }
         if let Some(execution) = execution {
+            for (stage, elapsed) in SELECTION_STAGES.iter().zip(self.selection_times) {
+                metrics::histogram!("bsc.build_diagnostics.selection_stage_seconds",
+                    "kind" => self.kind, "turn" => self.turn, "stage" => *stage,
+                    "status" => if self.stopped.is_some() { "complete" } else { "interrupted" })
+                .record(elapsed.as_secs_f64());
+            }
             // Loop wall time INCLUDING invalid scans and interrupted/failed attempts.
             // Existing execution_seconds only samples successfully completed payloads.
             metrics::histogram!("bsc.build_diagnostics.selection_wall_seconds", "kind" => self.kind, "turn" => self.turn,
@@ -236,6 +273,10 @@ impl Drop for BuildWorkObservation {
                     execution_ms = ?execution.map(|d| d.as_secs_f64() * 1000.0),
                     post_selection_ms = ?finish.map(|d| d.as_secs_f64() * 1000.0),
                     scanned = self.scanned, executed = self.executed,
+                    iterator_ms = self.selection_times[SelectionStage::Iterator as usize].as_secs_f64() * 1000.0,
+                    precheck_ms = self.selection_times[SelectionStage::Precheck as usize].as_secs_f64() * 1000.0,
+                    execute_ms = self.selection_times[SelectionStage::Execute as usize].as_secs_f64() * 1000.0,
+                    postprocess_ms = self.selection_times[SelectionStage::Postprocess as usize].as_secs_f64() * 1000.0,
                     nonce_too_low = self.skipped[SkipReason::NonceTooLow as usize],
                     invalid_transaction = self.skipped[SkipReason::InvalidTransaction as usize],
                     first_invalid_error = ?self.first_invalid_error,
@@ -354,6 +395,51 @@ impl Drop for AttemptObservation {
 mod tests {
     use super::*;
     use metrics_exporter_prometheus::PrometheusBuilder;
+
+    #[test]
+    fn selection_phases_partition_loop_time_and_keep_interrupted_work() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let mut work = BuildWorkObservation::new(AttemptKind::Regular, true, 1, 1, None);
+            work.permit_acquired();
+            let start = Instant::now() - Duration::from_millis(20);
+            work.execution_started(start);
+            work.close_selection_phase(start + Duration::from_millis(2));
+            work.selection_phase =
+                Some((SelectionStage::Iterator, start + Duration::from_millis(2)));
+            work.close_selection_phase(start + Duration::from_millis(5));
+            work.selection_phase =
+                Some((SelectionStage::Execute, start + Duration::from_millis(5)));
+            // Drop inside execute: the remaining phase must be exported as interrupted.
+        });
+        let rendered = handle.render();
+        let sample = |prefix: &str, stage: Option<&str>| -> f64 {
+            rendered
+                .lines()
+                .find(|l| {
+                    l.starts_with(prefix) &&
+                        l.contains("status=\"interrupted\"") &&
+                        stage.is_none_or(|s| l.contains(&format!("stage=\"{s}\"")))
+                })
+                .unwrap_or_else(|| panic!("missing {prefix}: {rendered}"))
+                .split_whitespace()
+                .last()
+                .unwrap()
+                .parse()
+                .unwrap()
+        };
+        let sum: f64 = SELECTION_STAGES
+            .iter()
+            .map(|s| sample("bsc_build_diagnostics_selection_stage_seconds_sum", Some(s)))
+            .sum();
+        let wall = sample("bsc_build_diagnostics_selection_wall_seconds_sum", None);
+        assert!((sum - wall).abs() < 1e-9);
+        assert_eq!(
+            sample("bsc_build_diagnostics_selection_stage_seconds_sum", Some("iterator")),
+            0.003
+        );
+    }
 
     #[test]
     fn interrupted_builds_keep_work_counts_and_distinguish_permit_from_prepare() {

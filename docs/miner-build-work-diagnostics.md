@@ -70,3 +70,5 @@ INFO 日志 `Sampled mining build budget breakdown`：许可等待或准备 ≥2
 ```
 
 诊断：parent_at_notification 偏大→父块提交/导入链路；cache/context/queue/prepare_job/schedule 偏大→矿工内部；原始剩余时间充足但交易窗口小→reserve 或轮次末块上限。时间戳偏移与本机单调时长是两种口径，先看同一条汇总日志对账，再看群体分布。
+
+读取次数、CachedReads 命中/未命中、provider 累计耗时，以及选交易/EVM 子阶段见 [miner-state-read-diagnostics.md](miner-state-read-diagnostics.md)。

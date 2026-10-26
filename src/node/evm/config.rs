@@ -118,7 +118,7 @@ pub struct BscNextBlockEnvAttributes {
     pub state_root_deadline_ms: Option<u64>,
     /// Monotonic local-build budget and cancellation; absent for import and RPC.
     pub build_control: Option<crate::node::miner::build_control::BuildControl>,
-    /// Miner-only bounded (attempt kind, consensus turn) labels for finish-stage diagnostics.
+    /// Miner-only bounded (attempt kind, consensus turn) labels for execution/finish diagnostics.
     /// None for import, RPC and bid simulation; never infer kind from transaction count.
     pub finish_diagnostics: Option<(&'static str, &'static str)>,
     /// Sub-second millisecond remainder (BEP-520) of the block being built, consumed by
@@ -224,7 +224,7 @@ pub struct BscBlockExecutionCtx<'a> {
     pub state_root_deadline_ms: Option<u64>,
     /// Monotonic local-build budget and cancellation; absent for import and RPC.
     pub build_control: Option<crate::node::miner::build_control::BuildControl>,
-    /// Miner-only bounded (attempt kind, consensus turn) labels for finish-stage diagnostics.
+    /// Miner-only bounded (attempt kind, consensus turn) labels for execution/finish diagnostics.
     /// None for import, RPC and bid simulation; never infer kind from transaction count.
     pub finish_diagnostics: Option<(&'static str, &'static str)>,
 }
