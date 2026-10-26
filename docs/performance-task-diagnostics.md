@@ -196,3 +196,42 @@ cargo check --locked --lib
 cargo test --locked --lib node::reorg_metrics::tests
 cargo test --locked --lib node::miner::build_diagnostics::tests
 ```
+
+## Miner critical-path additions (2026-10-26)
+
+This BSC-only addition leaves the Reth revision, budgets, scheduling and cache policy unchanged.
+
+* `bsc_miner_proof_overlay_prepare_seconds`: `cache_index_wait` measures acquiring the proof
+  cache mutex; `cache_index_work` measures selection/LRU insertion through unlocking;
+  `cache_retire` measures dropping an evicted entry outside the lock, only on eviction.
+  It is a reference release, not necessarily freeing the overlay (other Arcs may retain it).
+  Existing `cache_lookup` remains an aggregate including these phases and recorder overhead;
+  **do not add it to its subphases**. `cache_wait` is the separate per-key single-flight lock.
+* `bsc_miner_proof_overlay_evictions_total`: proof-cache entry retirements, not manager
+  generation changes. `bsc_miner_overlay_manager_index_seconds{phase=wait|work}` separately
+  exposes manager-selection mutex waiting and work; proof construction is outside that mutex.
+* `bsc_miner_proof_overlay_build_items{kind,component}`: O(1) top-level counts on successful
+  builds only: accounts, storage_accounts, account_trie_nodes and storage_tries. Hits add no
+  sample. These are not bytes or total storage slots. Existing overlay depth is a separate
+  population; its mean cannot establish a per-build size/latency relationship.
+* `bsc_build_diagnostics_root_waits_total{kind,turn,outcome,bucket}` counts foreground receive
+  attempts in disjoint <50, 50–100, 100–200, 200–400 and >=400ms ranges. Outcomes are delivered,
+  unavailable (task error/disconnection/legacy receive timeout), interrupted (early return),
+  or panic. Delivered does not mean the candidate was selected or included on chain.
+  Existing finish-stage timing includes acquiring the handle-slot lock; the new counter starts
+  after a handle is taken, and ends before trie-update unwrapping. Thus they differ slightly.
+* `Sampled slow miner root wait`: INFO for waits >=100ms, at most once per five seconds per
+  process, including successful waits. Fields: block_number, parent_hash, kind, turn, root_task_id,
+  outcome, budget and wait_ms. Suppressed logs increment `root_wait_logs_suppressed_total`.
+  Block/hash are log fields only; no high-cardinality metric labels. Budget is observed at
+  receive exit and is not proof of the cause. No extra timeout or cancellation is triggered.
+
+Use `increase(root_waits_total[window])` to compare tail counts across exact test windows,
+including early exits. Do not average rolling quantiles to produce a full-window P95.
+The pinned Reth already exports proof-session queue, dispatch, worker init, finish marker/drain
+and final-root phases. They overlap EVM work and each other; their durations cannot be added to
+foreground root_wait. Its handle exposes a process-local diagnostic ID, which is included in the new slow log to
+correlate existing root-task logs without conflating retries. It does not expose a progress snapshot: **this patch does not provide
+an exact per-attempt background breakdown**. That requires a separately reviewed Reth API
+extension, not an inference from aggregated metrics. This addition does not instrument the 50ms
+floor's effect, candidate inclusion, test conditions or parent-import/FCU latency.

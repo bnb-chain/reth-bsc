@@ -220,8 +220,8 @@ where
                 parking_lot::Mutex::new(crate::node::miner::overlay::MinerOverlayCache::default());
 
             let proof_overlay_cache = Arc::new(MinerProofOverlayCache::default());
-            let spawn_fn: crate::shared::SparseTrieSpawnFn =
-                std::sync::Arc::new(move |parent: SealedHeader<Header>, kind| {
+            let spawn_fn: crate::shared::SparseTrieSpawnFn = std::sync::Arc::new(
+                move |parent: SealedHeader<Header>, kind| {
                     let parent_hash = parent.hash();
                     let mut blocks = Vec::<ExecutedBlock<crate::BscPrimitives>>::new();
                     if let Some(cim) = crate::shared::get_canonical_in_memory_state() {
@@ -241,9 +241,18 @@ where
                     }
                     // Serialize cache selection/insertion only; never hold this lock during
                     // proof work or root waits. Old tasks own clones across generation changes.
-                    let (overlay_manager, retired) = overlay_cache.lock().for_parent(&blocks, || {
+                    let selection_start = std::time::Instant::now();
+                    let mut cache = overlay_cache.lock();
+                    let selection_acquired = std::time::Instant::now();
+                    let (overlay_manager, retired) = cache.for_parent(&blocks, || {
                         OverlayManager::new_with_diagnostic_origin(worker_pool.clone(), "miner")
                     });
+                    drop(cache);
+                    let selection_released = std::time::Instant::now();
+                    metrics::histogram!("bsc_miner_overlay_manager_index_seconds", "phase" => "wait")
+                        .record(selection_acquired.duration_since(selection_start).as_secs_f64());
+                    metrics::histogram!("bsc_miner_overlay_manager_index_seconds", "phase" => "work")
+                        .record(selection_released.duration_since(selection_acquired).as_secs_f64());
                     if !retired.is_empty() {
                         runtime.spawn_drop(retired);
                     }
@@ -283,7 +292,8 @@ where
                     metrics::histogram!("bsc_miner_sparse_trie_spawn_duration_seconds")
                         .record(spawn_start.elapsed().as_secs_f64());
                     Some(handle)
-                });
+                },
+            );
 
             if crate::shared::set_sparse_trie_spawn_fn(spawn_fn).is_err() {
                 tracing::warn!("Sparse-trie spawner already registered, keeping existing one");
