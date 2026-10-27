@@ -22,6 +22,9 @@ use std::sync::{
     Arc, OnceLock,
 };
 
+mod proof_hints;
+pub(crate) use proof_hints::ProofHints;
+
 const SHARDS: usize = 16;
 // Entry count is not a byte limit. Code has a separate byte admission budget; map/allocator
 // overhead is not included. Reaching either cap only stops admissions, never state reads.
@@ -176,7 +179,7 @@ pub(crate) fn cache_for_attempt(parent: B256) -> Option<Arc<SharedStateCache>> {
 }
 
 /// Dropping an attempt stops future speculative transactions without joining a slow EVM call.
-pub(crate) struct PrewarmGuard(Arc<AtomicBool>, Arc<SharedStateCache>);
+pub(crate) struct PrewarmGuard(Arc<AtomicBool>, Arc<SharedStateCache>, Option<Arc<ProofHints>>);
 impl PrewarmGuard {
     pub(crate) fn selected(&self, sender: Address, nonce: u64) {
         self.1.mark_selected(sender, nonce);
@@ -185,6 +188,9 @@ impl PrewarmGuard {
 impl Drop for PrewarmGuard {
     fn drop(&mut self) {
         self.0.store(true, Ordering::Relaxed);
+        if let Some(hints) = &self.2 {
+            hints.close();
+        }
     }
 }
 
@@ -233,6 +239,7 @@ fn workers() -> Option<&'static Workers> {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start<Pool, Client, EvmConfig>(
     cache: Option<Arc<SharedStateCache>>,
+    proof_hints: Option<Arc<ProofHints>>,
     pool: Pool,
     client: Client,
     evm_config: EvmConfig,
@@ -276,6 +283,7 @@ where
             cancel.clone(),
             control.clone(),
         );
+        let proof_hints = proof_hints.clone();
         workers.pool.spawn(move || {
             let _permit = permit;
             let should_stop = || stopped.load(Ordering::Relaxed) || cancel.is_cancelled() ||
@@ -301,12 +309,12 @@ where
                     return Some(tx.transaction.clone_into_consensus());
                 }
             };
-            let (completed, failed) = warm_transactions(db, config, env, next, should_stop);
+            let (completed, failed) = warm_transactions(db, config, env, next, should_stop, proof_hints);
             metrics::counter!("bsc.miner_prewarm.transactions_total", "result" => "completed").increment(completed);
             metrics::counter!("bsc.miner_prewarm.transactions_total", "result" => "error").increment(failed);
         });
     }
-    Some(PrewarmGuard(stopped, cache))
+    Some(PrewarmGuard(stopped, cache, proof_hints))
 }
 
 /// Executes against private journals while caching only the backing parent's reads.
@@ -316,12 +324,14 @@ fn warm_transactions<DB, Config>(
     env: EvmEnvFor<Config>,
     mut next: impl FnMut() -> Option<reth_primitives_traits::Recovered<TransactionSigned>>,
     should_stop: impl Fn() -> bool,
+    proof_hints: Option<Arc<ProofHints>>,
 ) -> (u64, u64)
 where
     DB: DatabaseRef<Error: std::error::Error + Send + Sync + 'static> + std::fmt::Debug,
     Config: ConfigureEvm,
     Config::Primitives: reth_primitives_traits::NodePrimitives<SignedTx = TransactionSigned>,
 {
+    let parent = db.cache.parent();
     let mut state = State::builder().with_database_ref(db).build();
     let mut evm = config.evm_with_env(&mut state, env);
     let (mut completed, mut failed) = (0, 0);
@@ -353,6 +363,11 @@ where
         }
         match evm.transact(tx) {
             Ok(result) => {
+                if !should_stop() {
+                    if let Some(hints) = &proof_hints {
+                        hints.record(parent, &result.state);
+                    }
+                }
                 // Like go-bsc's worker-local StateDB, preserve speculative transitions only in
                 // this worker's private State. Its backing read cache still contains parent
                 // values; no write reaches that cache, the provider or the actual miner.
@@ -360,6 +375,11 @@ where
                 completed += 1;
             }
             Err(_) => failed += 1,
+        }
+    }
+    if !should_stop() {
+        if let Some(hints) = &proof_hints {
+            hints.flush();
         }
     }
     (completed, failed)
@@ -497,6 +517,7 @@ mod tests {
     fn speculative_sstore_does_not_change_parent_or_real_execution_result() {
         let parent = ParentDb::default();
         let cache = SharedStateCache::new(B256::repeat_byte(1));
+        let (hints, sent) = ProofHints::captured(cache.parent());
         let (cfg, env) = config_and_env();
         let mut speculative_env = env.clone();
         speculative_env.cfg_env.disable_nonce_check = true;
@@ -507,12 +528,17 @@ mod tests {
                 cfg.clone(),
                 speculative_env,
                 || txs.next(),
-                || false
+                || false,
+                Some(hints)
             ),
             (1, 0)
         );
         assert_eq!(cache.storage(CONTRACT, U256::ZERO), Some(U256::from(3)));
         assert_eq!(cache.account(SENDER).unwrap().unwrap().nonce, 0);
+        assert!(sent.lock().iter().any(|hint| hint
+            .storages
+            .get(&alloy_primitives::keccak256(CONTRACT))
+            .is_some_and(|slots| slots.contains(&alloy_primitives::keccak256(B256::ZERO)))));
 
         let mut cold = State::builder().with_database_ref(parent.clone()).build();
         let cold_result =
@@ -568,7 +594,8 @@ mod tests {
                             cfg,
                             env,
                             || transactions.next(),
-                            || false
+                            || false,
+                            None
                         ),
                         (1, 0)
                     );
@@ -599,7 +626,8 @@ mod tests {
                     cfg,
                     env,
                     || transactions.next(),
-                    || false
+                    || false,
+                    None
                 ),
                 (1, 0)
             );
@@ -628,7 +656,7 @@ mod tests {
     #[test]
     fn dropping_guard_stops_before_selecting_another_transaction() {
         let stop = Arc::new(AtomicBool::new(false));
-        let guard = PrewarmGuard(stop.clone(), SharedStateCache::new(B256::ZERO));
+        let guard = PrewarmGuard(stop.clone(), SharedStateCache::new(B256::ZERO), None);
         drop(guard);
         let (cfg, env) = config_and_env();
         let result = warm_transactions(
@@ -637,6 +665,7 @@ mod tests {
             env,
             || panic!("cancelled worker selected a transaction"),
             || stop.load(Ordering::Relaxed),
+            None,
         );
         assert_eq!(result, (0, 0));
     }
@@ -689,6 +718,7 @@ mod tests {
         assert!(
             start(
                 Some(SharedStateCache::new(parent_hash)),
+                None,
                 pool.clone(),
                 provider.clone(),
                 cfg.clone(),
@@ -715,8 +745,10 @@ mod tests {
         .await
         .unwrap();
         let cache = SharedStateCache::new(parent_hash);
+        let (hints, sent) = ProofHints::captured(parent_hash);
         let guard = start(
             Some(cache.clone()),
+            Some(hints),
             pool,
             provider.clone(),
             cfg,
@@ -736,6 +768,17 @@ mod tests {
         .await
         .expect("actual worker did not warm the contract storage");
         assert_eq!(cache.storage(CONTRACT, U256::ZERO), Some(U256::from(3)));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while sent.lock().is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("actual worker did not prefetch the modified storage path");
+        assert!(sent.lock().iter().any(|hint| hint
+            .storages
+            .get(&alloy_primitives::keccak256(CONTRACT))
+            .is_some_and(|slots| slots.contains(&alloy_primitives::keccak256(B256::ZERO)))));
         drop(guard);
         tokio::time::timeout(Duration::from_secs(5), async {
             while workers().unwrap().active.load(Ordering::Relaxed) != 0 {

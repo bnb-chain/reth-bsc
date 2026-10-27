@@ -182,3 +182,38 @@ completed 只表示调用返回成功，EVM revert/halt 仍可能包含在其中
 各层耗时包含关系不变，不可相加。worker 在线程结束时汇总交易计数。
 
 开关开启后的收益需要同条件 A/B 验证，不能由线程存在或共享命中率直接推导TPS增益。
+
+### 并行预执行的 proof 路径提示
+
+启用同一个 `--engine.txpool-prewarming` 开关且本次构建拥有 sparse-trie root handle 时，
+miner 从该 handle 获取只读提示能力，交给本次 attempt 的预执行 workers。
+预执行返回后，提取 touched、非 selfdestructed 账户的变更路径：有账户信息变化或
+storage 变化才发送账户路径，storage 仅包含值发生变化的 slot。发送的只有
+Keccak(address)/Keccak(slot)，没有投机写值，也不发送正式更新或结束标记。
+正式执行的 StateHook 仍是状态更新和结束信号的唯一来源。
+
+这借鉴 go-bsc `StateDB.Finalise` / `stateObject.finalise` 提前准备脏账户和 slot 的 Trie
+路径、在 `IntermediateRoot` 中消费预取 Trie 的做法。Reth 原有正式状态更新已经是流式的，
+此处新增的是从预执行提前发送 best-effort access hints；预执行路径可能与实际执行不同，
+提示未被使用或被丢弃都不影响结果。现有 Reth `44371a` 已提供此接口，无须升级到2.8或修改依赖。
+
+限制按 attempt 隔离：跨 worker 去重，账户与 slot 合计最多16384个不同路径，最多256批，
+每批最多64个路径。每笔投机交易最多检查64个账户、每个账户最多检查64个 slot，最多
+提取64个路径；超出的部分不预取，正式 proof 仍走原路径。尚不足一批时，在 worker
+正常耗尽候选迭代器时发送，不在取消/预算截止时补发。
+正式交易循环结束时关闭发送门，丢弃未发送的尾批；发送门仅保护去重/批处理与非阻塞
+channel 提交，不包含 Keccak、EVM 或 provider 操作。关闭返回后，在途预执行也不能再发提示。
+关闭前已提交给 root 管线的提示可能仍会被处理，并不会被此门撤回。
+
+新增指标前缀为 `reth_bsc_miner_prewarm_`：
+
+- `proof_hint_batches_total`：通过提示接口提交的批数。
+- `proof_hint_targets_total{resource="account|storage"}`：提交的去重路径数。
+- `proof_hint_rejections_total{reason="parent_mismatch|duplicate|limit"}`：错父块记录、重复或预算拒绝。
+  错父块计数按被拒绝的记录调用次数，其他计数按路径数。
+- `proof_hint_budget_exhausted_total{reason="targets|batches"}`：本次 attempt 用尽提示预算。
+
+提交计数不代表后台已消费、proof 命中或上链成功；去重路径数上限也不是整个 proof 管线的
+严格字节/任务数上限。当前改动没有跨候选复用可变 sparse trie，也未改变 worker 数量和调度。
+需要同时比较 finish 时剩余 proofs、finish drain、root_wait、总构建时间及有压空块率，
+不能仅凭新增提示计数断言性能提升。
