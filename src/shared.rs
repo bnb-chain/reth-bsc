@@ -2,10 +2,7 @@ use crate::{
     consensus::parlia::SnapshotProvider,
     node::{
         engine_api::payload::BscPayloadTypes,
-        network::{
-            block_import::service::{IncomingBidBlock, IncomingBlock, IncomingMinedBlock},
-            BscNetworkPrimitives,
-        },
+        network::{block_import::service::IncomingLocalBlock, BscNetworkPrimitives},
         primitives::BscBlock,
     },
 };
@@ -34,7 +31,10 @@ use std::{
         Arc, OnceLock, RwLock,
     },
 };
-use tokio::sync::{broadcast, mpsc::UnboundedSender};
+use tokio::sync::{
+    broadcast,
+    mpsc::{Sender, UnboundedSender},
+};
 
 /// Public type alias for the BSC engine API sender (replaces private reth EngineApiTx).
 pub type BscEngineApiTx = UnboundedSender<
@@ -98,15 +98,8 @@ type BestTdFn = Arc<dyn Fn() -> Option<u128> + Send + Sync>;
 /// Global best total difficulty provider
 static BEST_TD_PROVIDER: OnceLock<BestTdFn> = OnceLock::new();
 
-/// Global sender for submitting mined blocks to the import service
-static BLOCK_IMPORT_MINED_SENDER: OnceLock<UnboundedSender<IncomingMinedBlock>> = OnceLock::new();
-
-/// Global sender for submitting built payload to the import service
-static BLOCK_IMPORT_SENDER: OnceLock<UnboundedSender<IncomingBlock>> = OnceLock::new();
-
-/// Global sender for submitting a selected (sealed, unexecuted) BEP-675 BidBlock to the import
-/// service, which broadcasts it then verifies it on import (zero-simulate).
-static BID_BLOCK_IMPORT_SENDER: OnceLock<UnboundedSender<IncomingBidBlock>> = OnceLock::new();
+/// Bounded ingress shared by locally mined, fallback and selected BidBlocks.
+static LOCAL_BLOCK_IMPORT_SENDER: OnceLock<Sender<IncomingLocalBlock>> = OnceLock::new();
 
 /// Global local peer ID for network identification
 static LOCAL_PEER_ID: OnceLock<PeerId> = OnceLock::new();
@@ -469,40 +462,16 @@ pub fn get_best_canonical_td() -> Option<u128> {
     BEST_TD_PROVIDER.get().and_then(|f| f())
 }
 
-/// Store the block import sender globally. Returns an error if it was set before.
-pub fn set_block_import_mined_sender(
-    sender: UnboundedSender<IncomingMinedBlock>,
-) -> Result<(), UnboundedSender<IncomingMinedBlock>> {
-    BLOCK_IMPORT_MINED_SENDER.set(sender)
+/// Store the local block import sender. Returns an error if already initialised.
+pub(crate) fn set_local_block_import_sender(
+    sender: Sender<IncomingLocalBlock>,
+) -> Result<(), Sender<IncomingLocalBlock>> {
+    LOCAL_BLOCK_IMPORT_SENDER.set(sender)
 }
 
-/// Get a reference to the global block import sender, if initialized.
-pub fn get_block_import_mined_sender() -> Option<&'static UnboundedSender<IncomingMinedBlock>> {
-    BLOCK_IMPORT_MINED_SENDER.get()
-}
-
-/// Store the block import sender globally. Returns an error if it was set before.
-pub fn set_block_import_sender(
-    sender: UnboundedSender<IncomingBlock>,
-) -> Result<(), UnboundedSender<IncomingBlock>> {
-    BLOCK_IMPORT_SENDER.set(sender)
-}
-
-/// Get a reference to the global block import sender, if initialized.
-pub fn get_block_import_sender() -> Option<&'static UnboundedSender<IncomingBlock>> {
-    BLOCK_IMPORT_SENDER.get()
-}
-
-/// Store the BidBlock import sender globally. Returns an error if it was set before.
-pub fn set_bid_block_import_sender(
-    sender: UnboundedSender<IncomingBidBlock>,
-) -> Result<(), UnboundedSender<IncomingBidBlock>> {
-    BID_BLOCK_IMPORT_SENDER.set(sender)
-}
-
-/// Get a reference to the global BidBlock import sender, if initialized.
-pub fn get_bid_block_import_sender() -> Option<&'static UnboundedSender<IncomingBidBlock>> {
-    BID_BLOCK_IMPORT_SENDER.get()
+/// The local producer must await capacity or reserve it before spawning a delayed send.
+pub(crate) fn get_local_block_import_sender() -> Option<&'static Sender<IncomingLocalBlock>> {
+    LOCAL_BLOCK_IMPORT_SENDER.get()
 }
 
 /// Store the local peer ID globally. Returns an error if it was set before.
