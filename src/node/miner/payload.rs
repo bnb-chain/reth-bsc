@@ -629,13 +629,6 @@ where
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
         let state = StateProviderDatabase::new(&state_provider);
         let prewarm_cache = super::prewarm::cache_for_attempt(parent_hash);
-        let proof_hints = prewarm_cache.as_ref().and_then(|_| {
-            trie_handle.lock().unwrap().as_mut().and_then(|handle| {
-                handle
-                    .take_isolated_hint_stream()
-                    .map(|stream| super::prewarm::ProofHints::new(parent_hash, stream))
-            })
-        });
         let (state, read_phase) =
             ObservedStateDb::new(&mut cached_reads, state, kind, self.ctx.is_inturn);
         let state = state.with_shared_prewarm(parent_hash, prewarm_cache.clone());
@@ -786,7 +779,6 @@ where
         };
         let prewarm = super::prewarm::start(
             prewarm_cache,
-            proof_hints,
             self.pool.clone(),
             self.client.clone(),
             self.evm_config.clone(),
