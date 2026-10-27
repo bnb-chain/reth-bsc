@@ -531,8 +531,7 @@ mod parent_block_env {
         use crate::node::evm::pre_execution::validators_at_parent;
         use alloy_primitives::{B256, U256};
         use reth_primitives_traits::{Account, Bytecode as PrimitivesBytecode, SealedHeader};
-        use reth_provider::ProviderResult;
-        use reth_revm::database::EvmStateProvider;
+        use reth_provider::{EvmStateProvider, ProviderResult};
 
         /// Serves [`WINDOW_REPORTING_VALIDATOR_SET`] as the code of `VALIDATOR_CONTRACT`, or an
         /// empty state when `code` is `None` — i.e. the contract not deployed.

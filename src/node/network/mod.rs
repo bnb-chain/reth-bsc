@@ -25,7 +25,7 @@ use reth::{
 use reth_chainspec::EthChainSpec;
 use reth_discv4::Discv4Config;
 use reth_engine_primitives::ConsensusEngineHandle;
-use reth_eth_wire::{BasicNetworkPrimitives, NewBlock, NewBlockPayload};
+use reth_eth_wire::{BasicNetworkPrimitives, HelloMessageWithProtocols, NewBlock, NewBlockPayload};
 use reth_ethereum_primitives::{PooledTransactionVariant, TransactionSigned};
 use reth_network::{NetworkConfig, NetworkHandle, NetworkManager, PeersConfig, SessionsConfig};
 use reth_network_api::PeersInfo;
@@ -169,6 +169,12 @@ pub struct BscNetworkBuilder {
     engine_handle_rx: Arc<Mutex<Option<oneshot::Receiver<ConsensusEngineHandle<BscPayloadTypes>>>>>,
 }
 
+fn apply_bsc_eth_protocol_overrides(hello: &mut HelloMessageWithProtocols) {
+    // BSC eth/70 retains total difficulty and omits UpgradeStatus, unlike Ethereum eth/70.
+    // Use the supported legacy handshake until the BSC-specific wire format is implemented.
+    hello.protocols.retain(|protocol| protocol.cap.name != "eth" || protocol.cap.version <= 68);
+}
+
 fn apply_bsc_discv4_overrides<I>(discv4_config: &mut Option<Discv4Config>, boot_nodes: Option<I>)
 where
     I: IntoIterator<Item = NodeRecord>,
@@ -270,25 +276,17 @@ impl BscNetworkBuilder {
 
         let network_builder = ctx.network_config_builder()?;
 
-        let (to_import_net, from_network) = mpsc::unbounded_channel();
-        let (to_import_mined, from_builder) = mpsc::unbounded_channel();
-        let (to_import_bid, from_bid_block) = mpsc::unbounded_channel();
-        let (to_network, import_outcome) = mpsc::unbounded_channel();
+        let (to_import_net, from_network) = mpsc::channel(block_import::IMPORT_QUEUE_CAPACITY);
+        let (to_local, from_local) = mpsc::channel(block_import::propagation::LOCAL_BLOCK_CAPACITY);
+        let (to_network, import_outcome) = block_import::propagation::channel();
 
-        let (to_hashes, from_hashes) = mpsc::unbounded_channel();
+        let (to_hashes, from_hashes) = mpsc::channel(block_import::IMPORT_QUEUE_CAPACITY);
         let handle = ImportHandle::new(to_import_net.clone(), to_hashes, import_outcome);
 
-        // Expose the sender globally so that the miner can submit newly mined blocks
-        if crate::shared::set_block_import_mined_sender(to_import_mined.clone()).is_err() {
-            warn!(target: "bsc", "Block import mined sender already initialised; overriding skipped");
-        }
-        if crate::shared::set_block_import_sender(to_import_net.clone()).is_err() {
-            warn!(target: "bsc", "Block import network sender already initialised; overriding skipped");
-        }
-        // Expose the BEP-675 BidBlock sender so the miner can submit a selected (sealed,
-        // unexecuted) BidBlock for broadcast-then-verify (zero-simulate).
-        if crate::shared::set_bid_block_import_sender(to_import_bid.clone()).is_err() {
-            warn!(target: "bsc", "BidBlock import sender already initialised; overriding skipped");
+        // Share bounded local ingress between mined blocks and selected BEP-675 BidBlocks.
+        // Selected sealed, unexecuted BidBlocks still use broadcast-then-verify (zero-simulate).
+        if crate::shared::set_local_block_import_sender(to_local).is_err() {
+            warn!(target: "bsc", "Local block import sender already initialised; overriding skipped");
         }
 
         // Import the necessary types for block import service
@@ -352,8 +350,7 @@ impl BscNetworkBuilder {
                 chain_spec,
                 handle,
                 from_network,
-                from_builder,
-                from_bid_block,
+                from_local,
                 from_hashes,
                 to_network,
             )
@@ -383,6 +380,7 @@ impl BscNetworkBuilder {
 
         let peer_id = network_builder.get_peer_id();
         let mut network_config = ctx.build_network_config(network_builder);
+        apply_bsc_eth_protocol_overrides(&mut network_config.hello_message);
         apply_bsc_discv4_overrides(
             &mut network_config.discovery_v4_config,
             ctx.chain_spec().bootnodes(),
@@ -655,7 +653,10 @@ async fn register_nodeids_actions<P: StateProviderFactory>(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_bsc_discv4_overrides, apply_bsc_peer_stability_overrides};
+    use super::{
+        apply_bsc_discv4_overrides, apply_bsc_eth_protocol_overrides,
+        apply_bsc_peer_stability_overrides,
+    };
     use reth_discv4::{Discv4Config, NatResolver};
     use reth_network::{PeersConfig, SessionsConfig};
     use reth_network_peers::NodeRecord;
@@ -663,6 +664,19 @@ mod tests {
         net::{IpAddr, Ipv4Addr},
         time::Duration,
     };
+
+    #[test]
+    fn negotiates_eth68_with_go_bsc_eth70_peer() {
+        use reth_eth_wire::{
+            capability::SharedCapabilities, Capability, EthVersion, HelloMessageWithProtocols,
+        };
+
+        let mut hello = HelloMessageWithProtocols::builder(Default::default()).build();
+        apply_bsc_eth_protocol_overrides(&mut hello);
+        let remote = vec![Capability::eth(EthVersion::Eth70), Capability::eth(EthVersion::Eth68)];
+        let shared = SharedCapabilities::try_new(hello.protocols, remote).unwrap();
+        assert_eq!(shared.eth_version().unwrap(), EthVersion::Eth68);
+    }
 
     #[test]
     fn bsc_discv4_overrides_preserve_external_ip_resolver() {

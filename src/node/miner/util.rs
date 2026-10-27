@@ -24,7 +24,7 @@ use alloy_primitives::{Address, Bytes, B256};
 use reth_chainspec::EthChainSpec;
 use reth_node_ethereum::engine::EthPayloadAttributes;
 use reth_primitives_traits::SealedHeader;
-use reth_provider::StateProviderFactory;
+use reth_provider::{EvmStateProviderAdapter, StateProviderFactory};
 use std::sync::Arc;
 
 /// Returns the validator set for `parent_header.number + 1`, or `None` off the epoch boundary.
@@ -64,7 +64,8 @@ where
     };
     let state = client.state_by_block_hash(parent_hash).map_err(|e| failed(&e))?;
     let validators =
-        validators_at_parent(&state, chain_spec.clone(), parent_header).map_err(|e| failed(&e))?;
+        validators_at_parent(EvmStateProviderAdapter(&state), chain_spec.clone(), parent_header)
+            .map_err(|e| failed(&e))?;
     // A cache miss means this process did not execute the parent block.
     tracing::warn!(
         target: "bsc::miner",

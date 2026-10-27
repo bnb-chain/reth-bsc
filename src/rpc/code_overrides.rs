@@ -20,8 +20,8 @@ use reth_evm::{
     EvmFactory,
 };
 use reth_primitives_traits::BlockBody;
-use reth_provider::{BlockIdReader, ProviderError};
-use reth_revm::{cancelled::CancelOnDrop, database::StateProviderDatabase, db::State};
+use reth_provider::{BlockIdReader, EvmStateProviderAdapter, ProviderError};
+use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_rpc_convert::RpcTypes;
 use reth_rpc_eth_api::{
     helpers::{estimate::EstimateCall, EthCall},
@@ -32,6 +32,7 @@ use reth_rpc_eth_types::{
     simulate::{self, EthSimulateError},
     BlockOverridesExt, EthApiError,
 };
+use reth_tasks::CancelOnDrop;
 use revm::{context::Block, context_interface::Cfg, database::InMemoryDB, DatabaseCommit};
 use revm_inspectors::transfer::TransferInspector;
 use std::collections::{BTreeMap, BTreeSet};
@@ -143,14 +144,14 @@ where
             env = self.0.evm_config().with_block_rules(env);
         }
         self.0
-            .spawn_with_state(Some(at), move |eth, provider| {
+            .spawn_blocking_io_with_state(at, move |eth, provider| {
                 // Block overrides are already in `env`; blockHash overrides are ignored, as in
                 // go-bsc.
                 EstimateCall::estimate_gas_with(
                     &eth,
                     env,
                     request,
-                    provider,
+                    EvmStateProviderAdapter(provider),
                     EvmOverrides::state(state),
                 )
             })
@@ -217,7 +218,7 @@ where
 
         self.0
             .spawn_with_state_at_block(block, move |this, db| {
-                let state_provider = db.database.0 .0;
+                let state_provider = db.database.into_inner();
                 let mut db = State::builder()
                     .with_database(StateProviderDatabase::new(&state_provider))
                     .with_bundle_update()
@@ -346,7 +347,7 @@ where
 
                         simulate::execute_transactions(
                             builder,
-                            &state_provider,
+                            &*state_provider,
                             calls,
                             &mut remaining_call_gas_limit,
                             chain_id,
@@ -368,7 +369,7 @@ where
 
                         simulate::execute_transactions(
                             builder,
-                            &state_provider,
+                            &*state_provider,
                             calls,
                             &mut remaining_call_gas_limit,
                             chain_id,

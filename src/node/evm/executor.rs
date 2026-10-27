@@ -1,10 +1,16 @@
-use super::config::{
-    revm_spec_by_timestamp_and_block_number, BscBlockExecutionCtx, BscExecutionMode,
+use super::{
+    config::{revm_spec_by_timestamp_and_block_number, BscBlockExecutionCtx, BscExecutionMode},
+    patch::HertzPatchManager,
 };
-use super::patch::HertzPatchManager;
-use crate::consensus::parlia::{util::calculate_millisecond_timestamp, SnapshotProvider};
 use crate::{
-    consensus::parlia::{Parlia, Snapshot, VoteAddress},
+    consensus::{
+        parlia::{
+            util::calculate_millisecond_timestamp, Parlia, Snapshot, SnapshotProvider, VoteAddress,
+        },
+        payment_lane::{
+            state::LaneState, LaneError, LaneLiveState, LaneType, PAYMENT_LANE_CONTRACT,
+        },
+    },
     evm::{
         blacklist::{self, BlacklistedAddressError},
         precompiles,
@@ -15,28 +21,26 @@ use crate::{
         BscBlockchainMetrics, BscConsensusMetrics, BscExecutorMetrics, BscRewardsMetrics,
         BscVoteMetrics,
     },
-    node::evm::config::BscExecutionSharedCtx,
+    node::evm::{
+        config::BscExecutionSharedCtx,
+        error::{lane_reject, BscBlockExecutionError, BscBlockValidationError},
+    },
     system_contracts::{
         feynman_fork::ValidatorElectionInfo, get_upgrade_system_contracts, is_system_transaction,
         SystemContract,
     },
 };
-use alloy_consensus::{Header, Transaction as _, TxReceipt, TxType};
-use alloy_eips::eip2935::{HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE};
-use alloy_eips::{eip7685::Requests, Encodable2718};
+use alloy_consensus::{constants::KECCAK_EMPTY, Header, Transaction as _, TxReceipt, TxType};
+use alloy_eips::{
+    eip2935::{HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE},
+    eip7685::Requests,
+    Encodable2718,
+};
 use alloy_evm::{
-    block::{
-        ExecutableTx, GasOutput, TxResult,
-    },
+    block::{ExecutableTx, GasOutput, TxResult},
     eth::receipt_builder::ReceiptBuilderCtx,
 };
-use crate::node::evm::error::{lane_reject, BscBlockExecutionError, BscBlockValidationError};
-use crate::consensus::payment_lane::{
-    state::LaneState, LaneError, LaneLiveState, LaneType, PAYMENT_LANE_CONTRACT,
-};
-use alloy_consensus::constants::KECCAK_EMPTY;
-use alloy_primitives::keccak256;
-use alloy_primitives::{hex, uint, Address, BlockNumber, Bytes, U256};
+use alloy_primitives::{hex, keccak256, uint, Address, BlockNumber, Bytes, U256};
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use reth_ethereum_primitives::TransactionSigned;
 use reth_evm::{
@@ -48,12 +52,11 @@ use reth_evm::{
 };
 use reth_primitives_traits::Recovered;
 use reth_provider::BlockExecutionResult;
-use revm::Database as _;
 use revm::{
     context::result::{ExecutionResult, Output, ResultAndState, ResultGas, SuccessReason},
     context_interface::{block::Block, result::InvalidTransaction},
     state::{Account as RevmAccount, Bytecode, EvmState},
-    DatabaseCommit,
+    Database as _, DatabaseCommit,
 };
 use std::{collections::HashMap, sync::Arc};
 use tracing::{debug, error, info, trace, warn};
@@ -368,8 +371,12 @@ where
         address: Address,
         code: Bytecode,
     ) -> Result<(), BlockExecutionError> {
-        let info =
-            self.evm.db_mut().basic(address).map_err(BlockExecutionError::other)?.unwrap_or_default();
+        let info = self
+            .evm
+            .db_mut()
+            .basic(address)
+            .map_err(BlockExecutionError::other)?
+            .unwrap_or_default();
         // Build the account from the PRE-upgrade info and mutate afterwards.
         // `impl From<AccountInfo> for Account` snapshots the value it is given into
         // `original_info`, and reth's `evm_state_to_hashed_post_state` decides whether an
@@ -406,7 +413,9 @@ where
             let db = self.evm.db_mut();
             let old_info = db.basic(address).map_err(BlockExecutionError::other)?;
             let info = old_info.unwrap_or_default();
-            if info.code_hash != revm::primitives::KECCAK_EMPTY && info.code_hash != alloy_primitives::B256::ZERO {
+            if info.code_hash != revm::primitives::KECCAK_EMPTY &&
+                info.code_hash != alloy_primitives::B256::ZERO
+            {
                 error!(
                     target: "bsc::executor::cas20",
                     block_number,
@@ -516,11 +525,7 @@ where
             self.evm.block().number().to::<u64>(),
             self.evm.block().timestamp().to::<u64>(),
         );
-        self.evm
-            .block()
-            .gas_limit()
-            .saturating_sub(reserved)
-            .saturating_sub(self.gas_used)
+        self.evm.block().gas_limit().saturating_sub(reserved).saturating_sub(self.gas_used)
     }
 
     /// Validates total block gas after all system transactions have executed.
@@ -693,7 +698,8 @@ where
         let block_number = block_env.number().to::<u64>();
         self.consensus_metrics.current_block_height.set(block_number as f64);
 
-        // pre check and prepare some intermediate data for commit parlia snapshot in finish function.
+        // pre check and prepare some intermediate data for commit parlia snapshot in finish
+        // function.
         if self.ctx.mode == BscExecutionMode::Import {
             self.check_new_block(&block_env)
                 .map_err(crate::node::evm::error::mark_pre_execution_error)?;
@@ -1033,7 +1039,9 @@ where
             let current_timestamp_ms = self.evm.block().milli_timestamp();
             let parent_timestamp_ms = calculate_millisecond_timestamp(parent_header);
             let time_diff_ms = current_timestamp_ms as i128 - parent_timestamp_ms as i128;
-            self.blockchain_metrics.block_receive_time_diff_seconds.set(time_diff_ms as f64 / 1000.0);
+            self.blockchain_metrics
+                .block_receive_time_diff_seconds
+                .set(time_diff_ms as f64 / 1000.0);
         }
 
         // Note: For gas-related metrics, use reth's ExecutorMetrics:
@@ -1051,7 +1059,6 @@ where
             },
         ))
     }
-
 
     fn evm_mut(&mut self) -> &mut Self::Evm {
         &mut self.evm
@@ -1162,8 +1169,8 @@ mod tests {
     #[test]
     fn block_interval_metric_preserves_milliseconds() {
         use crate::{
-            consensus::parlia::util::set_millisecond_part_of_timestamp, metrics::BscBlockchainMetrics,
-            node::evm::config::BscExecutionMode,
+            consensus::parlia::util::set_millisecond_part_of_timestamp,
+            metrics::BscBlockchainMetrics, node::evm::config::BscExecutionMode,
         };
         use metrics_exporter_prometheus::PrometheusBuilder;
 
@@ -1212,7 +1219,9 @@ mod tests {
             let output = recorder.handle().render();
             let value = output
                 .lines()
-                .find_map(|line| line.strip_prefix("bsc_blockchain_block_receive_time_diff_seconds "))
+                .find_map(|line| {
+                    line.strip_prefix("bsc_blockchain_block_receive_time_diff_seconds ")
+                })
                 .expect("block interval gauge should be exported")
                 .parse::<f64>()
                 .unwrap();

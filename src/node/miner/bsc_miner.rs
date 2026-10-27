@@ -1,7 +1,9 @@
 use super::startup_diagnostics::StartupTiming;
 use crate::{
     chainspec::BscChainSpec,
-    consensus::parlia::{provider::SnapshotProvider, util::calculate_millisecond_timestamp, Parlia},
+    consensus::parlia::{
+        provider::SnapshotProvider, util::calculate_millisecond_timestamp, Parlia,
+    },
     metrics::BscConsensusMetrics,
     node::{
         engine::BscBuiltPayload,
@@ -13,14 +15,9 @@ use crate::{
             signer::init_global_signer_from_k256,
             util::prepare_new_attributes,
         },
-        network::{
-            block_import::service::{IncomingBlock, IncomingMinedBlock},
-            BscNewBlock,
-        },
+        network::{block_import::service::IncomingLocalBlock, BscNewBlock},
     },
-    shared::{
-        get_block_import_mined_sender, get_block_import_sender, get_local_peer_id_or_default,
-    },
+    shared::get_local_block_import_sender,
 };
 use alloy_consensus::BlockHeader;
 use alloy_primitives::{Address, Sealable, U128};
@@ -36,8 +33,7 @@ use reth_primitives_traits::{BlockBody, SealedHeader};
 use reth_provider::{
     BlockNumReader, CanonStateNotification, CanonStateSubscriptions, HeaderProvider,
 };
-use reth_revm::cancelled::ManualCancel;
-use reth_tasks::TaskExecutor;
+use reth_tasks::{ManualCancel, TaskExecutor};
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -114,9 +110,10 @@ where
     Provider: HeaderProvider<Header = alloy_consensus::Header>
         + BlockNumReader
         + reth_provider::StateProviderFactory
-        + CanonStateSubscriptions
         + reth_provider::NodePrimitivesProvider
-        + Clone
+        + CanonStateSubscriptions<
+            Primitives = <Provider as reth_provider::NodePrimitivesProvider>::Primitives,
+        > + Clone
         + Send
         + Sync
         + 'static,
@@ -166,7 +163,9 @@ where
                     consensus,
                 );
                 let timing = StartupTiming::new(
-                    tip_header.hash(), calculate_millisecond_timestamp(tip_header.header()), "startup",
+                    tip_header.hash(),
+                    calculate_millisecond_timestamp(tip_header.header()),
+                    "startup",
                 );
                 worker.try_new_work(&tip_header, timing).await;
             });
@@ -881,10 +880,21 @@ where
         &self,
         payload: BscBuiltPayload,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let sender =
+            get_local_block_import_sender().ok_or("Local block import sender not initialised")?;
+        // Reserve one local ingress slot; send consumes it and an early return releases it.
+        // Wait in the existing result worker before checking freshness or claiming the
+        // signing slot, so congestion cannot make those checks stale before submission.
+        let wait_started = std::time::Instant::now();
+        let permit = sender.reserve().await.map_err(|_| "Local block import channel closed")?;
+        metrics::histogram!("bsc.block_import.local_admission_wait_seconds")
+            .record(wait_started.elapsed().as_secs_f64());
         let sealed_block = payload.block();
         let block_hash = sealed_block.hash();
         super::startup_diagnostics::ingress(
-            block_hash, calculate_millisecond_timestamp(sealed_block.header()), "local",
+            block_hash,
+            calculate_millisecond_timestamp(sealed_block.header()),
+            "local",
         );
         let block_number = sealed_block.number();
         let parent_hash = sealed_block.header().parent_hash;
@@ -1053,36 +1063,15 @@ where
             BscNewBlock(reth_eth_wire::NewBlock { block: sealed_block.clone_block(), td });
         let msg = NewBlockMessage { hash: block_hash, block: Arc::new(new_block) };
 
-        if self.submit_built_payload {
-            if let Some(sender) = get_block_import_mined_sender() {
-                let incoming: IncomingMinedBlock = (payload, msg.clone());
-                if sender.send(incoming).is_err() {
-                    warn!("Failed to send mined block to import service due to channel closed");
-                    return Err(
-                        "Failed to send mined block to import service due to channel closed".into(),
-                    );
-                } else {
-                    debug!("Succeed to send mined block to import service");
-                }
-            } else {
-                warn!("Failed to send mined block due to import sender not initialised");
-                return Err("Failed to send mined block due to import sender not initialised".into());
-            }
-        } else if let Some(sender) = get_block_import_sender() {
-            let peer_id = get_local_peer_id_or_default();
-            let incoming: IncomingBlock = (msg.clone(), peer_id);
-            if sender.send(incoming).is_err() {
-                warn!("Failed to send built block to import service due to channel closed");
-                return Err(
-                    "Failed to send built block to import service due to channel closed".into()
-                );
-            } else {
-                debug!("Succeed to send built block to import service");
-            }
+        let incoming = if self.submit_built_payload {
+            IncomingLocalBlock::Mined(Box::new((payload, msg)))
         } else {
-            warn!("Failed to send built block due to import sender not initialised");
-            return Err("Failed to send built block due to import sender not initialised".into());
-        }
+            IncomingLocalBlock::Unexecuted(msg)
+        };
+        // The permit guarantees capacity, not receipt or propagation. Keep the signing
+        // record even if the receiver shuts down after we reserved the slot.
+        permit.send(incoming);
+        debug!("Submitted local block to import service");
 
         Ok(())
     }
@@ -1218,8 +1207,10 @@ where
     Provider: HeaderProvider<Header = alloy_consensus::Header>
         + BlockNumReader
         + reth_provider::StateProviderFactory
-        + CanonStateSubscriptions
-        + Clone
+        + reth_provider::NodePrimitivesProvider
+        + CanonStateSubscriptions<
+            Primitives = <Provider as reth_provider::NodePrimitivesProvider>::Primitives,
+        > + Clone
         + Send
         + Sync
         + 'static,

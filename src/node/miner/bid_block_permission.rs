@@ -354,9 +354,8 @@ impl BidBlockPermissionManager {
         let duration_secs =
             if duration_secs == 0 { BID_BLOCK_REVOKE_DURATION_SECS } else { duration_secs };
         let duration_secs = match revoked.get(&builder) {
-            Some(rec) if rec.is_active(now) => {
-                duration_secs.max(rec.revoked_at.saturating_add(rec.duration_secs).saturating_sub(now))
-            }
+            Some(rec) if rec.is_active(now) => duration_secs
+                .max(rec.revoked_at.saturating_add(rec.duration_secs).saturating_sub(now)),
             _ => duration_secs,
         };
         revoked.insert(

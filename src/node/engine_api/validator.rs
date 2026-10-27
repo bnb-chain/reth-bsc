@@ -25,6 +25,7 @@ use reth_engine_tree::tree::{
     TxPoolPrewarmTransactions, WaitForCaches,
 };
 use reth_evm::{ConfigureEngineEvm, ConfigureEvm};
+use reth_network_p2p::full_block::SealedBlockWithAccessList;
 use reth_payload_primitives::{InvalidPayloadAttributesError, NewPayloadError, PayloadTypes};
 use reth_primitives_traits::{Block, RecoveredBlock, SealedBlock};
 use reth_provider::{HeaderProvider, ProviderResult};
@@ -203,7 +204,7 @@ where
 
     fn validate_block(
         &mut self,
-        block: SealedBlock<BscBlock>,
+        block: SealedBlockWithAccessList<BscBlock>,
         ctx: TreeCtx<'_, BscPrimitives>,
     ) -> ValidationOutcome<BscPrimitives> {
         let outcome = self.inner.validate_block(block, ctx);
@@ -297,7 +298,9 @@ impl BscEngineValidator {
 fn payload_failed_locally(outcome: &ValidationOutcome<BscPrimitives>) -> bool {
     let Err(InsertPayloadError::Block(error)) = outcome else { return false };
     match error.kind() {
-        InsertBlockErrorKind::Consensus(_) => false,
+        InsertBlockErrorKind::Consensus(_) | InsertBlockErrorKind::BlockAccessListDecode(_) => {
+            false
+        }
         InsertBlockErrorKind::Execution(error) => error.as_internal().is_some(),
         InsertBlockErrorKind::Provider(_) | InsertBlockErrorKind::Other(_) => true,
     }
@@ -501,6 +504,15 @@ mod tests {
             ),
             (InsertBlockErrorKind::Consensus(ConsensusError::RequestsHashMissing), false),
             (
+                InsertBlockErrorKind::BlockAccessListDecode(
+                    reth_engine_primitives::BlockAccessListDecodeError::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "malformed access list",
+                    )),
+                ),
+                false,
+            ),
+            (
                 InsertBlockErrorKind::Provider(reth_provider::ProviderError::StateForHashNotFound(
                     B256::ZERO,
                 )),
@@ -518,7 +530,6 @@ mod tests {
         assert!(!payload_failed_locally(&Ok(reth_engine_tree::tree::ValidationOutput {
             executed_block: ExecutedBlock::default(),
             execution_timing_stats: None,
-            raw_bal: None,
         })));
     }
 

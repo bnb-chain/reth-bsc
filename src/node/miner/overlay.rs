@@ -65,8 +65,8 @@ impl MinerOverlayCache {
                     .or_else(|| (generation.tip == anchor).then_some(blocks.len()))
             };
             let Some(added) = added else { continue };
-            if !generation.views.contains(&key)
-                && generation.views.len() == MAX_PARENTS_PER_GENERATION
+            if !generation.views.contains(&key) &&
+                generation.views.len() == MAX_PARENTS_PER_GENERATION
             {
                 capacity_seen = true;
                 continue;
@@ -162,8 +162,8 @@ mod tests {
     use reth_provider::{
         providers::LatestStateProvider, test_utils::create_test_provider_factory, StateRootProvider,
     };
-    use reth_storage_overlay::Overlay;
-    use reth_trie_common::{ComputedTrieData, HashedPostState, HashedStorage};
+    use reth_storage_overlay::StateTrieOverlay;
+    use reth_trie_common::{HashedPostState, HashedStorage, SortedTrieData};
     use std::sync::Arc;
 
     fn block(number: u64, parent_hash: B256, nonce: u64) -> ExecutedBlock<BscPrimitives> {
@@ -191,7 +191,7 @@ mod tests {
         ExecutedBlock::new(
             Arc::new(block),
             Default::default(),
-            ComputedTrieData::new(Arc::new(state), Default::default()),
+            SortedTrieData::new(Arc::new(state), Default::default()),
         )
     }
 
@@ -199,28 +199,33 @@ mod tests {
         manager: &OverlayManager<BscPrimitives>,
         tip: B256,
         anchor: BlockNumHash,
-    ) -> Overlay {
+    ) -> StateTrieOverlay {
         let factory = create_test_provider_factory();
         manager
             .overlay_builder(tip)
-            .build_overlay_at_frontiers(&factory.provider().unwrap(), anchor, anchor)
+            .build_state_trie_overlay_at_frontiers(
+                &factory.provider().unwrap(),
+                anchor,
+                anchor,
+                true,
+            )
             .unwrap()
     }
 
-    fn root(overlay: &Overlay) -> B256 {
+    fn root(overlay: &StateTrieOverlay) -> B256 {
         let factory = create_test_provider_factory();
         LatestStateProvider::new(factory.provider().unwrap())
             .state_root(HashedPostState {
-                accounts: overlay.hashed_post_state.accounts.iter().copied().collect(),
+                accounts: overlay.input().state.accounts.iter().copied().collect(),
                 storages: overlay
-                    .hashed_post_state
+                    .input()
+                    .state
                     .storages
                     .iter()
                     .map(|(address, storage)| {
                         (
                             *address,
                             HashedStorage {
-                                wiped: storage.wiped,
                                 storage: storage.storage_slots.iter().copied().collect(),
                             },
                         )
@@ -238,12 +243,14 @@ mod tests {
     /// parent overlays, but must produce independent roots even when running together.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn empty_and_normal_root_tasks_share_only_parent_overlay() {
+        use crate::node::miner::proof_provider::{
+            MinerProofOverlayCache, MinerProofProviderFactory,
+        };
         use alloy_primitives::{keccak256, Address, U256};
         use reth_engine_tree::tree::{
             state_root_strategy::spawn_payload_builder_state_root, TreeConfig,
         };
         use reth_evm::OnStateHook;
-        use reth_storage_overlay::OverlayStateProviderFactory;
         use reth_tasks::{RayonConfig, RuntimeBuilder, RuntimeConfig, TokioConfig};
         use revm::state::{AccountInfo, AccountStatus, EvmState, EvmStorageSlot, TransactionId};
 
@@ -278,7 +285,7 @@ mod tests {
                 Vec::new(),
             )),
             Default::default(),
-            ComputedTrieData::new(Arc::new(initial.clone().into_sorted()), Default::default()),
+            SortedTrieData::new(Arc::new(initial.clone().into_sorted()), Default::default()),
         );
         let runtime = RuntimeBuilder::new(
             RuntimeConfig::default()
@@ -314,23 +321,37 @@ mod tests {
         let parent_hash = parent.recovered_block().hash();
         let first = normal_manager
             .overlay_builder(parent_hash)
-            .build_overlay_at_frontiers(&factory.provider().unwrap(), anchor, anchor)
+            .build_state_trie_overlay_at_frontiers(
+                &factory.provider().unwrap(),
+                anchor,
+                anchor,
+                true,
+            )
             .unwrap();
         let (empty_manager, _) = cache.for_parent(std::slice::from_ref(&parent), || {
             panic!("empty fallback must reuse the parent's manager")
         });
         let second = empty_manager
             .overlay_builder(parent_hash)
-            .build_overlay_at_frontiers(&factory.provider().unwrap(), anchor, anchor)
+            .build_state_trie_overlay_at_frontiers(
+                &factory.provider().unwrap(),
+                anchor,
+                anchor,
+                true,
+            )
             .unwrap();
-        assert!(Arc::ptr_eq(&first.hashed_post_state, &second.hashed_post_state));
-        let spawn = |manager: &OverlayManager<BscPrimitives>, executor| {
+        assert!(Arc::ptr_eq(&first.input().state, &second.input().state));
+        let proof_cache = Arc::new(MinerProofOverlayCache::default());
+        let spawn = |manager: &OverlayManager<BscPrimitives>, executor, fallback| {
             spawn_payload_builder_state_root(
                 executor,
                 manager,
-                OverlayStateProviderFactory::new(
+                MinerProofProviderFactory::new(
                     factory.clone(),
                     manager.overlay_builder(parent_hash),
+                    parent_hash,
+                    proof_cache.clone(),
+                    fallback,
                 ),
                 parent.recovered_block().sealed_header().clone(),
                 None,
@@ -338,8 +359,8 @@ mod tests {
                 None,
             )
         };
-        let mut normal = spawn(&normal_manager, &runtime);
-        let mut empty = spawn(&empty_manager, &empty_runtime);
+        let mut normal = spawn(&normal_manager, &runtime, false);
+        let mut empty = spawn(&empty_manager, &empty_runtime, true);
         let update = |nonce: u64| {
             let mut account = revm::state::Account::default();
             account.info = AccountInfo { nonce, ..Default::default() };
@@ -389,14 +410,19 @@ mod tests {
         // Neither candidate may poison the reusable parent overlay.
         let after = empty_manager
             .overlay_builder(parent_hash)
-            .build_overlay_at_frontiers(&factory.provider().unwrap(), anchor, anchor)
+            .build_state_trie_overlay_at_frontiers(
+                &factory.provider().unwrap(),
+                anchor,
+                anchor,
+                true,
+            )
             .unwrap();
-        assert_eq!(after.hashed_post_state, first.hashed_post_state);
+        assert_eq!(after.input().state, first.input().state);
 
         // A cancelled normal producer must release its sessions so the fallback can finish.
-        let mut cancelled = spawn(&normal_manager, &runtime);
+        let mut cancelled = spawn(&normal_manager, &runtime, false);
         let cancelled_hook = cancelled.take_execution_hook();
-        let mut fallback = spawn(&empty_manager, &empty_runtime);
+        let mut fallback = spawn(&empty_manager, &empty_runtime, true);
         let mut hook = fallback.take_execution_hook();
         hook.on_state(update(2));
         drop(hook);
@@ -429,14 +455,14 @@ mod tests {
         let retry =
             cache.for_parent(std::slice::from_ref(&a), || panic!("retry must reuse manager")).0;
         let retried = overlay(&retry, a.recovered_block().hash(), anchor);
-        assert!(Arc::ptr_eq(&original.hashed_post_state, &retried.hashed_post_state));
+        assert!(Arc::ptr_eq(&original.input().state, &retried.input().state));
 
         let chain = [b.clone(), a.clone()];
         let extended = cache.for_parent(&chain, || panic!("linear extension must reuse manager")).0;
         let result = overlay(&extended, b.recovered_block().hash(), anchor);
         let baseline = overlay(&fresh(&chain), b.recovered_block().hash(), anchor);
-        assert_eq!(result.hashed_post_state, baseline.hashed_post_state);
-        assert_eq!(result.trie_updates, baseline.trie_updates);
+        assert_eq!(result.input().state, baseline.input().state);
+        assert_eq!(result.input().nodes, baseline.input().nodes);
         assert_eq!(root(&result), root(&baseline));
         assert_ne!(root(&result), root(&original));
         // An older task still sees its own parent, even after a new child is inserted.
@@ -485,7 +511,7 @@ mod tests {
         let after = overlay(&new, b.recovered_block().hash(), next_anchor);
         let baseline =
             overlay(&fresh(std::slice::from_ref(&b)), b.recovered_block().hash(), next_anchor);
-        assert_eq!(after.hashed_post_state, baseline.hashed_post_state);
+        assert_eq!(after.input().state, baseline.input().state);
         assert_eq!(root(&after), root(&baseline));
         assert_eq!(root(&overlay(&old, b.recovered_block().hash(), anchor)), root(&before));
         cache.for_parent(&[], OverlayManager::default);
@@ -545,7 +571,7 @@ mod tests {
             // Persistence can advance while the same in-memory snapshot is retained.
             let result = overlay(&extended, c.recovered_block().hash(), frontier);
             let expected = overlay(&fresh(&chain), c.recovered_block().hash(), frontier);
-            assert_eq!(result.hashed_post_state, expected.hashed_post_state);
+            assert_eq!(result.input().state, expected.input().state);
             assert_eq!(root(&result), root(&expected));
         }
         assert_eq!(root(&overlay(&first, a.recovered_block().hash(), anchor)), root(&before));
@@ -593,13 +619,13 @@ mod tests {
         let actual = overlay(&progressed, c.recovered_block().hash(), frontier);
         let expected =
             overlay(&fresh(&[c.clone(), b.clone()]), c.recovered_block().hash(), frontier);
-        assert_eq!(actual.hashed_post_state, expected.hashed_post_state);
-        assert_eq!(actual.trie_updates, expected.trie_updates);
+        assert_eq!(actual.input().state, expected.input().state);
+        assert_eq!(actual.input().nodes, expected.input().nodes);
         assert_eq!(root(&actual), root(&expected));
         let again =
             cache.for_parent(&[b.clone(), a.clone()], || panic!("older snapshot is retained")).0;
         let retried = overlay(&again, b.recovered_block().hash(), anchor);
-        assert!(Arc::ptr_eq(&old.hashed_post_state, &retried.hashed_post_state));
+        assert!(Arc::ptr_eq(&old.input().state, &retried.input().state));
         assert_eq!(cache.generations.len(), 1);
     }
 
@@ -616,7 +642,7 @@ mod tests {
         let reused =
             cache.for_parent(&[b.clone(), a.clone()], || panic!("retained fork must be found")).0;
         let retried = overlay(&reused, b.recovered_block().hash(), anchor);
-        assert!(Arc::ptr_eq(&original.hashed_post_state, &retried.hashed_post_state));
+        assert!(Arc::ptr_eq(&original.input().state, &retried.input().state));
         assert_eq!(cache.generations.len(), 2);
     }
 

@@ -102,7 +102,8 @@ impl BuildWorkObservation {
         // In-flight acquisition count, so a still-blocked task is visible before its
         // duration sample is emitted. No-control callers immediately mark acquisition.
         metrics::gauge!("bsc.build_diagnostics.permit_waiters", "kind" => kind.label(),
-            "turn" => if inturn { "inturn" } else { "outofturn" }).increment(1.0);
+            "turn" => if inturn { "inturn" } else { "outofturn" })
+        .increment(1.0);
         if let Some(control) = control {
             // Selection time left at attempt entry, before semaphore acquisition/setup.
             // Rebuilds share the job's deadline, so they may enter with a smaller window.
@@ -498,7 +499,8 @@ mod tests {
             &["regular", "invalid_transaction"]
         )
         .ends_with(" 1"));
-        for l in rendered.lines().filter(|l| l.starts_with("bsc_build_diagnostics_permit_waiters{")) {
+        for l in rendered.lines().filter(|l| l.starts_with("bsc_build_diagnostics_permit_waiters{"))
+        {
             assert!(l.ends_with(" 0"), "{l}");
         }
         assert!(!rendered.contains("trace_id="));
@@ -562,12 +564,15 @@ mod tests {
             work.completed();
         });
         let rendered = handle.render();
-        for (metric, value) in [
-            ("permit_wait", "0.02"), ("prepare", "0.05"), ("selection_wall", "0.02"),
-        ] {
-            assert!(rendered.lines().any(|l|
-                l.starts_with(&format!("bsc_build_diagnostics_{metric}_seconds_sum")) &&
-                l.ends_with(&format!(" {value}"))), "{rendered}");
+        for (metric, value) in
+            [("permit_wait", "0.02"), ("prepare", "0.05"), ("selection_wall", "0.02")]
+        {
+            assert!(
+                rendered.lines().any(|l| l
+                    .starts_with(&format!("bsc_build_diagnostics_{metric}_seconds_sum")) &&
+                    l.ends_with(&format!(" {value}"))),
+                "{rendered}"
+            );
         }
     }
 

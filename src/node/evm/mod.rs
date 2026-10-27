@@ -32,8 +32,8 @@ use revm::{
 
 mod assembler;
 mod builder;
-mod finish_metrics;
 pub mod config;
+mod finish_metrics;
 pub use config::BscEvmConfig;
 mod executor;
 pub use executor::{BscBlockExecutor, LaneAdmission};

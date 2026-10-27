@@ -8,7 +8,7 @@ use reth_provider::{
     StorageSettingsCache,
 };
 use reth_storage_overlay::{
-    database_state_frontiers, Overlay, OverlayBuilder, OverlayStateProvider,
+    database_state_frontiers, OverlayBuilder, OverlayStateProvider, OwnedProvider, StateTrieOverlay,
 };
 use std::{
     collections::VecDeque,
@@ -22,7 +22,7 @@ type Key = (B256, B256, B256);
 
 #[derive(Default)]
 struct Entry {
-    ready: OnceLock<Overlay>,
+    ready: OnceLock<StateTrieOverlay>,
     computing: Mutex<()>,
 }
 
@@ -68,8 +68,8 @@ impl MinerProofOverlayCache {
         &self,
         key: Key,
         fallback: bool,
-        build: impl FnOnce() -> ProviderResult<Overlay>,
-    ) -> ProviderResult<Overlay> {
+        build: impl FnOnce() -> ProviderResult<StateTrieOverlay>,
+    ) -> ProviderResult<StateTrieOverlay> {
         let start = Instant::now();
         let entry = self.entry(key, fallback);
         stage("cache_lookup", start, fallback);
@@ -96,10 +96,10 @@ impl MinerProofOverlayCache {
         // O(1) top-level counts, sampled once per successful build, not once per cache hit.
         // These are neither storage-slot counts nor allocated-byte estimates.
         for (component, count) in [
-            ("accounts", overlay.hashed_post_state.accounts.len()),
-            ("storage_accounts", overlay.hashed_post_state.storages.len()),
-            ("account_trie_nodes", overlay.trie_updates.account_nodes_ref().len()),
-            ("storage_tries", overlay.trie_updates.storage_tries_ref().len()),
+            ("accounts", overlay.input().state.accounts.len()),
+            ("storage_accounts", overlay.input().state.storages.len()),
+            ("account_trie_nodes", overlay.input().nodes.account_nodes_ref().len()),
+            ("storage_tries", overlay.input().nodes.storage_tries_ref().len()),
         ] {
             metrics::histogram!("bsc_miner_proof_overlay_build_items",
                 "kind" => if fallback { "empty" } else { "normal" }, "component" => component)
@@ -152,7 +152,7 @@ where
         + StorageChangeSetReader
         + StorageSettingsCache,
 {
-    type Provider = OverlayStateProvider<F::Provider>;
+    type Provider = OverlayStateProvider<OwnedProvider<F::Provider>, crate::BscPrimitives>;
 
     fn database_provider_ro(&self) -> ProviderResult<Self::Provider> {
         let start = Instant::now();
@@ -164,10 +164,10 @@ where
         let overlay = self.cache.get_or_build(
             (self.parent, trie.hash, finish.hash),
             self.fallback,
-            || self.builder.build_overlay_at_frontiers(&provider, trie, finish),
+            || self.builder.build_state_trie_overlay_at_frontiers(&provider, trie, finish, true),
         )?;
-        let is_v2 = provider.cached_storage_settings().is_v2();
-        Ok(OverlayStateProvider::new(provider, overlay, is_v2))
+        Ok(OverlayStateProvider::new(provider, self.builder.clone())
+            .with_state_trie_overlay(overlay))
     }
 }
 
@@ -175,10 +175,10 @@ where
 mod tests {
     use super::*;
     use reth_trie_common::{updates::TrieUpdatesSorted, HashedPostState};
-    fn value() -> Overlay {
-        Overlay {
-            trie_updates: Arc::new(TrieUpdatesSorted::default()),
-            hashed_post_state: Arc::new(
+    fn value() -> StateTrieOverlay {
+        StateTrieOverlay::new(reth_trie_common::TrieInputSorted::new(
+            Arc::new(TrieUpdatesSorted::default()),
+            Arc::new(
                 HashedPostState::default()
                     .with_accounts([(
                         B256::with_last_byte(9),
@@ -186,9 +186,10 @@ mod tests {
                     )])
                     .into_sorted(),
             ),
-        }
+            Default::default(),
+        ))
     }
-    fn root(overlay: &Overlay) -> B256 {
+    fn root(overlay: &StateTrieOverlay) -> B256 {
         use reth_provider::{
             providers::LatestStateProvider, test_utils::create_test_provider_factory,
             StateRootProvider,
@@ -196,7 +197,7 @@ mod tests {
         let factory = create_test_provider_factory();
         LatestStateProvider::new(factory.provider().unwrap())
             .state_root(HashedPostState {
-                accounts: overlay.hashed_post_state.accounts.iter().copied().collect(),
+                accounts: overlay.input().state.accounts.iter().copied().collect(),
                 storages: Default::default(),
             })
             .unwrap()
@@ -245,7 +246,7 @@ mod tests {
         let first = cache.get_or_build(key(1), false, || Ok(value())).unwrap();
         let retry =
             cache.get_or_build(key(1), true, || panic!("ready value must be reused")).unwrap();
-        assert!(Arc::ptr_eq(&first.hashed_post_state, &retry.hashed_post_state));
+        assert!(Arc::ptr_eq(&first.input().state, &retry.input().state));
         assert_eq!(root(&first), root(&retry));
         for k in [
             key(2),
@@ -254,7 +255,7 @@ mod tests {
         ] {
             let other = cache.get_or_build(k, false, || Ok(value())).unwrap();
             assert_eq!(root(&first), root(&other));
-            assert!(!Arc::ptr_eq(&first.hashed_post_state, &other.hashed_post_state));
+            assert!(!Arc::ptr_eq(&first.input().state, &other.input().state));
         }
     }
     #[test]
@@ -304,7 +305,7 @@ mod tests {
                 .collect();
             let overlays: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
             for overlay in &overlays[1..] {
-                assert!(Arc::ptr_eq(&overlays[0].hashed_post_state, &overlay.hashed_post_state));
+                assert!(Arc::ptr_eq(&overlays[0].input().state, &overlay.input().state));
             }
         });
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
@@ -320,7 +321,7 @@ mod tests {
         let result = cache.get_or_build(key(1), false, || Ok(value())).unwrap();
         let cached =
             cache.get_or_build(key(1), false, || panic!("retry must cache success")).unwrap();
-        assert!(Arc::ptr_eq(&result.hashed_post_state, &cached.hashed_post_state));
+        assert!(Arc::ptr_eq(&result.input().state, &cached.input().state));
     }
 
     #[test]
@@ -332,7 +333,7 @@ mod tests {
         }
         assert_eq!(cache.entries.lock().len(), MAX_OVERLAYS);
         let rebuilt = cache.get_or_build(key(1), false, || Ok(value())).unwrap();
-        assert!(!Arc::ptr_eq(&original.hashed_post_state, &rebuilt.hashed_post_state));
-        assert_eq!(*original.hashed_post_state, *rebuilt.hashed_post_state);
+        assert!(!Arc::ptr_eq(&original.input().state, &rebuilt.input().state));
+        assert_eq!(*original.input().state, *rebuilt.input().state);
     }
 }

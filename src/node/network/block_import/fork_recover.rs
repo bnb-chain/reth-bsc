@@ -1469,7 +1469,7 @@ mod tests {
             tokio::spawn(async move {
                 while let Some(msg) = from_engine.recv().await {
                     match msg {
-                        BeaconEngineMessage::NewPayload { payload, tx } => {
+                        BeaconEngineMessage::NewPayload { payload, tx, .. } => {
                             let (num, hash) = (payload.block_number(), payload.block_hash());
                             recorder.lock().unwrap().push((num, hash));
                             let status = if syncing_at.contains(&num) {

@@ -350,7 +350,8 @@ pub struct BscBlockchainMetrics {
     pub current_receipt_height: Gauge,
 
     /// Timestamp difference between the latest executed block and its parent, in seconds with
-    /// millisecond precision. This measures the block timestamp interval, not network receive time.
+    /// millisecond precision. This measures the block timestamp interval, not network receive
+    /// time.
     pub block_receive_time_diff_seconds: Gauge,
 
     /// Size of transactions in the current block in bytes (equivalent to chain/insert/txsize)

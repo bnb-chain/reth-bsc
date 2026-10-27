@@ -1,6 +1,6 @@
 //! One monotonic budget shared by all attempts for a local payload job.
 
-use reth_revm::cancelled::ManualCancel;
+use reth_tasks::ManualCancel;
 use std::time::{Duration, Instant};
 
 // Bound overlap while an obsolete synchronous transaction is returning to a cancellation check.

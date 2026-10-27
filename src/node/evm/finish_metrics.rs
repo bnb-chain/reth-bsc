@@ -187,7 +187,7 @@ impl Drop for RootWaitObservation {
 mod tests {
     use super::*;
     use metrics_exporter_prometheus::PrometheusBuilder;
-    use reth_revm::cancelled::ManualCancel;
+    use reth_tasks::ManualCancel;
     use std::time::Duration;
 
     #[test]

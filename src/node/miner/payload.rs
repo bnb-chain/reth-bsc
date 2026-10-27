@@ -56,10 +56,9 @@ use reth_primitives_traits::{
     transaction::error::InvalidTransactionError, Block, BlockBody, HeaderTy, RecoveredBlock,
     SealedBlock, SealedHeader, SignerRecoverable,
 };
-use reth_provider::StateProviderFactory;
-use reth_revm::{
-    cached::CachedReads, cancelled::ManualCancel, database::StateProviderDatabase, db::State,
-};
+use reth_provider::{EvmStateProviderAdapter, StateProviderFactory};
+use reth_revm::{cached::CachedReads, database::StateProviderDatabase, db::State};
+use reth_tasks::ManualCancel;
 use revm::context_interface::Block as EvmBlock;
 use std::{
     collections::HashMap,
@@ -627,7 +626,7 @@ where
         };
 
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
-        let state = StateProviderDatabase::new(&state_provider);
+        let state = StateProviderDatabase::new(EvmStateProviderAdapter(&state_provider));
         let prewarm_cache = super::prewarm::cache_for_attempt(parent_hash);
         let (state, read_phase) =
             ObservedStateDb::new(&mut cached_reads, state, kind, self.ctx.is_inturn);
@@ -1318,7 +1317,7 @@ where
         .increment(1);
 
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
-        let state = StateProviderDatabase::new(&state_provider);
+        let state = StateProviderDatabase::new(EvmStateProviderAdapter(&state_provider));
         let (state, read_phase) =
             ObservedStateDb::new(&mut cached_reads, state, AttemptKind::Empty, self.ctx.is_inturn);
         let mut db = State::builder().with_database(state).with_bundle_update().build();
@@ -2688,6 +2687,7 @@ where
     ///
     /// Returns `false` when there is no candidate, it does not win, or the import sender is missing
     /// — in which case the caller falls back to submitting the best local payload.
+    /// A full or closed local ingress also falls back, before claiming a signing slot.
     fn try_submit_winning_bid_block(&mut self) -> bool {
         let Some(bid) = self.bid_block_candidate.take() else { return false };
 
@@ -2796,7 +2796,9 @@ where
             return false;
         }
 
-        let Some(sender) = crate::shared::get_bid_block_import_sender() else {
+        // BidBlocks share bounded local ingress with mined/fallback blocks, isolated from
+        // remote traffic. The Bid variant still selects BEP-675 broadcast-then-verify handling.
+        let Some(sender) = crate::shared::get_local_block_import_sender() else {
             warn!(
                 target: "bsc::miner::payload",
                 trace_id = self.trace_id,
@@ -2804,6 +2806,22 @@ where
                 "BidBlock won but import sender is not initialised; falling back to local payload"
             );
             return false;
+        };
+
+        // Reserve before claiming the signing slot or spawning the timestamp delay. A full
+        // local ingress falls back to the normal result worker, which awaits capacity; it must
+        // not create an unbounded set of delayed tasks waiting to send signed BidBlocks.
+        let permit = match sender.clone().try_reserve_owned() {
+            Ok(permit) => permit,
+            Err(error) => {
+                if matches!(error, tokio::sync::mpsc::error::TrySendError::Full(_)) {
+                    crate::node::network::block_import::metrics::Queue::LocalIngress
+                        .full(sender.max_capacity(), "fallback_to_local_payload");
+                } else {
+                    warn!(target: "bsc::miner::payload", %error, "Local import channel closed; falling back to local payload");
+                }
+                return false;
+            }
         };
 
         // Double-sign guard shared with the local/legacy path (`ResultWorkWorker::submit_payload`
@@ -2836,25 +2854,18 @@ where
         let (builder_addr, bid_hash, gas_fee, system_tx_start) =
             (bid.builder, bid.bid_hash, bid.gas_fee, bid.system_tx_start);
         tokio::spawn(async move {
-            if let Err(e) = send_bid_block_after_delay(
-                sender,
-                (sealed, builder_addr, bid_hash, gas_fee, system_tx_start),
+            send_bid_block_after_delay(
+                permit,
+                crate::node::network::block_import::service::IncomingLocalBlock::Bid(Box::new((
+                    sealed,
+                    builder_addr,
+                    bid_hash,
+                    gas_fee,
+                    system_tx_start,
+                ))),
                 delay,
             )
-            .await
-            {
-                // The slot was never actually broadcast — release it so a later legitimate
-                // block at this height is not wrongly rejected as a double sign.
-                crate::shared::forget_recorded_mined_block(block_number, parent_hash);
-                warn!(
-                    target: "bsc::miner::payload",
-                    trace_id,
-                    bid_hash = %bid_hash,
-                    error = %e,
-                    "Failed to hand BidBlock to import service"
-                );
-                return;
-            }
+            .await;
 
             use crate::metrics::BscMevMetrics;
             use once_cell::sync::Lazy;
@@ -2870,7 +2881,7 @@ where
                 builder = ?builder_addr,
                 bid_fees = %gas_fee,
                 best_local_fee = %best_local_fee,
-                "[BID BLOCK selected] broadcasting before verification (zero-simulate)"
+                "[BID BLOCK selected] submitted for broadcast before verification (zero-simulate)"
             );
         });
         true
@@ -3138,17 +3149,19 @@ fn bid_block_broadcast_delay(header: &alloy_consensus::Header, now_ms: u64) -> s
 /// actually begins.
 ///
 /// Split out from `try_submit_winning_bid_block` so the "not before its timestamp" invariant can be
-/// tested against a channel instead of a P2P capture: the `send` below *is* the start of broadcast,
-/// so a test that observes when the receiver sees the block observes the real timing.
+/// tested against a channel instead of a P2P capture. This is admission to the importer;
+/// actual network propagation happens after the importer consumes the block.
+/// The permit guarantees capacity, not receipt; checking channel liveness before sending
+/// would not make delivery atomic. The caller retains its signing record after this handoff.
 async fn send_bid_block_after_delay<T>(
-    sender: &tokio::sync::mpsc::UnboundedSender<T>,
+    permit: tokio::sync::mpsc::OwnedPermit<T>,
     block: T,
     delay: std::time::Duration,
-) -> Result<(), tokio::sync::mpsc::error::SendError<T>> {
+) {
     if !delay.is_zero() {
         tokio::time::sleep(delay).await;
     }
-    sender.send(block)
+    permit.send(block);
 }
 
 fn refresh_and_reseal_bid_block(
@@ -3444,16 +3457,20 @@ mod tests {
 
     /// The delay must actually withhold the block, not merely be computed.
     ///
-    /// `send_bid_block_after_delay`'s send is where broadcast begins — the import service takes it
-    /// from there — so observing when the receiver sees the block observes the real broadcast
-    /// timing, without a P2P capture. Time is paused, so this asserts ordering deterministically
+    /// The import service cannot begin broadcast before this handoff. Observe admission
+    /// timing without a P2P capture. Time is paused, so this asserts ordering deterministically
     /// instead of racing a wall clock.
     #[tokio::test(start_paused = true)]
     async fn bid_block_send_is_withheld_until_the_delay_elapses() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<u64>(1);
+        let permit = tx.clone().try_reserve_owned().unwrap();
         let delay = Duration::from_millis(600);
 
-        let task = tokio::spawn(async move { send_bid_block_after_delay(&tx, 7u64, delay).await });
+        let other_producer = tx.clone();
+        let task =
+            tokio::spawn(async move { send_bid_block_after_delay(permit, 7u64, delay).await });
+        // The delayed task already owns capacity: another task cannot accumulate behind it.
+        assert!(other_producer.try_reserve().is_err());
 
         // One millisecond short of due: still withheld.
         tokio::time::advance(Duration::from_millis(599)).await;
@@ -3464,19 +3481,19 @@ mod tests {
 
         // Past due: released.
         tokio::time::advance(Duration::from_millis(2)).await;
-        task.await.expect("send task panicked").expect("receiver is still alive");
+        task.await.expect("send task panicked");
         assert_eq!(rx.try_recv().expect("BidBlock must be released once due"), 7);
+        assert!(other_producer.try_reserve().is_ok());
     }
 
     /// A block already past its timestamp — the common case, sealed at the end of its slot — must
     /// go out without waiting.
     #[tokio::test(start_paused = true)]
     async fn bid_block_send_is_immediate_when_already_due() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<u64>(1);
+        let permit = tx.clone().try_reserve_owned().unwrap();
 
-        send_bid_block_after_delay(&tx, 9u64, Duration::ZERO)
-            .await
-            .expect("receiver is still alive");
+        send_bid_block_after_delay(permit, 9u64, Duration::ZERO).await;
 
         assert_eq!(
             rx.try_recv().expect("a due BidBlock must not be delayed"),
@@ -3485,18 +3502,17 @@ mod tests {
         );
     }
 
-    /// A closed receiver must surface as an error, because the caller uses it to release the
-    /// double-sign slot: the block was never broadcast, so a later block at this height must remain
-    /// free to claim it.
+    /// Receiver::close stops new reservations but must still drain an already reserved block.
     #[tokio::test(start_paused = true)]
-    async fn bid_block_send_reports_a_closed_receiver() {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
-        drop(rx);
+    async fn bid_block_send_uses_existing_permit_after_receiver_close() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<u64>(1);
+        let permit = tx.clone().try_reserve_owned().unwrap();
+        rx.close();
+        assert!(tx.clone().try_reserve_owned().is_err());
 
-        let err = send_bid_block_after_delay(&tx, 1u64, Duration::from_millis(50))
-            .await
-            .expect_err("a closed receiver must be reported so the slot can be released");
-        assert_eq!(err.0, 1, "the undelivered block is returned to the caller");
+        send_bid_block_after_delay(permit, 1u64, Duration::from_millis(50)).await;
+        assert_eq!(rx.recv().await, Some(1));
+        assert_eq!(rx.recv().await, None);
     }
 
     fn test_parlia() -> Parlia<BscChainSpec> {

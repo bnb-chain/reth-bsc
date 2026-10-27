@@ -141,63 +141,41 @@ sum by (instance) (
 本地测试覆盖冷热读、负账户缓存、storage 隐式账户读取、错误传播/不缓存失败读取、
 阶段归属与失败退出汇总、重建计数隔离、执行器禁用路径和循环分段对账。
 
-## 矿工并行预执行与共享读取缓存
+## 不可变交易池预热快照
 
-启用 `--engine.txpool-prewarming` 后，矿工在正式交易循环前启动当前 attempt 的投机预执行。
-对齐 go-bsc `PrefetchMining` 的共享读取机制：MEV（`bid-block-enabled`）开启时3个 worker，
-关闭时 `max(3, 3 * available_parallelism / 5)`。线程池在 engine 初始化时创建，跨 attempt 复用。
-非矿工节点仍使用 Reth 既有 canonical-head 预热；矿工不同时运行那组后台任务，避免重复执行。
+启用 `--engine.txpool-prewarming` 后，engine 的既有 worker 发布只读预热快照。
+engine builder 将只读获取函数注册给自定义 miner，不另启预热线程，也不共享可变 ExecutionCache。
+每次构建只获取一次匹配 parent hash 的已完成快照，克隆的是 Arc 句柄，不复制账户/slot映射。
+发布端后续换代不影响进行中的构建；错父块或尚未发布时退回原读取路径，不等待预热。
 
-每个 attempt 创建父块 hash 固定的共享读取缓存。层次是：
-REVM State → 本地 CachedReads → 共享原始状态读取缓存 → StateProviderDatabase。
-worker 和 miner 都能填充读取缓存；miner 从开始就持有同一 Arc，后续填入的数据立即可见，
-没有快照发布周期，也没有“启动时未取得就永久回退”的缺口。空候选不启动预执行。
-账户不存在、零 slot 和空 bytecode 都可命中，读取错误不缓存。
+层次为 REVM State → 本地 CachedReads → 不可变 prewarm snapshot → StateProviderDatabase。
+本地缓存 miss 即使由预热满足，仍记在 `layer=cached,outcome=miss`；
+新增 `layer=prewarm,outcome=hit/miss` 独立统计快照查找，原 `layer=provider,outcome=read`
+只记录真正的后备 provider 调用及耗时。cached 耗时包含其下层，不可相加。
+未取得快照时不产生 prewarm 读取样本；`prewarm_snapshot_total{kind,turn,result=available/unavailable}`
+按构建计数，包括空候选，不代表上链块数或快照字节命中率。
+零 storage 和账户不存在都可命中；缺失 code（含空 code）按快照既有语义回退。
 
-账户/storage/code 分16片，每片读写锁；provider 读取在锁外，允许并发 miss 重复读取。
-不共享 REVM State/journal，不采用投机执行的写结果。只有预执行关闭 nonce 检查，
-正式执行的 nonce、余额、gas、签名校验保持不变。worker 显式预读 sender、receiver、code、
-access list，再试执行普通交易以发现动态 storage；blob 跳过。试执行结果只提交到该 worker 的私有 State，
-随 worker 退出丢弃，正式执行不采用这些结果。
+这份快照仅包含父块原始状态的读取，投机执行的写入不被正式执行采用。
+不能将不同 parent 的读集合合并，也不绕过 nonce/gas/签名等正式执行校验。
+启用 worker 可能增加 CPU/IO/内存占用，收益必须看上述命中及 provider 耗时。
+构建启动时快照尚未就绪会立即回退；此实现不会中途刷新快照或阻塞等它就绪。
 
-对齐的是缓存共享和并行预读，不是逐行翻译 go-bsc：这里用共享 iterator 直接派发，最多每 worker
-一笔在途，没有额外发送队列；矿工推进每个 sender 的已选 nonce，worker 跳过已经处理的 nonce。
-它等价于 go-bsc Forward 的追赶目的，不修改真实交易池或正式选择顺序；已在途的交易不会中断。
-线程池有全局在途额度，过期 worker 尚未返回时新 attempt 只使用空闲额度，不无限排队。
-交易循环退出或 attempt drop 会停止新预执行，现有 EVM 调用结束后释放 provider 和额度，
-主线程不 join，不在结束阶段额外等待。每个 worker 的执行状态不跨 attempt 复用。
+## Reth 2.8 mining transaction prewarming trial
 
-共享缓存最多131072项（账户/slot/code合计），代码原始字节另有32MiB准入预算。
-另有最多131072个 sender 的已选 nonce 游标。上述限制不是严格内存上限，
-未包含 map/allocator/分析后 bytecode 开销；满额只停止准入，provider
-仍可正常返回。缓存随 attempt 和残余在途 worker 释放，不跨父块继承，不跨重组混合读取。
+On mining nodes, `--engine.txpool-prewarming` selects attempt-scoped parallel EVM
+prewarming instead of also running the canonical-head snapshot worker. Non-mining
+nodes retain the engine worker. The miner consumes live, parent-scoped successful
+account/storage/code reads; execution journals and writes stay worker-local.
 
-`prewarm_cache_total{kind,turn,result=attached/disabled/parent_mismatch}` 替代旧
-`prewarm_snapshot_total`。attached 表示持有缓存，并不表示已经命中。
-`layer=prewarm,outcome=hit/miss` 表示共享读取层命中，数据既可能来自 worker，也可能来自 miner。
-原 `layer=provider,outcome=read` 只记录 miner 真正调用后备 provider 的次数与耗时；不含 worker 的读取。
-`miner_prewarm_workers_total{result=started/busy/provider_error}` 和
-`miner_prewarm_transactions_total{result=completed/error}` 记录预执行任务与调用结果；`miner_prewarm_active_workers` 表示进程当前在途额度。
-completed 只表示调用返回成功，EVM revert/halt 仍可能包含在其中，不代表正式执行或上链成功。
-各层耗时包含关系不变，不可相加。worker 在线程结束时汇总交易计数。
+The independent `miner-prewarm-*` Rayon pool owns candidate iterator creation, its
+initial peek, provider creation and speculative execution. Setup and execution
+jobs share a bounded process-wide permit count. Ending transaction selection drops
+a non-joining guard and signals workers to stop; stale parent reads cannot enter
+a different parent's cache. The existing entry/code admission limits bound cache
+admissions, not total byte usage including allocator overhead.
 
-开关开启后的收益需要同条件 A/B 验证，不能由线程存在或共享命中率直接推导TPS增益。
-
-### 撤除投机 proof 与正式 overlay 增量复用实验
-
-投机 EVM 的共享 account/storage/code 读取预热保留；撤除额外的 proof hints、
-独立 proof worker 和完整 multiproof 缓存。正式交易的 StateHook 与流式算根不变。
-go-bsc 的挖矿投机预执行主要预热 reader；其正式 Trie 预取根据已执行交易的脏账户/槽位
-加载 Trie，不能把本次已撤除的投机 multiproof 实验称作直接照搬该实现。
-
-Reth overlay manager 在同一 anchor、同一分支上寻找最近的已完成祖先，批量合并新增块后
-再与祖先结果合并一次。可选祖先处于 Computing 时跳过，不等待它；当前目标自身的
-singleflight 等待保留。直接父块复用保留；更早祖先至少覆盖整段路径的一半才复用，
-否则完整合并，避免“几乎完整的 delta 再合并一次”造成回退。这是按块数的保守启发式，
-不是按字节估计的成本模型。跨 anchor 重新构建，不做持久化边界重基，也不复用可变候选 Trie。
-
-新增 `reth_trie_diagnostics_overlay_ancestor_reuse_total{origin,result="parent|ancestor|miss"}`
-记录实际计算的复用方式；`overlay_ancestor_plan_skips_total{origin,reason="small_base"}` 记录规划阶段的保守拒绝次数。`overlay_delta_blocks` 记录实际
-合并的块数，原 `overlay_blocks` 保持完整路径长度口径。需要同时观察 ancestor 的实际
-使用频率、overlay build/wait、root_wait 和 canonical TPS。人工 debug 基准不能预测TPS；
-撤除投机 proof 与祖先复用组合的线上收益，不能全部归到祖先复用。
+This trial does not add speculative proof hints or change Reth 2.8 root scheduling,
+block deadlines, root reserve, consensus validation, or formal transaction gas.
+Measure canonical throughput and finish/root-wait alongside provider-read savings:
+background work is not free even when it uses independent threads.
