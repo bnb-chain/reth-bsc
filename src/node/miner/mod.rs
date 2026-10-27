@@ -19,4 +19,5 @@ pub(crate) mod build_diagnostics;
 
 pub(crate) mod startup_diagnostics;
 
+pub(crate) mod prewarm;
 pub(crate) mod state_read_diagnostics;

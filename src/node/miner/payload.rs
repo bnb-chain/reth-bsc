@@ -521,7 +521,7 @@ pub struct BscPayloadBuilder<Pool, Client, EvmConfig = BscEvmConfig> {
 
 impl<Pool, Client, EvmConfig> BscPayloadBuilder<Pool, Client, EvmConfig>
 where
-    Client: StateProviderFactory + 'static,
+    Client: StateProviderFactory + Clone + 'static,
     EvmConfig: ConfigureEvm<NextBlockEnvCtx = BscNextBlockEnvAttributes> + 'static,
     <EvmConfig as ConfigureEvm>::Primitives: reth_primitives_traits::NodePrimitives<
         BlockHeader = alloy_consensus::Header,
@@ -627,10 +627,10 @@ where
 
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
         let state = StateProviderDatabase::new(EvmStateProviderAdapter(&state_provider));
+        let prewarm_cache = super::prewarm::cache_for_attempt(parent_hash);
         let (state, read_phase) =
             ObservedStateDb::new(&mut cached_reads, state, kind, self.ctx.is_inturn);
-        let state = state
-            .with_prewarm_snapshot(parent_hash, crate::shared::miner_prewarm_snapshot(parent_hash));
+        let state = state.with_shared_prewarm(parent_hash, prewarm_cache.clone());
         let mut db = State::builder().with_database(state).with_bundle_update().build();
 
         // Sinks transport current_validators / turn_length from the builder (which is consumed by
@@ -772,6 +772,22 @@ where
         }
 
         // Total time spent selecting + executing user transactions.
+        let prewarm_env = reth_evm::EvmEnv {
+            cfg_env: builder.evm_mut().cfg_env().clone(),
+            block_env: builder.evm_mut().block().clone(),
+        };
+        let prewarm = super::prewarm::start(
+            prewarm_cache,
+            self.pool.clone(),
+            self.client.clone(),
+            self.evm_config.clone(),
+            prewarm_env,
+            base_fee,
+            blob_fee.map(|fee| fee as u64),
+            min_gas_tip,
+            cancel.clone(),
+            build_control.clone(),
+        );
         let exec_start = std::time::Instant::now();
         // Everything before `exec_start` is treated as "prepare" time for this payload attempt.
         let prepare_duration = exec_start.duration_since(build_start);
@@ -789,6 +805,9 @@ where
             }
             work.selection_stage(SelectionStage::Iterator);
             let Some(pool_tx) = best_tx_list.next() else { break };
+            if let Some(prewarm) = &prewarm {
+                prewarm.selected(pool_tx.sender(), pool_tx.nonce());
+            }
             work.selection_stage(SelectionStage::Precheck);
             work.scanned += 1;
 
@@ -1080,6 +1099,7 @@ where
                 sidecars_map.insert(*tx.hash(), sidecar);
             }
         }
+        drop(prewarm);
         work.selection_stage(SelectionStage::Control);
         let exec_duration = exec_start.elapsed();
         read_phase.finish();
@@ -1300,9 +1320,6 @@ where
         let state = StateProviderDatabase::new(EvmStateProviderAdapter(&state_provider));
         let (state, read_phase) =
             ObservedStateDb::new(&mut cached_reads, state, AttemptKind::Empty, self.ctx.is_inturn);
-        let parent_hash = parent_header.hash_slow();
-        let state = state
-            .with_prewarm_snapshot(parent_hash, crate::shared::miner_prewarm_snapshot(parent_hash));
         let mut db = State::builder().with_database(state).with_bundle_update().build();
 
         // Sinks for empty-payload builds (same delayed-seal mechanism as normal builds).

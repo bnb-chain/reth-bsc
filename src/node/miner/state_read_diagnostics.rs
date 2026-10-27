@@ -3,7 +3,6 @@
 
 use super::build_diagnostics::AttemptKind;
 use alloy_primitives::{Address, B256, U256};
-use reth_engine_tree::tree::TxPoolPrewarmCacheSnapshot;
 use reth_revm::cached::{CachedReads, CachedReadsDbMut};
 use revm::{bytecode::Bytecode, state::AccountInfo, Database, DatabaseRef};
 use std::{
@@ -34,24 +33,26 @@ impl<'a, DB> ObservedStateDb<'a, DB> {
             inner: db,
             reads: ReadObservation::new(kind, inturn, "provider", phase.clone()),
             prewarm_reads: ReadObservation::new(kind, inturn, "prewarm", phase.clone()),
-            snapshot: None,
+            shared: None,
             calls: Cell::new(0),
         };
         (Self { inner: cache.as_db_mut(provider), reads }, phase)
     }
 
-    /// Attach one immutable snapshot for this attempt's exact parent, without copying its maps.
-    pub(crate) fn with_prewarm_snapshot(
+    pub(crate) fn with_shared_prewarm(
         mut self,
         parent: B256,
-        snapshot: Option<TxPoolPrewarmCacheSnapshot>,
+        cache: Option<Arc<super::prewarm::SharedStateCache>>,
     ) -> Self {
-        let snapshot = snapshot.filter(|snapshot| snapshot.parent_hash() == parent);
-        metrics::counter!("bsc.build_diagnostics.prewarm_snapshot_total",
-            "kind" => self.reads.kind, "turn" => self.reads.turn,
-            "result" => if snapshot.is_some() { "available" } else { "unavailable" })
+        let result = match cache.as_ref() {
+            None => "disabled",
+            Some(cache) if cache.parent() != parent => "parent_mismatch",
+            Some(_) => "attached",
+        };
+        metrics::counter!("bsc.build_diagnostics.prewarm_cache_total",
+            "kind" => self.reads.kind, "turn" => self.reads.turn, "result" => result)
         .increment(1);
-        self.inner.db.snapshot = snapshot;
+        self.inner.db.shared = cache.filter(|cache| cache.parent() == parent);
         self
     }
 }
@@ -119,31 +120,29 @@ struct ObservedProvider<DB> {
     inner: DB,
     reads: ReadObservation,
     prewarm_reads: ReadObservation,
-    snapshot: Option<TxPoolPrewarmCacheSnapshot>,
+    shared: Option<Arc<super::prewarm::SharedStateCache>>,
     calls: Cell<u64>,
 }
 impl<DB: DatabaseRef> ObservedProvider<DB> {
-    fn prewarmed<T>(
+    fn shared_prewarmed<T>(
         &self,
         resource: usize,
-        lookup: impl FnOnce(&TxPoolPrewarmCacheSnapshot) -> Option<T>,
+        lookup: impl FnOnce(&super::prewarm::SharedStateCache) -> Option<T>,
     ) -> Option<T> {
-        let snapshot = self.snapshot.as_ref()?;
+        let cache = self.shared.as_ref()?;
         let start = Instant::now();
-        let result = lookup(snapshot);
+        let value = lookup(cache);
         self.prewarm_reads.record(
             self.reads.phase.index(),
             resource,
-            usize::from(result.is_none()),
+            usize::from(value.is_none()),
             start.elapsed(),
             false,
         );
-        if result.is_some() {
-            // This tier is below CachedReads: an outer miss remains a miss even if prewarm
-            // satisfies it. The provider timing below only counts actual backing reads.
+        if value.is_some() {
             self.calls.set(self.calls.get() + 1);
         }
-        result
+        value
     }
     fn read<T>(
         &self,
@@ -161,24 +160,34 @@ impl<DB: DatabaseRef> ObservedProvider<DB> {
 impl<DB: DatabaseRef> DatabaseRef for ObservedProvider<DB> {
     type Error = DB::Error;
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        if let Some(account) = self.prewarmed(0, |s| s.account(&address)) {
-            return Ok(account.map(Into::into));
+        if let Some(account) = self.shared_prewarmed(0, |s| s.account(address)) {
+            return Ok(account);
         }
-        self.read(0, |db| db.basic_ref(address))
+        let value = self.read(0, |db| db.basic_ref(address))?;
+        if let Some(cache) = &self.shared {
+            cache.insert_account(address, value.clone());
+        }
+        Ok(value)
     }
     fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
-        if let Some(value) =
-            self.prewarmed(1, |s| s.storage(address, B256::new(index.to_be_bytes())))
-        {
+        if let Some(value) = self.shared_prewarmed(1, |s| s.storage(address, index)) {
             return Ok(value);
         }
-        self.read(1, |db| db.storage_ref(address, index))
+        let value = self.read(1, |db| db.storage_ref(address, index))?;
+        if let Some(cache) = &self.shared {
+            cache.insert_storage(address, index, value);
+        }
+        Ok(value)
     }
     fn code_by_hash_ref(&self, hash: B256) -> Result<Bytecode, Self::Error> {
-        if let Some(code) = self.prewarmed(2, |s| s.bytecode(&hash)) {
-            return Ok(code.unwrap_or_default().0);
+        if let Some(code) = self.shared_prewarmed(2, |s| s.code(hash)) {
+            return Ok(code);
         }
-        self.read(2, |db| db.code_by_hash_ref(hash))
+        let value = self.read(2, |db| db.code_by_hash_ref(hash))?;
+        if let Some(cache) = &self.shared {
+            cache.insert_code(hash, value.clone());
+        }
+        Ok(value)
     }
     fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
         self.inner.block_hash_ref(number)
@@ -368,27 +377,23 @@ mod tests {
         assert_eq!(db.reads.totals[0][0][0].get().calls, 1);
     }
 
-    fn snapshot(parent: B256) -> TxPoolPrewarmCacheSnapshot {
-        let mut reads = CachedReads::default();
-        let mut slots = alloy_primitives::map::U256Map::default();
-        slots.insert(U256::ZERO, U256::from(7));
-        slots.insert(U256::from(1), U256::ZERO);
-        reads.insert_account(Address::ZERO, AccountInfo::default(), slots);
-        reads.accounts.insert(
-            Address::repeat_byte(1),
-            reth_revm::cached::CachedAccount { info: None, storage: Default::default() },
-        );
-        reads.contracts.insert(
+    fn populated_cache(parent: B256) -> Arc<super::super::prewarm::SharedStateCache> {
+        let cache = super::super::prewarm::SharedStateCache::new(parent);
+        cache.insert_account(Address::ZERO, Some(AccountInfo::default()));
+        cache.insert_storage(Address::ZERO, U256::ZERO, U256::from(7));
+        cache.insert_storage(Address::ZERO, U256::from(1), U256::ZERO);
+        cache.insert_account(Address::repeat_byte(1), None);
+        cache.insert_code(
             B256::repeat_byte(2),
             Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x00])),
         );
-        TxPoolPrewarmCacheSnapshot::new(parent, Arc::new(reads))
+        cache
     }
 
     #[test]
     fn prewarm_reads_preserve_zero_absent_and_code_without_backing_reads() {
         let parent = B256::repeat_byte(3);
-        let snapshot = snapshot(parent);
+        let shared = populated_cache(parent);
         let mut cache = CachedReads::default();
         let (db, phase) = ObservedStateDb::new(
             &mut cache,
@@ -396,7 +401,7 @@ mod tests {
             AttemptKind::Regular,
             true,
         );
-        let mut db = db.with_prewarm_snapshot(parent, Some(snapshot.clone()));
+        let mut db = db.with_shared_prewarm(parent, Some(shared.clone()));
         phase.selection();
         assert_eq!(db.basic(Address::ZERO).unwrap(), Some(AccountInfo::default()));
         assert_eq!(db.storage(Address::ZERO, U256::ZERO).unwrap(), U256::from(7));
@@ -407,7 +412,7 @@ mod tests {
         assert_eq!(db.inner.db.prewarm_reads.totals[1][0][0].get().calls, 2);
         assert_eq!(db.inner.db.prewarm_reads.totals[1][1][0].get().calls, 2);
         assert_eq!(db.inner.db.prewarm_reads.totals[1][2][0].get().calls, 1);
-        // A local cache change must not mutate the engine's immutable snapshot.
+        // A local cache change must not mutate the shared original-state cache.
         db.inner
             .cached
             .accounts
@@ -415,7 +420,7 @@ mod tests {
             .unwrap()
             .storage
             .insert(U256::ZERO, U256::from(99));
-        assert_eq!(snapshot.storage(Address::ZERO, B256::ZERO), Some(U256::from(7)));
+        assert_eq!(shared.storage(Address::ZERO, U256::ZERO), Some(U256::from(7)));
     }
 
     #[test]
@@ -429,8 +434,8 @@ mod tests {
                 AttemptKind::Regular,
                 true,
             );
-            let mut db = db.with_prewarm_snapshot(requested, Some(snapshot(parent)));
-            assert_eq!(db.inner.db.snapshot.is_some(), requested == parent);
+            let mut db = db.with_shared_prewarm(requested, Some(populated_cache(parent)));
+            assert_eq!(db.inner.db.shared.is_some(), requested == parent);
             let address = if requested == parent { Address::repeat_byte(9) } else { Address::ZERO };
             assert_eq!(db.basic(address).unwrap_err().to_string(), "account read failed");
             assert_eq!(
@@ -450,7 +455,7 @@ mod tests {
             ObservedStateDb::new(&mut cold_cache, TestDb::default(), AttemptKind::Regular, true);
         let (warm, _) =
             ObservedStateDb::new(&mut warm_cache, TestDb::default(), AttemptKind::Regular, true);
-        let mut warm = warm.with_prewarm_snapshot(parent, Some(snapshot(parent)));
+        let mut warm = warm.with_shared_prewarm(parent, Some(populated_cache(parent)));
         assert_eq!(cold.basic(Address::ZERO).unwrap(), warm.basic(Address::ZERO).unwrap());
         assert_eq!(
             cold.storage(Address::ZERO, U256::ZERO).unwrap(),
@@ -459,6 +464,33 @@ mod tests {
         assert_eq!(cold.block_hash(1).unwrap(), warm.block_hash(1).unwrap());
         assert_eq!(warm.inner.db.reads.totals[0][0][0].get().calls, 0);
         assert_eq!(cold.inner.db.reads.totals[0][0][0].get().calls, 1);
+    }
+
+    #[test]
+    fn running_attempt_consumes_reads_produced_after_it_started() {
+        let parent = B256::repeat_byte(3);
+        let shared = super::super::prewarm::SharedStateCache::new(parent);
+        let mut local = CachedReads::default();
+        let (db, _) = ObservedStateDb::new(
+            &mut local,
+            TestDb { fail: true, absent: false },
+            AttemptKind::Regular,
+            true,
+        );
+        let mut db = db.with_shared_prewarm(parent, Some(shared.clone()));
+        // Attach an empty cache, then establish that the backing provider cannot serve it.
+        assert!(db.basic(Address::ZERO).is_err());
+        std::thread::spawn(move || {
+            shared.insert_account(Address::ZERO, Some(AccountInfo::default()));
+            shared.insert_storage(Address::ZERO, U256::ZERO, U256::from(7));
+        })
+        .join()
+        .unwrap();
+        // No refresh, re-attachment or new attempt: this same DB sees the later worker reads.
+        assert_eq!(db.basic(Address::ZERO).unwrap(), Some(AccountInfo::default()));
+        assert_eq!(db.storage(Address::ZERO, U256::ZERO).unwrap(), U256::from(7));
+        assert_eq!(db.inner.db.reads.totals[0][0][0].get().calls, 1);
+        assert_eq!(db.inner.db.prewarm_reads.totals[0][0][0].get().calls, 1);
     }
 
     #[test]

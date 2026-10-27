@@ -50,21 +50,6 @@ type HeaderByNumberFn = Arc<dyn Fn(u64) -> Option<Header> + Send + Sync>;
 /// Global shared access to the snapshot provider for RPC
 static SNAPSHOT_PROVIDER: OnceLock<Arc<dyn SnapshotProvider + Send + Sync>> = OnceLock::new();
 
-/// Read-only bridge from the engine's existing prewarm worker to the local miner.
-pub type MinerPrewarmSnapshotFn =
-    Arc<dyn Fn(B256) -> Option<reth_engine_tree::tree::TxPoolPrewarmCacheSnapshot> + Send + Sync>;
-static MINER_PREWARM_SNAPSHOT: OnceLock<MinerPrewarmSnapshotFn> = OnceLock::new();
-
-pub fn set_miner_prewarm_snapshot_provider(provider: MinerPrewarmSnapshotFn) {
-    let _ = MINER_PREWARM_SNAPSHOT.set(provider);
-}
-
-pub fn miner_prewarm_snapshot(
-    parent: B256,
-) -> Option<reth_engine_tree::tree::TxPoolPrewarmCacheSnapshot> {
-    MINER_PREWARM_SNAPSHOT.get().and_then(|read| read(parent))
-}
-
 /// Select independent normal/fallback worker sessions while sharing parent overlays.
 #[derive(Debug, Clone, Copy)]
 pub enum MinerRootKind {

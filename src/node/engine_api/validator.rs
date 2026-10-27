@@ -100,12 +100,16 @@ where
             overlay_manager,
             ctx.node.task_executor().clone(),
         );
-        // Mirrors reth's `BasicEngineValidatorBuilder`, whose pool adapter is crate-private.
-        if txpool_prewarming {
+        let mining = crate::node::miner::config::get_global_mining_config()
+            .cloned()
+            .unwrap_or_else(crate::node::miner::config::MiningConfig::from_env)
+            .is_mining_enabled();
+        crate::node::miner::prewarm::configure(txpool_prewarming && mining);
+        // Mining owns its attempt-scoped prefetch workers and shared read cache. Running the
+        // canonical-head worker as well would duplicate speculative execution on validators.
+        // Non-mining nodes retain the engine's validation prewarming path.
+        if txpool_prewarming && !mining {
             inner = inner.with_txpool_prewarming(PoolPrewarmSource(ctx.node.pool().clone()));
-            if let Some(read) = inner.txpool_prewarm_snapshot_provider() {
-                crate::shared::set_miner_prewarm_snapshot_provider(read);
-            }
         }
 
         Ok(BscEngineValidatorWithEvidence {
