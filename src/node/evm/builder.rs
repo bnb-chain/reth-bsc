@@ -193,6 +193,13 @@ where
             stages.enter("root_wait");
             if let Some(mut handle) = handle_slot.lock().unwrap().take() {
                 let wait_start = std::time::Instant::now();
+                let mut wait_observation = super::finish_metrics::RootWaitObservation::new(
+                    self.ctx.finish_diagnostics,
+                    build_control.clone(),
+                    self.parent.number + 1,
+                    self.parent.hash(),
+                    handle.diagnostics().id(),
+                );
                 // R2: bound the wait by the slot deadline (if set) so an in-turn block
                 // never blocks unboundedly past its slot. On timeout/error we leave the
                 // sink empty, so the MDBX branch below falls back to the synchronous
@@ -261,6 +268,8 @@ where
                         },
                     }
                 };
+                wait_observation.returned(delivered.is_some());
+                drop(wait_observation);
                 stages.enter("root_result");
                 if let Some(outcome) = delivered {
                     let updates = std::sync::Arc::try_unwrap(outcome.trie_updates)

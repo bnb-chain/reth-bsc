@@ -18,3 +18,5 @@ pub use config::{keystore, MiningConfig};
 pub(crate) mod build_diagnostics;
 
 pub(crate) mod startup_diagnostics;
+
+pub(crate) mod state_read_diagnostics;

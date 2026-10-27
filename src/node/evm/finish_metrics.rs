@@ -1,4 +1,5 @@
-//! Miner finish() wall-clock accounting. No transaction/hash labels or per-block log output.
+//! Miner finish() wall-clock accounting. No transaction/hash metric labels. Slow root waits have
+//! rate-limited logs.
 //!
 //! `bsc.build_diagnostics.finish_stage_seconds{kind,turn,stage,outcome}` records each
 //! entered phase, including its elapsed time on early error/unwind. `completed` means the
@@ -89,12 +90,148 @@ impl Drop for FinishObservation {
     }
 }
 
+/// Foreground receive attribution only. The opaque Reth payload handle does not expose its
+/// proof-session snapshot; do not infer a per-build background breakdown from these samples.
+pub(super) struct RootWaitObservation {
+    labels: Option<(&'static str, &'static str)>,
+    control: Option<BuildControl>,
+    block_number: u64,
+    parent_hash: alloy_primitives::B256,
+    root_task_id: u64,
+    started: Instant,
+    outcome: &'static str,
+}
+
+impl RootWaitObservation {
+    pub(super) fn new(
+        labels: Option<(&'static str, &'static str)>,
+        control: Option<BuildControl>,
+        block_number: u64,
+        parent_hash: alloy_primitives::B256,
+        root_task_id: u64,
+    ) -> Self {
+        Self {
+            labels,
+            control,
+            block_number,
+            parent_hash,
+            root_task_id,
+            started: Instant::now(),
+            outcome: "interrupted",
+        }
+    }
+
+    pub(super) fn returned(&mut self, delivered: bool) {
+        self.outcome = if delivered { "delivered" } else { "unavailable" };
+    }
+}
+
+fn wait_bucket(elapsed: std::time::Duration) -> &'static str {
+    match elapsed.as_millis() {
+        0..=49 => "lt50ms",
+        50..=99 => "50to100ms",
+        100..=199 => "100to200ms",
+        200..=399 => "200to400ms",
+        _ => "ge400ms",
+    }
+}
+
+impl Drop for RootWaitObservation {
+    fn drop(&mut self) {
+        let Some((kind, turn)) = self.labels else { return };
+        let elapsed = self.started.elapsed();
+        let outcome = if std::thread::panicking() { "panic" } else { self.outcome };
+        metrics::counter!("bsc.build_diagnostics.root_waits_total",
+            "kind" => kind, "turn" => turn, "outcome" => outcome,
+            "bucket" => wait_bucket(elapsed))
+        .increment(1);
+        if elapsed < std::time::Duration::from_millis(100) {
+            return;
+        }
+        // Metrics include all attempts. Bound INFO output to one slow wait per five seconds
+        // across the process; no sleeps, extra RPCs, task cancellation or timeout marking.
+        use std::sync::{
+            atomic::{AtomicU64, Ordering},
+            OnceLock,
+        };
+        static CLOCK: OnceLock<Instant> = OnceLock::new();
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let now = CLOCK.get_or_init(Instant::now).elapsed().as_millis() as u64;
+        let next = NEXT.load(Ordering::Relaxed);
+        if now < next ||
+            NEXT.compare_exchange(
+                next,
+                now.saturating_add(5000),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            metrics::counter!("bsc.build_diagnostics.root_wait_logs_suppressed_total").increment(1);
+            return;
+        }
+        let budget = self.control.as_ref().map_or("none", |control| {
+            match control.check_active(Instant::now()) {
+                Ok(()) => "active",
+                Err("payload build canceled") => "cancelled",
+                Err(_) => "deadline_elapsed",
+            }
+        });
+        tracing::info!(target: "bsc::miner::diagnostics", block_number = self.block_number,
+            parent_hash = %self.parent_hash, kind, turn, root_task_id = self.root_task_id, outcome, budget,
+            wait_ms = elapsed.as_secs_f64() * 1000.0, "Sampled slow miner root wait");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use metrics_exporter_prometheus::PrometheusBuilder;
     use reth_tasks::ManualCancel;
     use std::time::Duration;
+
+    #[test]
+    fn root_wait_outcomes_include_early_exit_and_exclude_non_miner() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            for outcome in [Some(true), Some(false), None] {
+                let mut sample = RootWaitObservation::new(
+                    Some(("regular", "inturn")),
+                    None,
+                    10,
+                    alloy_primitives::B256::ZERO,
+                    123,
+                );
+                sample.started = Instant::now() - Duration::from_millis(200);
+                if let Some(delivered) = outcome {
+                    sample.returned(delivered);
+                }
+                drop(sample);
+            }
+            let mut sample =
+                RootWaitObservation::new(None, None, 10, alloy_primitives::B256::ZERO, 123);
+            sample.started = Instant::now() - Duration::from_millis(500);
+        });
+        let text = handle.render();
+        for outcome in ["delivered", "unavailable", "interrupted"] {
+            let expected = format!("root_waits_total{{kind=\"regular\",turn=\"inturn\",outcome=\"{outcome}\",bucket=\"200to400ms\"}} 1");
+            assert!(text.contains(&expected), "missing {expected}: {text}");
+        }
+        assert!(!text.contains("ge400ms"), "{text}");
+        for (ms, expected) in [
+            (49, "lt50ms"),
+            (50, "50to100ms"),
+            (99, "50to100ms"),
+            (100, "100to200ms"),
+            (199, "100to200ms"),
+            (200, "200to400ms"),
+            (399, "200to400ms"),
+            (400, "ge400ms"),
+        ] {
+            assert_eq!(wait_bucket(Duration::from_millis(ms)), expected);
+        }
+    }
 
     #[test]
     fn records_success_and_early_exit_with_budget_without_polluting_non_miner_paths() {

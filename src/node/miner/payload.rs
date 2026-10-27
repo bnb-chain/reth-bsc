@@ -1,4 +1,9 @@
-use super::build_diagnostics::{AttemptKind, AttemptObservation, BuildWorkObservation, SkipReason};
+use super::{
+    build_diagnostics::{
+        AttemptKind, AttemptObservation, BuildWorkObservation, SelectionStage, SkipReason,
+    },
+    state_read_diagnostics::ObservedStateDb,
+};
 use crate::{
     chainspec::BscChainSpec,
     consensus::{
@@ -622,10 +627,11 @@ where
 
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
         let state = StateProviderDatabase::new(EvmStateProviderAdapter(&state_provider));
-        let mut db = State::builder()
-            .with_database(cached_reads.as_db_mut(state))
-            .with_bundle_update()
-            .build();
+        let (state, read_phase) =
+            ObservedStateDb::new(&mut cached_reads, state, kind, self.ctx.is_inturn);
+        let state = state
+            .with_prewarm_snapshot(parent_hash, crate::shared::miner_prewarm_snapshot(parent_hash));
+        let mut db = State::builder().with_database(state).with_bundle_update().build();
 
         // Sinks transport current_validators / turn_length from the builder (which is consumed by
         // `finish`) back to this layer so they can be written to cache after
@@ -769,8 +775,10 @@ where
         let exec_start = std::time::Instant::now();
         // Everything before `exec_start` is treated as "prepare" time for this payload attempt.
         let prepare_duration = exec_start.duration_since(build_start);
+        read_phase.selection();
         work.execution_started(exec_start);
         loop {
+            work.selection_stage(SelectionStage::Control);
             let iteration_started = std::time::Instant::now();
             if cancel.is_cancelled() ||
                 build_control
@@ -779,7 +787,9 @@ where
             {
                 break;
             }
+            work.selection_stage(SelectionStage::Iterator);
             let Some(pool_tx) = best_tx_list.next() else { break };
+            work.selection_stage(SelectionStage::Precheck);
             work.scanned += 1;
 
             // filter out blacklisted transactions before executing.
@@ -958,7 +968,10 @@ where
                 );
             }
 
-            let gas_used = match builder.execute_transaction(tx.clone()) {
+            work.selection_stage(SelectionStage::Execute);
+            let execution_result = builder.execute_transaction(tx.clone());
+            work.selection_stage(SelectionStage::Postprocess);
+            let gas_used = match execution_result {
                 Ok(gas_used) => gas_used,
                 Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
                     error,
@@ -1067,7 +1080,9 @@ where
                 sidecars_map.insert(*tx.hash(), sidecar);
             }
         }
+        work.selection_stage(SelectionStage::Control);
         let exec_duration = exec_start.elapsed();
+        read_phase.finish();
         if let Some(control) = &build_control {
             let now = std::time::Instant::now();
             let reason = if cancel.is_cancelled() {
@@ -1283,10 +1298,12 @@ where
 
         let state_provider = self.client.state_by_block_hash(parent_header.hash_slow())?;
         let state = StateProviderDatabase::new(EvmStateProviderAdapter(&state_provider));
-        let mut db = State::builder()
-            .with_database(cached_reads.as_db_mut(state))
-            .with_bundle_update()
-            .build();
+        let (state, read_phase) =
+            ObservedStateDb::new(&mut cached_reads, state, AttemptKind::Empty, self.ctx.is_inturn);
+        let parent_hash = parent_header.hash_slow();
+        let state = state
+            .with_prewarm_snapshot(parent_hash, crate::shared::miner_prewarm_snapshot(parent_hash));
+        let mut db = State::builder().with_database(state).with_bundle_update().build();
 
         // Sinks for empty-payload builds (same delayed-seal mechanism as normal builds).
         let validator_cache_sink: ValidatorCacheSink = Arc::new(Mutex::new(None));
@@ -1353,6 +1370,7 @@ where
         })?;
         let exec_duration = exec_start.elapsed();
 
+        read_phase.finish();
         // No user transactions - only system transactions will be added by finish()
         let total_fees = U256::ZERO;
         let cumulative_gas_used = 0;

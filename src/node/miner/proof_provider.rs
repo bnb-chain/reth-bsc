@@ -32,20 +32,35 @@ pub(crate) struct MinerProofOverlayCache {
 }
 
 impl MinerProofOverlayCache {
-    fn entry(&self, key: Key) -> Arc<Entry> {
+    fn entry(&self, key: Key, fallback: bool) -> Arc<Entry> {
+        let start = Instant::now();
         let mut entries = self.entries.lock();
-        if let Some(index) = entries.iter().position(|(k, _)| *k == key) {
+        let acquired = Instant::now();
+        let (entry, retired) = if let Some(index) = entries.iter().position(|(k, _)| *k == key) {
             let item = entries.remove(index).expect("index exists");
             let entry = item.1.clone();
             entries.push_back(item);
-            return entry;
-        }
-        let entry = Arc::new(Entry::default());
-        let retired = if entries.len() == MAX_OVERLAYS { entries.pop_front() } else { None };
-        entries.push_back((key, entry.clone()));
+            (entry, None)
+        } else {
+            let entry = Arc::new(Entry::default());
+            let retired = if entries.len() == MAX_OVERLAYS { entries.pop_front() } else { None };
+            entries.push_back((key, entry.clone()));
+            (entry, retired)
+        };
         drop(entries);
+        let released = Instant::now();
         // Large overlay data must never be released under the cache index lock.
+        let evicted = retired.is_some();
         drop(retired);
+        let retired_at = Instant::now();
+        // Record only after unlocking and releasing the retired entry. Recorder work must not
+        // extend the lock hold, or be mistaken for overlay destruction time.
+        duration("cache_index_wait", acquired.duration_since(start), fallback);
+        duration("cache_index_work", released.duration_since(acquired), fallback);
+        if evicted {
+            duration("cache_retire", retired_at.duration_since(released), fallback);
+            metrics::counter!("bsc_miner_proof_overlay_evictions_total").increment(1);
+        }
         entry
     }
 
@@ -56,7 +71,7 @@ impl MinerProofOverlayCache {
         build: impl FnOnce() -> ProviderResult<StateTrieOverlay>,
     ) -> ProviderResult<StateTrieOverlay> {
         let start = Instant::now();
-        let entry = self.entry(key);
+        let entry = self.entry(key, fallback);
         stage("cache_lookup", start, fallback);
         if let Some(overlay) = entry.ready.get() {
             metrics::counter!("bsc_miner_proof_overlay_cache_total", "result" => "hit")
@@ -78,6 +93,18 @@ impl MinerProofOverlayCache {
         // Errors/cancellation never poison the cache. A fallback may race a normal builder;
         // both values describe the exact same parent and durable frontiers.
         let overlay = result?;
+        // O(1) top-level counts, sampled once per successful build, not once per cache hit.
+        // These are neither storage-slot counts nor allocated-byte estimates.
+        for (component, count) in [
+            ("accounts", overlay.input().state.accounts.len()),
+            ("storage_accounts", overlay.input().state.storages.len()),
+            ("account_trie_nodes", overlay.input().nodes.account_nodes_ref().len()),
+            ("storage_tries", overlay.input().nodes.storage_tries_ref().len()),
+        ] {
+            metrics::histogram!("bsc_miner_proof_overlay_build_items",
+                "kind" => if fallback { "empty" } else { "normal" }, "component" => component)
+            .record(count as f64);
+        }
         let _ = entry.ready.set(overlay.clone());
         metrics::counter!("bsc_miner_proof_overlay_cache_total", "result" => if fallback { "fallback_fill" } else { "fill" }).increment(1);
         Ok(overlay)
@@ -85,9 +112,13 @@ impl MinerProofOverlayCache {
 }
 
 fn stage(phase: &'static str, start: Instant, fallback: bool) {
+    duration(phase, start.elapsed(), fallback);
+}
+
+fn duration(phase: &'static str, elapsed: std::time::Duration, fallback: bool) {
     // Wall time, not CPU time; concurrent workers overlap. No hashes or task IDs in labels.
     metrics::histogram!("bsc_miner_proof_overlay_prepare_seconds", "phase" => phase, "kind" => if fallback { "empty" } else { "normal" })
-        .record(start.elapsed().as_secs_f64());
+        .record(elapsed.as_secs_f64());
 }
 
 #[derive(Clone)]
@@ -175,6 +206,40 @@ mod tests {
     fn key(n: u8) -> Key {
         (B256::with_last_byte(n), B256::ZERO, B256::ZERO)
     }
+    #[test]
+    fn telemetry_preserves_failure_retry_and_records_retirement_only_on_eviction() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let cache = MinerProofOverlayCache::default();
+            assert!(cache
+                .get_or_build(key(1), false, || {
+                    Err(reth_provider::ProviderError::other(std::io::Error::other("failure")))
+                })
+                .is_err());
+            cache.get_or_build(key(1), false, || Ok(value())).unwrap();
+            cache.get_or_build(key(1), false, || panic!("must hit")).unwrap();
+            for n in 2..=MAX_OVERLAYS as u8 + 1 {
+                cache.get_or_build(key(n), false, || Ok(value())).unwrap();
+            }
+        });
+        let text = handle.render();
+        for phase in [
+            "cache_index_wait",
+            "cache_index_work",
+            "cache_lookup",
+            "cache_wait",
+            "build",
+            "cache_retire",
+        ] {
+            assert!(text.contains(&format!("phase=\"{phase}\"")), "{text}");
+        }
+        assert!(text.contains("bsc_miner_proof_overlay_evictions_total 1"), "{text}");
+        assert!(text.contains("component=\"accounts\""), "{text}");
+        // Failed initialization has no item sample; a ready cache hit adds none either.
+        assert!(text.contains("bsc_miner_proof_overlay_build_items_count{kind=\"normal\",component=\"accounts\"} 17"), "{text}");
+    }
+
     #[test]
     fn ready_values_reuse_but_parent_and_both_frontiers_isolate() {
         let cache = MinerProofOverlayCache::default();
