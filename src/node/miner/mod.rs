@@ -7,8 +7,8 @@ pub mod bsc_miner;
 pub mod build_control;
 pub mod config;
 pub(crate) mod overlay;
-pub(crate) mod proof_provider;
 pub mod payload;
+pub(crate) mod proof_provider;
 pub mod signer;
 pub mod util;
 
@@ -19,4 +19,5 @@ pub(crate) mod build_diagnostics;
 
 pub(crate) mod startup_diagnostics;
 
+pub(crate) mod prewarm;
 pub(crate) mod state_read_diagnostics;
