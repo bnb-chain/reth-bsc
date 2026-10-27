@@ -630,8 +630,10 @@ where
         let state = StateProviderDatabase::new(&state_provider);
         let prewarm_cache = super::prewarm::cache_for_attempt(parent_hash);
         let proof_hints = prewarm_cache.as_ref().and_then(|_| {
-            trie_handle.lock().unwrap().as_mut().map(|handle| {
-                super::prewarm::ProofHints::new(parent_hash, handle.take_hint_stream())
+            trie_handle.lock().unwrap().as_mut().and_then(|handle| {
+                handle
+                    .take_isolated_hint_stream()
+                    .map(|stream| super::prewarm::ProofHints::new(parent_hash, stream))
             })
         });
         let (state, read_phase) =

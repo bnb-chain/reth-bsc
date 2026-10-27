@@ -8,16 +8,21 @@ use alloy_primitives::{
 use parking_lot::Mutex;
 use reth_engine_tree::tree::state_root_strategy::{StateAccessHint, StateRootHintStream};
 use revm::state::EvmState;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 const BATCH_TARGETS: usize = 64;
-const MAX_TARGETS: usize = 16_384;
-const MAX_BATCHES: usize = 256;
+const MAX_TARGETS: usize = 512;
+const MAX_BATCHES: usize = 8;
 // Bound both scanning and hashing work for an individual speculative transaction.
 const MAX_TRANSACTION_TARGETS: usize = 64;
 
 pub(crate) struct ProofHints {
     parent: B256,
+    closed: AtomicBool,
+    stream: Option<StateRootHintStream>,
     state: Mutex<HintState>,
 }
 
@@ -32,15 +37,27 @@ struct HintState {
 
 impl ProofHints {
     pub(crate) fn new(parent: B256, stream: StateRootHintStream) -> Arc<Self> {
-        Self::with_sender(parent, move |hint| stream.on_access_hint(hint))
+        let sender = stream.clone();
+        Self::build(parent, move |hint| sender.on_access_hint(hint), Some(stream))
     }
 
+    #[cfg(test)]
     fn with_sender(
         parent: B256,
         send: impl Fn(StateAccessHint) + Send + Sync + 'static,
     ) -> Arc<Self> {
+        Self::build(parent, send, None)
+    }
+
+    fn build(
+        parent: B256,
+        send: impl Fn(StateAccessHint) + Send + Sync + 'static,
+        stream: Option<StateRootHintStream>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             parent,
+            closed: AtomicBool::new(false),
+            stream,
             state: Mutex::new(HintState {
                 send: Some(Box::new(send)),
                 accounts: Default::default(),
@@ -53,6 +70,9 @@ impl ProofHints {
     }
 
     pub(crate) fn record(&self, parent: B256, state: &EvmState) {
+        if self.closed.load(Ordering::Acquire) {
+            return
+        }
         if parent != self.parent {
             metrics::counter!("bsc.miner_prewarm.proof_hint_rejections_total", "reason" => "parent_mismatch").increment(1);
             return
@@ -102,7 +122,7 @@ impl ProofHints {
 
     fn admit(&self, hint: StateAccessHint) {
         let mut state = self.state.lock();
-        if state.send.is_none() {
+        if self.closed.load(Ordering::Acquire) || state.send.is_none() {
             return
         }
         let mut duplicates = 0;
@@ -146,16 +166,27 @@ impl ProofHints {
 
     /// Flush a partial batch when a worker exhausts the candidate iterator, not at a deadline.
     pub(crate) fn flush(&self) {
-        self.state.lock().flush();
+        if self.closed.load(Ordering::Acquire) {
+            return
+        }
+        let mut state = self.state.lock();
+        if !self.closed.load(Ordering::Acquire) {
+            state.flush();
+        }
     }
 
-    /// Serialize against the short send section: no hint can be emitted after this returns.
-    /// The gate never contains EVM execution, database reads, Keccak or a blocking channel.
+    /// Stops the independent lane without waiting for a speculative sender's mutex.
+    /// The Reth close gate also rejects an already-in-flight submission and drops late results.
     pub(crate) fn close(&self) {
-        let mut state = self.state.lock();
-        state.send = None;
-        state.pending = StateAccessHint::default();
-        state.pending_targets = 0;
+        self.closed.store(true, Ordering::Release);
+        if let Some(stream) = &self.stream {
+            stream.close();
+        }
+        if let Some(mut state) = self.state.try_lock() {
+            state.send = None;
+            state.pending = StateAccessHint::default();
+            state.pending_targets = 0;
+        }
     }
 
     #[cfg(test)]
@@ -334,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn close_serializes_with_an_inflight_send_and_stops_future_sends() {
+    fn close_does_not_wait_for_an_inflight_send_and_stops_future_sends() {
         use std::{sync::mpsc, time::Duration};
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -352,10 +383,11 @@ mod tests {
         let closer = hints.clone();
         let (closing_tx, closing_rx) = mpsc::channel();
         let close = std::thread::spawn(move || {
-            closing_tx.send(()).unwrap();
             closer.close();
+            closing_tx.send(()).unwrap();
         });
-        closing_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // A blocked sender still holds the mutex. Closing must return before we release it.
+        closing_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         release_tx.send(()).unwrap();
         send.join().unwrap();
         close.join().unwrap();

@@ -192,18 +192,23 @@ storage 变化才发送账户路径，storage 仅包含值发生变化的 slot�
 Keccak(address)/Keccak(slot)，没有投机写值，也不发送正式更新或结束标记。
 正式执行的 StateHook 仍是状态更新和结束信号的唯一来源。
 
-这借鉴 go-bsc `StateDB.Finalise` / `stateObject.finalise` 提前准备脏账户和 slot 的 Trie
-路径、在 `IntermediateRoot` 中消费预取 Trie 的做法。Reth 原有正式状态更新已经是流式的，
-此处新增的是从预执行提前发送 best-effort access hints；预执行路径可能与实际执行不同，
-提示未被使用或被丢弃都不影响结果。现有 Reth `44371a` 已提供此接口，无须升级到2.8或修改依赖。
+此前实现把 access hints 送入正式 sparse-trie 更新队列，会把未打包交易的路径也变成
+正式 root 的待完成工作。本次改为独立 advisory lane，依赖 Reth 2.5.1 分支的 `c3af7e8aa` 修复，
+没有升级到2.8。节点启动时创建一个独立线程，有界队列容量8；正式 root 不等待该线程。
+同一父块、同一 attempt 的已完成 proof 才可复用；目前仅复用未知父节点的完整 proof，
+部分路径请求沿用正式计算。未完成、锁忙、计算失败或超预算时直接回退正式路径。
+投机路径不再成为 Touched 更新，不改变正式更新流的结束条件。
 
-限制按 attempt 隔离：跨 worker 去重，账户与 slot 合计最多16384个不同路径，最多256批，
-每批最多64个路径。每笔投机交易最多检查64个账户、每个账户最多检查64个 slot，最多
-提取64个路径；超出的部分不预取，正式 proof 仍走原路径。尚不足一批时，在 worker
-正常耗尽候选迭代器时发送，不在取消/预算截止时补发。
-正式交易循环结束时关闭发送门，丢弃未发送的尾批；发送门仅保护去重/批处理与非阻塞
-channel 提交，不包含 Keccak、EVM 或 provider 操作。关闭返回后，在途预执行也不能再发提示。
-关闭前已提交给 root 管线的提示可能仍会被处理，并不会被此门撤回。
+BSC 提示端每个 attempt 最多512个去重路径、8批，每批64；Reth 独立通道最多接受128个
+不同路径，单 proof 最多128节点，完成缓存估算预算2MiB，每次正式查询最多复用256节点。
+估算预算不是进程 RSS 的硬上限；一个正在执行的 provider 调用不能中途抢占。
+每笔投机交易最多检查64个账户、每个账户最多检查64个 slot，最多提取64个路径。
+正常耗尽候选迭代器时可发送尾批，预算截止时不补发。正式执行结束只设置关闭原子门，
+不等待 worker 锁、不 join；排队工作跳过，晚完成结果丢弃，已有完整结果仍可消费。
+
+与本地 go-bsc 对照：其挖矿预执行共享 reader 缓存，StateDB.Copy 不继承正式 Trie
+prefetcher。双方 storage 缓存均采用16个按账户地址分片的短读写锁，双方都会在前台
+复制候选迭代器；这两处保持现状，尚无证据把本轮回退归因于它们。
 
 新增指标前缀为 `reth_bsc_miner_prewarm_`：
 
@@ -214,6 +219,8 @@ channel 提交，不包含 Keccak、EVM 或 provider 操作。关闭返回后，
 - `proof_hint_budget_exhausted_total{reason="targets|batches"}`：本次 attempt 用尽提示预算。
 
 提交计数不代表后台已消费、proof 命中或上链成功；去重路径数上限也不是整个 proof 管线的
-严格字节/任务数上限。当前改动没有跨候选复用可变 sparse trie，也未改变 worker 数量和调度。
+严格字节/任务数上限。当前改动没有跨候选复用可变 sparse trie，正式 proof worker 数量和调度保持现状。
+独立通道新增 `reth_trie_prefetch_events_total{result}`，区分 queued/queue_full/ready/hit/miss、
+lookup_busy、取消、错误与预算拒绝；`reth_trie_prefetch_compute_seconds` 记录投机计算耗时。
 需要同时比较 finish 时剩余 proofs、finish drain、root_wait、总构建时间及有压空块率，
 不能仅凭新增提示计数断言性能提升。

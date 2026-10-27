@@ -172,7 +172,11 @@ impl<DB: DatabaseRef> DatabaseRef for SharedStateDb<DB> {
 
 pub(crate) fn configure(enabled: bool) {
     // Allocate OS threads during node setup, never on the first miner execution path.
-    ENABLED.store(enabled && workers().is_some(), Ordering::Relaxed);
+    let enabled = enabled && workers().is_some();
+    if enabled {
+        reth_engine_tree::tree::state_root_strategy::initialize_isolated_proof_prefetch();
+    }
+    ENABLED.store(enabled, Ordering::Relaxed);
 }
 pub(crate) fn cache_for_attempt(parent: B256) -> Option<Arc<SharedStateCache>> {
     ENABLED.load(Ordering::Relaxed).then(|| SharedStateCache::new(parent))
