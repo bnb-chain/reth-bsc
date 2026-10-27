@@ -182,3 +182,22 @@ completed 只表示调用返回成功，EVM revert/halt 仍可能包含在其中
 各层耗时包含关系不变，不可相加。worker 在线程结束时汇总交易计数。
 
 开关开启后的收益需要同条件 A/B 验证，不能由线程存在或共享命中率直接推导TPS增益。
+
+### 撤除投机 proof 与正式 overlay 增量复用实验
+
+投机 EVM 的共享 account/storage/code 读取预热保留；撤除额外的 proof hints、
+独立 proof worker 和完整 multiproof 缓存。正式交易的 StateHook 与流式算根不变。
+go-bsc 的挖矿投机预执行主要预热 reader；其正式 Trie 预取根据已执行交易的脏账户/槽位
+加载 Trie，不能把本次已撤除的投机 multiproof 实验称作直接照搬该实现。
+
+Reth overlay manager 在同一 anchor、同一分支上寻找最近的已完成祖先，批量合并新增块后
+再与祖先结果合并一次。可选祖先处于 Computing 时跳过，不等待它；当前目标自身的
+singleflight 等待保留。直接父块复用保留；更早祖先至少覆盖整段路径的一半才复用，
+否则完整合并，避免“几乎完整的 delta 再合并一次”造成回退。这是按块数的保守启发式，
+不是按字节估计的成本模型。跨 anchor 重新构建，不做持久化边界重基，也不复用可变候选 Trie。
+
+新增 `reth_trie_diagnostics_overlay_ancestor_reuse_total{origin,result="parent|ancestor|miss"}`
+记录实际计算的复用方式；`overlay_ancestor_plan_skips_total{origin,reason="small_base"}` 记录规划阶段的保守拒绝次数。`overlay_delta_blocks` 记录实际
+合并的块数，原 `overlay_blocks` 保持完整路径长度口径。需要同时观察 ancestor 的实际
+使用频率、overlay build/wait、root_wait 和 canonical TPS。人工 debug 基准不能预测TPS；
+撤除投机 proof 与祖先复用组合的线上收益，不能全部归到祖先复用。
