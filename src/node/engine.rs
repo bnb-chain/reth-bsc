@@ -154,6 +154,15 @@ where
         // `overlay_builder_for_parent`: anchor at `parent_hash` and feed the in-memory canonical
         // chain to a miner-owned overlay cache so proof workers can resolve a
         // not-yet-persisted parent without merging every ancestor on each build.
+        crate::node::miner::pipeline::configure(ctx.task_executor().handle().clone())?;
+        let private_provider = ctx.provider().clone();
+        let _ = crate::shared::set_private_miner_state_fn(Arc::new(move |block| {
+            reth_provider::StateProviderFactory::state_with_block_appended(
+                &private_provider,
+                block.recovered_block().parent_hash,
+                block,
+            )
+        }));
         if mining_config.use_sparse_trie_state_root {
             use crate::node::miner::proof_provider::{
                 MinerProofOverlayCache, MinerProofProviderFactory,
@@ -214,18 +223,49 @@ where
             )
             .with_worker_namespace("miner-empty")
             .build()?;
+            let pipeline_runtime = if crate::node::miner::pipeline::enabled() {
+                Some(
+                    RuntimeBuilder::new(
+                        RuntimeConfig::default()
+                            .with_tokio(TokioConfig::existing_handle(
+                                ctx.task_executor().handle().clone(),
+                            ))
+                            .with_rayon(RayonConfig {
+                                cpu_threads: Some(1),
+                                rpc_threads: Some(1),
+                                storage_threads: Some(1),
+                                proof_storage_worker_threads: Some(2),
+                                proof_account_worker_threads: Some(2),
+                                prewarming_threads: Some(1),
+                                bal_streaming_threads: Some(1),
+                                state_trie_overlay_worker_threads: Some(1),
+                                ..Default::default()
+                            }),
+                    )
+                    .with_worker_namespace("miner-pipeline")
+                    .build()?,
+                )
+            } else {
+                None
+            };
             let worker_pool = runtime.state_trie_overlay_worker_pool();
             let tree_config_for_closure = tree_config.clone();
             let overlay_cache =
                 parking_lot::Mutex::new(crate::node::miner::overlay::MinerOverlayCache::default());
 
             let proof_overlay_cache = Arc::new(MinerProofOverlayCache::default());
+            let pipeline_proof_overlay_cache = Arc::new(MinerProofOverlayCache::default());
             let spawn_fn: crate::shared::SparseTrieSpawnFn = std::sync::Arc::new(
-                move |parent: SealedHeader<Header>, kind| {
+                move |parent: SealedHeader<Header>, kind, private_parent| {
+                    let is_private = private_parent.is_some();
                     let parent_hash = parent.hash();
                     let mut blocks = Vec::<ExecutedBlock<crate::BscPrimitives>>::new();
                     if let Some(cim) = crate::shared::get_canonical_in_memory_state() {
-                        if let Some(state) = cim.state_by_hash(parent_hash) {
+                        if let Some(state) = cim.state_by_hash(
+                            private_parent
+                                .as_ref()
+                                .map_or(parent_hash, |b| b.recovered_block().parent_hash),
+                        ) {
                             // chain() yields newest-to-oldest including the parent itself.
                             blocks = state.chain().map(|bs| bs.block()).collect();
                             metrics::histogram!("bsc_miner_overlay_depth")
@@ -239,20 +279,34 @@ where
                     } else {
                         metrics::counter!("bsc_miner_sparse_trie_anchor_nocim_total").increment(1);
                     }
+                    if let Some(block) = private_parent {
+                        blocks.insert(0, block);
+                    }
                     // Serialize cache selection/insertion only; never hold this lock during
                     // proof work or root waits. Old tasks own clones across generation changes.
-                    let selection_start = std::time::Instant::now();
-                    let mut cache = overlay_cache.lock();
-                    let selection_acquired = std::time::Instant::now();
-                    let (overlay_manager, retired) = cache.for_parent(&blocks, || {
-                        OverlayManager::new_with_diagnostic_origin(worker_pool.clone(), "miner")
-                    });
-                    drop(cache);
-                    let selection_released = std::time::Instant::now();
-                    metrics::histogram!("bsc_miner_overlay_manager_index_seconds", "phase" => "wait")
-                        .record(selection_acquired.duration_since(selection_start).as_secs_f64());
-                    metrics::histogram!("bsc_miner_overlay_manager_index_seconds", "phase" => "work")
-                        .record(selection_released.duration_since(selection_acquired).as_secs_f64());
+                    let (overlay_manager, retired) = if is_private {
+                        let pool = pipeline_runtime.as_ref()?.state_trie_overlay_worker_pool();
+                        let manager =
+                            OverlayManager::new_with_diagnostic_origin(pool, "miner-pipeline");
+                        for block in blocks.iter().rev() {
+                            manager.insert_block(block.clone());
+                        }
+                        (manager, Vec::new())
+                    } else {
+                        let selection_start = std::time::Instant::now();
+                        let mut cache = overlay_cache.lock();
+                        let selection_acquired = std::time::Instant::now();
+                        let result = cache.for_parent(&blocks, || {
+                            OverlayManager::new_with_diagnostic_origin(worker_pool.clone(), "miner")
+                        });
+                        drop(cache);
+                        let selection_released = std::time::Instant::now();
+                        metrics::histogram!("bsc_miner_overlay_manager_index_seconds", "phase" => "wait")
+                            .record(selection_acquired.duration_since(selection_start).as_secs_f64());
+                        metrics::histogram!("bsc_miner_overlay_manager_index_seconds", "phase" => "work")
+                            .record(selection_released.duration_since(selection_acquired).as_secs_f64());
+                        result
+                    };
                     if !retired.is_empty() {
                         runtime.spawn_drop(retired);
                     }
@@ -270,14 +324,22 @@ where
                         provider.clone(),
                         overlay_builder,
                         parent_hash,
-                        proof_overlay_cache.clone(),
+                        if is_private {
+                            pipeline_proof_overlay_cache.clone()
+                        } else {
+                            proof_overlay_cache.clone()
+                        },
                         matches!(kind, crate::shared::MinerRootKind::EmptyFallback),
                     );
 
                     let spawn_start = std::time::Instant::now();
-                    let executor = match kind {
-                        crate::shared::MinerRootKind::Normal => &runtime,
-                        crate::shared::MinerRootKind::EmptyFallback => &empty_runtime,
+                    let executor = if is_private {
+                        pipeline_runtime.as_ref()?
+                    } else {
+                        match kind {
+                            crate::shared::MinerRootKind::Normal => &runtime,
+                            crate::shared::MinerRootKind::EmptyFallback => &empty_runtime,
+                        }
                     };
                     let handle = spawn_payload_builder_state_root(
                         executor,

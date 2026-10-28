@@ -61,6 +61,14 @@ pub type ValidatorCacheSink = Arc<Mutex<Option<(Vec<Address>, Vec<VoteAddress>)>
 pub type StateRootPrecomputedSink =
     Arc<Mutex<Option<(alloy_primitives::B256, reth_trie_common::updates::TrieUpdates)>>>;
 
+/// Parent data owned by one unpublished mining computation. Never inserted in the
+/// global header/snapshot caches, which may persist snapshots at checkpoints.
+#[derive(Debug, Clone)]
+pub struct PrivateMiningParent {
+    pub header: SealedHeader<Header>,
+    pub snapshot: Arc<crate::consensus::parlia::Snapshot>,
+}
+
 /// What the executor is doing with the block it is running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BscExecutionMode {
@@ -121,6 +129,8 @@ pub struct BscNextBlockEnvAttributes {
     /// Miner-only bounded (attempt kind, consensus turn) labels for execution/finish diagnostics.
     /// None for import, RPC and bid simulation; never infer kind from transaction count.
     pub finish_diagnostics: Option<(&'static str, &'static str)>,
+    /// Exact unpublished parent context; absent for canonical mining, import and RPC.
+    pub private_parent: Option<Arc<PrivateMiningParent>>,
     /// Sub-second millisecond remainder (BEP-520) of the block being built, consumed by
     /// [`BscBlockEnv`] and the BEP-706 precompile. The miner and bid simulator fill it
     /// with `block_timestamp_ms % 1000` (the planned millisecond timestamp that is
@@ -147,6 +157,7 @@ impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
             state_root_deadline_ms: None,
             build_control: None,
             finish_diagnostics: None,
+            private_parent: None,
             // RPC pending/simulate blocks have no millisecond source — second precision
             // (`Time*1000`), like go-bsc's zero-MixDigest synthetic headers.
             milli_remainder: 0,
@@ -227,6 +238,8 @@ pub struct BscBlockExecutionCtx<'a> {
     /// Miner-only bounded (attempt kind, consensus turn) labels for execution/finish diagnostics.
     /// None for import, RPC and bid simulation; never infer kind from transaction count.
     pub finish_diagnostics: Option<(&'static str, &'static str)>,
+    /// Exact unpublished parent context; absent for canonical mining, import and RPC.
+    pub private_parent: Option<Arc<PrivateMiningParent>>,
 }
 
 impl<'a> BscBlockExecutionCtx<'a> {
@@ -622,6 +635,7 @@ where
             state_root_deadline_ms: None,
             build_control: None,
             finish_diagnostics: None,
+            private_parent: None,
         })
     }
 
@@ -658,6 +672,7 @@ where
             state_root_deadline_ms: attributes.state_root_deadline_ms,
             build_control: attributes.build_control,
             finish_diagnostics: attributes.finish_diagnostics,
+            private_parent: attributes.private_parent,
         })
     }
 
@@ -731,6 +746,7 @@ where
             state_root_deadline_ms: None,
             build_control: None,
             finish_diagnostics: None,
+            private_parent: None,
         })
     }
 

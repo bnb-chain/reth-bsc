@@ -219,6 +219,7 @@ where
                 state_root_deadline_ms: None,
                 build_control: None,
                 finish_diagnostics: None,
+                private_parent: None,
             },
         )
         .map_err(|e| internal_err(format!("builder_for_next_block: {e}")))?;

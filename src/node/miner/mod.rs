@@ -8,6 +8,7 @@ pub mod build_control;
 pub mod config;
 pub(crate) mod overlay;
 pub mod payload;
+pub(crate) mod pipeline;
 pub(crate) mod proof_provider;
 pub mod signer;
 pub mod util;

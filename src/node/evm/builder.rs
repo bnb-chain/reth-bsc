@@ -114,10 +114,12 @@ where
         // multi-block eth_simulateV1 the parent is the previous in-memory simulated
         // block, so seed it here — by hash only, to leave the canonical block-number
         // index intact. Re-seeding an already-canonical parent is a no-op.
-        crate::node::evm::util::insert_header_to_cache_hash_only(
-            self.parent.header().clone(),
-            self.parent.hash(),
-        );
+        if self.ctx.private_parent.is_none() {
+            crate::node::evm::util::insert_header_to_cache_hash_only(
+                self.parent.header().clone(),
+                self.parent.hash(),
+            );
+        }
         self.executor.apply_pre_execution_changes()
     }
 
