@@ -239,6 +239,78 @@ mod tests {
         MinerOverlayCache::default().for_parent(blocks, OverlayManager::default).0
     }
 
+    /// Execution reads and root input for an unpublished parent must agree with the
+    /// same parent admitted to a managed graph, without writing canonical DB state.
+    #[test]
+    fn private_parent_overlay_matches_managed_parent_without_canonical_writes() {
+        use alloy_primitives::{keccak256, Address, U256};
+        use reth_execution_types::BlockExecutionOutput;
+        use reth_provider::{AccountReader, DatabaseProviderROFactory, StateProvider};
+        use reth_storage_overlay::OverlayStateProviderFactory;
+        use revm::{database::BundleState, state::AccountInfo};
+
+        let factory = reth_provider::test_utils::create_test_provider_factory_with_chain_spec(
+            Arc::new(reth_chainspec::ChainSpec::default()),
+        );
+        let genesis = reth_db_common::init::init_genesis(&factory).unwrap();
+        let address = Address::with_last_byte(7);
+        let slot = U256::from(9);
+        let state = BundleState::builder(1..=1)
+            .state_present_account_info(address, AccountInfo { nonce: 4, ..Default::default() })
+            .state_storage(address, [(slot, (U256::ZERO, U256::from(77)))].into_iter().collect())
+            .build();
+        let hashed = HashedPostState::default()
+            .with_accounts([(keccak256(address), Some(Account { nonce: 4, ..Default::default() }))])
+            .with_storages([(
+                keccak256(address),
+                HashedStorage::from_iter([(keccak256(B256::from(slot)), U256::from(77))]),
+            )]);
+        let parent: ExecutedBlock<BscPrimitives> = ExecutedBlock::new(
+            Arc::new(RecoveredBlock::new_unhashed(
+                BscBlock {
+                    header: Header { number: 1, parent_hash: genesis, ..Default::default() },
+                    body: Default::default(),
+                },
+                Vec::new(),
+            )),
+            Arc::new(BlockExecutionOutput { state, result: Default::default() }),
+            SortedTrieData::new(Arc::new(hashed.into_sorted()), Default::default()),
+        );
+        let private_manager = OverlayManager::default();
+        let private = private_manager.overlay_builder(genesis).with_appended_block(parent.clone());
+        let managed = OverlayManager::default();
+        managed.insert_block(parent.clone());
+        let ordinary = managed.overlay_builder(parent.recovered_block().hash());
+        let db = factory.provider().unwrap();
+        let private_reads = OverlayStateProviderFactory::new(factory.clone(), private.clone())
+            .database_provider_ro()
+            .unwrap();
+        let ordinary_reads = OverlayStateProviderFactory::new(factory.clone(), ordinary.clone())
+            .database_provider_ro()
+            .unwrap();
+        assert_eq!(private_reads.basic_account(&address).unwrap().unwrap().nonce, 4);
+        assert_eq!(private_reads.storage(address, B256::from(slot)).unwrap(), Some(U256::from(77)));
+        assert_eq!(
+            private_reads.basic_account(&address).unwrap(),
+            ordinary_reads.basic_account(&address).unwrap()
+        );
+        assert_eq!(
+            private_reads.storage(address, B256::from(slot)).unwrap(),
+            ordinary_reads.storage(address, B256::from(slot)).unwrap()
+        );
+        let anchor = BlockNumHash::new(0, genesis);
+        let private_root =
+            private.build_state_trie_overlay_at_frontiers(&db, anchor, anchor, true).unwrap();
+        let ordinary_root =
+            ordinary.build_state_trie_overlay_at_frontiers(&db, anchor, anchor, true).unwrap();
+        assert_eq!(root(&private_root), root(&ordinary_root));
+        assert!(!private_manager.contains_hash(parent.recovered_block().hash(), genesis, genesis));
+        assert!(LatestStateProvider::new(factory.provider().unwrap())
+            .basic_account(&address)
+            .unwrap()
+            .is_none());
+    }
+
     /// An empty candidate's system writes and a normal candidate's user writes share
     /// parent overlays, but must produce independent roots even when running together.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -679,9 +679,18 @@ where
         // query block header and snapshot by hash from cache.
         let mut target_hash = self.ctx.base.parent_hash;
         for _ in (start..end).rev() {
-            let header = get_header_by_hash_from_cache(&target_hash).ok_or_else(|| {
-                BlockExecutionError::msg(format!("Header not found for block hash: {target_hash}"))
-            })?;
+            let header = self
+                .ctx
+                .private_parent
+                .as_ref()
+                .filter(|p| p.header.hash() == target_hash)
+                .map(|p| p.header.header().clone())
+                .or_else(|| get_header_by_hash_from_cache(&target_hash))
+                .ok_or_else(|| {
+                    BlockExecutionError::msg(format!(
+                        "Header not found for block hash: {target_hash}"
+                    ))
+                })?;
             let snap = self
                 .snapshot_provider
                 .as_ref()

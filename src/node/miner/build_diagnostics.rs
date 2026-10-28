@@ -15,6 +15,7 @@ use std::{
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum AttemptKind {
     Speculative,
+    Pipeline,
     Regular,
     Rebuild,
     Empty,
@@ -23,6 +24,7 @@ impl AttemptKind {
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Speculative => "speculative",
+            Self::Pipeline => "pipeline",
             Self::Regular => "regular",
             Self::Rebuild => "rebuild",
             Self::Empty => "empty",
@@ -360,6 +362,15 @@ impl AttemptObservation {
         };
         metrics::counter!("bsc.build_diagnostics.finished_total", "kind" => self.kind, "turn" => self.turn, "outcome" => outcome).increment(1);
         if let Some(payload) = payload {
+            if self.kind != "pipeline" &&
+                payload.diagnostics.as_ref().is_some_and(|d| d.kind == "pipeline")
+            {
+                // Adoption waits for an existing physical computation. Final selection
+                // must credit that computation, not count its execution again.
+                metrics::counter!("bsc_miner_pipeline_total", "outcome" => "reuse_observed")
+                    .increment(1);
+                return;
+            }
             static NEXT_ID: AtomicU64 = AtomicU64::new(1);
             metrics::histogram!("bsc.build_diagnostics.execution_seconds", "kind" => self.kind, "turn" => self.turn).record(payload.exec_duration.as_secs_f64());
             metrics::histogram!("bsc.build_diagnostics.root_seconds", "kind" => self.kind, "turn" => self.turn).record(payload.trie_root_duration.as_secs_f64());

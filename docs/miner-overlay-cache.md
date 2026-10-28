@@ -37,6 +37,15 @@ cursor is cached. An empty fallback may reuse a completed value but never waits 
 build to populate it. Failed construction leaves the entry retryable, and evicted entries stay
 alive while existing workers hold them.
 
+Each proof cache admits at most two queued or active retirements to its runtime's drop worker.
+When both slots are occupied, it releases the evicted entry inline, after unlocking the cache.
+The ordinary and private-child caches use separate runtimes and retirement budgets. These
+limits bound retained entries, not allocated bytes or ownership held by in-flight readers.
+`bsc_miner_proof_overlay_retirements_total{mode}` counts background and inline retirements;
+`bsc_miner_proof_overlay_retire_seconds{mode,kind}` measures destruction on either path.
+The existing `cache_retire` preparation phase measures caller latency, including submission
+or inline cleanup, rather than background destruction time.
+
 ## Validation
 
 Local tests compare overlay contents and state roots against fresh managers for retries, linear

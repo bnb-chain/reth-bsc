@@ -191,6 +191,7 @@ where
             let event = event; // rebind to avoid move issues
                     let committed = event.committed();
                     let tip = committed.tip();
+                    super::pipeline::canonical_head(tip.hash());
                     let mut startup_timing = StartupTiming::new(tip.hash(), super::startup_diagnostics::header_ms(tip.header()), "canonical");
                     let is_reorg = matches!(event, CanonStateNotification::Reorg { .. });
                     debug!(
@@ -727,6 +728,7 @@ where
             mining_ctx.clone(),
         );
         let build_args = BscBuildArguments {
+            pipeline_parent: None,
             cached_reads: mining_ctx.cached_reads.clone().unwrap_or_default(),
             // `% 1000` matches `set_millisecond_part_of_timestamp`, which seals the same
             // remainder into the header's mix_hash at finalize time.

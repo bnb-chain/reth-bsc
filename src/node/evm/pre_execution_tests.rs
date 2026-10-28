@@ -653,6 +653,7 @@ mod parent_block_env {
             state_root_deadline_ms: None,
             build_control: None,
             finish_diagnostics: None,
+            private_parent: None,
         };
 
         let mut executor = BscBlockExecutor::new(
@@ -665,6 +666,48 @@ mod parent_block_env {
         );
         executor.inner_ctx.parent_header = Some(header_at(EPOCH_BLOCK - 1));
         executor
+    }
+
+    #[test]
+    fn private_mining_parent_needs_no_global_header_or_snapshot_registration() {
+        use crate::{
+            consensus::parlia::Snapshot,
+            node::evm::{config::PrivateMiningParent, util::HEADER_CACHE_READER},
+        };
+        use alloy_evm::Evm;
+        use reth_primitives_traits::SealedHeader;
+
+        let mut executor = executor();
+        let mut header = header_at(EPOCH_BLOCK - 1);
+        header.extra_data = alloy_primitives::B256::random().as_slice().to_vec().into();
+        let parent = SealedHeader::seal_slow(header);
+        let snap = Snapshot::new(
+            vec![Address::with_last_byte(1)],
+            parent.number,
+            parent.hash(),
+            200,
+            None,
+        );
+        executor.ctx.mode = BscExecutionMode::Mining;
+        executor.ctx.base.parent_hash = parent.hash();
+        executor.ctx.private_parent = Some(Arc::new(PrivateMiningParent {
+            header: parent.clone(),
+            snapshot: Arc::new(snap),
+        }));
+        executor.snapshot_provider = None;
+        let block = executor.evm.block().clone();
+        executor.prepare_new_block(&block).unwrap();
+        assert_eq!(executor.inner_ctx.parent_header.as_ref().unwrap(), parent.header());
+        assert_eq!(executor.inner_ctx.snap.as_ref().unwrap().block_hash, parent.hash());
+        assert!(HEADER_CACHE_READER
+            .lock()
+            .unwrap()
+            .cached_header_by_hash(&parent.hash())
+            .is_none());
+
+        executor.ctx.base.parent_hash = alloy_primitives::B256::random();
+        let error = executor.prepare_new_block(&block).unwrap_err().to_string();
+        assert!(error.contains("Private mining parent context mismatch"), "{error}");
     }
 
     fn touched(address: Address) -> revm::state::EvmState {

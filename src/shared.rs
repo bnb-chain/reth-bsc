@@ -72,7 +72,11 @@ pub enum MinerRootKind {
 /// `--mining.use-sparse-trie-state-root` is enabled. Returns `None` if the engine
 /// has not been wired (graceful fallback to legacy `state_root_with_updates`).
 pub type SparseTrieSpawnFn = Arc<
-    dyn Fn(SealedHeader<Header>, MinerRootKind) -> Option<reth_engine_tree::tree::StateRootHandle>
+    dyn Fn(
+            SealedHeader<Header>,
+            MinerRootKind,
+            Option<reth_chain_state::ExecutedBlock<crate::BscPrimitives>>,
+        ) -> Option<reth_engine_tree::tree::StateRootHandle>
         + Send
         + Sync,
 >;
@@ -338,7 +342,7 @@ pub fn set_sparse_trie_spawn_fn(spawner: SparseTrieSpawnFn) -> Result<(), Sparse
 pub fn spawn_sparse_trie_state_root(
     parent_header: SealedHeader<Header>,
 ) -> Option<reth_engine_tree::tree::StateRootHandle> {
-    SPARSE_TRIE_SPAWN_FN.get().and_then(|f| f(parent_header, MinerRootKind::Normal))
+    SPARSE_TRIE_SPAWN_FN.get().and_then(|f| f(parent_header, MinerRootKind::Normal, None))
 }
 
 /// Reuse miner parent overlays, with independent workers so a normal task waiting for
@@ -346,7 +350,34 @@ pub fn spawn_sparse_trie_state_root(
 pub fn spawn_empty_sparse_trie_state_root(
     parent_header: SealedHeader<Header>,
 ) -> Option<reth_engine_tree::tree::StateRootHandle> {
-    SPARSE_TRIE_SPAWN_FN.get().and_then(|f| f(parent_header, MinerRootKind::EmptyFallback))
+    SPARSE_TRIE_SPAWN_FN.get().and_then(|f| f(parent_header, MinerRootKind::EmptyFallback, None))
+}
+
+/// Isolated state for exactly one unpublished parent; never inserts it into engine/canonical state.
+pub type PrivateMinerStateFn = Arc<
+    dyn Fn(
+            reth_chain_state::ExecutedBlock<crate::BscPrimitives>,
+        ) -> reth_errors::ProviderResult<reth_provider::StateProviderBox>
+        + Send
+        + Sync,
+>;
+static PRIVATE_MINER_STATE: OnceLock<PrivateMinerStateFn> = OnceLock::new();
+pub fn set_private_miner_state_fn(f: PrivateMinerStateFn) -> Result<(), PrivateMinerStateFn> {
+    PRIVATE_MINER_STATE.set(f)
+}
+pub fn private_miner_state(
+    parent: reth_chain_state::ExecutedBlock<crate::BscPrimitives>,
+) -> reth_errors::ProviderResult<reth_provider::StateProviderBox> {
+    let f = PRIVATE_MINER_STATE.get().ok_or(reth_errors::ProviderError::HeaderNotFound(
+        parent.recovered_block().hash().into(),
+    ))?;
+    f(parent)
+}
+pub fn spawn_private_sparse_trie_state_root(
+    parent_header: SealedHeader<Header>,
+    parent: reth_chain_state::ExecutedBlock<crate::BscPrimitives>,
+) -> Option<reth_engine_tree::tree::StateRootHandle> {
+    SPARSE_TRIE_SPAWN_FN.get().and_then(|f| f(parent_header, MinerRootKind::Normal, Some(parent)))
 }
 
 /// Whether the sparse-trie state-root fast path is wired up.
@@ -920,6 +951,9 @@ pub fn get_miner_recommit_interval_ms() -> Option<u64> {
 // --- mining enabled ---
 
 pub fn set_mining_enabled(val: bool) {
+    if !val {
+        crate::node::miner::pipeline::selected_parent(None);
+    }
     if let Some(v) = MINING_ENABLED.get() {
         v.store(val, Ordering::Relaxed);
     }
