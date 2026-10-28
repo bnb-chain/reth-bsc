@@ -219,7 +219,7 @@ where
             let overlay_cache =
                 parking_lot::Mutex::new(crate::node::miner::overlay::MinerOverlayCache::default());
 
-            let proof_overlay_cache = Arc::new(MinerProofOverlayCache::default());
+            let proof_overlay_cache = Arc::new(MinerProofOverlayCache::new(runtime.clone()));
             let spawn_fn: crate::shared::SparseTrieSpawnFn = std::sync::Arc::new(
                 move |parent: SealedHeader<Header>, kind| {
                     let parent_hash = parent.hash();

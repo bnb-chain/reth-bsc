@@ -341,7 +341,7 @@ mod tests {
             )
             .unwrap();
         assert!(Arc::ptr_eq(&first.input().state, &second.input().state));
-        let proof_cache = Arc::new(MinerProofOverlayCache::default());
+        let proof_cache = Arc::new(MinerProofOverlayCache::new(runtime.clone()));
         let spawn = |manager: &OverlayManager<BscPrimitives>, executor, fallback| {
             spawn_payload_builder_state_root(
                 executor,

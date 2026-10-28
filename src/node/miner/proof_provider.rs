@@ -10,14 +10,18 @@ use reth_provider::{
 use reth_storage_overlay::{
     database_state_frontiers, OverlayBuilder, OverlayStateProvider, OwnedProvider, StateTrieOverlay,
 };
+use reth_tasks::Runtime;
 use std::{
     collections::VecDeque,
     sync::{Arc, OnceLock},
     time::Instant,
 };
+use tokio::sync::Semaphore;
 
 // Bound ready overlays independently of persistence progress. In-flight readers retain their Arc.
 const MAX_OVERLAYS: usize = 16;
+// Includes queued and active destruction; overflow is released on the requesting worker.
+const MAX_PENDING_RETIREMENTS: usize = 2;
 type Key = (B256, B256, B256);
 
 #[derive(Default)]
@@ -26,12 +30,21 @@ struct Entry {
     computing: Mutex<()>,
 }
 
-#[derive(Default)]
 pub(crate) struct MinerProofOverlayCache {
     entries: Mutex<VecDeque<(Key, Arc<Entry>)>>,
+    runtime: Runtime,
+    retirement_slots: Arc<Semaphore>,
 }
 
 impl MinerProofOverlayCache {
+    pub(crate) fn new(runtime: Runtime) -> Self {
+        Self {
+            entries: Mutex::new(VecDeque::new()),
+            runtime,
+            retirement_slots: Arc::new(Semaphore::new(MAX_PENDING_RETIREMENTS)),
+        }
+    }
+
     fn entry(&self, key: Key, fallback: bool) -> Arc<Entry> {
         let start = Instant::now();
         let mut entries = self.entries.lock();
@@ -51,10 +64,11 @@ impl MinerProofOverlayCache {
         let released = Instant::now();
         // Large overlay data must never be released under the cache index lock.
         let evicted = retired.is_some();
-        drop(retired);
+        if let Some((_, retired)) = retired {
+            self.retire(retired, fallback);
+        }
         let retired_at = Instant::now();
-        // Record only after unlocking and releasing the retired entry. Recorder work must not
-        // extend the lock hold, or be mistaken for overlay destruction time.
+        // Record caller latency after unlocking. Background destruction has a separate timer.
         duration("cache_index_wait", acquired.duration_since(start), fallback);
         duration("cache_index_work", released.duration_since(acquired), fallback);
         if evicted {
@@ -62,6 +76,29 @@ impl MinerProofOverlayCache {
             metrics::counter!("bsc_miner_proof_overlay_evictions_total").increment(1);
         }
         entry
+    }
+
+    fn retire(&self, retired: Arc<Entry>, fallback: bool) {
+        let permit = self.retirement_slots.clone().try_acquire_owned();
+        let mode = if permit.is_ok() { "background" } else { "inline" };
+        metrics::counter!("bsc_miner_proof_overlay_retirements_total", "mode" => mode).increment(1);
+        let elapsed = metrics::histogram!("bsc_miner_proof_overlay_retire_seconds",
+            "mode" => mode, "kind" => if fallback { "empty" } else { "normal" });
+        if let Ok(permit) = permit {
+            let span = tracing::Span::current();
+            // The permit bounds this cache's contribution to the shared drop worker's queue.
+            self.runtime.spawn_blocking_named("drop", move || {
+                let _entered = span.enter();
+                let start = Instant::now();
+                drop(retired);
+                elapsed.record(start.elapsed().as_secs_f64());
+                drop(permit);
+            });
+        } else {
+            let start = Instant::now();
+            drop(retired);
+            elapsed.record(start.elapsed().as_secs_f64());
+        }
     }
 
     fn get_or_build(
@@ -211,7 +248,7 @@ mod tests {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, || {
-            let cache = MinerProofOverlayCache::default();
+            let cache = MinerProofOverlayCache::new(Runtime::test());
             assert!(cache
                 .get_or_build(key(1), false, || {
                     Err(reth_provider::ProviderError::other(std::io::Error::other("failure")))
@@ -242,7 +279,7 @@ mod tests {
 
     #[test]
     fn ready_values_reuse_but_parent_and_both_frontiers_isolate() {
-        let cache = MinerProofOverlayCache::default();
+        let cache = MinerProofOverlayCache::new(Runtime::test());
         let first = cache.get_or_build(key(1), false, || Ok(value())).unwrap();
         let retry =
             cache.get_or_build(key(1), true, || panic!("ready value must be reused")).unwrap();
@@ -260,7 +297,7 @@ mod tests {
     }
     #[test]
     fn fallback_does_not_wait_for_normal_initialization() {
-        let cache = Arc::new(MinerProofOverlayCache::default());
+        let cache = Arc::new(MinerProofOverlayCache::new(Runtime::test()));
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let normal_cache = cache.clone();
@@ -286,7 +323,7 @@ mod tests {
 
     #[test]
     fn concurrent_normal_workers_build_once() {
-        let cache = Arc::new(MinerProofOverlayCache::default());
+        let cache = Arc::new(MinerProofOverlayCache::new(Runtime::test()));
         let calls = std::sync::atomic::AtomicUsize::new(0);
         let barrier = std::sync::Barrier::new(4);
         std::thread::scope(|scope| {
@@ -313,7 +350,7 @@ mod tests {
 
     #[test]
     fn failed_build_can_be_retried() {
-        let cache = MinerProofOverlayCache::default();
+        let cache = MinerProofOverlayCache::new(Runtime::test());
         let error = cache.get_or_build(key(1), false, || {
             Err(reth_provider::ProviderError::other(std::io::Error::other("injected failure")))
         });
@@ -326,7 +363,7 @@ mod tests {
 
     #[test]
     fn eviction_keeps_inflight_values_alive() {
-        let cache = MinerProofOverlayCache::default();
+        let cache = MinerProofOverlayCache::new(Runtime::test());
         let original = cache.get_or_build(key(1), false, || Ok(value())).unwrap();
         for n in 2..=MAX_OVERLAYS as u8 + 1 {
             cache.get_or_build(key(n), false, || Ok(value())).unwrap();
@@ -335,5 +372,59 @@ mod tests {
         let rebuilt = cache.get_or_build(key(1), false, || Ok(value())).unwrap();
         assert!(!Arc::ptr_eq(&original.input().state, &rebuilt.input().state));
         assert_eq!(*original.input().state, *rebuilt.input().state);
+    }
+
+    #[test]
+    fn background_retirement_is_bounded_and_overflow_drops_inline() {
+        let runtime = Runtime::test();
+        let cache = MinerProofOverlayCache::new(runtime.clone());
+        let (release, wait) = std::sync::mpsc::channel();
+        runtime.spawn_blocking_named("drop", move || {
+            wait.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        });
+        let mut queued = Vec::new();
+        for _ in 0..MAX_PENDING_RETIREMENTS {
+            let entry = Arc::new(Entry::default());
+            queued.push(Arc::downgrade(&entry));
+            cache.retire(entry, false);
+        }
+        assert_eq!(cache.retirement_slots.available_permits(), 0);
+        assert!(queued.iter().all(|entry| entry.upgrade().is_some()));
+        let overflow = Arc::new(Entry::default());
+        let weak = Arc::downgrade(&overflow);
+        cache.retire(overflow, true);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(cache.retirement_slots.available_permits(), 0);
+        release.send(()).unwrap();
+        let (done, drained) = std::sync::mpsc::channel();
+        runtime.spawn_blocking_named("drop", move || done.send(()).unwrap());
+        drained.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(queued.iter().all(|entry| entry.upgrade().is_none()));
+        assert_eq!(cache.retirement_slots.available_permits(), MAX_PENDING_RETIREMENTS);
+    }
+
+    #[test]
+    fn closed_retirement_slots_drop_inline() {
+        let cache = MinerProofOverlayCache::new(Runtime::test());
+        cache.retirement_slots.close();
+        let entry = Arc::new(Entry::default());
+        let weak = Arc::downgrade(&entry);
+        cache.retire(entry, false);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn dropping_cache_drains_background_retirements_and_preserves_readers() {
+        let cache = MinerProofOverlayCache::new(Runtime::test());
+        let original = cache.get_or_build(key(1), false, || Ok(value())).unwrap();
+        let entry = cache.entry(key(1), false);
+        let weak = Arc::downgrade(&entry);
+        drop(entry);
+        for n in 2..=MAX_OVERLAYS as u8 + 1 {
+            cache.get_or_build(key(n), false, || Ok(value())).unwrap();
+        }
+        drop(cache);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(original.input().state.accounts[0].1.unwrap().nonce, 7);
     }
 }
