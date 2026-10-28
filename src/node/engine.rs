@@ -188,7 +188,8 @@ where
             use alloy_consensus::Header;
             use reth_chain_state::ExecutedBlock;
             use reth_engine_tree::tree::state_root_strategy::{
-                spawn_payload_builder_state_root, spawn_payload_builder_state_root_with_cache,
+                spawn_payload_builder_state_root,
+                spawn_payload_builder_state_root_with_cache_origin,
             };
             use reth_primitives_traits::SealedHeader;
             use reth_storage_overlay::OverlayManager;
@@ -213,7 +214,9 @@ where
                         cpu_threads: Some(2),
                         rpc_threads: Some(1),
                         storage_threads: Some(1),
-                        proof_storage_worker_threads: Some(proof_threads),
+                        proof_storage_worker_threads: Some(
+                            crate::node::miner::perf_tuning::storage_proof_threads(proof_threads),
+                        ),
                         proof_account_worker_threads: Some(proof_threads),
                         prewarming_threads: Some(1),
                         bal_streaming_threads: Some(1),
@@ -260,6 +263,8 @@ where
                 Arc::new(MinerProofOverlayCache::new(runtime.clone()));
             let spawn_fn: crate::shared::SparseTrieSpawnFn = std::sync::Arc::new(
                 move |parent: SealedHeader<Header>, kind, private_parent| {
+                    let private_depth =
+                        private_parent.as_ref().map_or(0, |chain| chain.blocks().len());
                     let is_private = private_parent.is_some();
                     let parent_hash = parent.hash();
                     let mut blocks = Vec::<ExecutedBlock<crate::BscPrimitives>>::new();
@@ -336,7 +341,7 @@ where
                         matches!(kind, crate::shared::MinerRootKind::Normal)
                     {
                         let preserved = root_cache.lock().take(&parent);
-                        let (handle, pending) = spawn_payload_builder_state_root_with_cache(
+                        let (handle, pending) = spawn_payload_builder_state_root_with_cache_origin(
                             executor,
                             overlay_factory,
                             parent,
@@ -344,6 +349,11 @@ where
                             tree_config_for_closure.as_ref(),
                             Some(blocks),
                             preserved,
+                            match private_depth {
+                                1 => "miner-pipeline1",
+                                2 => "miner-pipeline2",
+                                _ => "miner",
+                            },
                             |factory, anchor, roots| factory.with_reused_sparse_trie(anchor, roots),
                         );
                         let retired = root_cache.lock().insert(parent_hash, pending);

@@ -25,7 +25,7 @@ use crate::node::miner::build_control::BuildControl;
 use std::time::Instant;
 
 pub(super) struct FinishObservation {
-    labels: Option<(&'static str, &'static str)>,
+    labels: Option<(&'static str, &'static str, usize)>,
     control: Option<BuildControl>,
     started: Instant,
     phase_started: Instant,
@@ -35,7 +35,7 @@ pub(super) struct FinishObservation {
 
 impl FinishObservation {
     pub(super) fn new(
-        labels: Option<(&'static str, &'static str)>,
+        labels: Option<(&'static str, &'static str, usize)>,
         control: Option<BuildControl>,
     ) -> Self {
         let now = Instant::now();
@@ -43,10 +43,13 @@ impl FinishObservation {
     }
 
     fn record_phase(&self, now: Instant, outcome: &'static str) {
-        if let Some((kind, turn)) = self.labels {
+        if let Some((kind, turn, depth)) = self.labels {
             metrics::histogram!("bsc.build_diagnostics.finish_stage_seconds",
                 "kind" => kind, "turn" => turn, "stage" => self.stage, "outcome" => outcome)
             .record(now.duration_since(self.phase_started).as_secs_f64());
+            if depth > 0 {
+                metrics::histogram!("bsc.miner_pipeline_finish_stage_seconds", "depth" => crate::node::miner::perf_tuning::depth_label(depth), "stage" => self.stage, "outcome" => outcome).record(now.duration_since(self.phase_started).as_secs_f64());
+            }
         }
     }
 
@@ -64,7 +67,7 @@ impl FinishObservation {
 
 impl Drop for FinishObservation {
     fn drop(&mut self) {
-        let Some((kind, turn)) = self.labels else { return };
+        let Some((kind, turn, _depth)) = self.labels else { return };
         let now = Instant::now();
         let outcome = if self.completed {
             "completed"
@@ -93,7 +96,7 @@ impl Drop for FinishObservation {
 /// Foreground receive attribution only. The opaque Reth payload handle does not expose its
 /// proof-session snapshot; do not infer a per-build background breakdown from these samples.
 pub(super) struct RootWaitObservation {
-    labels: Option<(&'static str, &'static str)>,
+    labels: Option<(&'static str, &'static str, usize)>,
     control: Option<BuildControl>,
     block_number: u64,
     parent_hash: alloy_primitives::B256,
@@ -104,7 +107,7 @@ pub(super) struct RootWaitObservation {
 
 impl RootWaitObservation {
     pub(super) fn new(
-        labels: Option<(&'static str, &'static str)>,
+        labels: Option<(&'static str, &'static str, usize)>,
         control: Option<BuildControl>,
         block_number: u64,
         parent_hash: alloy_primitives::B256,
@@ -138,7 +141,7 @@ fn wait_bucket(elapsed: std::time::Duration) -> &'static str {
 
 impl Drop for RootWaitObservation {
     fn drop(&mut self) {
-        let Some((kind, turn)) = self.labels else { return };
+        let Some((kind, turn, _depth)) = self.labels else { return };
         let elapsed = self.started.elapsed();
         let outcome = if std::thread::panicking() { "panic" } else { self.outcome };
         metrics::counter!("bsc.build_diagnostics.root_waits_total",
@@ -178,7 +181,7 @@ impl Drop for RootWaitObservation {
             }
         });
         tracing::info!(target: "bsc::miner::diagnostics", block_number = self.block_number,
-            parent_hash = %self.parent_hash, kind, turn, root_task_id = self.root_task_id, outcome, budget,
+            parent_hash = %self.parent_hash, kind, turn, pipeline_depth = _depth, root_task_id = self.root_task_id, outcome, budget,
             wait_ms = elapsed.as_secs_f64() * 1000.0, "Sampled slow miner root wait");
     }
 }
@@ -197,7 +200,7 @@ mod tests {
         metrics::with_local_recorder(&recorder, || {
             for outcome in [Some(true), Some(false), None] {
                 let mut sample = RootWaitObservation::new(
-                    Some(("regular", "inturn")),
+                    Some(("regular", "inturn", 0)),
                     None,
                     10,
                     alloy_primitives::B256::ZERO,
@@ -238,7 +241,7 @@ mod tests {
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, || {
-            let mut ok = FinishObservation::new(Some(("regular", "inturn")), None);
+            let mut ok = FinishObservation::new(Some(("regular", "inturn", 0)), None);
             ok.enter("system_transactions");
             ok.enter("assemble");
             ok.complete();
@@ -252,7 +255,7 @@ mod tests {
                 Duration::ZERO,
                 ManualCancel::default(),
             );
-            let mut failed = FinishObservation::new(Some(("regular", "inturn")), Some(control));
+            let mut failed = FinishObservation::new(Some(("regular", "inturn", 0)), Some(control));
             failed.enter("root_wait");
             drop(failed);
 
@@ -265,7 +268,8 @@ mod tests {
                 Duration::from_secs(1),
                 cancel,
             );
-            let mut cancelled = FinishObservation::new(Some(("empty", "outofturn")), Some(control));
+            let mut cancelled =
+                FinishObservation::new(Some(("empty", "outofturn", 0)), Some(control));
             cancelled.enter("hash_state");
             drop(cancelled);
             let mut rpc = FinishObservation::new(None, None);

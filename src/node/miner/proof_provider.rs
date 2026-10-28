@@ -205,7 +205,10 @@ where
 
     fn database_provider_ro(&self) -> ProviderResult<Self::Provider> {
         if let Some(factory) = &self.reused {
-            return factory.database_provider_ro()
+            let start = Instant::now();
+            let provider = factory.database_provider_ro();
+            stage("reused_database_provider", start, self.fallback);
+            return provider
         }
         let start = Instant::now();
         let provider = self.factory.database_provider_ro()?;

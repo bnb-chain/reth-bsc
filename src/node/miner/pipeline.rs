@@ -44,6 +44,8 @@ pub(crate) struct Key {
     pub min_gas_tip: u128,
 }
 struct Entry {
+    depth: usize,
+    ready: Arc<std::sync::OnceLock<std::time::Instant>>,
     key: Key,
     receiver: oneshot::Receiver<BuildResult>,
 }
@@ -51,6 +53,7 @@ struct Chain {
     id: u64,
     base: B256,
     parents: Vec<B256>,
+    ready: Vec<Arc<std::sync::OnceLock<std::time::Instant>>>,
     cancel: ManualCancel,
     entries: VecDeque<Entry>,
     running: bool,
@@ -98,8 +101,20 @@ pub(crate) fn configure(handle: tokio::runtime::Handle) -> std::io::Result<()> {
     let _ = EXECUTOR.set(executor(handle)?);
     Ok(())
 }
+static LAST_WORKER_EXIT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 pub(crate) fn launch(task: impl std::future::Future<Output = ()> + Send + 'static) -> bool {
-    EXECUTOR.get().is_some_and(|executor| executor.try_send(Box::pin(task)).is_ok())
+    EXECUTOR.get().is_some_and(|executor| {
+        executor
+            .try_send(Box::pin(async move {
+                let previous = LAST_WORKER_EXIT.lock().take();
+                if let Some(previous) = previous {
+                    metrics::histogram!("bsc.miner_pipeline_batch_gap_seconds")
+                        .record(previous.elapsed().as_secs_f64());
+                }
+                task.await;
+            }))
+            .is_ok()
+    })
 }
 
 pub(crate) fn enabled() -> bool {
@@ -117,12 +132,14 @@ impl Coordinator {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let cancel = ManualCancel::default();
         let (sender, receiver) = oneshot::channel();
+        let ready = Arc::new(std::sync::OnceLock::new());
         state.chain = Some(Chain {
             id,
             base,
             parents: vec![key.parent],
+            ready: vec![ready.clone()],
             cancel: cancel.clone(),
-            entries: VecDeque::from([Entry { key, receiver }]),
+            entries: VecDeque::from([Entry { key, receiver, depth: 1, ready }]),
             running: true,
         });
         Some((id, cancel, sender, permit))
@@ -139,7 +156,9 @@ impl Coordinator {
         }
         let (sender, receiver) = oneshot::channel();
         chain.parents.push(key.parent);
-        chain.entries.push_back(Entry { key, receiver });
+        let ready = Arc::new(std::sync::OnceLock::new());
+        chain.ready.push(ready.clone());
+        chain.entries.push_back(Entry { key, receiver, depth: chain.parents.len(), ready });
         Some(sender)
     }
     fn finished(&self, id: u64) {
@@ -220,7 +239,14 @@ impl Coordinator {
         drop(retired);
         if entry.key == *key && !cancel.is_cancelled() {
             event("adopted");
-            Some(Adoption { receiver: entry.receiver, cancel, accepted: false })
+            depth_event(entry.depth, "adopted");
+            Some(Adoption {
+                receiver: entry.receiver,
+                depth: entry.depth,
+                ready: entry.ready,
+                cancel,
+                accepted: false,
+            })
         } else {
             cancel.cancel();
             event("parameters_changed");
@@ -242,14 +268,27 @@ pub(crate) struct WorkerCompletion(pub u64);
 impl Drop for WorkerCompletion {
     fn drop(&mut self) {
         COORDINATOR.finished(self.0);
+        *LAST_WORKER_EXIT.lock() = Some(std::time::Instant::now());
     }
 }
 pub(crate) fn can_start(base: B256) -> bool {
-    if !enabled() || COORDINATOR.worker.available_permits() == 0 {
+    if !enabled() {
+        return false
+    }
+    if COORDINATOR.worker.available_permits() == 0 {
+        depth_event(1, "start_check_worker_busy");
         return false
     }
     let state = COORDINATOR.state.lock();
-    state.chain.is_none() && state.head == Some(base)
+    if state.chain.is_some() {
+        depth_event(1, "start_check_pending_chain");
+        return false
+    }
+    if state.head != Some(base) {
+        depth_event(1, "start_check_parent_not_head");
+        return false
+    }
+    true
 }
 pub(crate) fn reserve(key: Key, base: B256) -> Option<Reservation<'static>> {
     if !enabled() {
@@ -275,6 +314,8 @@ pub(crate) fn failed(id: u64) {
 /// Adopts the same running computation, before taking the ordinary builder's build permit.
 pub(crate) struct Adoption {
     pub receiver: oneshot::Receiver<BuildResult>,
+    pub depth: usize,
+    ready: Arc<std::sync::OnceLock<std::time::Instant>>,
     cancel: ManualCancel,
     accepted: bool,
 }
@@ -282,11 +323,16 @@ impl Adoption {
     /// Accepting one result must not cancel descendants still using its private state.
     pub(crate) fn accept(&mut self) {
         self.accepted = true;
+        depth_event(self.depth, "reused");
+        if let Some(ready) = self.ready.get() {
+            metrics::histogram!("bsc.miner_pipeline_ready_to_adoption_seconds", "depth" => super::perf_tuning::depth_label(self.depth)).record(ready.elapsed().as_secs_f64());
+        }
     }
 }
 impl Drop for Adoption {
     fn drop(&mut self) {
         if !self.accepted {
+            depth_event(self.depth, "adoption_abandoned");
             self.cancel.clone().cancel();
         }
     }
@@ -299,6 +345,19 @@ pub(crate) fn take(key: &Key) -> Option<Adoption> {
 }
 pub(crate) fn event(outcome: &'static str) {
     metrics::counter!("bsc_miner_pipeline_total", "outcome" => outcome).increment(1);
+}
+
+/// Records only bounded private-depth labels, never block identities.
+pub(crate) fn depth_event(depth: usize, outcome: &'static str) {
+    metrics::counter!("bsc.miner_pipeline_depth_total", "depth" => super::perf_tuning::depth_label(depth), "outcome" => outcome).increment(1);
+}
+pub(crate) fn ready(id: u64, depth: usize) {
+    let state = COORDINATOR.state.lock();
+    if let Some(chain) = state.chain.as_ref().filter(|chain| chain.id == id) {
+        if let Some(ready) = chain.ready.get(depth.saturating_sub(1)) {
+            let _ = ready.set(std::time::Instant::now());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -411,6 +470,7 @@ mod tests {
         c.selected_parent(Some(key().parent));
         c.canonical_head(key().parent);
         let mut first = c.take(&key()).unwrap();
+        assert_eq!(first.depth, 1);
         first_sender.send(Err("first original result".into())).unwrap();
         assert_eq!((&mut first.receiver).await.unwrap().unwrap_err(), "first original result");
         first.accept();
@@ -422,6 +482,7 @@ mod tests {
         c.selected_parent(Some(second_key.parent));
         c.canonical_head(second_key.parent);
         let mut second = c.take(&second_key).unwrap();
+        assert_eq!(second.depth, 2);
         assert_eq!((&mut second.receiver).await.unwrap().unwrap_err(), "second original result");
         second.accept();
         drop(second);

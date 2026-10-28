@@ -365,7 +365,10 @@ impl<DB: DatabaseRef> DatabaseRef for SharedStateDb<DB> {
 
 pub(crate) fn configure(enabled: bool) {
     // Allocate OS threads during node setup, never on the first miner execution path.
-    ENABLED.store(enabled && workers().is_some(), Ordering::Relaxed);
+    ENABLED.store(
+        enabled && (configured_worker_count() == 0 || workers().is_some()),
+        Ordering::Relaxed,
+    );
 }
 pub(crate) fn cache_for_attempt(parent: B256) -> Option<Arc<SharedStateCache>> {
     ENABLED.load(Ordering::Relaxed).then(|| SharedStateCache::new(parent))
@@ -454,12 +457,23 @@ fn worker_count(mev: bool, cpus: usize) -> usize {
     }
 }
 
+fn configured_worker_count() -> usize {
+    static COUNT: OnceLock<usize> = OnceLock::new();
+    *COUNT.get_or_init(|| {
+        let mev = super::config::get_global_mining_config()
+            .is_some_and(|cfg| cfg.get_bid_block_enabled());
+        super::perf_tuning::prewarm_threads(worker_count(
+            mev,
+            std::thread::available_parallelism().map_or(1, usize::from),
+        ))
+    })
+}
+
 fn workers() -> Option<&'static Workers> {
     static WORKERS: OnceLock<Option<Workers>> = OnceLock::new();
     WORKERS.get_or_init(|| {
-        let mev = super::config::get_global_mining_config()
-            .is_some_and(|cfg| cfg.get_bid_block_enabled());
-        let count = worker_count(mev, std::thread::available_parallelism().map_or(1, usize::from));
+        let count = configured_worker_count();
+        if count == 0 { return None }
         match rayon::ThreadPoolBuilder::new().num_threads(count)
             .thread_name(|i| format!("miner-prewarm-{i}")).build() {
             Ok(pool) => Some(Workers { pool, active: AtomicUsize::new(0) }),

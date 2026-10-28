@@ -295,6 +295,7 @@ impl Drop for BuildWorkObservation {
 /// Metadata follows a candidate through cloning and finalization; it retains no task resources.
 #[derive(Debug)]
 pub(crate) struct CandidateDiagnostics {
+    pub(crate) ready_at: Instant,
     pub(crate) id: u64,
     pub(crate) kind: &'static str,
     turn: &'static str,
@@ -377,6 +378,7 @@ impl AttemptObservation {
             metrics::histogram!("bsc.build_diagnostics.transactions", "kind" => self.kind, "turn" => self.turn).record(payload.block.body().transaction_count() as f64);
             metrics::histogram!("bsc.build_diagnostics.gas", "kind" => self.kind, "turn" => self.turn).record(payload.block.header().gas_used() as f64);
             payload.diagnostics = Some(Arc::new(CandidateDiagnostics {
+                ready_at: Instant::now(),
                 id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
                 kind: self.kind,
                 turn: self.turn,
@@ -629,6 +631,7 @@ mod tests {
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, || {
             let candidate = Arc::new(CandidateDiagnostics {
+                ready_at: Instant::now(),
                 id: 1,
                 kind: "speculative",
                 turn: "outofturn",
@@ -643,6 +646,7 @@ mod tests {
             drop(candidate);
             drop(clone);
             let candidate = Arc::new(CandidateDiagnostics {
+                ready_at: Instant::now(),
                 id: 2,
                 kind: "speculative",
                 turn: "outofturn",

@@ -593,12 +593,19 @@ where
             };
             if let Some(mut adopted) = super::pipeline::take(&key) {
                 let adoption_start = std::time::Instant::now();
+                let adoption_phase = super::perf_tuning::Phase::new(
+                    "pipeline",
+                    true,
+                    adopted.depth,
+                    "adoption_wait",
+                );
                 let result = tokio::select! {
                     result = &mut adopted.receiver => result,
                     _ = async { loop { if args.cancel.is_cancelled() { break } tokio::time::sleep(std::time::Duration::from_millis(10)).await; } } => {
                         return Err(std::io::Error::other("pipelined build cancelled").into());
                     }
                 };
+                adoption_phase.complete();
                 metrics::histogram!("bsc_miner_pipeline_adoption_wait_seconds")
                     .record(adoption_start.elapsed().as_secs_f64());
                 if args.cancel.is_cancelled() {
@@ -633,6 +640,7 @@ where
         let PayloadConfig { parent_header, attributes, payload_id: _, parent_block_info: _ } =
             config;
 
+        let private_depth = pipeline_parent.as_ref().map_or(0, |chain| chain.blocks().len());
         let parent_hash = parent_header.hash_slow();
         let mut work = BuildWorkObservation::new(
             kind,
@@ -660,6 +668,12 @@ where
 
         // Each candidate owns its root task; all candidates reuse the miner's dedicated
         // executor. `None` keeps the synchronous path when sparse-trie building is disabled.
+        let root_setup = super::perf_tuning::Phase::new(
+            kind.label(),
+            self.ctx.is_inturn,
+            private_depth,
+            "root_setup",
+        );
         let trie_handle: Arc<Mutex<Option<reth_engine_tree::tree::StateRootHandle>>> = {
             let use_sparse_trie = crate::node::miner::config::get_global_mining_config()
                 .is_some_and(|c| c.use_sparse_trie_state_root);
@@ -677,12 +691,27 @@ where
             }))
         };
 
+        root_setup.complete();
+        let parent_setup = super::perf_tuning::Phase::new(
+            kind.label(),
+            self.ctx.is_inturn,
+            private_depth,
+            "parent_state_factory",
+        );
         let parent_state = if let Some(parent) = &pipeline_parent {
             super::prewarm::ParentState::private(parent.clone())?
         } else {
             super::prewarm::ParentState::canonical(self.client.clone(), parent_hash)
         };
+        parent_setup.complete();
+        let provider_setup = super::perf_tuning::Phase::new(
+            kind.label(),
+            self.ctx.is_inturn,
+            private_depth,
+            "state_provider_open",
+        );
         let state_provider = parent_state.open()?;
+        provider_setup.complete();
         let state = StateProviderDatabase::new(EvmStateProviderAdapter(&state_provider));
         let prewarm_cache = super::prewarm::cache_for_attempt(parent_hash);
         let (state, read_phase) =
@@ -743,13 +772,22 @@ where
             finish_diagnostics: Some((
                 kind.label(),
                 if self.ctx.is_inturn { "inturn" } else { "outofturn" },
+                private_depth,
             )),
         };
 
+        let evm_setup = super::perf_tuning::Phase::new(
+            kind.label(),
+            self.ctx.is_inturn,
+            private_depth,
+            "evm_context",
+        );
         let mut builder = self
             .evm_config
             .builder_for_next_block(&mut db, &parent_header, next_env_attributes)
             .map_err(PayloadBuilderError::other)?;
+
+        evm_setup.complete();
 
         // Wire the sparse-trie state-root task's update hook onto the building EVM's DB.
         //
@@ -770,6 +808,12 @@ where
             );
         }
 
+        let pre_execution = super::perf_tuning::Phase::new(
+            kind.label(),
+            self.ctx.is_inturn,
+            private_depth,
+            "system_pre_execution",
+        );
         builder.apply_pre_execution_changes().map_err(|err| {
             warn!(
                 target: "payload_builder",
@@ -780,6 +824,13 @@ where
             PayloadBuilderError::Internal(err.into())
         })?;
 
+        pre_execution.complete();
+        let selection_setup = super::perf_tuning::Phase::new(
+            kind.label(),
+            self.ctx.is_inturn,
+            private_depth,
+            "selection_setup",
+        );
         let mut total_fees = U256::ZERO;
         let mut cumulative_gas_used = 0;
         // reserve the systemtx gas
@@ -845,6 +896,13 @@ where
             min_gas_tip,
             cancel.clone(),
             build_control.clone(),
+        );
+        selection_setup.complete();
+        let execution_phase = super::perf_tuning::Phase::new(
+            kind.label(),
+            self.ctx.is_inturn,
+            private_depth,
+            "execution",
         );
         let exec_start = std::time::Instant::now();
         // Everything before `exec_start` is treated as "prepare" time for this payload attempt.
@@ -1167,6 +1225,7 @@ where
             cache.execution_finished();
         }
         drop(prewarm);
+        execution_phase.complete();
         work.selection_stage(SelectionStage::Control);
         let exec_duration = exec_start.elapsed();
         read_phase.finish();
@@ -1432,6 +1491,7 @@ where
                     finish_diagnostics: Some((
                         "empty",
                         if self.ctx.is_inturn { "inturn" } else { "outofturn" },
+                        0,
                     )),
                 },
             )
@@ -2653,12 +2713,16 @@ where
         }
         let now_ms = super::startup_diagnostics::wall_ms();
         if self.mining_ctx.end_mining_timestamp_ms.saturating_sub(now_ms) < 25 {
+            pipeline::depth_event(1, "start_check_no_lead");
             return
         }
         let Some(best) = self.potential_payloads.iter().max_by_key(|p| p.fees()) else { return };
         if best.build_kind == BuildKind::EmptyFallback || best.bid_builder.is_some() {
             return
         }
+        let mut parent_ready_at = best.diagnostics.as_ref().map(|d| d.ready_at);
+        let parent_preparation =
+            super::perf_tuning::Phase::new("pipeline", true, 1, "successor_context");
         let Some((parent, context, attributes)) = prepare_pipeline_successor(
             best,
             &self.mining_ctx,
@@ -2667,6 +2731,7 @@ where
         ) else {
             return
         };
+        parent_preparation.complete();
         let parent_header = parent.block().clone_sealed_header();
         let signer = parent.block().beneficiary();
         let gas_limit = self.builder.builder_config.gas_limit(parent_header.gas_limit);
@@ -2689,13 +2754,18 @@ where
         let chain_spec = self.builder.chain_spec.clone();
         let parlia = self.parlia.clone();
         let parent_publish_at = self.mining_ctx.end_mining_timestamp_ms;
+        let launch_queue = super::perf_tuning::Phase::new("pipeline", true, 1, "launch_queue");
         let launched = pipeline::launch(async move {
+            launch_queue.complete();
             let _permit = permit;
             let _completion = pipeline::WorkerCompletion(id);
             let depth = pipeline::depth();
             metrics::histogram!("bsc_miner_pipeline_target_depth").record(depth as f64);
+            let initial_state =
+                super::perf_tuning::Phase::new("pipeline", true, 1, "executed_parent");
             let mut ancestry =
                 crate::shared::PrivateMinerChain::new(executed_pipeline_parent(&parent));
+            initial_state.complete();
             let (mut context, mut attributes, mut result, mut parent_publish_at) =
                 (context, attributes, result, parent_publish_at);
             let mut private_context = None;
@@ -2703,6 +2773,18 @@ where
                 if cancel.is_cancelled() {
                     break
                 }
+                pipeline::depth_event(level, "compute_started");
+                if let Some(ready) = parent_ready_at {
+                    metrics::histogram!("bsc.miner_pipeline_parent_ready_to_start_seconds", "depth" => super::perf_tuning::depth_label(level)).record(ready.elapsed().as_secs_f64());
+                }
+                let compute_phase =
+                    super::perf_tuning::Phase::new("pipeline", true, level, "compute_total");
+                let args_phase = super::perf_tuning::Phase::new(
+                    "pipeline",
+                    true,
+                    level,
+                    "arguments_and_parent_cache",
+                );
                 let started = std::time::Instant::now();
                 metrics::histogram!("bsc_miner_pipeline_start_lead_seconds").record(
                     parent_publish_at.saturating_sub(super::startup_diagnostics::wall_ms()) as f64 /
@@ -2764,6 +2846,7 @@ where
                     parlia.clone(),
                     context,
                 );
+                args_phase.complete();
                 let mut observation = AttemptObservation::new(AttemptKind::Pipeline, true);
                 observation.start();
                 let mut built = builder.build_payload_observed(args, AttemptKind::Pipeline).await;
@@ -2775,17 +2858,31 @@ where
                     _ => {
                         pipeline::failed(id);
                         pipeline::event("compute_failed");
+                        pipeline::depth_event(
+                            level,
+                            if cancel.is_cancelled() {
+                                "compute_cancelled"
+                            } else {
+                                "compute_error"
+                            },
+                        );
                         let _ = result.send(Err("private build failed or cancelled".to_owned()));
                         return
                     }
                 };
+                compute_phase.complete();
+                pipeline::ready(id, level);
+                pipeline::depth_event(level, "ready");
                 let now = super::startup_diagnostics::wall_ms();
+                metrics::histogram!("bsc.miner_pipeline_deadline_seconds", "depth" => super::perf_tuning::depth_label(level), "side" => if now > child_publish_at { "late" } else { "early" }).record(now.abs_diff(child_publish_at) as f64 / 1000.0);
                 metrics::histogram!("bsc_miner_pipeline_ready_lead_seconds")
                     .record(child_publish_at.saturating_sub(now) as f64 / 1000.0);
                 metrics::histogram!("bsc_miner_pipeline_ready_late_seconds")
                     .record(now.saturating_sub(child_publish_at) as f64 / 1000.0);
                 // Register the exact next parent before delivering this candidate: a fast
                 // canonical notification must recognize it while the descendant is running.
+                let successor_phase =
+                    super::perf_tuning::Phase::new("pipeline", true, level, "successor_context");
                 let next = if level < depth &&
                     !cancel.is_cancelled() &&
                     child_publish_at.saturating_sub(super::startup_diagnostics::wall_ms()) >= 25
@@ -2811,7 +2908,25 @@ where
                 } else {
                     None
                 };
+                successor_phase.complete();
+                if level < depth && next.is_none() {
+                    pipeline::depth_event(
+                        level,
+                        if cancel.is_cancelled() {
+                            "stop_cancelled"
+                        } else if child_publish_at
+                            .saturating_sub(super::startup_diagnostics::wall_ms()) <
+                            25
+                        {
+                            "stop_no_lead"
+                        } else {
+                            "stop_successor_unavailable"
+                        },
+                    );
+                }
+                parent_ready_at = payload.diagnostics.as_ref().map(|d| d.ready_at);
                 if result.send(Ok(payload)).is_err() {
+                    pipeline::depth_event(level, "result_receiver_dropped");
                     pipeline::failed(id);
                     return
                 }

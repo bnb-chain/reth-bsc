@@ -1,0 +1,43 @@
+Proof任务与提前构建诊断、启动并发配置
+分支不变：BSC codex/perf-task-diagnostics；Reth codex/pr584-proof-sessions-v2.8。
+本次只补监控和配置，默认算法/并发不变；不引入滑动窗口或新的投机proof。
+
+配置（启动时读取，变更需重启）
+BSC_MINING_PREWARM_THREADS：未设置保留旧策略（MEV3；否则max(3,CPU*3/5)）。显式0–64；0停止后台投机worker，但保留正式共享读取缓存，便于单变量对照。
+BSC_MINING_STORAGE_PROOF_THREADS：未设置保留旧策略min(max(CPU-2,1),4)，显式1–64。只调整普通/提前矿工共用storage proof池；account池仍旧策略，导入池/空块fallback池不变。
+无效值WARN并回退默认；日志和reth_bsc_miner_configured_threads记录生效值。显式高并发允许超出CPU数，操作人需根据读等待/竞争实测决定，不表示推荐64。
+示例：BSC_MINING_PREWARM_THREADS=3 BSC_MINING_STORAGE_PROOF_THREADS=8；首轮验证保留原默认值，不同时调两个参数。
+
+Reth新指标（导出前缀reth_，点转下划线）
+trie.diagnostics.proof_job_queue_seconds：实际逐job发送前到worker取到，区别已有session排队和broadcast dispatch。
+proof_job_call_seconds：只计multiproof_v2调用；kind=account/storage，call=first/subsequent，outcome=success/error。首次可能包含延迟创建calculator/cursor。
+proof_job_delivery_seconds：接口返回到root消费结果，含worker记录/发送及通道驻留，不是单纯send耗时。消费后再开始coalesce/reveal已有计时。
+proof_worker_provider_seconds：worker打开provider的成功/失败耗时，包含其factory内部overlay等待；BSC已有proof_overlay_prepare_seconds进一步拆database_provider/frontiers/cache_wait/build/reused_database_provider。
+proof_job_targets、proof_job_queue_depth、proof_job_active_workers：按任务采样的目标数、出队后近似队列长度、同池实际活跃job数；不是时间加权利用率，不将瞬时样本当平均活跃核心。
+新proof指标origin=miner/miner-pipeline1/miner-pipeline2/import等固定角色；旧指标仍保留origin=miner聚合，现有图表口径不变。
+external_cache_initializations_total{origin,result=reused/fresh}：实际就绪树交接结果，按深度拆分；不等于manager/flattened overlay命中，也不是canonical上链比例。
+所有proof结果仍按原成功/错误值处理；只有消息信封增加返回时间戳，root消费处取出并计时。初始化失败结果无虚构job交付样本。
+
+BSC新指标
+miner_build_phase_seconds{kind,turn,depth=0/1/2,phase,outcome=completed/early_exit}：root_setup、parent_state_factory、state_provider_open、evm_context、system_pre_execution、selection_setup、execution，以及pipeline的successor_context/launch_queue/executed_parent/arguments_and_parent_cache/compute_total/adoption_wait。
+compute_total包含内层准备/执行/收尾；不要与内层阶段相加。phase early_exit包括取消、错误和future丢弃，不等同成功耗时。
+miner_pipeline_finish_stage_seconds{depth,stage,outcome}：沿用顺序finish分段，包含root_wait、system_transactions、merge_state、hash_state、assemble等。旧finish指标不变。
+miner_pipeline_parent_ready_to_start_seconds：父候选物理完成到下一层计算开始，含准备/启动间隔。
+miner_pipeline_ready_to_adoption_seconds：私有结果就绪到正式成功接管，含发布时间约束及结果交付；不是自动证明可消除的浪费。
+miner_pipeline_deadline_seconds{depth,side=early/late}：相对该候选发布时间的提前/晚到。
+miner_pipeline_batch_gap_seconds：上批worker退出到下批worker启动，包含合法等待/轮次间隔，不全是可优化空档。需结合parent_ready_to_start及启动检查原因。
+miner_pipeline_depth_total{depth,outcome}：compute_started/ready/reused/adopted/compute_cancelled/compute_error/result_receiver_dropped/adoption_abandoned及第二层停止原因stop_no_lead/stop_cancelled/stop_successor_unavailable。
+start_check_*是启动条件检查次数，可能对同一候选重复检查，不是独立区块数量，不能当作区块占比。
+深度2仍为每条私有链最多两层，未改滑动窗口。
+
+定位顺序
+1 parent_ready_to_start与launch_queue大：启动/接管/批次约束；核对start_check原因。
+2 私有prepare分段大：确定parent state、root setup、provider、系统预执行还是候选迭代器准备。
+3 provider init大：结合cache_wait/build/reused_database_provider，区分共享overlay等待与provider建立。
+4 proof queue大且workers忙：并发候选；call随并发显著变慢：核对缺页、物理读取和CPU资源竞争。
+5 first call高而subsequent低：优先查calculator/cursor初始化。
+6 delivery高：结果消费/根合并侧；已有coalesce/reveal/final_root继续拆分。
+7 ready early而reused少：核对参数变化/取消/丢弃，不把候选完成次数当上链收益。
+所有变化以完整run、实际链TPS/Mgas、空块率验收，不把阶段均值机械相加或把majorfault直接换算为阻塞毫秒。
+
+本地验证：Reth proof层24项、state_root_strategy 30项通过；涉及Reth包严格Clippy通过（--no-deps，engine检查lib）。BSC完整库串行884通过、1忽略，严格lib/tests Clippy通过。并行全库出现7项共享投票池计数测试失败，串行全库复核全部通过；本次未修改投票代码。Reth配套提交c0b28c3767e6a52b639e2af991e84df8fa524977。Cargo/EF清单与lock统一更新，没有无关依赖升级。
