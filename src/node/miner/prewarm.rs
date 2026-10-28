@@ -253,62 +253,80 @@ where
 {
     let cache = cache?;
     let workers = workers()?;
-    let mut best =
-        pool.best_transactions_with_attributes(BestTransactionsAttributes::new(base_fee, blob_fee));
-    best.skip_blobs();
-    // Match go-bsc's initial Peek: an idle pool must not open one provider per worker.
-    let first = best.next()?;
-    let candidates = Arc::new(Mutex::new(std::iter::once(first).chain(best)));
-    let stopped = Arc::new(AtomicBool::new(false));
-    env.cfg_env.disable_nonce_check = true;
-    for _ in 0..workers.pool.current_num_threads() {
-        if !reserve(&workers.active, 1, workers.pool.current_num_threads()) {
-            metrics::counter!("bsc.miner_prewarm.workers_total", "result" => "busy").increment(1);
-            break
-        }
-        let permit = WorkerPermit(workers);
-        metrics::gauge!("bsc.miner_prewarm.active_workers").increment(1.0);
-        let (cache, client, config, env, candidates, stopped, cancel, control) = (
-            cache.clone(),
-            client.clone(),
-            evm_config.clone(),
-            env.clone(),
-            candidates.clone(),
-            stopped.clone(),
-            cancel.clone(),
-            control.clone(),
-        );
-        workers.pool.spawn(move || {
-            let _permit = permit;
-            let should_stop = || stopped.load(Ordering::Relaxed) || cancel.is_cancelled() ||
-                control.as_ref().is_some_and(|c| c.stop_transactions(std::time::Instant::now()));
-            if should_stop() { return }
-            let provider = match client.state_by_block_hash(cache.parent()) {
-                Ok(provider) => provider,
-                Err(_) => {
-                    metrics::counter!("bsc.miner_prewarm.workers_total", "result" => "provider_error").increment(1);
-                    return
-                }
-            };
-            metrics::counter!("bsc.miner_prewarm.workers_total", "result" => "started").increment(1);
-            let db = SharedStateDb { inner: StateProviderDatabase::new(EvmStateProviderAdapter(provider)), cache };
-            let progress = db.cache.clone();
-            let next = || loop {
-                if should_stop() { return None }
-                let tx = candidates.lock().next()?;
-                // go-bsc periodically forwards its prefetch iterator to the miner's cursor.
-                // Skip consumed sender nonces without changing the actual pool or its ordering.
-                if progress.already_selected(tx.sender(), tx.nonce()) { continue }
-                if super::super::pool::tip::meets_tip_floor(tx.effective_tip_per_gas(base_fee), min_tip) {
-                    return Some(tx.transaction.clone_into_consensus());
-                }
-            };
-            let (completed, failed) = warm_transactions(db, config, env, next, should_stop);
-            metrics::counter!("bsc.miner_prewarm.transactions_total", "result" => "completed").increment(completed);
-            metrics::counter!("bsc.miner_prewarm.transactions_total", "result" => "error").increment(failed);
-        });
+    // Reserve the setup job as well: cancelled attempts cannot build up an unbounded queue.
+    if !reserve(&workers.active, 1, workers.pool.current_num_threads()) {
+        metrics::counter!("bsc.miner_prewarm.workers_total", "result" => "busy").increment(1);
+        return None
     }
-    Some(PrewarmGuard(stopped, cache))
+    let setup_permit = WorkerPermit(workers);
+    metrics::gauge!("bsc.miner_prewarm.active_workers").increment(1.0);
+    let stopped = Arc::new(AtomicBool::new(false));
+    let guard = PrewarmGuard(stopped.clone(), cache.clone());
+    workers.pool.spawn(move || {
+        let setup_permit = setup_permit;
+        let should_stop = || stopped.load(Ordering::Relaxed) || cancel.is_cancelled() ||
+            control.as_ref().is_some_and(|c| c.stop_transactions(std::time::Instant::now()));
+        if should_stop() { return }
+        // Pool iteration can wait for maintenance. Keep both creation and initial Peek off
+        // the miner thread, and recheck cancellation before opening any state provider.
+        let mut best = pool.best_transactions_with_attributes(
+            BestTransactionsAttributes::new(base_fee, blob_fee));
+        best.skip_blobs();
+        let Some(first) = best.next() else { return };
+        if should_stop() { return }
+        let candidates = Arc::new(Mutex::new(std::iter::once(first).chain(best)));
+        // Transfer capacity from setup to execution jobs in the same independent pool.
+        drop(setup_permit);
+        env.cfg_env.disable_nonce_check = true;
+        for _ in 0..workers.pool.current_num_threads() {
+            if !reserve(&workers.active, 1, workers.pool.current_num_threads()) {
+                metrics::counter!("bsc.miner_prewarm.workers_total", "result" => "busy").increment(1);
+                break
+            }
+            let permit = WorkerPermit(workers);
+            metrics::gauge!("bsc.miner_prewarm.active_workers").increment(1.0);
+            let (cache, client, config, env, candidates, stopped, cancel, control) = (
+                cache.clone(),
+                client.clone(),
+                evm_config.clone(),
+                env.clone(),
+                candidates.clone(),
+                stopped.clone(),
+                cancel.clone(),
+                control.clone(),
+            );
+            workers.pool.spawn(move || {
+                let _permit = permit;
+                let should_stop = || stopped.load(Ordering::Relaxed) || cancel.is_cancelled() ||
+                    control.as_ref().is_some_and(|c| c.stop_transactions(std::time::Instant::now()));
+                if should_stop() { return }
+                let provider = match client.state_by_block_hash(cache.parent()) {
+                    Ok(provider) => provider,
+                    Err(_) => {
+                        metrics::counter!("bsc.miner_prewarm.workers_total", "result" => "provider_error").increment(1);
+                        return
+                    }
+                };
+                metrics::counter!("bsc.miner_prewarm.workers_total", "result" => "started").increment(1);
+                let db = SharedStateDb { inner: StateProviderDatabase::new(EvmStateProviderAdapter(provider)), cache };
+                let progress = db.cache.clone();
+                let next = || loop {
+                    if should_stop() { return None }
+                    let tx = candidates.lock().next()?;
+                    // go-bsc periodically forwards its prefetch iterator to the miner's cursor.
+                    // Skip consumed sender nonces without changing the actual pool or its ordering.
+                    if progress.already_selected(tx.sender(), tx.nonce()) { continue }
+                    if super::super::pool::tip::meets_tip_floor(tx.effective_tip_per_gas(base_fee), min_tip) {
+                        return Some(tx.transaction.clone_into_consensus());
+                    }
+                };
+                let (completed, failed) = warm_transactions(db, config, env, next, should_stop);
+                metrics::counter!("bsc.miner_prewarm.transactions_total", "result" => "completed").increment(completed);
+                metrics::counter!("bsc.miner_prewarm.transactions_total", "result" => "error").increment(failed);
+            });
+        }
+    });
+    Some(guard)
 }
 
 /// Executes against private journals while caching only the backing parent's reads.
@@ -688,22 +706,29 @@ mod tests {
             PoolConfig::default().with_disabled_protocol_base_fee(),
         );
         let (cfg, env) = config_and_env();
-        assert!(
-            start(
-                Some(SharedStateCache::new(parent_hash)),
-                pool.clone(),
-                provider.clone(),
-                cfg.clone(),
-                env.clone(),
-                0,
-                None,
-                0,
-                ManualCancel::default(),
-                None
-            )
-            .is_none(),
-            "empty pool must not schedule workers"
-        );
+        let empty_cache = SharedStateCache::new(parent_hash);
+        let empty_guard = start(
+            Some(empty_cache.clone()),
+            pool.clone(),
+            provider.clone(),
+            cfg.clone(),
+            env.clone(),
+            0,
+            None,
+            0,
+            ManualCancel::default(),
+            None,
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while workers().unwrap().active.load(Ordering::Relaxed) != 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("empty setup job leaked a permit");
+        assert_eq!(empty_cache.account(SENDER), None, "empty pool must not read state");
+        drop(empty_guard);
         pool.set_block_info(BlockInfo {
             last_seen_block_hash: parent_hash,
             block_gas_limit: 200_000_000,
