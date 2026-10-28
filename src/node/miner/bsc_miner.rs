@@ -729,6 +729,7 @@ where
         );
         let build_args = BscBuildArguments {
             pipeline_parent: None,
+            pipeline_context: None,
             cached_reads: mining_ctx.cached_reads.clone().unwrap_or_default(),
             // `% 1000` matches `set_millisecond_part_of_timestamp`, which seals the same
             // remainder into the header's mix_hash at finalize time.

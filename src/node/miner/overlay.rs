@@ -309,6 +309,61 @@ mod tests {
             .basic_account(&address)
             .unwrap()
             .is_none());
+        // A second unpublished parent must override the first parent's account and slot,
+        // with identical proof/root input to the same two blocks in a managed graph.
+        let second_state = BundleState::builder(2..=2)
+            .state_present_account_info(address, AccountInfo { nonce: 5, ..Default::default() })
+            .state_storage(
+                address,
+                [(slot, (U256::from(77), U256::from(88)))].into_iter().collect(),
+            )
+            .build();
+        let second_hashed = HashedPostState::default()
+            .with_accounts([(keccak256(address), Some(Account { nonce: 5, ..Default::default() }))])
+            .with_storages([(
+                keccak256(address),
+                HashedStorage::from_iter([(keccak256(B256::from(slot)), U256::from(88))]),
+            )]);
+        let second = ExecutedBlock::<BscPrimitives>::new(
+            Arc::new(RecoveredBlock::new_unhashed(
+                BscBlock {
+                    header: Header {
+                        number: 2,
+                        parent_hash: parent.recovered_block().hash(),
+                        ..Default::default()
+                    },
+                    body: Default::default(),
+                },
+                Vec::new(),
+            )),
+            Arc::new(BlockExecutionOutput { state: second_state, result: Default::default() }),
+            SortedTrieData::new(Arc::new(second_hashed.clone().into_sorted()), Default::default()),
+        );
+        let private_second = private.with_appended_block(second.clone());
+        managed.insert_block(second.clone());
+        let managed_second = managed.overlay_builder(second.recovered_block().hash());
+        let reads = OverlayStateProviderFactory::new(factory.clone(), private_second.clone())
+            .database_provider_ro()
+            .unwrap();
+        assert_eq!(reads.basic_account(&address).unwrap().unwrap().nonce, 5);
+        assert_eq!(reads.storage(address, B256::from(slot)).unwrap(), Some(U256::from(88)));
+        let private_root = private_second
+            .build_state_trie_overlay_at_frontiers(&db, anchor, anchor, true)
+            .unwrap();
+        let managed_root = managed_second
+            .build_state_trie_overlay_at_frontiers(&db, anchor, anchor, true)
+            .unwrap();
+        assert_eq!(root(&private_root), root(&managed_root));
+        assert_eq!(
+            root(&private_root),
+            LatestStateProvider::new(factory.provider().unwrap())
+                .state_root(second_hashed)
+                .unwrap()
+        );
+        assert!(LatestStateProvider::new(factory.provider().unwrap())
+            .basic_account(&address)
+            .unwrap()
+            .is_none());
     }
 
     /// An empty candidate's system writes and a normal candidate's user writes share
@@ -506,6 +561,43 @@ mod tests {
             .unwrap()
             .unwrap();
         drop(fallback);
+        // A completed parent and its private child can use the same full-size runtime
+        // sequentially. Cancellation also releases the old named root stream; no second
+        // reduced proof pool or fallback-only fencing is needed for normal work.
+        for cancel_first in [false, true] {
+            let mut previous = spawn(&normal_manager, &runtime, false);
+            let mut hook = previous.take_execution_hook();
+            hook.on_state(update(3));
+            drop(hook);
+            if !cancel_first {
+                assert_eq!(
+                    previous
+                        .take_state_root_rx()
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap()
+                        .unwrap()
+                        .state_root,
+                    expected(3)
+                );
+            }
+            drop(previous);
+            let private_manager = OverlayManager::new(runtime.state_trie_overlay_worker_pool());
+            private_manager.insert_block(parent.clone());
+            let mut child = spawn(&private_manager, &runtime, false);
+            let mut hook = child.take_execution_hook();
+            hook.on_state(update(4));
+            drop(hook);
+            assert_eq!(
+                child
+                    .take_state_root_rx()
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap()
+                    .state_root,
+                expected(4)
+            );
+            drop(child);
+        }
         tokio::task::block_in_place(|| {
             for executor in [&runtime, &empty_runtime] {
                 for name in ["sparse-trie", "trie-hashing", "account-workers", "storage-workers"] {

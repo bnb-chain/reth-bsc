@@ -156,12 +156,25 @@ where
         // not-yet-persisted parent without merging every ancestor on each build.
         crate::node::miner::pipeline::configure(ctx.task_executor().handle().clone())?;
         let private_provider = ctx.provider().clone();
-        let _ = crate::shared::set_private_miner_state_fn(Arc::new(move |block| {
-            reth_provider::StateProviderFactory::state_with_block_appended(
-                &private_provider,
-                block.recovered_block().parent_hash,
-                block,
-            )
+        let _ = crate::shared::set_private_miner_state_fn(Arc::new(move |chain| {
+            use reth_provider::DatabaseProviderROFactory;
+            use reth_storage_overlay::{OverlayManager, OverlayStateProviderFactory};
+            // Resolve the canonical base once, then append the private ancestry without
+            // registering any of it in the engine's managed/canonical graph.
+            let manager = OverlayManager::default();
+            if let Some(state) = crate::shared::get_canonical_in_memory_state()
+                .and_then(|cim| cim.state_by_hash(chain.base_hash()))
+            {
+                for block in state.chain().collect::<Vec<_>>().into_iter().rev() {
+                    manager.insert_block(block.block());
+                }
+            }
+            let mut overlay = manager.overlay_builder(chain.base_hash());
+            for block in chain.blocks() {
+                overlay = overlay.with_appended_block(block.clone());
+            }
+            let factory = OverlayStateProviderFactory::new(private_provider.clone(), overlay);
+            Ok(Arc::new(move || Ok(Box::new(factory.database_provider_ro()?))))
         }));
         if mining_config.use_sparse_trie_state_root {
             use crate::node::miner::proof_provider::{
@@ -223,40 +236,14 @@ where
             )
             .with_worker_namespace("miner-empty")
             .build()?;
-            let pipeline_runtime = if crate::node::miner::pipeline::enabled() {
-                Some(
-                    RuntimeBuilder::new(
-                        RuntimeConfig::default()
-                            .with_tokio(TokioConfig::existing_handle(
-                                ctx.task_executor().handle().clone(),
-                            ))
-                            .with_rayon(RayonConfig {
-                                cpu_threads: Some(1),
-                                rpc_threads: Some(1),
-                                storage_threads: Some(1),
-                                proof_storage_worker_threads: Some(2),
-                                proof_account_worker_threads: Some(2),
-                                prewarming_threads: Some(1),
-                                bal_streaming_threads: Some(1),
-                                state_trie_overlay_worker_threads: Some(1),
-                                ..Default::default()
-                            }),
-                    )
-                    .with_worker_namespace("miner-pipeline")
-                    .build()?,
-                )
-            } else {
-                None
-            };
             let worker_pool = runtime.state_trie_overlay_worker_pool();
             let tree_config_for_closure = tree_config.clone();
             let overlay_cache =
                 parking_lot::Mutex::new(crate::node::miner::overlay::MinerOverlayCache::default());
 
             let proof_overlay_cache = Arc::new(MinerProofOverlayCache::new(runtime.clone()));
-            let pipeline_proof_overlay_cache = Arc::new(MinerProofOverlayCache::new(
-                pipeline_runtime.as_ref().unwrap_or(&runtime).clone(),
-            ));
+            let pipeline_proof_overlay_cache =
+                Arc::new(MinerProofOverlayCache::new(runtime.clone()));
             let spawn_fn: crate::shared::SparseTrieSpawnFn = std::sync::Arc::new(
                 move |parent: SealedHeader<Header>, kind, private_parent| {
                     let is_private = private_parent.is_some();
@@ -264,9 +251,7 @@ where
                     let mut blocks = Vec::<ExecutedBlock<crate::BscPrimitives>>::new();
                     if let Some(cim) = crate::shared::get_canonical_in_memory_state() {
                         if let Some(state) = cim.state_by_hash(
-                            private_parent
-                                .as_ref()
-                                .map_or(parent_hash, |b| b.recovered_block().parent_hash),
+                            private_parent.as_ref().map_or(parent_hash, |chain| chain.base_hash()),
                         ) {
                             // chain() yields newest-to-oldest including the parent itself.
                             blocks = state.chain().map(|bs| bs.block()).collect();
@@ -281,13 +266,13 @@ where
                     } else {
                         metrics::counter!("bsc_miner_sparse_trie_anchor_nocim_total").increment(1);
                     }
-                    if let Some(block) = private_parent {
-                        blocks.insert(0, block);
+                    if let Some(chain) = private_parent {
+                        blocks.splice(0..0, chain.blocks().iter().rev().cloned());
                     }
                     // Serialize cache selection/insertion only; never hold this lock during
                     // proof work or root waits. Old tasks own clones across generation changes.
                     let (overlay_manager, retired) = if is_private {
-                        let pool = pipeline_runtime.as_ref()?.state_trie_overlay_worker_pool();
+                        let pool = worker_pool.clone();
                         let manager =
                             OverlayManager::new_with_diagnostic_origin(pool, "miner-pipeline");
                         for block in blocks.iter().rev() {
@@ -335,13 +320,11 @@ where
                     );
 
                     let spawn_start = std::time::Instant::now();
-                    let executor = if is_private {
-                        pipeline_runtime.as_ref()?
-                    } else {
-                        match kind {
-                            crate::shared::MinerRootKind::Normal => &runtime,
-                            crate::shared::MinerRootKind::EmptyFallback => &empty_runtime,
-                        }
+                    // Private and canonical builds hold the same local build lease: only
+                    // one live normal root stream uses these full-size miner workers.
+                    let executor = match kind {
+                        crate::shared::MinerRootKind::Normal => &runtime,
+                        crate::shared::MinerRootKind::EmptyFallback => &empty_runtime,
                     };
                     let handle = spawn_payload_builder_state_root(
                         executor,

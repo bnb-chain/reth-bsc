@@ -67,6 +67,19 @@ pub type StateRootPrecomputedSink =
 pub struct PrivateMiningParent {
     pub header: SealedHeader<Header>,
     pub snapshot: Arc<crate::consensus::parlia::Snapshot>,
+    pub ancestor: Option<Arc<PrivateMiningParent>>,
+}
+impl PrivateMiningParent {
+    fn find(&self, hash: &alloy_primitives::B256) -> Option<&Self> {
+        let mut current = Some(self);
+        while let Some(parent) = current {
+            if parent.header.hash() == *hash {
+                return Some(parent)
+            }
+            current = parent.ancestor.as_deref();
+        }
+        None
+    }
 }
 
 /// What the executor is doing with the block it is running.
@@ -243,6 +256,20 @@ pub struct BscBlockExecutionCtx<'a> {
 }
 
 impl<'a> BscBlockExecutionCtx<'a> {
+    pub(crate) fn header_by_hash(&self, hash: &alloy_primitives::B256) -> Option<Header> {
+        self.private_parent
+            .as_ref()
+            .and_then(|p| p.find(hash))
+            .map(|p| p.header.header().clone())
+            .or_else(|| super::util::get_header_by_hash_from_cache(hash))
+    }
+    pub(crate) fn private_snapshot(
+        &self,
+        hash: &alloy_primitives::B256,
+    ) -> Option<crate::consensus::parlia::Snapshot> {
+        self.private_parent.as_ref().and_then(|p| p.find(hash)).map(|p| p.snapshot.as_ref().clone())
+    }
+
     /// Convert to EthBlockExecutionCtx for compatibility with existing BlockAssembler.
     pub fn as_eth_context(&self) -> &EthBlockExecutionCtx<'a> {
         &self.base

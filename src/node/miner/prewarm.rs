@@ -227,16 +227,66 @@ fn workers() -> Option<&'static Workers> {
     }).as_ref()
 }
 
+/// Open on the prewarm worker itself: MDBX read transactions must not cross threads.
+/// Private parents use the same appended state as formal execution, without importing it.
+#[derive(Clone)]
+pub(crate) struct ParentState {
+    open:
+        Arc<dyn Fn() -> reth_errors::ProviderResult<reth_provider::StateProviderBox> + Send + Sync>,
+    consumed: Option<Arc<AddressMap<u64>>>,
+}
+impl ParentState {
+    pub(crate) fn canonical(
+        client: impl StateProviderFactory + Clone + 'static,
+        hash: B256,
+    ) -> Self {
+        Self { open: Arc::new(move || client.state_by_block_hash(hash)), consumed: None }
+    }
+
+    pub(crate) fn private(
+        parent: crate::shared::PrivateMinerChain,
+    ) -> reth_errors::ProviderResult<Self> {
+        let open = crate::shared::private_miner_state_factory(parent.clone())?;
+        Ok(Self::with_private(parent, open))
+    }
+    fn with_private(
+        parent: crate::shared::PrivateMinerChain,
+        open: crate::shared::PrivateMinerStateFactory,
+    ) -> Self {
+        let mut consumed = AddressMap::<u64>::default();
+        for block in parent.blocks() {
+            for (sender, tx) in block.recovered_block().transactions_with_sender() {
+                consumed
+                    .entry(*sender)
+                    .and_modify(|n| *n = (*n).max(tx.nonce()))
+                    .or_insert(tx.nonce());
+            }
+        }
+        Self { open, consumed: Some(Arc::new(consumed)) }
+    }
+    pub(crate) fn open(&self) -> reth_errors::ProviderResult<reth_provider::StateProviderBox> {
+        (self.open)()
+    }
+
+    /// The private parent's transactions may still be pending until canonical import.
+    /// Skip only its consumed nonces locally; never invalidate the pool's descendants.
+    pub(crate) fn consumed(&self, sender: Address, nonce: u64) -> bool {
+        self.consumed
+            .as_ref()
+            .is_some_and(|nonces| nonces.get(&sender).is_some_and(|n| nonce <= *n))
+    }
+}
+
 /// Starts the go-bsc-style mining prefetch alongside the actual transaction loop.
 ///
 /// A shared iterator assigns each candidate once. Unlike a dispatcher with a buffered queue,
 /// at most one candidate per worker is outstanding. Every worker owns its provider and EVM.
 /// Process-wide permits prevent old, slow attempts from accumulating queued worker jobs.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn start<Pool, Client, EvmConfig>(
+pub(crate) fn start<Pool, EvmConfig>(
     cache: Option<Arc<SharedStateCache>>,
     pool: Pool,
-    client: Client,
+    parent_state: ParentState,
     evm_config: EvmConfig,
     mut env: EvmEnvFor<EvmConfig>,
     base_fee: u64,
@@ -246,7 +296,6 @@ pub(crate) fn start<Pool, Client, EvmConfig>(
     control: Option<super::build_control::BuildControl>,
 ) -> Option<PrewarmGuard>
 where
-    Client: StateProviderFactory + Clone + 'static,
     EvmConfig: ConfigureEvm + 'static,
     EvmConfig::Primitives: reth_primitives_traits::NodePrimitives<SignedTx = TransactionSigned>,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>> + 'static,
@@ -285,9 +334,9 @@ where
             }
             let permit = WorkerPermit(workers);
             metrics::gauge!("bsc.miner_prewarm.active_workers").increment(1.0);
-            let (cache, client, config, env, candidates, stopped, cancel, control) = (
+            let (cache, parent_state, config, env, candidates, stopped, cancel, control) = (
                 cache.clone(),
-                client.clone(),
+                parent_state.clone(),
                 evm_config.clone(),
                 env.clone(),
                 candidates.clone(),
@@ -300,7 +349,7 @@ where
                 let should_stop = || stopped.load(Ordering::Relaxed) || cancel.is_cancelled() ||
                     control.as_ref().is_some_and(|c| c.stop_transactions(std::time::Instant::now()));
                 if should_stop() { return }
-                let provider = match client.state_by_block_hash(cache.parent()) {
+                let provider = match (parent_state.open)() {
                     Ok(provider) => provider,
                     Err(_) => {
                         metrics::counter!("bsc.miner_prewarm.workers_total", "result" => "provider_error").increment(1);
@@ -315,7 +364,8 @@ where
                     let tx = candidates.lock().next()?;
                     // go-bsc periodically forwards its prefetch iterator to the miner's cursor.
                     // Skip consumed sender nonces without changing the actual pool or its ordering.
-                    if progress.already_selected(tx.sender(), tx.nonce()) { continue }
+                    if parent_state.consumed(tx.sender(), tx.nonce()) ||
+                        progress.already_selected(tx.sender(), tx.nonce()) { continue }
                     if super::super::pool::tip::meets_tip_floor(tx.effective_tip_per_gas(base_fee), min_tip) {
                         return Some(tx.transaction.clone_into_consensus());
                     }
@@ -567,6 +617,172 @@ mod tests {
     }
 
     #[test]
+    fn private_parent_workers_read_appended_state_and_keep_journals_private() {
+        use reth_execution_types::BlockExecutionOutput;
+        use reth_primitives_traits::RecoveredBlock;
+        use reth_provider::{AccountReader, DatabaseProviderROFactory};
+        use reth_storage_overlay::{OverlayManager, OverlayStateProviderFactory};
+        use reth_trie_common::SortedTrieData;
+        use revm::database::BundleState;
+
+        let factory = reth_provider::test_utils::create_test_provider_factory_with_chain_spec(
+            Arc::new(reth_chainspec::ChainSpec::default()),
+        );
+        let genesis = reth_db_common::init::init_genesis(&factory).unwrap();
+        let code = ParentDb::default().code;
+        let state = BundleState::builder(1..=1)
+            .state_present_account_info(
+                SENDER,
+                AccountInfo {
+                    balance: U256::from(1_000_000_000u64),
+                    nonce: 1,
+                    ..Default::default()
+                },
+            )
+            .state_present_account_info(CONTRACT, AccountInfo::default().with_code(code.clone()))
+            .contract(code.hash_slow(), code.clone())
+            .state_storage(
+                CONTRACT,
+                [(U256::ZERO, (U256::ZERO, U256::from(77)))].into_iter().collect(),
+            )
+            .build();
+        let parent = reth_chain_state::ExecutedBlock::<crate::BscPrimitives>::new(
+            Arc::new(RecoveredBlock::new_unhashed(
+                crate::BscBlock {
+                    header: alloy_consensus::Header {
+                        number: 1,
+                        parent_hash: genesis,
+                        ..Default::default()
+                    },
+                    body: crate::node::primitives::BscBlockBody {
+                        inner: alloy_consensus::BlockBody {
+                            transactions: vec![transaction(0).into_inner()],
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                },
+                vec![SENDER],
+            )),
+            Arc::new(BlockExecutionOutput { state, result: Default::default() }),
+            SortedTrieData::default(),
+        );
+        let child_state = BundleState::builder(2..=2)
+            .state_present_account_info(
+                SENDER,
+                AccountInfo {
+                    balance: U256::from(1_000_000_000u64),
+                    nonce: 2,
+                    ..Default::default()
+                },
+            )
+            .state_present_account_info(CONTRACT, AccountInfo::default().with_code(code.clone()))
+            .state_storage(
+                CONTRACT,
+                [(U256::ZERO, (U256::from(77), U256::from(99)))].into_iter().collect(),
+            )
+            .build();
+        let child = reth_chain_state::ExecutedBlock::<crate::BscPrimitives>::new(
+            Arc::new(RecoveredBlock::new_unhashed(
+                crate::BscBlock {
+                    header: alloy_consensus::Header {
+                        number: 2,
+                        parent_hash: parent.recovered_block().hash(),
+                        ..Default::default()
+                    },
+                    body: crate::node::primitives::BscBlockBody {
+                        inner: alloy_consensus::BlockBody {
+                            transactions: vec![transaction(1).into_inner()],
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                },
+                vec![SENDER],
+            )),
+            Arc::new(BlockExecutionOutput { state: child_state, result: Default::default() }),
+            SortedTrieData::default(),
+        );
+        let parent_hash = child.recovered_block().hash();
+        let first = crate::shared::PrivateMinerChain::new(parent);
+        let ancestry = first.appended(child.clone()).unwrap();
+        assert_eq!(first.blocks().len(), 1);
+        assert_eq!(ancestry.blocks().len(), 2);
+        assert!(first.appended(first.parent().clone()).is_none(), "reject non-child");
+        assert!(ancestry.appended(child).is_none(), "bound retained state at two private parents");
+        let mut source = ParentState::with_private(
+            ancestry.clone(),
+            Arc::new(|| Err(reth_errors::ProviderError::UnsupportedProvider)),
+        );
+        assert!(source.consumed(SENDER, 0));
+        assert!(source.consumed(SENDER, 1));
+        assert!(!source.consumed(SENDER, 2), "next nonce must remain eligible");
+        assert!(!source.consumed(CONTRACT, 0));
+        // Same appended overlay as the production private-state callback, backed by a
+        // test DB. Opening inside the worker is essential; the DB transaction is not sent.
+        let opens = Arc::new(AtomicU64::new(0));
+        let main_thread = std::thread::current().id();
+        let private_factory = factory.clone();
+        let opened = opens.clone();
+        source.open = Arc::new(move || {
+            assert_ne!(std::thread::current().id(), main_thread);
+            opened.fetch_add(1, Ordering::Relaxed);
+            let manager = OverlayManager::default();
+            let mut overlay = manager.overlay_builder(genesis);
+            for block in ancestry.blocks() {
+                overlay = overlay.with_appended_block(block.clone());
+            }
+            Ok(Box::new(
+                OverlayStateProviderFactory::new(private_factory.clone(), overlay)
+                    .database_provider_ro()?,
+            ))
+        });
+        let cache = SharedStateCache::new(parent_hash);
+        let (cfg, mut env) = config_and_env();
+        env.cfg_env.disable_nonce_check = true;
+        std::thread::scope(|scope| {
+            for _ in 0..3 {
+                let (source, cache, cfg, env) =
+                    (source.clone(), cache.clone(), cfg.clone(), env.clone());
+                scope.spawn(move || {
+                    let db = SharedStateDb {
+                        inner: StateProviderDatabase::new(EvmStateProviderAdapter(
+                            (source.open)().unwrap(),
+                        )),
+                        cache,
+                    };
+                    assert_eq!(db.basic_ref(SENDER).unwrap().unwrap().nonce, 2);
+                    assert_eq!(db.storage_ref(CONTRACT, U256::ZERO).unwrap(), U256::from(99));
+                    let mut txs = vec![transaction(0), transaction(1), transaction(2)].into_iter();
+                    assert_eq!(
+                        warm_transactions(
+                            db,
+                            cfg,
+                            env,
+                            || txs.find(|tx| !source.consumed(tx.signer(), tx.nonce())),
+                            || false
+                        ),
+                        (1, 0)
+                    );
+                });
+            }
+        });
+        assert_eq!(opens.load(Ordering::Relaxed), 3);
+        assert_eq!(cache.account(SENDER).unwrap().unwrap().nonce, 2);
+        assert_eq!(
+            cache.storage(CONTRACT, U256::ZERO),
+            Some(U256::from(99)),
+            "speculative SSTORE must not replace parent value"
+        );
+        let canonical =
+            reth_provider::providers::LatestStateProvider::new(factory.provider().unwrap());
+        assert!(
+            canonical.basic_account(&SENDER).unwrap().is_none(),
+            "private parent was never imported"
+        );
+    }
+
+    #[test]
     fn concurrent_workers_share_reads_without_changing_parent_identity() {
         let cache = SharedStateCache::new(B256::repeat_byte(1));
         let next_parent = SharedStateCache::new(B256::repeat_byte(2));
@@ -710,7 +926,7 @@ mod tests {
         let empty_guard = start(
             Some(empty_cache.clone()),
             pool.clone(),
-            provider.clone(),
+            ParentState::canonical(provider.clone(), parent_hash),
             cfg.clone(),
             env.clone(),
             0,
@@ -745,7 +961,7 @@ mod tests {
         let guard = start(
             Some(cache.clone()),
             pool,
-            provider.clone(),
+            ParentState::canonical(provider.clone(), parent_hash),
             cfg,
             env,
             0,

@@ -290,18 +290,20 @@ where
             .clone()
             .ok_or_else(|| BlockExecutionError::msg("Missing header in execution context"))?;
 
-        let parent_header = crate::node::evm::util::get_header_by_hash_from_cache(
-            &header.parent_hash,
-        )
-        .ok_or(BlockExecutionError::msg("Failed to get parent header from global header reader"))?;
+        let parent_header = self.ctx.header_by_hash(&header.parent_hash).ok_or(
+            BlockExecutionError::msg("Failed to get parent header from global header reader"),
+        )?;
         self.inner_ctx.parent_header = Some(parent_header.clone());
 
-        let snap = self
-            .snapshot_provider
-            .as_ref()
-            .ok_or_else(|| BlockExecutionError::msg("Snapshot provider is not available"))?
-            .snapshot_by_hash(&header.parent_hash)
-            .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
+        let snap = if let Some(private) = self.ctx.private_snapshot(&header.parent_hash) {
+            private
+        } else {
+            self.snapshot_provider
+                .as_ref()
+                .ok_or_else(|| BlockExecutionError::msg("Snapshot provider is not available"))?
+                .snapshot_by_hash(&header.parent_hash)
+                .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?
+        };
         self.inner_ctx.snap = Some(snap.clone());
         self.inner_ctx.expected_turn_length = None;
 
@@ -644,11 +646,9 @@ where
                     is_match = true;
                     break;
                 }
-                ancestor =
-                    crate::node::evm::util::get_header_by_hash_from_cache(&ancestor.parent_hash())
-                        .ok_or_else(|| BscBlockExecutionError::UnknownHeader {
-                            block_hash: ancestor.parent_hash(),
-                        })?;
+                ancestor = self.ctx.header_by_hash(&ancestor.parent_hash()).ok_or_else(|| {
+                    BscBlockExecutionError::UnknownHeader { block_hash: ancestor.parent_hash() }
+                })?;
                 tracing::debug!("ancestor: {:?}", ancestor);
             }
 
@@ -691,14 +691,17 @@ where
                 .into());
             }
 
-            let pre_snap = self
-                .snapshot_provider
-                .as_ref()
-                .ok_or_else(|| BlockExecutionError::msg("Snapshot provider is not available"))?
-                .snapshot_by_hash(&ancestor.parent_hash)
-                .ok_or(BlockExecutionError::msg(
-                    "Failed to get pre snapshot from snapshot provider",
-                ))?;
+            let pre_snap = if let Some(private) = self.ctx.private_snapshot(&ancestor.parent_hash) {
+                private
+            } else {
+                self.snapshot_provider
+                    .as_ref()
+                    .ok_or_else(|| BlockExecutionError::msg("Snapshot provider is not available"))?
+                    .snapshot_by_hash(&ancestor.parent_hash)
+                    .ok_or(BlockExecutionError::msg(
+                        "Failed to get pre snapshot from snapshot provider",
+                    ))?
+            };
 
             // query bls keys from snapshot.
             let validators_count = pre_snap.validators.len();
@@ -876,11 +879,9 @@ where
             });
         }
 
-        crate::node::evm::util::get_header_by_hash_from_cache(&snap.vote_data.target_hash)
-            .ok_or_else(|| {
-                BscBlockExecutionError::UnknownHeader { block_hash: snap.vote_data.target_hash }
-                    .into()
-            })
+        self.ctx.header_by_hash(&snap.vote_data.target_hash).ok_or_else(|| {
+            BscBlockExecutionError::UnknownHeader { block_hash: snap.vote_data.target_hash }.into()
+        })
     }
 
     /// prepare some intermediate data for produce new block.
@@ -898,10 +899,9 @@ where
             }
             private.header.header().clone()
         } else {
-            crate::node::evm::util::get_header_by_hash_from_cache(&self.ctx.base.parent_hash)
-                .ok_or(BlockExecutionError::msg(
-                    "Failed to get parent header from global header reader",
-                ))?
+            self.ctx.header_by_hash(&self.ctx.base.parent_hash).ok_or(BlockExecutionError::msg(
+                "Failed to get parent header from global header reader",
+            ))?
         };
         self.inner_ctx.parent_header = Some(parent_header.clone());
 
