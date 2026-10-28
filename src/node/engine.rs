@@ -281,8 +281,8 @@ where
                     } else {
                         metrics::counter!("bsc_miner_sparse_trie_anchor_nocim_total").increment(1);
                     }
-                    if let Some(block) = private_parent {
-                        blocks.insert(0, block);
+                    if let Some(block) = &private_parent {
+                        blocks.insert(0, block.clone());
                     }
                     // Serialize cache selection/insertion only; never hold this lock during
                     // proof work or root waits. Old tasks own clones across generation changes.
@@ -333,6 +333,11 @@ where
                         },
                         matches!(kind, crate::shared::MinerRootKind::EmptyFallback),
                     );
+                    let overlay_factory = if let Some(block) = private_parent {
+                        overlay_factory.with_private_parent(block, proof_overlay_cache.clone())
+                    } else {
+                        overlay_factory
+                    };
 
                     let spawn_start = std::time::Instant::now();
                     let executor = if is_private {

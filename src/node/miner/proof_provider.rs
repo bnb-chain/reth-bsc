@@ -2,6 +2,7 @@
 //! cached.
 use alloy_primitives::B256;
 use parking_lot::Mutex;
+use reth_chain_state::ExecutedBlock;
 use reth_provider::{
     BlockNumReader, ChangeSetReader, DatabaseProviderFactory, DatabaseProviderROFactory,
     ProviderResult, PruneCheckpointReader, StageCheckpointReader, StorageChangeSetReader,
@@ -146,6 +147,12 @@ impl MinerProofOverlayCache {
         metrics::counter!("bsc_miner_proof_overlay_cache_total", "result" => if fallback { "fallback_fill" } else { "fill" }).increment(1);
         Ok(overlay)
     }
+
+    fn ready(&self, key: Key) -> Option<StateTrieOverlay> {
+        // Speculative work must not wait for or create an ordinary miner cache entry.
+        let entries = self.entries.try_lock()?;
+        entries.iter().find(|(k, _)| *k == key)?.1.ready.get().cloned()
+    }
 }
 
 fn stage(phase: &'static str, start: Instant, fallback: bool) {
@@ -165,6 +172,7 @@ pub(crate) struct MinerProofProviderFactory<F> {
     parent: B256,
     cache: Arc<MinerProofOverlayCache>,
     fallback: bool,
+    private_parent: Option<(ExecutedBlock<crate::BscPrimitives>, Arc<MinerProofOverlayCache>)>,
 }
 
 impl<F> MinerProofProviderFactory<F> {
@@ -175,7 +183,63 @@ impl<F> MinerProofProviderFactory<F> {
         cache: Arc<MinerProofOverlayCache>,
         fallback: bool,
     ) -> Self {
-        Self { factory, builder, parent, cache, fallback }
+        Self { factory, builder, parent, cache, fallback, private_parent: None }
+    }
+
+    pub(crate) fn with_private_parent(
+        mut self,
+        block: ExecutedBlock<crate::BscPrimitives>,
+        parent_cache: Arc<MinerProofOverlayCache>,
+    ) -> Self {
+        self.private_parent = Some((block, parent_cache));
+        self
+    }
+
+    fn private_parent_overlay(&self, trie: B256, finish: B256) -> Option<StateTrieOverlay> {
+        let (block, parent_cache) = self.private_parent.as_ref()?;
+        if block.recovered_block().hash() != self.parent {
+            metrics::counter!("bsc_miner_private_overlay_total", "result" => "parent_mismatch")
+                .increment(1);
+            return None;
+        }
+        let Some(base) = parent_cache.ready((block.recovered_block().parent_hash, trie, finish))
+        else {
+            metrics::counter!("bsc_miner_private_overlay_total", "result" => "unavailable")
+                .increment(1);
+            return None;
+        };
+        let input = base.input().clone();
+        let data = block.trie_data().clone();
+        let span = tracing::Span::current();
+        let start = Instant::now();
+        let overlay =
+            self.cache.runtime.state_trie_overlay_worker_pool().spawn_and_wait(move || {
+                let _entered = span.enter();
+                let started = Instant::now();
+                let mut input = input;
+                // The cached input includes exact trie changesets for this DB snapshot. Apply only
+                // the sealed private parent's delta, preserving the ordinary cache's immutable
+                // Arcs.
+                rayon::join(
+                    || {
+                        if !data.hashed_state.is_empty() {
+                            Arc::make_mut(&mut input.state).extend_ref_and_sort(&data.hashed_state);
+                        }
+                    },
+                    || {
+                        if !data.trie_updates.is_empty() {
+                            Arc::make_mut(&mut input.nodes).extend_ref_and_sort(&data.trie_updates);
+                        }
+                    },
+                );
+                metrics::histogram!("bsc_miner_private_overlay_extend_seconds")
+                    .record(started.elapsed().as_secs_f64());
+                StateTrieOverlay::new(input)
+            });
+        metrics::histogram!("bsc_miner_private_overlay_total_seconds")
+            .record(start.elapsed().as_secs_f64());
+        metrics::counter!("bsc_miner_private_overlay_total", "result" => "reused").increment(1);
+        Some(overlay)
     }
 }
 
@@ -201,7 +265,12 @@ where
         let overlay = self.cache.get_or_build(
             (self.parent, trie.hash, finish.hash),
             self.fallback,
-            || self.builder.build_state_trie_overlay_at_frontiers(&provider, trie, finish, true),
+            || {
+                if let Some(overlay) = self.private_parent_overlay(trie.hash, finish.hash) {
+                    return Ok(overlay);
+                }
+                self.builder.build_state_trie_overlay_at_frontiers(&provider, trie, finish, true)
+            },
         )?;
         Ok(OverlayStateProvider::new(provider, self.builder.clone())
             .with_state_trie_overlay(overlay))
@@ -211,7 +280,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reth_trie_common::{updates::TrieUpdatesSorted, HashedPostState};
+    use alloy_consensus::Header;
+    use alloy_eips::BlockNumHash;
+    use alloy_primitives::U256;
+    use reth_primitives_traits::{Account, RecoveredBlock};
+    use reth_provider::{
+        providers::LatestStateProvider, test_utils::create_test_provider_factory, StateRootProvider,
+    };
+    use reth_storage_overlay::OverlayManager;
+    use reth_trie_common::{
+        updates::TrieUpdatesSorted, HashedPostState, HashedStorage, SortedTrieData,
+    };
     fn value() -> StateTrieOverlay {
         StateTrieOverlay::new(reth_trie_common::TrieInputSorted::new(
             Arc::new(TrieUpdatesSorted::default()),
@@ -426,5 +505,180 @@ mod tests {
         drop(cache);
         assert!(weak.upgrade().is_none());
         assert_eq!(original.input().state.accounts[0].1.unwrap().nonce, 7);
+    }
+
+    #[test]
+    fn speculative_lookup_only_reads_completed_matching_entries() {
+        let cache = MinerProofOverlayCache::new(Runtime::test());
+        assert!(cache.ready(key(1)).is_none());
+        assert!(cache.entries.lock().is_empty());
+        let pending = cache.entry(key(1), false);
+        let _computing = pending.computing.lock();
+        assert!(cache.ready(key(1)).is_none());
+        pending.ready.set(value()).unwrap();
+        let before = cache.ready(key(1)).unwrap();
+        for mismatched in [
+            key(2),
+            (key(1).0, B256::with_last_byte(1), B256::ZERO),
+            (key(1).0, B256::ZERO, B256::with_last_byte(1)),
+        ] {
+            assert!(cache.ready(mismatched).is_none());
+        }
+        let index = cache.entries.lock();
+        assert!(cache.ready(key(1)).is_none());
+        drop(index);
+        let after = cache.ready(key(1)).unwrap();
+        assert!(Arc::ptr_eq(&before.input().state, &after.input().state));
+        assert_eq!(cache.entries.lock().len(), 1);
+    }
+
+    #[test]
+    fn private_parent_reuse_matches_fresh_proofs_and_preserves_ancestor() {
+        let factory = create_test_provider_factory();
+        let genesis = reth_db_common::init::init_genesis(&factory).unwrap();
+        let anchor = BlockNumHash::new(0, genesis);
+        let account = B256::repeat_byte(0x11);
+        let removed = B256::repeat_byte(0x12);
+        let retained = B256::repeat_byte(0x13);
+        let storage = B256::repeat_byte(0x21);
+        let initial = HashedPostState::default()
+            .with_accounts([account, removed, retained].map(|key| (key, Some(Account::default()))))
+            .with_storages([(
+                account,
+                HashedStorage::from_iter([
+                    (storage, U256::from(7)),
+                    (B256::repeat_byte(0x22), U256::from(8)),
+                ]),
+            )]);
+        let (initial_root, initial_nodes) = LatestStateProvider::new(factory.provider().unwrap())
+            .state_root_with_updates(initial.clone())
+            .unwrap();
+        let make_block = |number, parent_hash, state_root, state: HashedPostState, nodes| {
+            ExecutedBlock::<crate::BscPrimitives>::new(
+                Arc::new(RecoveredBlock::new_unhashed(
+                    crate::BscBlock {
+                        header: Header { number, parent_hash, state_root, ..Default::default() },
+                        body: Default::default(),
+                    },
+                    Vec::new(),
+                )),
+                Default::default(),
+                SortedTrieData::new(Arc::new(state.into_sorted()), Arc::new(nodes)),
+            )
+        };
+        let ancestor = make_block(1, genesis, initial_root, initial, initial_nodes.into_sorted());
+        let ancestor_hash = ancestor.recovered_block().hash();
+        let manager = OverlayManager::default();
+        manager.insert_block(ancestor.clone());
+        let base = manager
+            .overlay_builder(ancestor_hash)
+            .build_state_trie_overlay_at_frontiers(
+                &factory.provider().unwrap(),
+                anchor,
+                anchor,
+                true,
+            )
+            .unwrap();
+        assert!(!base.input().nodes.is_empty());
+        let original_state = base.input().state.clone();
+        let original_nodes = base.input().nodes.clone();
+        let runtime = Runtime::test();
+        let shared = Arc::new(MinerProofOverlayCache::new(runtime.clone()));
+        shared.get_or_build((ancestor_hash, genesis, genesis), false, || Ok(base)).unwrap();
+
+        // Sibling candidates overwrite an account, delete another, and clear a storage slot.
+        for nonce in [2, 99] {
+            let delta = HashedPostState::default()
+                .with_accounts([
+                    (account, Some(Account { nonce, ..Default::default() })),
+                    (removed, None),
+                ])
+                .with_storages([(
+                    account,
+                    HashedStorage::from_iter([
+                        (storage, U256::from(nonce)),
+                        (B256::repeat_byte(0x22), U256::ZERO),
+                    ]),
+                )]);
+            let (expected_root, nodes) = OverlayStateProvider::new(
+                factory.provider().unwrap(),
+                manager.overlay_builder(ancestor_hash),
+            )
+            .state_root_with_updates(delta.clone())
+            .unwrap();
+            let parent = make_block(2, ancestor_hash, expected_root, delta, nodes.into_sorted());
+            let parent_hash = parent.recovered_block().hash();
+            let private_manager = OverlayManager::default();
+            private_manager.insert_block(ancestor.clone());
+            private_manager.insert_block(parent.clone());
+            let builder = private_manager.overlay_builder(parent_hash);
+            let fresh = builder
+                .build_state_trie_overlay_at_frontiers(
+                    &factory.provider().unwrap(),
+                    anchor,
+                    anchor,
+                    true,
+                )
+                .unwrap();
+            let proof = MinerProofProviderFactory::new(
+                factory.clone(),
+                builder,
+                parent_hash,
+                Arc::new(MinerProofOverlayCache::new(runtime.clone())),
+                false,
+            )
+            .with_private_parent(parent.clone(), shared.clone());
+            let reused = proof.private_parent_overlay(genesis, genesis).unwrap();
+            assert_eq!(reused.input().state, fresh.input().state);
+            assert_eq!(reused.input().nodes, fresh.input().nodes);
+            assert_eq!(
+                proof
+                    .database_provider_ro()
+                    .unwrap()
+                    .state_root(HashedPostState::default())
+                    .unwrap(),
+                expected_root
+            );
+            assert!(proof.private_parent_overlay(ancestor_hash, genesis).is_none());
+            assert!(proof.private_parent_overlay(genesis, ancestor_hash).is_none());
+            let mut mismatched = proof.clone();
+            mismatched.parent = ancestor_hash;
+            assert!(mismatched.private_parent_overlay(genesis, genesis).is_none());
+            assert!(!manager.contains_hash(parent_hash, genesis, genesis));
+            let preserved = shared.ready((ancestor_hash, genesis, genesis)).unwrap();
+            assert!(Arc::ptr_eq(&preserved.input().state, &original_state));
+            assert!(Arc::ptr_eq(&preserved.input().nodes, &original_nodes));
+            assert_eq!(
+                preserved
+                    .input()
+                    .state
+                    .accounts
+                    .iter()
+                    .find(|(key, _)| *key == account)
+                    .unwrap()
+                    .1
+                    .unwrap()
+                    .nonce,
+                0
+            );
+
+            // A cold ancestor cache still resolves the same root through the original builder.
+            let cold = MinerProofProviderFactory::new(
+                factory.clone(),
+                private_manager.overlay_builder(parent_hash),
+                parent_hash,
+                Arc::new(MinerProofOverlayCache::new(runtime.clone())),
+                false,
+            )
+            .with_private_parent(parent, Arc::new(MinerProofOverlayCache::new(runtime.clone())));
+            assert!(cold.private_parent_overlay(genesis, genesis).is_none());
+            assert_eq!(
+                cold.database_provider_ro()
+                    .unwrap()
+                    .state_root(HashedPostState::default())
+                    .unwrap(),
+                expected_root
+            );
+        }
     }
 }

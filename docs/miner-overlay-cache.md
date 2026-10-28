@@ -46,6 +46,23 @@ limits bound retained entries, not allocated bytes or ownership held by in-fligh
 The existing `cache_retire` preparation phase measures caller latency, including submission
 or inline cleanup, rather than background destruction time.
 
+## Private-child parent reuse
+
+A private child can extend an already completed ordinary proof overlay with its sealed private
+parent's trie and hashed-state updates. The lookup requires the private parent's ancestor hash
+and both durable frontier hashes to match the current database transaction. It uses a nonblocking
+cache lookup and never waits for an ordinary computation. Missing, busy, or unfinished entries
+fall back to the private manager's fresh overlay construction.
+
+The extension runs on the existing private overlay worker pool. Copy-on-write preserves the
+ordinary overlay; private blocks and derived results stay in the private manager/proof cache.
+No database transaction, mutable sparse trie, or candidate state is shared with ordinary mining.
+The existing private proof-cache bound and retirement budget also cover extended values.
+
+`bsc_miner_private_overlay_total{result}` counts reuse and fallback reasons.
+`bsc_miner_private_overlay_extend_seconds` measures extension work, and
+`bsc_miner_private_overlay_total_seconds` includes the private worker queue wait.
+
 ## Validation
 
 Local tests compare overlay contents and state roots against fresh managers for retries, linear
