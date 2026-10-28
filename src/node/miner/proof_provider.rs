@@ -1,6 +1,6 @@
 //! Miner-only immutable parent overlays. No candidate writes, DB transactions or cursors are
 //! cached.
-use alloy_primitives::B256;
+use alloy_primitives::{map::B256Map, B256};
 use parking_lot::Mutex;
 use reth_provider::{
     BlockNumReader, ChangeSetReader, DatabaseProviderFactory, DatabaseProviderROFactory,
@@ -8,7 +8,8 @@ use reth_provider::{
     StorageSettingsCache,
 };
 use reth_storage_overlay::{
-    database_state_frontiers, OverlayBuilder, OverlayStateProvider, OwnedProvider, StateTrieOverlay,
+    database_state_frontiers, OverlayBuilder, OverlayStateProvider, OverlayStateProviderFactory,
+    OwnedProvider, StateTrieOverlay,
 };
 use reth_tasks::Runtime;
 use std::{
@@ -165,6 +166,7 @@ pub(crate) struct MinerProofProviderFactory<F> {
     parent: B256,
     cache: Arc<MinerProofOverlayCache>,
     fallback: bool,
+    reused: Option<OverlayStateProviderFactory<F, crate::BscPrimitives>>,
 }
 
 impl<F> MinerProofProviderFactory<F> {
@@ -175,7 +177,17 @@ impl<F> MinerProofProviderFactory<F> {
         cache: Arc<MinerProofOverlayCache>,
         fallback: bool,
     ) -> Self {
-        Self { factory, builder, parent, cache, fallback }
+        Self { factory, builder, parent, cache, fallback, reused: None }
+    }
+    pub(crate) fn with_reused_sparse_trie(mut self, anchor: B256, roots: B256Map<B256>) -> Self
+    where
+        F: Clone,
+    {
+        self.reused = Some(
+            OverlayStateProviderFactory::new(self.factory.clone(), self.builder.clone())
+                .with_skip_overlay_for_reused_sparse_trie(anchor, roots),
+        );
+        self
     }
 }
 
@@ -192,6 +204,9 @@ where
     type Provider = OverlayStateProvider<OwnedProvider<F::Provider>, crate::BscPrimitives>;
 
     fn database_provider_ro(&self) -> ProviderResult<Self::Provider> {
+        if let Some(factory) = &self.reused {
+            return factory.database_provider_ro()
+        }
         let start = Instant::now();
         let provider = self.factory.database_provider_ro()?;
         stage("database_provider", start, self.fallback);

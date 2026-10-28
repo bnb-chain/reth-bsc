@@ -156,23 +156,28 @@ where
         // not-yet-persisted parent without merging every ancestor on each build.
         crate::node::miner::pipeline::configure(ctx.task_executor().handle().clone())?;
         let private_provider = ctx.provider().clone();
+        let private_state_cache = parking_lot::Mutex::new(
+            crate::node::miner::overlay::MinerOverlayCache::for_scope("private_state"),
+        );
+        let private_state_executor = ctx.task_executor().handle().clone();
         let _ = crate::shared::set_private_miner_state_fn(Arc::new(move |chain| {
             use reth_provider::DatabaseProviderROFactory;
             use reth_storage_overlay::{OverlayManager, OverlayStateProviderFactory};
             // Resolve the canonical base once, then append the private ancestry without
             // registering any of it in the engine's managed/canonical graph.
-            let manager = OverlayManager::default();
+            let mut blocks = Vec::new();
             if let Some(state) = crate::shared::get_canonical_in_memory_state()
                 .and_then(|cim| cim.state_by_hash(chain.base_hash()))
             {
-                for block in state.chain().collect::<Vec<_>>().into_iter().rev() {
-                    manager.insert_block(block.block());
-                }
+                blocks = state.chain().map(|block| block.block()).collect();
             }
-            let mut overlay = manager.overlay_builder(chain.base_hash());
-            for block in chain.blocks() {
-                overlay = overlay.with_appended_block(block.clone());
+            blocks.splice(0..0, chain.blocks().iter().rev().cloned());
+            let (manager, retired) =
+                private_state_cache.lock().for_parent(&blocks, OverlayManager::default);
+            if !retired.is_empty() {
+                private_state_executor.spawn_blocking(move || drop(retired));
             }
+            let overlay = manager.overlay_builder(chain.parent().recovered_block().hash());
             let factory = OverlayStateProviderFactory::new(private_provider.clone(), overlay);
             Ok(Arc::new(move || Ok(Box::new(factory.database_provider_ro()?))))
         }));
@@ -182,7 +187,9 @@ where
             };
             use alloy_consensus::Header;
             use reth_chain_state::ExecutedBlock;
-            use reth_engine_tree::tree::state_root_strategy::spawn_payload_builder_state_root;
+            use reth_engine_tree::tree::state_root_strategy::{
+                spawn_payload_builder_state_root, spawn_payload_builder_state_root_with_cache,
+            };
             use reth_primitives_traits::SealedHeader;
             use reth_storage_overlay::OverlayManager;
             use reth_tasks::{RayonConfig, RuntimeBuilder, RuntimeConfig, TokioConfig};
@@ -238,9 +245,16 @@ where
             .build()?;
             let worker_pool = runtime.state_trie_overlay_worker_pool();
             let tree_config_for_closure = tree_config.clone();
+            let root_reuse_enabled = crate::node::miner::root_reuse::enabled();
+            tracing::info!(target: "bsc::miner", root_reuse_enabled, "Miner completed-parent sparse trie handoff configured");
+            let root_cache =
+                parking_lot::Mutex::new(crate::node::miner::root_reuse::MinerRootCache::default());
             let overlay_cache =
                 parking_lot::Mutex::new(crate::node::miner::overlay::MinerOverlayCache::default());
 
+            let private_overlay_cache = parking_lot::Mutex::new(
+                crate::node::miner::overlay::MinerOverlayCache::for_scope("pipeline"),
+            );
             let proof_overlay_cache = Arc::new(MinerProofOverlayCache::new(runtime.clone()));
             let pipeline_proof_overlay_cache =
                 Arc::new(MinerProofOverlayCache::new(runtime.clone()));
@@ -273,12 +287,9 @@ where
                     // proof work or root waits. Old tasks own clones across generation changes.
                     let (overlay_manager, retired) = if is_private {
                         let pool = worker_pool.clone();
-                        let manager =
-                            OverlayManager::new_with_diagnostic_origin(pool, "miner-pipeline");
-                        for block in blocks.iter().rev() {
-                            manager.insert_block(block.clone());
-                        }
-                        (manager, Vec::new())
+                        private_overlay_cache.lock().for_parent(&blocks, || {
+                            OverlayManager::new_with_diagnostic_origin(pool, "miner-pipeline")
+                        })
                     } else {
                         let selection_start = std::time::Instant::now();
                         let mut cache = overlay_cache.lock();
@@ -296,11 +307,6 @@ where
                     };
                     if !retired.is_empty() {
                         runtime.spawn_drop(retired);
-                    }
-                    // The external builder still starts a fresh sparse trie. Discard any
-                    // previous result retained by Reth, without dropping a large trie inline.
-                    if let Some(trie) = overlay_manager.take_sparse_trie() {
-                        runtime.spawn_drop(trie);
                     }
 
                     // Anchor directly at the parent hash; the overlay manager resolves the
@@ -326,16 +332,36 @@ where
                         crate::shared::MinerRootKind::Normal => &runtime,
                         crate::shared::MinerRootKind::EmptyFallback => &empty_runtime,
                     };
-                    let handle = spawn_payload_builder_state_root(
-                        executor,
-                        &overlay_manager,
-                        overlay_factory,
-                        parent,
-                        None, // tx count unknown at spawn time → full proof-worker pool
-                        tree_config_for_closure.as_ref(),
-                        // Pruning hint; sparse-trie reuse is controlled inside the wrapper.
-                        None,
-                    );
+                    let handle = if root_reuse_enabled &&
+                        matches!(kind, crate::shared::MinerRootKind::Normal)
+                    {
+                        let preserved = root_cache.lock().take(&parent);
+                        let (handle, pending) = spawn_payload_builder_state_root_with_cache(
+                            executor,
+                            overlay_factory,
+                            parent,
+                            None,
+                            tree_config_for_closure.as_ref(),
+                            Some(blocks),
+                            preserved,
+                            |factory, anchor, roots| factory.with_reused_sparse_trie(anchor, roots),
+                        );
+                        let retired = root_cache.lock().insert(parent_hash, pending);
+                        if let Some(retired) = retired {
+                            runtime.spawn_drop(retired);
+                        }
+                        handle
+                    } else {
+                        spawn_payload_builder_state_root(
+                            executor,
+                            &overlay_manager,
+                            overlay_factory,
+                            parent,
+                            None,
+                            tree_config_for_closure.as_ref(),
+                            None,
+                        )
+                    };
                     metrics::histogram!("bsc_miner_sparse_trie_spawn_duration_seconds")
                         .record(spawn_start.elapsed().as_secs_f64());
                     Some(handle)

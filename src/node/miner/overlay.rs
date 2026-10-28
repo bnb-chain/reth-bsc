@@ -15,8 +15,8 @@ use std::{
 const MAX_PARENTS_PER_GENERATION: usize = 32;
 const MAX_GENERATIONS: usize = 2;
 
-#[derive(Default)]
 pub(crate) struct MinerOverlayCache {
+    scope: &'static str,
     // Most recently selected manager first. Never prune a manager in place: old proof
     // workers may still depend on its captured chain and durable frontier.
     generations: VecDeque<Generation>,
@@ -29,7 +29,16 @@ struct Generation {
     views: HashSet<(B256, B256)>,
 }
 
+impl Default for MinerOverlayCache {
+    fn default() -> Self {
+        Self::for_scope("normal")
+    }
+}
+
 impl MinerOverlayCache {
+    pub(crate) fn for_scope(scope: &'static str) -> Self {
+        Self { scope, generations: VecDeque::new() }
+    }
     /// Reuse a manager only when its block graph covers the requested chain, or its
     /// tip is an ancestor in the captured snapshot. The underlying Reth cache still
     /// keys each flattened overlay by (anchor, parent); changing frontiers does not
@@ -44,7 +53,7 @@ impl MinerOverlayCache {
         let started = Instant::now();
         let (Some(tip), Some(oldest)) = (blocks.first(), blocks.last()) else {
             let retired: Vec<_> = self.generations.drain(..).map(|g| g.manager).collect();
-            metrics::counter!("bsc_miner_overlay_cache_evictions_total", "reason" => "empty_snapshot")
+            metrics::counter!("bsc_miner_overlay_cache_evictions_total", "scope" => self.scope, "reason" => "empty_snapshot")
                 .increment(retired.len() as u64);
             self.record("empty", started, 0);
             return (new_manager(), retired);
@@ -114,7 +123,7 @@ impl MinerOverlayCache {
         } else {
             "chain_miss"
         };
-        metrics::counter!("bsc_miner_overlay_cache_generations_total", "reason" => reason)
+        metrics::counter!("bsc_miner_overlay_cache_generations_total", "scope" => self.scope, "reason" => reason)
             .increment(1);
         self.generations.push_front(Generation {
             manager: manager.clone(),
@@ -123,7 +132,7 @@ impl MinerOverlayCache {
             views: HashSet::from([key]),
         });
         let retired = if self.generations.len() > MAX_GENERATIONS {
-            metrics::counter!("bsc_miner_overlay_cache_evictions_total", "reason" => "capacity")
+            metrics::counter!("bsc_miner_overlay_cache_evictions_total", "scope" => self.scope, "reason" => "capacity")
                 .increment(1);
             vec![self.generations.pop_back().expect("over capacity").manager]
         } else {
@@ -137,17 +146,19 @@ impl MinerOverlayCache {
         // Selections are manager reuse, NOT flattened-overlay hits. Views bound admissions;
         // block references may overlap across generations, and neither gauge measures bytes
         // or references held by in-flight tasks after eviction. No parent hashes as labels.
-        metrics::counter!("bsc_miner_overlay_cache_selections_total", "result" => result)
+        metrics::counter!("bsc_miner_overlay_cache_selections_total", "scope" => self.scope, "result" => result)
             .increment(1);
-        metrics::gauge!("bsc_miner_overlay_cache_generations").set(self.generations.len() as f64);
-        metrics::gauge!("bsc_miner_overlay_cache_views")
+        metrics::gauge!("bsc_miner_overlay_cache_generations", "scope" => self.scope)
+            .set(self.generations.len() as f64);
+        metrics::gauge!("bsc_miner_overlay_cache_views", "scope" => self.scope)
             .set(self.generations.iter().map(|g| g.views.len()).sum::<usize>() as f64);
-        metrics::gauge!("bsc_miner_overlay_cache_block_references")
+        metrics::gauge!("bsc_miner_overlay_cache_block_references", "scope" => self.scope)
             .set(self.generations.iter().map(|g| g.blocks).sum::<usize>() as f64);
-        metrics::histogram!("bsc_miner_overlay_cache_inserted_blocks").record(inserted as f64);
+        metrics::histogram!("bsc_miner_overlay_cache_inserted_blocks", "scope" => self.scope)
+            .record(inserted as f64);
         // Includes the caller's cache lock hold work, but not time acquiring that lock,
         // proof computation, waiting for a flattened overlay, or asynchronous retirement.
-        metrics::histogram!("bsc_miner_overlay_cache_selection_seconds")
+        metrics::histogram!("bsc_miner_overlay_cache_selection_seconds", "scope" => self.scope)
             .record(started.elapsed().as_secs_f64());
     }
 }
@@ -276,6 +287,20 @@ mod tests {
             Arc::new(BlockExecutionOutput { state, result: Default::default() }),
             SortedTrieData::new(Arc::new(hashed.into_sorted()), Default::default()),
         );
+        let mut retained_private = MinerOverlayCache::default();
+        let creations = std::cell::Cell::new(0);
+        let (retained, _) = retained_private.for_parent(std::slice::from_ref(&parent), || {
+            creations.set(creations.get() + 1);
+            OverlayManager::default()
+        });
+        let retained_first = retained.overlay_builder(parent.recovered_block().hash());
+        let retained_reads = OverlayStateProviderFactory::new(factory.clone(), retained_first)
+            .database_provider_ro()
+            .unwrap();
+        assert_eq!(
+            retained_reads.storage(address, B256::from(slot)).unwrap(),
+            Some(U256::from(77))
+        );
         let private_manager = OverlayManager::default();
         let private = private_manager.overlay_builder(genesis).with_appended_block(parent.clone());
         let managed = OverlayManager::default();
@@ -339,6 +364,21 @@ mod tests {
             Arc::new(BlockExecutionOutput { state: second_state, result: Default::default() }),
             SortedTrieData::new(Arc::new(second_hashed.clone().into_sorted()), Default::default()),
         );
+        let (retained, _) = retained_private.for_parent(&[second.clone(), parent.clone()], || {
+            creations.set(creations.get() + 1);
+            OverlayManager::default()
+        });
+        assert_eq!(creations.get(), 1);
+        let retained_second = retained.overlay_builder(second.recovered_block().hash());
+        let retained_reads =
+            OverlayStateProviderFactory::new(factory.clone(), retained_second.clone())
+                .database_provider_ro()
+                .unwrap();
+        assert_eq!(retained_reads.basic_account(&address).unwrap().unwrap().nonce, 5);
+        assert_eq!(
+            retained_reads.storage(address, B256::from(slot)).unwrap(),
+            Some(U256::from(88))
+        );
         let private_second = private.with_appended_block(second.clone());
         managed.insert_block(second.clone());
         let managed_second = managed.overlay_builder(second.recovered_block().hash());
@@ -347,6 +387,17 @@ mod tests {
             .unwrap();
         assert_eq!(reads.basic_account(&address).unwrap().unwrap().nonce, 5);
         assert_eq!(reads.storage(address, B256::from(slot)).unwrap(), Some(U256::from(88)));
+        let retained_root = retained_second
+            .build_state_trie_overlay_at_frontiers(&db, anchor, anchor, true)
+            .unwrap();
+        assert_eq!(
+            root(&retained_root),
+            root(
+                &private_second
+                    .build_state_trie_overlay_at_frontiers(&db, anchor, anchor, true)
+                    .unwrap()
+            )
+        );
         let private_root = private_second
             .build_state_trie_overlay_at_frontiers(&db, anchor, anchor, true)
             .unwrap();

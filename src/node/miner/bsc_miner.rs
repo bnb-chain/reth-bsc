@@ -421,19 +421,7 @@ where
             reth::providers::Chain<<Provider as reth_provider::NodePrimitivesProvider>::Primitives>,
         >,
     ) {
-        // Build pre-cache from execution outcome
-        let mut cached = reth_revm::cached::CachedReads::default();
-        let new_execution_outcome = committed.execution_outcome();
-
-        for (addr, acc) in new_execution_outcome.bundle_accounts_iter() {
-            if let Some(info) = acc.info.clone() {
-                // Pre-cache existing accounts and their storage
-                // This only includes changed accounts and storage but is better than nothing
-                let storage =
-                    acc.storage.iter().map(|(key, slot)| (*key, slot.present_value)).collect();
-                cached.insert_account(addr, info, storage);
-            }
-        }
+        let cached = super::parent_state::cached_reads(&committed.execution_outcome().bundle);
 
         self.pre_cached = Some(PrecachedState { block: committed.tip().hash(), cached });
     }

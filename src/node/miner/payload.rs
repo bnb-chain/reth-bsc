@@ -2732,7 +2732,9 @@ where
                 let args = BscBuildArguments {
                     pipeline_context: private_context.clone(),
                     pipeline_parent: Some(ancestry.clone()),
-                    cached_reads: CachedReads::default(),
+                    cached_reads: super::parent_state::cached_reads(
+                        &ancestry.parent().execution_output.state,
+                    ),
                     milli_remainder: context.block_timestamp_ms % 1000,
                     config: PayloadConfig::new(
                         Arc::new(parent_header),
