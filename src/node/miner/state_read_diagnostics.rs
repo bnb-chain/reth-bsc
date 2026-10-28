@@ -160,7 +160,7 @@ impl<DB: DatabaseRef> ObservedProvider<DB> {
 impl<DB: DatabaseRef> DatabaseRef for ObservedProvider<DB> {
     type Error = DB::Error;
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        if let Some(account) = self.shared_prewarmed(0, |s| s.account(address)) {
+        if let Some(account) = self.shared_prewarmed(0, |s| s.miner_account(address)) {
             return Ok(account);
         }
         let value = self.read(0, |db| db.basic_ref(address))?;
@@ -170,7 +170,7 @@ impl<DB: DatabaseRef> DatabaseRef for ObservedProvider<DB> {
         Ok(value)
     }
     fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
-        if let Some(value) = self.shared_prewarmed(1, |s| s.storage(address, index)) {
+        if let Some(value) = self.shared_prewarmed(1, |s| s.miner_storage(address, index)) {
             return Ok(value);
         }
         let value = self.read(1, |db| db.storage_ref(address, index))?;
@@ -180,7 +180,7 @@ impl<DB: DatabaseRef> DatabaseRef for ObservedProvider<DB> {
         Ok(value)
     }
     fn code_by_hash_ref(&self, hash: B256) -> Result<Bytecode, Self::Error> {
-        if let Some(code) = self.shared_prewarmed(2, |s| s.code(hash)) {
+        if let Some(code) = self.shared_prewarmed(2, |s| s.miner_code(hash)) {
             return Ok(code);
         }
         let value = self.read(2, |db| db.code_by_hash_ref(hash))?;

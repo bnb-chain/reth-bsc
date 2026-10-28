@@ -835,7 +835,7 @@ where
             block_env: builder.evm_mut().block().clone(),
         };
         let prewarm = super::prewarm::start(
-            prewarm_cache,
+            prewarm_cache.clone(),
             self.pool.clone(),
             parent_state.clone(),
             self.evm_config.clone(),
@@ -850,6 +850,9 @@ where
         // Everything before `exec_start` is treated as "prepare" time for this payload attempt.
         let prepare_duration = exec_start.duration_since(build_start);
         read_phase.selection();
+        if let Some(cache) = &prewarm_cache {
+            cache.execution_started();
+        }
         work.execution_started(exec_start);
         loop {
             work.selection_stage(SelectionStage::Control);
@@ -1159,6 +1162,9 @@ where
             if let Some(sidecar) = blob_tx_sidecar {
                 sidecars_map.insert(*tx.hash(), sidecar);
             }
+        }
+        if let Some(cache) = &prewarm_cache {
+            cache.execution_finished();
         }
         drop(prewarm);
         work.selection_stage(SelectionStage::Control);

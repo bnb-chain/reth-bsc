@@ -1,0 +1,74 @@
+预热与缺页诊断：补充监控，供本地 review
+分支 codex/perf-task-diagnostics，基于4b7889c补充监控。
+本次只补观测，不调整线程数、停止预热策略、缓存上限、MDBX或内核设置。
+
+优先判断的方向
+1. 预热交付：正式执行是否真正用到预热线程提前读取的值、首次使用距离交付多久。
+2. 结束时机：正式交易循环结束后，哪些预热任务仍在工作、多久才退出。
+3. 线程分配：排队、候选迭代器锁、provider打开，还是CPU/运行队列在等待。
+4. 读取/页缓存：首次读取，还是页被回收后再读；先区分这一点再决定是否改缓存大小。
+这些观测可以筛选方向，不能仅凭相关性证明缺页造成多少root_wait。
+
+miner新增指标（Prometheus前缀 reth_bsc_miner_prewarm_）
+job_queue_seconds{stage=setup|execution}：任务入队至开始运行。
+job_wall_seconds{stage}：任务开始至退出；setup包括创建/首次读取候选迭代器和分发工作。
+guard_stop_to_exit_seconds{stage}：正式构建释放预热guard至任务退出。
+  只记录退出前已观察到guard释放时间的任务；不代表deadline首次触发或外部cancel的精确延迟。
+iterator_setup_seconds：候选迭代器创建至首次next返回，空池也计入。
+iterator_lock_wait_seconds：每个worker一生累计等待候选迭代器锁的时间，每worker一个样本。
+  不含iterator.next本身耗时，不能与job_wall相加。
+provider_open_seconds：成功打开parent provider所用时间；失败仍由既有workers_total统计。
+candidates_total{result=selected|parent_consumed|miner_consumed|tip_filtered}：worker选择/跳过原因。
+transactions_by_completion_phase_total{phase=prepare|execution|finish,result=completed|error}：
+  按EVM调用返回时的正式构建阶段计数；不是按阶段切割整笔预热耗时。
+  finish也覆盖guard在错误/取消路径释放之后，不等同成功出块；未进入/未返回EVM的显式touch不计入此指标。
+cache_admissions_total{producer=prewarm|miner,resource=account|storage|code,result=admitted|duplicate|limit}：
+  识别填充来源、provider读返回后被其他线程抢先填充、达到计数/代码字节上限的拒绝。
+  duplicate不是重复交易计数，limit不是LRU淘汰。共享缓存仍会由正式执行回填。
+cache_entries、cache_code_bytes：cache销毁时记录的最终占用直方图，非实时gauge。
+  entries不是内存字节数，code_bytes不包含map和allocator开销。
+
+抽样交付指标
+handoff_samples_total{resource,result=used|unobserved}：只对预热线程成功首次填充的抽样条目统计。
+handoff_uses_total{resource,phase}及handoff_age_nanoseconds_total{resource,phase}：
+  首次被正式执行读到时的数量及交付至使用的总纳秒数；相除再除1e9得到加权平均秒数。
+handoff_max_age_seconds{resource,phase}：每个cache各资源/阶段的最大首次使用年龄直方图。
+  它的分位数是“每cache最大值”的分位数，不是全部命中读取的分位数。
+确定性键抽样：account地址尾字节为0；storage地址尾字节异或slot低字节为0；code hash尾字节为0。
+每个分片最多32条元数据，共最多512条，达到后只停止诊断采样，不停止值入缓存。
+它不是随机交易抽样：地址/slot分布及每分片先到先得会产生偏差，少量代码hash可能没有样本。
+worker自身命中不算正式使用，miner先填充的值不会冒充预热交付，重复正式命中只统计首次。
+unobserved只能说明该条目在cache存活期内未从这个共享层被正式读取，不能直接叫无效预热：
+它可能通过系统页缓存、正式执行其他缓存层带来收益。生命周期结束后批量输出，时间序列存在延迟。
+无地址、slot、交易hash、块hash等动态标签；在既有cache锁中维护小计，不增加新的全局读写锁。
+时钟读取限于worker任务/候选锁等待与抽样条目，正式读取不逐次调用指标后端。
+缓存最终释放时最多处理512条诊断元数据，并批量输出固定维度指标；并非零开销。
+
+常驻 reth-resource-collector 补充
+/proc/vmstat保留workingset_*，兼容旧内核无_file/_anon后缀的refault/activate/nodereclaim。
+线程schedstat保留runtime_ns/runqueue_wait_ns/timeslices增量及sched_matched_threads覆盖率。
+Linux截断的miner-pipeline-*归到独立miner_pipeline总组，无法再从comm区分其中proof/执行子组。
+每分钟额外保留现有miner分层state_read、transaction_stage、预热及sync caching占用/命中计数。
+启动时记录sched_schedstats和vm dirty/swappiness/vfs_cache_pressure，只读，不自动修改。
+内核未提供或关闭schedstat时不可把零wait当作没有调度争用。refault是主机级，不能直接归因MDBX。
+缺页地址、具体文件/偏移和单次缺页阻塞时间仍需必要时另做短时采样，本次没有加常驻perf。
+5秒系统采样、60秒metrics、1%单核CPU配额、Nice10及128MiB日志上限保持不变。
+更多metrics会缩短固定容量日志的保留时间，按实际日志速度评估，不能假定保留天数。
+
+验证
+Rust库测试876通过、1忽略，4个需本地监听权限的既有gRPC测试过滤；Clippy -D warnings通过。
+增加两项测试验证预热/正式来源区分、首次使用阶段、worker命中不冒充收益、采样封顶不影响值。
+原有预热测试覆盖正式执行gas/receipt/error/state不变、取消、并发及私有父状态。
+采集器5项测试通过：包含refault字段、schedstat缺失/线程重用、缓存gauge过滤、日志轮转及敏感信息排除。
+.55最终版5样本探测无错误，CPU约0.503%单核，峰值RSS29.73MiB；探测不受服务CPU配额限制。
+常驻受限额影响的实际墙钟开销另行记录；没有node侧新埋点的线上开销或性能收益数据。
+本次提交监控源码与说明；未编译部署validator、未重启node、未发压。
+独立监控程序的部署及PID/哈希记录在工作区performance/monitoring/2026-10-28-resident-resources/。
+
+线上采集器复核
+三台新版服务active/running，PID .55=16887、.175=9712、.42=11894，源SHA256=75402fd448664f71a1cf498fe735ded817749c1e8d7094d3571d32bb960d01ae。
+系统refault字段已读到；三台sched_schedstats=0，暂不能依赖runqueue_wait_ns判断有无争用，未开启该内核设置。
+约110秒同进程观测CPU0.426%/0.491%/0.497%单核，峰值RSS32.80/38.98/38.91MiB，无采样错误。
+受1%单核CPU限额影响，最大采样墙钟5.3～6.0秒，所有速率按真实间隔计算。
+原node PID .55=23831、.175=19618、.42=24507，更新独立采集服务前后相同。
+最终源码额外运行11项预热专项测试全部通过（含guard释放阶段标记）。

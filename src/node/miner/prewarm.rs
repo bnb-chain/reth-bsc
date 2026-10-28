@@ -18,9 +18,14 @@ use reth_transaction_pool::{
     BestTransactions, BestTransactionsAttributes, PoolTransaction, TransactionPool,
 };
 use revm::{bytecode::Bytecode, state::AccountInfo, Database, DatabaseCommit, DatabaseRef};
-use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc, OnceLock,
+use std::{
+    cell::Cell,
+    collections::hash_map::Entry,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, OnceLock,
+    },
+    time::{Duration, Instant},
 };
 
 const SHARDS: usize = 16;
@@ -38,6 +43,7 @@ pub(crate) struct SharedStateCache {
     entries: AtomicUsize,
     code_bytes: AtomicUsize,
     selected: RwLock<AddressMap<u64>>,
+    phase: AtomicUsize,
 }
 
 #[derive(Debug, Default)]
@@ -45,6 +51,53 @@ struct Shard {
     accounts: AddressMap<Option<AccountInfo>>,
     storage: HashMap<(Address, U256), U256>,
     code: B256Map<Bytecode>,
+    // Only sampled keys have metadata. Bounded separately from the value admission budget.
+    samples: HashMap<SampleKey, WarmSample>,
+    admissions: [[[u64; 3]; 3]; 2], // producer(prewarm/miner), resource, admitted/duplicate/limit
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SampleKey {
+    Account(Address),
+    Storage(Address, U256),
+    Code(B256),
+}
+impl SampleKey {
+    fn sampled(self) -> bool {
+        match self {
+            Self::Account(address) => address[19] == 0,
+            Self::Storage(address, slot) => address[19] ^ slot.as_limbs()[0] as u8 == 0,
+            Self::Code(hash) => hash[31] == 0,
+        }
+    }
+    const fn resource_index(self) -> usize {
+        match self {
+            Self::Account(_) => 0,
+            Self::Storage(..) => 1,
+            Self::Code(_) => 2,
+        }
+    }
+}
+#[derive(Debug)]
+struct WarmSample {
+    admitted: Instant,
+    first_use: OnceLock<(Duration, &'static str)>,
+}
+impl Shard {
+    fn admitted(&mut self, producer: usize, resource: usize, key: SampleKey) {
+        self.admissions[producer][resource][0] += 1;
+        if producer == 0 && key.sampled() && self.samples.len() < 32 {
+            self.samples
+                .insert(key, WarmSample { admitted: Instant::now(), first_use: OnceLock::new() });
+        }
+    }
+    fn used(&self, key: SampleKey, phase: &'static str) {
+        if key.sampled() {
+            if let Some(sample) = self.samples.get(&key) {
+                sample.first_use.get_or_init(|| (sample.admitted.elapsed(), phase));
+            }
+        }
+    }
 }
 
 impl SharedStateCache {
@@ -55,11 +108,47 @@ impl SharedStateCache {
             entries: AtomicUsize::new(0),
             code_bytes: AtomicUsize::new(0),
             selected: Default::default(),
+            phase: AtomicUsize::new(0),
         })
     }
 
     pub(crate) const fn parent(&self) -> B256 {
         self.parent
+    }
+
+    pub(crate) fn execution_started(&self) {
+        self.phase.store(1, Ordering::Relaxed);
+    }
+    pub(crate) fn execution_finished(&self) {
+        self.phase.store(2, Ordering::Relaxed);
+    }
+    fn phase(&self) -> &'static str {
+        ["prepare", "execution", "finish"][self.phase.load(Ordering::Relaxed)]
+    }
+
+    pub(crate) fn miner_account(&self, address: Address) -> Option<Option<AccountInfo>> {
+        let shard = self.shards[address[0] as usize % SHARDS].read();
+        let value = shard.accounts.get(&address).cloned();
+        if value.is_some() {
+            shard.used(SampleKey::Account(address), self.phase());
+        }
+        value
+    }
+    pub(crate) fn miner_storage(&self, address: Address, slot: U256) -> Option<U256> {
+        let shard = self.shards[address[0] as usize % SHARDS].read();
+        let value = shard.storage.get(&(address, slot)).copied();
+        if value.is_some() {
+            shard.used(SampleKey::Storage(address, slot), self.phase());
+        }
+        value
+    }
+    pub(crate) fn miner_code(&self, hash: B256) -> Option<Bytecode> {
+        let shard = self.shards[hash[0] as usize % SHARDS].read();
+        let value = shard.code.get(&hash).cloned();
+        if value.is_some() {
+            shard.used(SampleKey::Code(hash), self.phase());
+        }
+        value
     }
 
     fn mark_selected(&self, sender: Address, nonce: u64) {
@@ -92,33 +181,138 @@ impl SharedStateCache {
     }
 
     pub(crate) fn insert_account(&self, address: Address, value: Option<AccountInfo>) {
+        self.insert_account_from(address, value, 1);
+    }
+    fn insert_account_from(&self, address: Address, value: Option<AccountInfo>, producer: usize) {
         let mut shard = self.shards[address[0] as usize % SHARDS].write();
-        if !shard.accounts.contains_key(&address) && self.reserve_entry() {
-            shard.accounts.insert(address, value);
+        let outcome = match shard.accounts.entry(address) {
+            Entry::Occupied(_) => 1,
+            Entry::Vacant(entry) => {
+                if self.reserve_entry() {
+                    entry.insert(value);
+                    0
+                } else {
+                    2
+                }
+            }
+        };
+        if outcome == 0 {
+            shard.admitted(producer, 0, SampleKey::Account(address));
+        } else {
+            shard.admissions[producer][0][outcome] += 1;
         }
     }
-
     pub(crate) fn insert_storage(&self, address: Address, slot: U256, value: U256) {
+        self.insert_storage_from(address, slot, value, 1);
+    }
+    fn insert_storage_from(&self, address: Address, slot: U256, value: U256, producer: usize) {
         let mut shard = self.shards[address[0] as usize % SHARDS].write();
-        if !shard.storage.contains_key(&(address, slot)) && self.reserve_entry() {
-            shard.storage.insert((address, slot), value);
+        let outcome = match shard.storage.entry((address, slot)) {
+            Entry::Occupied(_) => 1,
+            Entry::Vacant(entry) => {
+                if self.reserve_entry() {
+                    entry.insert(value);
+                    0
+                } else {
+                    2
+                }
+            }
+        };
+        if outcome == 0 {
+            shard.admitted(producer, 1, SampleKey::Storage(address, slot));
+        } else {
+            shard.admissions[producer][1][outcome] += 1;
         }
     }
-
     pub(crate) fn insert_code(&self, hash: B256, value: Bytecode) {
+        self.insert_code_from(hash, value, 1);
+    }
+    fn insert_code_from(&self, hash: B256, value: Bytecode, producer: usize) {
         let mut shard = self.shards[hash[0] as usize % SHARDS].write();
         if shard.code.contains_key(&hash) {
+            shard.admissions[producer][2][1] += 1;
             return
         }
         let bytes = value.original_bytes().len();
         if !reserve(&self.code_bytes, bytes, MAX_CODE_BYTES) {
+            shard.admissions[producer][2][2] += 1;
             return
         }
         if self.reserve_entry() {
             shard.code.insert(hash, value);
+            shard.admitted(producer, 2, SampleKey::Code(hash));
         } else {
             self.code_bytes.fetch_sub(bytes, Ordering::Relaxed);
+            shard.admissions[producer][2][2] += 1;
         }
+    }
+}
+
+impl Drop for SharedStateCache {
+    fn drop(&mut self) {
+        // Arc has no remaining users: export in batches without any per-read metric update
+        // or additional cache lock. Cache lifetime can extend beyond the miner's finish.
+        let mut admissions = [[[0u64; 3]; 3]; 2];
+        let mut samples = [[0u64; 2]; 3];
+        let mut ages = [[(0u64, 0u64, 0.0f64); 3]; 3];
+        for shard in &mut self.shards {
+            let shard = shard.get_mut();
+            for (p, resources) in shard.admissions.iter().enumerate() {
+                for (r, outcomes) in resources.iter().enumerate() {
+                    for (o, n) in outcomes.iter().enumerate() {
+                        admissions[p][r][o] += n;
+                    }
+                }
+            }
+            for (key, sample) in &shard.samples {
+                let resource = key.resource_index();
+                if let Some((age, phase)) = sample.first_use.get() {
+                    samples[resource][0] += 1;
+                    let phase = match *phase {
+                        "prepare" => 0,
+                        "execution" => 1,
+                        _ => 2,
+                    };
+                    let stats = &mut ages[resource][phase];
+                    stats.0 += 1;
+                    stats.1 =
+                        stats.1.saturating_add(u64::try_from(age.as_nanos()).unwrap_or(u64::MAX));
+                    stats.2 = stats.2.max(age.as_secs_f64());
+                } else {
+                    samples[resource][1] += 1;
+                }
+            }
+        }
+        for (r, outcomes) in samples.iter().enumerate() {
+            let resource = ["account", "storage", "code"][r];
+            for (o, count) in outcomes.iter().enumerate() {
+                if *count > 0 {
+                    metrics::counter!("bsc.miner_prewarm.handoff_samples_total", "resource" => resource, "result" => ["used", "unobserved"][o]).increment(*count);
+                }
+            }
+            for (p, (count, sum, max)) in ages[r].iter().enumerate() {
+                if *count > 0 {
+                    let phase = ["prepare", "execution", "finish"][p];
+                    metrics::counter!("bsc.miner_prewarm.handoff_uses_total", "resource" => resource, "phase" => phase).increment(*count);
+                    metrics::counter!("bsc.miner_prewarm.handoff_age_nanoseconds_total", "resource" => resource, "phase" => phase).increment(*sum);
+                    metrics::histogram!("bsc.miner_prewarm.handoff_max_age_seconds", "resource" => resource, "phase" => phase).record(*max);
+                }
+            }
+        }
+
+        for (p, resources) in admissions.iter().enumerate() {
+            for (r, outcomes) in resources.iter().enumerate() {
+                for (o, n) in outcomes.iter().enumerate() {
+                    if *n > 0 {
+                        metrics::counter!("bsc.miner_prewarm.cache_admissions_total", "producer" => ["prewarm", "miner"][p], "resource" => ["account", "storage", "code"][r], "result" => ["admitted", "duplicate", "limit"][o]).increment(*n);
+                    }
+                }
+            }
+        }
+        metrics::histogram!("bsc.miner_prewarm.cache_entries")
+            .record(*self.entries.get_mut() as f64);
+        metrics::histogram!("bsc.miner_prewarm.cache_code_bytes")
+            .record(*self.code_bytes.get_mut() as f64);
     }
 }
 
@@ -145,7 +339,7 @@ impl<DB: DatabaseRef> DatabaseRef for SharedStateDb<DB> {
             return Ok(value)
         }
         let value = self.inner.basic_ref(address)?;
-        self.cache.insert_account(address, value.clone());
+        self.cache.insert_account_from(address, value.clone(), 0);
         Ok(value)
     }
     fn storage_ref(&self, address: Address, slot: U256) -> Result<U256, Self::Error> {
@@ -153,7 +347,7 @@ impl<DB: DatabaseRef> DatabaseRef for SharedStateDb<DB> {
             return Ok(value)
         }
         let value = self.inner.storage_ref(address, slot)?;
-        self.cache.insert_storage(address, slot, value);
+        self.cache.insert_storage_from(address, slot, value, 0);
         Ok(value)
     }
     fn code_by_hash_ref(&self, hash: B256) -> Result<Bytecode, Self::Error> {
@@ -161,7 +355,7 @@ impl<DB: DatabaseRef> DatabaseRef for SharedStateDb<DB> {
             return Ok(value)
         }
         let value = self.inner.code_by_hash_ref(hash)?;
-        self.cache.insert_code(hash, value.clone());
+        self.cache.insert_code_from(hash, value.clone(), 0);
         Ok(value)
     }
     fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
@@ -178,7 +372,7 @@ pub(crate) fn cache_for_attempt(parent: B256) -> Option<Arc<SharedStateCache>> {
 }
 
 /// Dropping an attempt stops future speculative transactions without joining a slow EVM call.
-pub(crate) struct PrewarmGuard(Arc<AtomicBool>, Arc<SharedStateCache>);
+pub(crate) struct PrewarmGuard(Arc<AtomicBool>, Arc<SharedStateCache>, Arc<OnceLock<Instant>>);
 impl PrewarmGuard {
     pub(crate) fn selected(&self, sender: Address, nonce: u64) {
         self.1.mark_selected(sender, nonce);
@@ -186,7 +380,57 @@ impl PrewarmGuard {
 }
 impl Drop for PrewarmGuard {
     fn drop(&mut self) {
+        self.1.execution_finished();
+        self.2.get_or_init(Instant::now);
         self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+struct JobObservation {
+    started: Instant,
+    stop_requested: Arc<OnceLock<Instant>>,
+    stage: &'static str,
+}
+impl JobObservation {
+    fn start(queued: Instant, stop_requested: Arc<OnceLock<Instant>>, stage: &'static str) -> Self {
+        metrics::histogram!("bsc.miner_prewarm.job_queue_seconds", "stage" => stage)
+            .record(queued.elapsed().as_secs_f64());
+        Self { started: Instant::now(), stop_requested, stage }
+    }
+}
+impl Drop for JobObservation {
+    fn drop(&mut self) {
+        metrics::histogram!("bsc.miner_prewarm.job_wall_seconds", "stage" => self.stage)
+            .record(self.started.elapsed().as_secs_f64());
+        if let Some(stopped) = self.stop_requested.get() {
+            metrics::histogram!("bsc.miner_prewarm.guard_stop_to_exit_seconds", "stage" => self.stage).record(stopped.elapsed().as_secs_f64());
+        }
+    }
+}
+
+#[derive(Default)]
+struct CandidateObservation {
+    selected: Cell<u64>,
+    parent_consumed: Cell<u64>,
+    miner_consumed: Cell<u64>,
+    tip_filtered: Cell<u64>,
+    iterator_wait: Cell<Duration>,
+}
+impl Drop for CandidateObservation {
+    fn drop(&mut self) {
+        for (result, count) in [
+            ("selected", self.selected.get()),
+            ("parent_consumed", self.parent_consumed.get()),
+            ("miner_consumed", self.miner_consumed.get()),
+            ("tip_filtered", self.tip_filtered.get()),
+        ] {
+            if count > 0 {
+                metrics::counter!("bsc.miner_prewarm.candidates_total", "result" => result)
+                    .increment(count);
+            }
+        }
+        metrics::histogram!("bsc.miner_prewarm.iterator_lock_wait_seconds")
+            .record(self.iterator_wait.get().as_secs_f64());
     }
 }
 
@@ -310,18 +554,24 @@ where
     let setup_permit = WorkerPermit(workers);
     metrics::gauge!("bsc.miner_prewarm.active_workers").increment(1.0);
     let stopped = Arc::new(AtomicBool::new(false));
-    let guard = PrewarmGuard(stopped.clone(), cache.clone());
+    let stop_requested = Arc::new(OnceLock::new());
+    let guard = PrewarmGuard(stopped.clone(), cache.clone(), stop_requested.clone());
+    let queued = Instant::now();
     workers.pool.spawn(move || {
         let setup_permit = setup_permit;
+        let _observation = JobObservation::start(queued, stop_requested.clone(), "setup");
         let should_stop = || stopped.load(Ordering::Relaxed) || cancel.is_cancelled() ||
             control.as_ref().is_some_and(|c| c.stop_transactions(std::time::Instant::now()));
         if should_stop() { return }
         // Pool iteration can wait for maintenance. Keep both creation and initial Peek off
         // the miner thread, and recheck cancellation before opening any state provider.
+        let iterator_started = Instant::now();
         let mut best = pool.best_transactions_with_attributes(
             BestTransactionsAttributes::new(base_fee, blob_fee));
         best.skip_blobs();
-        let Some(first) = best.next() else { return };
+        let first = best.next();
+        metrics::histogram!("bsc.miner_prewarm.iterator_setup_seconds").record(iterator_started.elapsed().as_secs_f64());
+        let Some(first) = first else { return };
         if should_stop() { return }
         let candidates = Arc::new(Mutex::new(std::iter::once(first).chain(best)));
         // Transfer capacity from setup to execution jobs in the same independent pool.
@@ -344,11 +594,15 @@ where
                 cancel.clone(),
                 control.clone(),
             );
+            let queued = Instant::now();
+            let stop_requested = stop_requested.clone();
             workers.pool.spawn(move || {
+                let _observation = JobObservation::start(queued, stop_requested, "execution");
                 let _permit = permit;
                 let should_stop = || stopped.load(Ordering::Relaxed) || cancel.is_cancelled() ||
                     control.as_ref().is_some_and(|c| c.stop_transactions(std::time::Instant::now()));
                 if should_stop() { return }
+                let provider_started = Instant::now();
                 let provider = match (parent_state.open)() {
                     Ok(provider) => provider,
                     Err(_) => {
@@ -356,19 +610,34 @@ where
                         return
                     }
                 };
+                metrics::histogram!("bsc.miner_prewarm.provider_open_seconds").record(provider_started.elapsed().as_secs_f64());
                 metrics::counter!("bsc.miner_prewarm.workers_total", "result" => "started").increment(1);
                 let db = SharedStateDb { inner: StateProviderDatabase::new(EvmStateProviderAdapter(provider)), cache };
                 let progress = db.cache.clone();
+                let candidates_observed = CandidateObservation::default();
                 let next = || loop {
                     if should_stop() { return None }
-                    let tx = candidates.lock().next()?;
+                    let waiting = Instant::now();
+                    let mut iterator = candidates.lock();
+                    candidates_observed.iterator_wait.set(candidates_observed.iterator_wait.get() + waiting.elapsed());
+                    let tx = iterator.next();
+                    drop(iterator);
+                    let tx = tx?;
                     // go-bsc periodically forwards its prefetch iterator to the miner's cursor.
                     // Skip consumed sender nonces without changing the actual pool or its ordering.
-                    if parent_state.consumed(tx.sender(), tx.nonce()) ||
-                        progress.already_selected(tx.sender(), tx.nonce()) { continue }
+                    if parent_state.consumed(tx.sender(), tx.nonce()) {
+                        candidates_observed.parent_consumed.set(candidates_observed.parent_consumed.get() + 1);
+                        continue
+                    }
+                    if progress.already_selected(tx.sender(), tx.nonce()) {
+                        candidates_observed.miner_consumed.set(candidates_observed.miner_consumed.get() + 1);
+                        continue
+                    }
                     if super::super::pool::tip::meets_tip_floor(tx.effective_tip_per_gas(base_fee), min_tip) {
+                        candidates_observed.selected.set(candidates_observed.selected.get() + 1);
                         return Some(tx.transaction.clone_into_consensus());
                     }
+                    candidates_observed.tip_filtered.set(candidates_observed.tip_filtered.get() + 1);
                 };
                 let (completed, failed) = warm_transactions(db, config, env, next, should_stop);
                 metrics::counter!("bsc.miner_prewarm.transactions_total", "result" => "completed").increment(completed);
@@ -377,6 +646,22 @@ where
         }
     });
     Some(guard)
+}
+
+struct TransactionObservation {
+    cache: Arc<SharedStateCache>,
+    outcomes: [[u64; 2]; 3],
+}
+impl Drop for TransactionObservation {
+    fn drop(&mut self) {
+        for (phase, outcomes) in self.outcomes.iter().enumerate() {
+            for (outcome, count) in outcomes.iter().enumerate() {
+                if *count > 0 {
+                    metrics::counter!("bsc.miner_prewarm.transactions_by_completion_phase_total", "phase" => ["prepare", "execution", "finish"][phase], "result" => ["completed", "error"][outcome]).increment(*count);
+                }
+            }
+        }
+    }
 }
 
 /// Executes against private journals while caching only the backing parent's reads.
@@ -392,6 +677,7 @@ where
     Config: ConfigureEvm,
     Config::Primitives: reth_primitives_traits::NodePrimitives<SignedTx = TransactionSigned>,
 {
+    let mut observation = TransactionObservation { cache: db.cache.clone(), outcomes: [[0; 2]; 3] };
     let mut state = State::builder().with_database_ref(db).build();
     let mut evm = config.evm_with_env(&mut state, env);
     let (mut completed, mut failed) = (0, 0);
@@ -421,7 +707,10 @@ where
         if should_stop() {
             break
         }
-        match evm.transact(tx) {
+        let result = evm.transact(tx);
+        let phase = observation.cache.phase.load(Ordering::Relaxed);
+        observation.outcomes[phase][usize::from(result.is_err())] += 1;
+        match result {
             Ok(result) => {
                 // Like go-bsc's worker-local StateDB, preserve speculative transitions only in
                 // this worker's private State. Its backing read cache still contains parent
@@ -445,6 +734,56 @@ mod tests {
 
     const SENDER: Address = Address::repeat_byte(0x11);
     const CONTRACT: Address = Address::repeat_byte(0x22);
+
+    #[test]
+    fn sampled_handoff_only_counts_formal_use_of_worker_produced_entries() {
+        let cache = SharedStateCache::new(B256::ZERO);
+        let address = Address::ZERO;
+        cache.insert_account_from(address, None, 0);
+        assert_eq!(cache.account(address), Some(None)); // a worker hit is not a miner use
+        {
+            let shard = cache.shards[0].read();
+            assert!(shard.samples[&SampleKey::Account(address)].first_use.get().is_none());
+        }
+        cache.execution_started();
+        assert_eq!(cache.miner_account(address), Some(None));
+        cache.execution_finished();
+        assert_eq!(cache.miner_account(address), Some(None));
+        let shard = cache.shards[0].read();
+        assert_eq!(
+            shard.samples[&SampleKey::Account(address)].first_use.get().unwrap().1,
+            "execution"
+        );
+        drop(shard);
+        // A miner-produced entry and a later speculative duplicate must not become a warm hit.
+        cache.insert_storage(address, U256::ZERO, U256::from(7));
+        cache.insert_storage_from(address, U256::ZERO, U256::from(9), 0);
+        assert_eq!(cache.miner_storage(address, U256::ZERO), Some(U256::from(7)));
+        let shard = cache.shards[0].read();
+        assert!(!shard.samples.contains_key(&SampleKey::Storage(address, U256::ZERO)));
+        assert_eq!(shard.admissions[0][1][1], 1);
+    }
+
+    #[test]
+    fn sample_metadata_is_bounded_and_finish_use_is_distinct() {
+        let cache = SharedStateCache::new(B256::ZERO);
+        for slot in 0..100u64 {
+            cache.insert_storage_from(Address::ZERO, U256::from(slot * 256), U256::from(slot), 0);
+        }
+        cache.execution_finished();
+        assert_eq!(cache.miner_storage(Address::ZERO, U256::ZERO), Some(U256::ZERO));
+        let shard = cache.shards[0].read();
+        assert_eq!(shard.samples.len(), 32);
+        assert_eq!(shard.storage.len(), 100); // diagnostic cap cannot reject state values
+        assert_eq!(
+            shard.samples[&SampleKey::Storage(Address::ZERO, U256::ZERO)]
+                .first_use
+                .get()
+                .unwrap()
+                .1,
+            "finish"
+        );
+    }
 
     #[derive(Debug, Clone)]
     struct ParentDb {
@@ -864,7 +1203,11 @@ mod tests {
     #[test]
     fn dropping_guard_stops_before_selecting_another_transaction() {
         let stop = Arc::new(AtomicBool::new(false));
-        let guard = PrewarmGuard(stop.clone(), SharedStateCache::new(B256::ZERO));
+        let guard = PrewarmGuard(
+            stop.clone(),
+            SharedStateCache::new(B256::ZERO),
+            Arc::new(OnceLock::new()),
+        );
         drop(guard);
         let (cfg, env) = config_and_env();
         let result = warm_transactions(
