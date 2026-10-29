@@ -96,6 +96,13 @@ pub enum BscBlockValidationError {
     #[error("unexpected system tx")]
     UnexpectedSystemTx,
 
+    /// Error when a mandatory system tx reverts or halts
+    #[error("system tx to {to} failed")]
+    SystemTxFailed {
+        /// The system contract that was called.
+        to: Address,
+    },
+
     /// Error when there are normal tx after system tx
     #[error("unexpected normal tx after system tx")]
     UnexpectedNormalTx,
