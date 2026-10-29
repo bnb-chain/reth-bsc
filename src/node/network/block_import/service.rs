@@ -82,6 +82,11 @@ pub(crate) type IncomingHashes = (NewBlockHashes, PeerId);
 /// Size of the LRU cache for processed blocks.
 const LRU_PROCESSED_BLOCKS_SIZE: u32 = 100;
 
+/// Blocks further than this behind the canonical head are dropped on arrival. Without this
+/// guard, proof workers open read transactions against cold historical trie pages, blocking
+/// until db.read-transaction-timeout (5 min default) is hit.
+const MAX_STALE_BLOCK_DISTANCE: u64 = 64;
+
 /// A service that handles bidirectional block import communication with the network.
 /// It receives new blocks from the network via `from_network` channel and sends back
 /// import outcomes via `to_network` channel.
@@ -801,10 +806,8 @@ where
         crate::node::network::bsc_protocol::registry::record_announcer(block.hash, peer_id);
 
         // Drop blocks that are far behind the canonical head early to avoid wasting
-        // resources on stale blocks from misbehaving or out-of-sync peers. Without this
-        // guard, proof workers open read transactions against cold historical trie pages,
-        // blocking until db.read-transaction-timeout (5 min default) is hit.
-        const MAX_STALE_BLOCK_DISTANCE: u64 = 64;
+        // resources on stale blocks from misbehaving or out-of-sync peers; see
+        // `MAX_STALE_BLOCK_DISTANCE`.
         if let Ok(info) = self.forkchoice_engine.provider.chain_info() {
             let block_number = block.block.0.block.header.number;
             if block_number.saturating_add(MAX_STALE_BLOCK_DISTANCE) < info.best_number {
@@ -877,6 +880,14 @@ where
         self.pending_imports.push(Box::pin(async move { (hash, payload_fut.await) }));
     }
 
+    /// Whether an announced head is more than `MAX_STALE_BLOCK_DISTANCE` behind the canonical head.
+    fn is_stale_announcement(&self, number: u64) -> bool {
+        self.forkchoice_engine
+            .provider
+            .chain_info()
+            .is_ok_and(|info| number.saturating_add(MAX_STALE_BLOCK_DISTANCE) < info.best_number)
+    }
+
     /// Recover announced heads through full payload validation and Parlia fork choice.
     /// Far heads first resolve a bounded intermediate target from the local tip.
     fn on_new_block_hashes(&mut self, hashes: NewBlockHashes, peer_id: PeerId) {
@@ -891,6 +902,19 @@ where
                 continue;
             }
             if self.queued_blocks.contains(&hash_number.hash) {
+                continue;
+            }
+            // Same stale-head guard as `on_new_block`: fork recovery would otherwise
+            // execute on cold historical state (SRC-2598). An announced height is only a
+            // hint, so recovery also binds every fetched block and stops at finality.
+            if self.is_stale_announcement(hash_number.number) {
+                tracing::debug!(
+                    target: "bsc::block_import",
+                    block_hash = %hash_number.hash,
+                    block_number = hash_number.number,
+                    %peer_id,
+                    "Skipping fork recovery: announced head far behind canonical head"
+                );
                 continue;
             }
             if self.failed_heads.is_cooling(&hash_number.hash) {
@@ -1122,7 +1146,6 @@ where
 /// there's no evidence it is ahead, and the worst case is the peer ignores the
 /// hint.
 fn plan_head_announcements(local_head: u64, peers: &[(PeerId, Option<u64>)]) -> Vec<PeerId> {
-    const MAX_STALE_BLOCK_DISTANCE: u64 = 64;
     peers
         .iter()
         .filter_map(|(peer_id, peer_best)| match peer_best {
@@ -2559,6 +2582,30 @@ mod tests {
     #[tokio::test]
     async fn forged_unknown_head_and_duplicates_remain_retryable() {
         assert_forged_announcement_is_retryable(false).await;
+    }
+
+    /// An announced head far behind the tip must not start fork recovery, which would
+    /// execute on cold historical state (SRC-2598). A near-tip head still does.
+    #[tokio::test]
+    async fn stale_announced_head_does_not_start_fork_recovery() {
+        let (mut service, _events, _engine) = direct_service();
+        service
+            .forkchoice_engine
+            .provider
+            .insert(Header { number: 100, ..Default::default() }, U256::from(100));
+
+        for (number, recovers) in [(100 - MAX_STALE_BLOCK_DISTANCE - 1, false), (99, true)] {
+            let hash = B256::random();
+            service.on_new_block_hashes(
+                NewBlockHashes(vec![BlockHashNumber { hash, number }]),
+                PeerId::random(),
+            );
+            assert_eq!(
+                service.recovering_heads.lock().contains(&hash),
+                recovers,
+                "announced head {number}"
+            );
+        }
     }
 
     #[tokio::test]

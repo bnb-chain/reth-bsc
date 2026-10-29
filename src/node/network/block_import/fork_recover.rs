@@ -92,6 +92,9 @@ pub enum ForkRecoverError {
         got: B256,
     },
 
+    #[error("fork base {base} is below the finalized block {finalized}")]
+    BelowFinalized { base: u64, finalized: u64 },
+
     #[error("local provider error: {0}")]
     Provider(#[from] reth_provider::ProviderError),
 
@@ -500,57 +503,66 @@ async fn discover_fork_blocks_after<
         // A hop came back: this walk is alive, however deep it still has to go.
         progress.record_progress();
 
-        if validated_ancestor.is_some() {
-            if resp.len() as u64 > count {
-                return Err(ForkRecoverError::FetchFailed(
-                    "oversized recovery range".into(),
-                ));
-            }
-            // Bind every body to the requested hash and its predecessor before
-            // Phase 2 can execute anything. Height alone cannot prove ancestry.
-            for block in &resp {
-                let got = block.header.hash_slow();
-                if block.header.number != cursor_num || got != cursor_hash {
-                    return Err(ForkRecoverError::RecoveryAncestryMismatch {
-                        number: cursor_num,
-                        expected: cursor_hash,
-                        got,
-                    });
-                }
-                cursor_hash = block.header.parent_hash;
-                cursor_num = cursor_num.saturating_sub(1);
-                fork_blocks.push(block.clone());
-            }
-            walked += resp.len() as u64;
-            continue;
+        if resp.len() as u64 > count {
+            return Err(ForkRecoverError::FetchFailed("oversized recovery range".into()));
         }
-
-        // Iterate newest -> oldest (the order we got them in).
+        // Iterate newest -> oldest (the order we got them in), binding every
+        // body to the requested hash and its predecessor before Phase 2 can
+        // execute anything. Height alone cannot prove ancestry: without this a
+        // peer can splice `[child of an old block, old canonical block]` and end
+        // discovery on an ancestor far below the tip (SRC-2598).
+        //
+        // saturating_sub: if we're already at block 0 with no match, the next
+        // pre-hop check fails and `walked >= MAX_FORK_DEPTH` eventually trips
+        // ForkTooDeep rather than panicking on underflow.
         let mut found_ancestor = false;
-        for b in &resp {
-            if provider.block_hash(b.header.number)? == Some(b.header.hash_slow()) {
-                found_ancestor = true;
-                break;
+        for block in &resp {
+            let got = block.header.hash_slow();
+            if block.header.number != cursor_num || got != cursor_hash {
+                return Err(ForkRecoverError::RecoveryAncestryMismatch {
+                    number: cursor_num,
+                    expected: cursor_hash,
+                    got,
+                });
             }
-            // Side-chain already present: skip adding to fork_blocks, but keep walking.
-            if provider.header(b.header.hash_slow())?.is_some() {
-                continue;
+            cursor_hash = block.header.parent_hash;
+            cursor_num = cursor_num.saturating_sub(1);
+            if validated_ancestor.is_none() {
+                if provider.block_hash(block.header.number)? == Some(got) {
+                    found_ancestor = true;
+                    break;
+                }
+                // Side-chain already present: skip adding to fork_blocks, but keep walking.
+                if provider.header(got)?.is_some() {
+                    continue;
+                }
             }
-            fork_blocks.push(b.clone());
+            fork_blocks.push(block.clone());
         }
         if found_ancestor {
             return Ok(Discovery { fork_blocks, outcome: DiscoveryOutcome::AncestorFound });
         }
-
-        // Advance cursor to the block just below the oldest in this response.
-        // saturating_sub: if we're already at block 0 with no match, the next
-        // pre-hop check fails and `walked >= MAX_FORK_DEPTH` eventually trips
-        // ForkTooDeep rather than panicking on underflow.
-        let oldest = resp.last().unwrap();
         walked += resp.len() as u64;
-        cursor_num = oldest.header.number.saturating_sub(1);
-        cursor_hash = oldest.header.parent_hash;
     }
+}
+
+/// Parlia never reorganises a finalized block, so a fork whose base is below it
+/// cannot win. Rejecting it before Phase 2 also keeps `new_payload` from
+/// executing on a parent far below the tip, which opens cold historical state
+/// before the engine checks the header (SRC-2598). `fork_blocks` is newest ->
+/// oldest, as [`Discovery`] returns it.
+fn ensure_fork_above_finalized(
+    fork_blocks: &[crate::BscBlock],
+    finalized: Option<u64>,
+) -> Result<(), ForkRecoverError> {
+    let (Some(oldest), Some(finalized)) = (fork_blocks.last(), finalized) else {
+        return Ok(());
+    };
+    let base = oldest.header.number.saturating_sub(1);
+    if base < finalized {
+        return Err(ForkRecoverError::BelowFinalized { base, finalized });
+    }
+    Ok(())
 }
 
 /// Inputs to [`recover_ancestors`]. The discovery start and FCU target are
@@ -690,6 +702,7 @@ where
         outcome = ?discovery.outcome,
         "Phase 1 complete"
     );
+    ensure_fork_above_finalized(&discovery.fork_blocks, forkchoice_engine.finalized_number()?)?;
 
     // ---- Phase 2: import oldest → newest via new_payload ----
     let mut to_import = discovery.fork_blocks;
@@ -1417,6 +1430,61 @@ mod tests {
         // already holding 97Y as Valid (which is why the side-block exists).
         assert_eq!(nums, vec![99, 98, 96], "97Y skipped because already on side-chain");
         assert_eq!(fetcher.calls().len(), 1);
+    }
+
+    // ---- SRC-2598: the first walk binds every block to the cursor ----
+    #[tokio::test]
+    async fn discover_rejects_spliced_ranges_on_the_first_walk() {
+        let mut provider = FakeProvider::default();
+        let (local, local_hashes) = linear_chain(0, 201, B256::ZERO, 0xC);
+        for h in &local {
+            provider.insert_canonical(h.clone());
+        }
+        // Declares a near-tip height but points at old canonical block 128.
+        let crafted = make_header(10_001, local_hashes[128], 0xD);
+        let crafted_hash = crafted.hash_slow();
+
+        let splices = [
+            // The reported splice: the old parent ends discovery on block 128.
+            vec![make_block(crafted.clone()), make_block(local[128].clone())],
+            // A response that does not start at the requested hash.
+            vec![make_block(local[200].clone())],
+        ];
+        for resp in splices {
+            let fetcher = ScriptedFetcher::new(vec![Ok(resp)]);
+            let err = discover_fork_blocks(
+                fake_peer(),
+                crafted_hash,
+                10_001,
+                &provider,
+                fetcher.as_ref(),
+                &(),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, ForkRecoverError::RecoveryAncestryMismatch { .. }), "{err}");
+        }
+    }
+
+    // ---- SRC-2598: a linked fork below finality never reaches Phase 2 ----
+    #[test]
+    fn fork_base_below_finalized_is_rejected() {
+        // Fork blocks newest -> oldest: [130', 129'] on canonical block 128.
+        let fork = |oldest: u64| {
+            vec![
+                make_block(make_header(oldest + 1, B256::ZERO, 0xD)),
+                make_block(make_header(oldest, B256::ZERO, 0xD)),
+            ]
+        };
+
+        let err = ensure_fork_above_finalized(&fork(129), Some(9_900)).unwrap_err();
+        assert!(
+            matches!(err, ForkRecoverError::BelowFinalized { base: 128, finalized: 9_900 }),
+            "{err}"
+        );
+        ensure_fork_above_finalized(&fork(129), Some(128)).expect("a fork may start at finality");
+        ensure_fork_above_finalized(&fork(129), None).expect("no floor before fast finality");
+        ensure_fork_above_finalized(&[], Some(9_900)).expect("nothing to import");
     }
 
     // ---- RecoverTarget constructor tests ----
