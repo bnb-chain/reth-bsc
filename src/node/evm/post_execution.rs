@@ -480,6 +480,18 @@ where
 
         let result_and_state = self.evm.transact(tx_env.into_tx_env()).map_err(BlockExecutionError::other)?;
         let ResultAndState { result, state } = result_and_state;
+        // go-bsc's `applyMessage` returns the revert/halt as an error, and Finalize propagates it
+        // for every mandatory system tx, invalidating the block. Fail before anything is
+        // committed or reported to the state hook. Slash is the exception: go-bsc only logs its
+        // failure.
+        if !result.is_success() && tx_to != Some(SLASH_CONTRACT) {
+            self.executor_metrics.system_contract_errors_total.increment(1);
+            warn!("system tx failed: {:?}", result);
+            return Err(BscBlockExecutionError::Validation(BscBlockValidationError::SystemTxFailed {
+                to: tx_to.unwrap_or_default(),
+            })
+            .into());
+        }
         let mut temp_state = state.clone();
         temp_state.remove(&SYSTEM_ADDRESS);
         self.system_caller.on_state(StateChangeSource::Transaction(self.receipts.len()), &temp_state);

@@ -966,4 +966,73 @@ mod parent_block_env {
         assert_eq!(gas_used, 21_000);
         assert_eq!(queued, 1, "only the deposit is a system tx");
     }
+
+    type TypedTransaction = reth_ethereum_primitives::Transaction;
+
+    /// Installs `code` at `contract`, queues `call` as the block's system tx, then matches and
+    /// executes it. Returns the result and the receipt count afterwards.
+    fn run_system_tx_against(
+        contract: Address,
+        code: &'static [u8],
+        call: impl FnOnce(&SystemContract<Arc<BscChainSpec>>, Address) -> TypedTransaction,
+    ) -> (Result<(), reth_evm::execute::BlockExecutionError>, usize) {
+        use alloy_evm::block::BlockExecutor;
+        use alloy_primitives::Signature;
+        use reth_ethereum_primitives::TransactionSigned;
+        use reth_primitives_traits::Recovered;
+
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            contract,
+            AccountInfo::default().with_code(Bytecode::new_raw(Bytes::from_static(code))),
+        );
+        let mut executor = executor_over(db);
+        let coinbase = header_at(EPOCH_BLOCK).beneficiary;
+        let system_call = call(&executor.system_contracts, coinbase);
+        let tx = TransactionSigned::new_unhashed(
+            system_call.clone(),
+            Signature::new(Default::default(), Default::default(), false),
+        );
+        executor
+            .execute_transaction(&Recovered::new_unchecked(tx, coinbase))
+            .expect("the block tx is queued");
+
+        let result = executor.transact_system_tx(system_call, coinbase);
+        (result, executor.receipts().len())
+    }
+
+    /// go-bsc's `applyMessage` returns a reverting or halting mandatory system tx as an error,
+    /// which Finalize propagates, so the block is invalid. It must not commit a failed receipt.
+    #[test]
+    fn failing_mandatory_system_tx_invalidates_the_block() {
+        const REVERT: &[u8] = &[0x60, 0x00, 0x60, 0x00, 0xfd]; // PUSH1 0 PUSH1 0 REVERT
+        const HALT: &[u8] = &[0xfe]; // INVALID
+        let deposit = |contracts: &SystemContract<_>, coinbase| {
+            contracts.distribute_to_validator(coinbase, 0)
+        };
+
+        for (name, code) in [("revert", REVERT), ("halt", HALT)] {
+            let (result, receipts) = run_system_tx_against(VALIDATOR_CONTRACT, code, deposit);
+            let err = result.expect_err(name);
+            assert!(err.to_string().contains("system tx to"), "{name}: {err}");
+            assert_eq!(receipts, 0, "{name}: no receipt may be recorded");
+        }
+
+        let (result, receipts) = run_system_tx_against(VALIDATOR_CONTRACT, &[0x00], deposit);
+        result.expect("a succeeding deposit is committed");
+        assert_eq!(receipts, 1);
+    }
+
+    /// go-bsc only logs a failed slash and keeps finalizing, so a reverting slash is not an error.
+    #[test]
+    fn failing_slash_system_tx_does_not_invalidate_the_block() {
+        use crate::system_contracts::SLASH_CONTRACT;
+
+        let (result, _) = run_system_tx_against(
+            SLASH_CONTRACT,
+            &[0x60, 0x00, 0x60, 0x00, 0xfd],
+            |contracts, coinbase| contracts.slash(coinbase),
+        );
+        result.expect("a failed slash is tolerated");
+    }
 }
