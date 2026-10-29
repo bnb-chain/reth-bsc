@@ -43,6 +43,8 @@ pub struct BscBuiltPayload {
         Option<Arc<crate::node::miner::build_diagnostics::CandidateDiagnostics>>,
     /// The built block
     pub(crate) block: Arc<SealedBlock<BscBlock>>,
+    /// Exact sealed identity committed to by an early descendant. Publication must preserve it.
+    pub(crate) pipeline_seal: Option<alloy_primitives::B256>,
     /// The fees of the block
     pub(crate) fees: U256,
     /// The requests of the payload

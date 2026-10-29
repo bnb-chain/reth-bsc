@@ -295,6 +295,7 @@ fn skip_redundant_empty_fallback<T: 'static>(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LocalRebuildPolicyInput {
+    parent_frozen: bool,
     current_payload_fees: U256,
     estimated_new_fees: U256,
     last_build_duration: std::time::Duration,
@@ -355,6 +356,9 @@ fn miner_metrics() -> &'static crate::metrics::BscMinerMetrics {
 }
 
 fn local_rebuild_action(input: LocalRebuildPolicyInput) -> LocalRebuildAction {
+    if input.parent_frozen {
+        return LocalRebuildAction::ReturnBestPayload
+    }
     let finalize_margin = std::time::Duration::from_millis(FINALIZE_MARGIN_MS);
     if input.remaining_duration < input.last_build_duration.saturating_add(finalize_margin) {
         return LocalRebuildAction::ReturnBestPayload;
@@ -1421,6 +1425,7 @@ where
         let pending_turn_length = turn_length_sink.lock().unwrap().take();
 
         let payload = BscBuiltPayload {
+            pipeline_seal: None,
             diagnostics: None,
             block: sealed_block.clone(),
             fees: total_fees,
@@ -1604,6 +1609,7 @@ where
         let pending_turn_length = turn_length_sink.lock().unwrap().take();
 
         let payload = BscBuiltPayload {
+            pipeline_seal: None,
             diagnostics: None,
             block: sealed_block.clone(),
             fees: total_fees,
@@ -1954,6 +1960,10 @@ where
                 args = self.try_build_rx.recv() => {
                     match args {
                         Some(_) => {
+                            if self.has_frozen_pipeline_parent() {
+                                super::pipeline::event("rebuild_suppressed_frozen_parent");
+                                return self.try_return_best_payload()
+                            }
                             if self.retries > 0 {
                                 super::pipeline::selected_parent(None);
                             }
@@ -2325,14 +2335,22 @@ where
             .saturating_mul(U256::from(pool_tx.gas_limit().min(ESTIMATED_FEE_GAS_CAP)))
     }
 
+    fn has_frozen_pipeline_parent(&self) -> bool {
+        self.potential_payloads.iter().any(|payload| payload.pipeline_seal.is_some())
+    }
+
     fn evaluate_local_rebuild_action(
         &self,
         remaining_duration: std::time::Duration,
     ) -> Option<LocalRebuildAction> {
+        if self.has_frozen_pipeline_parent() {
+            super::pipeline::event("rebuild_suppressed_frozen_parent");
+        }
         let last_build_duration = self.last_local_build_duration?;
         let last_build_finished_at = self.last_local_build_finished_at?;
 
         Some(local_rebuild_action(LocalRebuildPolicyInput {
+            parent_frozen: self.has_frozen_pipeline_parent(),
             current_payload_fees: self.current_local_payload_fees,
             estimated_new_fees: self.estimated_new_local_fees,
             last_build_duration,
@@ -2732,8 +2750,11 @@ where
 
     /// Start at most one unpublished child while this job is waiting to publish its parent.
     /// The ordinary canonical builder later adopts it only for the exact finalized parent/env.
-    fn try_start_next_pipeline(&self) {
+    fn try_start_next_pipeline(&mut self) {
         use super::pipeline;
+        if self.has_frozen_pipeline_parent() {
+            return
+        }
         if !pipeline::enabled() || !self.mining_ctx.is_inturn || !crate::shared::is_mining_enabled()
         {
             return;
@@ -2746,7 +2767,16 @@ where
             pipeline::depth_event(1, "start_check_no_lead");
             return
         }
-        let Some(best) = self.potential_payloads.iter().max_by_key(|p| p.fees()) else { return };
+        let Some(best_index) = self
+            .potential_payloads
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, p)| p.fees())
+            .map(|(i, _)| i)
+        else {
+            return
+        };
+        let best = &self.potential_payloads[best_index];
         if best.build_kind == BuildKind::EmptyFallback || best.bid_builder.is_some() {
             return
         }
@@ -2785,6 +2815,7 @@ where
         let parlia = self.parlia.clone();
         let parent_publish_at = self.mining_ctx.end_mining_timestamp_ms;
         let launch_queue = super::perf_tuning::Phase::new("pipeline", true, 1, "launch_queue");
+        let frozen_parent = parent.clone();
         let launched = pipeline::launch(async move {
             launch_queue.complete();
             let _permit = permit;
@@ -2901,7 +2932,7 @@ where
                 observation.finish(built.as_mut().ok(), cancel.is_cancelled());
                 metrics::histogram!("bsc_miner_pipeline_compute_seconds")
                     .record(started.elapsed().as_secs_f64());
-                let payload = match built {
+                let mut payload = match built {
                     Ok(payload) if !cancel.is_cancelled() => payload,
                     _ => {
                         pipeline::failed(id);
@@ -2950,6 +2981,9 @@ where
                             min_gas_tip,
                         };
                         let sender = pipeline::extend(id, key)?;
+                        // Deliver the same sealed parent used by the successor, not its
+                        // unsealed pre-finalization input.
+                        payload = parent;
                         Some((chain, context, attrs, sender))
                     })
                 } else {
@@ -2986,6 +3020,8 @@ where
             pipeline::event("launch_failed");
             return;
         }
+        self.potential_payloads[best_index] = frozen_parent;
+        pipeline::event("parent_frozen");
         pipeline::event("started");
     }
 
@@ -3637,6 +3673,7 @@ fn prepare_pipeline_successor(
     }
     metrics::histogram!("bsc_miner_pipeline_preview_seconds")
         .record(preview_start.elapsed().as_secs_f64());
+    parent.pipeline_seal = Some(parent.block().hash());
     let Ok(attestation) =
         parlia.get_vote_attestation_from_header(parent.block().header(), snap.epoch_num)
     else {
@@ -3756,6 +3793,18 @@ fn finalize_payload_inner(
     epoch_validators: Option<EpochValidators>,
     publish_cache: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(sealed) = payload.pipeline_seal {
+        if sealed != payload.block().hash() ||
+            sealed != payload.executed_block.recovered_block.hash()
+        {
+            return Err(std::io::Error::other("frozen pipeline payload identity changed").into())
+        }
+        if publish_cache {
+            publish_payload_caches(payload, parent_header.hash(), sealed);
+            super::pipeline::event("frozen_parent_published");
+        }
+        return Ok(())
+    }
     let senders = payload.executed_block.recovered_block.senders().to_vec();
     let mut plain_block = payload.executed_block.recovered_block.sealed_block().clone_block();
 
@@ -3794,27 +3843,7 @@ fn finalize_payload_inner(
 
     let final_hash = plain_block.header.hash_slow();
     if publish_cache {
-        if let Some((validators, vote_addresses)) = payload.pending_validators.take() {
-            VALIDATOR_CACHE.lock().unwrap().insert(final_hash, (validators, vote_addresses));
-            tracing::debug!(
-                "Updated validator cache after finalize, block_number: {}, block_hash: {}",
-                plain_block.header.number,
-                final_hash
-            );
-        }
-        if let Some(turn_length) = payload.pending_turn_length.take() {
-            TURN_LENGTH_CACHE.lock().unwrap().insert(final_hash, turn_length);
-            tracing::debug!(
-                "Updated turn length cache after finalize, block_number: {}, block_hash: {}",
-                plain_block.header.number,
-                final_hash
-            );
-        }
-        crate::consensus::payment_lane::meta::inherit_if_untouched(
-            &payload.executed_block.execution_output.state,
-            parent_header.hash(),
-            final_hash,
-        );
+        publish_payload_caches(payload, parent_header.hash(), final_hash);
     }
     // Both payload blocks must carry sidecars with the final sealed hash.
     plain_block.body.sidecars = payload.block.body().sidecars.clone();
@@ -3830,6 +3859,35 @@ fn finalize_payload_inner(
     Ok(())
 }
 
+/// Publish metadata for an already sealed block without modifying its identity.
+fn publish_payload_caches(
+    payload: &mut BscBuiltPayload,
+    parent_hash: alloy_primitives::B256,
+    final_hash: alloy_primitives::B256,
+) {
+    if let Some((validators, vote_addresses)) = payload.pending_validators.take() {
+        VALIDATOR_CACHE.lock().unwrap().insert(final_hash, (validators, vote_addresses));
+        tracing::debug!(
+            "Updated validator cache after finalize, block_number: {}, block_hash: {}",
+            payload.block().number(),
+            final_hash
+        );
+    }
+    if let Some(turn_length) = payload.pending_turn_length.take() {
+        TURN_LENGTH_CACHE.lock().unwrap().insert(final_hash, turn_length);
+        tracing::debug!(
+            "Updated turn length cache after finalize, block_number: {}, block_hash: {}",
+            payload.block().number(),
+            final_hash
+        );
+    }
+    crate::consensus::payment_lane::meta::inherit_if_untouched(
+        &payload.executed_block.execution_output.state,
+        parent_hash,
+        final_hash,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use tokio::sync::oneshot;
@@ -3843,6 +3901,32 @@ mod tests {
             depth_high: 40,
             reserve_max_ms: max_ms,
             reserve_min_ms: min_ms,
+        }
+    }
+
+    #[test]
+    fn frozen_parent_ignores_new_transaction_value_until_publication() {
+        for remaining in [180, 500] {
+            let input = super::LocalRebuildPolicyInput {
+                parent_frozen: false,
+                current_payload_fees: U256::from(1_000_000),
+                estimated_new_fees: U256::from(10_000_000),
+                last_build_duration: Duration::from_millis(100),
+                since_last_build: Duration::from_millis(100),
+                remaining_duration: Duration::from_millis(remaining),
+                final_shot_used: false,
+            };
+            assert!(matches!(
+                super::local_rebuild_action(input),
+                super::LocalRebuildAction::RebuildNow { .. }
+            ));
+            assert_eq!(
+                super::local_rebuild_action(super::LocalRebuildPolicyInput {
+                    parent_frozen: true,
+                    ..input
+                }),
+                super::LocalRebuildAction::ReturnBestPayload
+            );
         }
     }
 
@@ -4131,6 +4215,7 @@ mod tests {
                 }
 
                 match local_rebuild_action(LocalRebuildPolicyInput {
+                    parent_frozen: false,
                     current_payload_fees,
                     estimated_new_fees,
                     last_build_duration: build_duration,
@@ -4154,6 +4239,7 @@ mod tests {
 
             estimated_new_fees = estimated_new_fees.saturating_add(estimated_fees);
             match local_rebuild_action(LocalRebuildPolicyInput {
+                parent_frozen: false,
                 current_payload_fees,
                 estimated_new_fees,
                 last_build_duration: build_duration,
@@ -4176,6 +4262,7 @@ mod tests {
 
         while let Some(deadline_ms) = wait_deadline_ms {
             match local_rebuild_action(LocalRebuildPolicyInput {
+                parent_frozen: false,
                 current_payload_fees,
                 estimated_new_fees,
                 last_build_duration: build_duration,
@@ -4235,6 +4322,7 @@ mod tests {
     #[test]
     fn local_rebuild_policy_skips_when_uplift_is_below_threshold() {
         let action = local_rebuild_action(LocalRebuildPolicyInput {
+            parent_frozen: false,
             current_payload_fees: U256::from(1_000_000_u64),
             estimated_new_fees: U256::from(100_000_u64),
             last_build_duration: Duration::from_millis(100),
@@ -4249,6 +4337,7 @@ mod tests {
     #[test]
     fn local_rebuild_policy_rebuilds_after_cooldown_when_uplift_is_high_enough() {
         let action = local_rebuild_action(LocalRebuildPolicyInput {
+            parent_frozen: false,
             current_payload_fees: U256::from(1_000_000_u64),
             estimated_new_fees: U256::from(200_000_u64),
             last_build_duration: Duration::from_millis(100),
@@ -4263,6 +4352,7 @@ mod tests {
     #[test]
     fn local_rebuild_policy_returns_best_when_remaining_time_cannot_cover_rebuild() {
         let action = local_rebuild_action(LocalRebuildPolicyInput {
+            parent_frozen: false,
             current_payload_fees: U256::from(1_000_000_u64),
             estimated_new_fees: U256::from(500_000_u64),
             last_build_duration: Duration::from_millis(100),
@@ -4277,6 +4367,7 @@ mod tests {
     #[test]
     fn local_rebuild_policy_allows_one_final_shot_in_near_deadline_window() {
         let action = local_rebuild_action(LocalRebuildPolicyInput {
+            parent_frozen: false,
             current_payload_fees: U256::from(1_000_000_u64),
             estimated_new_fees: U256::from(350_000_u64),
             last_build_duration: Duration::from_millis(100),
@@ -4291,6 +4382,7 @@ mod tests {
     #[test]
     fn local_rebuild_policy_does_not_allow_second_final_shot() {
         let action = local_rebuild_action(LocalRebuildPolicyInput {
+            parent_frozen: false,
             current_payload_fees: U256::from(1_000_000_u64),
             estimated_new_fees: U256::from(350_000_u64),
             last_build_duration: Duration::from_millis(100),
@@ -4305,6 +4397,7 @@ mod tests {
     #[test]
     fn local_rebuild_policy_uses_synthetic_baseline_for_empty_payloads() {
         let action = local_rebuild_action(LocalRebuildPolicyInput {
+            parent_frozen: false,
             current_payload_fees: U256::ZERO,
             estimated_new_fees: U256::from(1_000_000_000_000_u64),
             last_build_duration: Duration::from_millis(100),
@@ -4496,6 +4589,7 @@ mod tests {
             let mut executed_block = block.clone();
             executed_block.body.sidecars = None;
             let mut payload = super::BscBuiltPayload {
+                pipeline_seal: None,
                 diagnostics: None,
                 block: Arc::new(block.into()),
                 fees: U256::ZERO,
@@ -4549,6 +4643,48 @@ mod tests {
             assert!(preview.pending_validators.is_some());
             assert_eq!(preview.pending_turn_length, Some(7));
             assert_eq!(preview.executed_block.recovered_block.hash(), preview.block.hash());
+
+            preview.pipeline_seal = Some(preview.block.hash());
+            let sealed_header = preview.block.clone();
+            super::finalize_payload(
+                &mut preview,
+                parlia.clone(),
+                &parent_snap,
+                &parent_header,
+                &snapshot_provider,
+                0,
+                None,
+            )
+            .unwrap();
+            assert!(
+                Arc::ptr_eq(&sealed_header, &preview.block),
+                "publication must not reseal the parent's header"
+            );
+            assert_eq!(preview.executed_block.recovered_block.hash(), sealed_header.hash());
+            assert!(preview.pending_validators.is_none());
+            assert!(preview.pending_turn_length.is_none());
+            assert_eq!(
+                crate::node::evm::pre_execution::TURN_LENGTH_CACHE
+                    .lock()
+                    .unwrap()
+                    .get(&sealed_header.hash())
+                    .copied(),
+                Some(7)
+            );
+            assert!(cache_get(sealed_header.hash()).is_some());
+            let mut changed = preview.clone();
+            changed.pipeline_seal = Some(B256::repeat_byte(99));
+            let err = super::finalize_payload(
+                &mut changed,
+                parlia.clone(),
+                &parent_snap,
+                &parent_header,
+                &snapshot_provider,
+                0,
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(err.to_string(), "frozen pipeline payload identity changed");
 
             super::finalize_payload(
                 &mut payload,
