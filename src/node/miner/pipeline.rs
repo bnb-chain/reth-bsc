@@ -67,6 +67,7 @@ struct Coordinator {
     state: Mutex<State>,
     worker: Arc<Semaphore>,
     next_id: AtomicU64,
+    limit: usize,
 }
 impl Default for Coordinator {
     fn default() -> Self {
@@ -74,6 +75,7 @@ impl Default for Coordinator {
             state: Mutex::default(),
             worker: Arc::new(Semaphore::new(1)),
             next_id: AtomicU64::new(1),
+            limit: depth(),
         }
     }
 }
@@ -150,7 +152,7 @@ impl Coordinator {
         if chain.id != id ||
             chain.cancel.is_cancelled() ||
             !chain.running ||
-            chain.parents.len() >= 2
+            chain.parents.len() > self.limit
         {
             return None
         }
@@ -160,6 +162,13 @@ impl Coordinator {
         chain.ready.push(ready.clone());
         chain.entries.push_back(Entry { key, receiver, depth: chain.parents.len(), ready });
         Some(sender)
+    }
+    fn slot(&self, id: u64, parent: B256) -> Option<(usize, bool)> {
+        let state = self.state.lock();
+        let chain =
+            state.chain.as_ref().filter(|chain| chain.id == id && !chain.cancel.is_cancelled())?;
+        let index = chain.parents.iter().position(|hash| *hash == parent)?;
+        Some((index + 1, index < self.limit))
     }
     fn finished(&self, id: u64) {
         let retired = {
@@ -181,6 +190,15 @@ impl Coordinator {
         let retired = {
             let mut state = self.state.lock();
             state.head = Some(head);
+            // Retain the accepted tip as the first parent, dropping only its ancestors.
+            // Adoption alone does not advance the window: canonical acceptance does.
+            if let Some(chain) = state.chain.as_mut() {
+                if let Some(index) = chain.parents.iter().position(|parent| *parent == head) {
+                    chain.parents.drain(..index);
+                    chain.ready.drain(..index);
+                    chain.base = head;
+                }
+            }
             if state.chain.as_ref().is_some_and(|c| head != c.base && !c.parents.contains(&head)) {
                 state.chain.take()
             } else {
@@ -254,8 +272,10 @@ impl Coordinator {
         }
     }
 }
+// Bounds unpublished state and queued results, not concurrent execution threads.
+pub(crate) const MAX_DEPTH: usize = 8;
 fn parse_depth(value: Option<&str>) -> usize {
-    value.and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).clamp(1, 2)
+    value.and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).clamp(1, MAX_DEPTH)
 }
 pub(crate) fn depth() -> usize {
     static DEPTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -263,6 +283,31 @@ pub(crate) fn depth() -> usize {
 }
 pub(crate) fn extend(id: u64, key: Key) -> Option<oneshot::Sender<BuildResult>> {
     COORDINATOR.extend(id, key)
+}
+/// A successor receiver is registered before its parent is delivered, so a fast
+/// canonical import can adopt it even while the window is full. Only computation
+/// waits for capacity; the extra receiver does not hold another computed block.
+pub(crate) async fn wait_for_slot(id: u64, parent: B256, deadline_ms: u64) -> Option<usize> {
+    let start = std::time::Instant::now();
+    loop {
+        let (depth, available) = COORDINATOR.slot(id, parent)?;
+        if available {
+            metrics::histogram!("bsc.miner_pipeline_window_wait_seconds")
+                .record(start.elapsed().as_secs_f64());
+            metrics::gauge!("bsc.miner_pipeline_window_used").set(depth as f64);
+            return Some(depth)
+        }
+        if super::startup_diagnostics::wall_ms() >= u128::from(deadline_ms) {
+            event("window_wait_expired");
+            return None
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+}
+pub(crate) fn accepted_parent(id: u64) -> Option<B256> {
+    let state = COORDINATOR.state.lock();
+    state.chain.as_ref().filter(|chain| chain.id == id && !chain.cancel.is_cancelled())?;
+    state.head
 }
 pub(crate) struct WorkerCompletion(pub u64);
 impl Drop for WorkerCompletion {
@@ -351,10 +396,15 @@ pub(crate) fn event(outcome: &'static str) {
 pub(crate) fn depth_event(depth: usize, outcome: &'static str) {
     metrics::counter!("bsc.miner_pipeline_depth_total", "depth" => super::perf_tuning::depth_label(depth), "outcome" => outcome).increment(1);
 }
-pub(crate) fn ready(id: u64, depth: usize) {
+pub(crate) fn ready(id: u64, parent: B256) {
     let state = COORDINATOR.state.lock();
     if let Some(chain) = state.chain.as_ref().filter(|chain| chain.id == id) {
-        if let Some(ready) = chain.ready.get(depth.saturating_sub(1)) {
+        if let Some(ready) = chain
+            .parents
+            .iter()
+            .position(|hash| *hash == parent)
+            .and_then(|index| chain.ready.get(index))
+        {
             let _ = ready.set(std::time::Instant::now());
         }
     }
@@ -373,7 +423,7 @@ mod tests {
         }
     }
     fn coordinator() -> Coordinator {
-        let c = Coordinator::default();
+        let c = Coordinator { limit: 2, ..Default::default() };
         c.canonical_head(B256::with_last_byte(1));
         c
     }
@@ -449,13 +499,57 @@ mod tests {
         drop(permit);
     }
     #[test]
+    fn sliding_window_refills_after_acceptance_without_growing_history() {
+        for limit in [1, 2, MAX_DEPTH] {
+            let c = Coordinator { limit, ..Default::default() };
+            c.canonical_head(B256::with_last_byte(1));
+            let (id, cancel, first, _permit) = reserve(&c);
+            let mut senders = VecDeque::from([first]);
+            let mut keys = VecDeque::from([key()]);
+            let mut next = key();
+            for i in 0..limit {
+                next.parent = B256::with_last_byte((3 + i) as u8);
+                next.timestamp_ms += 450;
+                senders.push_back(c.extend(id, next.clone()).unwrap());
+                keys.push_back(next.clone());
+            }
+            assert_eq!(c.slot(id, next.parent), Some((limit + 1, false)));
+            assert!(c.extend(id, next.clone()).is_none());
+            for round in 0..30 {
+                let current = keys.pop_front().unwrap();
+                c.canonical_head(current.parent);
+                let mut adopted = c.take(&current).unwrap();
+                senders.pop_front().unwrap().send(Err("fixture".into())).unwrap();
+                adopted.accept();
+                // Merely adopting does not open the last receiver's compute slot.
+                assert_eq!(c.slot(id, next.parent), Some((limit + 1, false)));
+                c.canonical_head(keys.front().unwrap().parent);
+                assert_eq!(c.slot(id, next.parent), Some((limit, true)));
+                next.parent = B256::with_last_byte((30 + round) as u8);
+                next.timestamp_ms += 450;
+                senders.push_back(c.extend(id, next.clone()).unwrap());
+                keys.push_back(next.clone());
+                let state = c.state.lock();
+                let chain = state.chain.as_ref().unwrap();
+                assert_eq!(chain.parents.len(), limit + 1);
+                assert_eq!(chain.ready.len(), limit + 1);
+                assert_eq!(chain.entries.len(), limit + 1);
+            }
+            c.canonical_head(B256::repeat_byte(99));
+            assert!(cancel.is_cancelled());
+            assert!(c.slot(id, next.parent).is_none());
+            assert!(senders.iter().all(oneshot::Sender::is_closed));
+        }
+    }
+
+    #[test]
     fn depth_configuration_is_bounded_and_defaults_to_one() {
         assert_eq!(parse_depth(None), 1);
         assert_eq!(parse_depth(Some("bad")), 1);
         assert_eq!(parse_depth(Some("0")), 1);
         assert_eq!(parse_depth(Some("1")), 1);
         assert_eq!(parse_depth(Some("2")), 2);
-        assert_eq!(parse_depth(Some("100")), 2);
+        assert_eq!(parse_depth(Some("100")), MAX_DEPTH);
     }
     #[tokio::test]
     async fn two_results_are_adopted_in_order_without_cancelling_the_descendant() {
@@ -465,7 +559,7 @@ mod tests {
         second_key.parent = B256::with_last_byte(3);
         second_key.timestamp_ms += 450;
         let second_sender = c.extend(1, second_key.clone()).unwrap();
-        assert!(c.extend(1, second_key.clone()).is_none(), "bounded at two");
+        // One successor receiver may be queued while the computation window is full.
         assert!(c.take(&second_key).is_none());
         c.selected_parent(Some(key().parent));
         c.canonical_head(key().parent);

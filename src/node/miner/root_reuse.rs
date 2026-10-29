@@ -61,7 +61,7 @@ mod tests {
     use crate::{node::primitives::BscPrimitives, BscBlock};
     use alloy_primitives::{Address, U256};
     use reth_engine_tree::tree::{
-        state_root_strategy::spawn_payload_builder_state_root_with_cache, TreeConfig,
+        state_root_strategy::spawn_payload_builder_state_root_with_cache_wait, TreeConfig,
     };
     use reth_execution_types::BlockExecutionOutput;
     use reth_primitives_traits::RecoveredBlock;
@@ -73,10 +73,38 @@ mod tests {
         state::{Account, AccountInfo, AccountStatus, EvmState, EvmStorageSlot, TransactionId},
         OnStateHook,
     };
-    use std::{
-        sync::Arc,
-        time::{Duration, Instant},
-    };
+    use std::{sync::Arc, time::Duration};
+
+    #[test]
+    fn private_and_import_share_sorted_outputs_but_replaced_sources_do_not() {
+        let mut block = reth_payload_primitives::BuiltPayloadExecutedBlock::<BscPrimitives> {
+            recovered_block: Arc::new(RecoveredBlock::new_unhashed(
+                BscBlock::default(),
+                Vec::new(),
+            )),
+            execution_output: Default::default(),
+            hashed_state: Default::default(),
+            trie_updates: Default::default(),
+            shared_trie_data: None,
+        }
+        .with_shared_trie_data();
+        assert!(block.ready_trie_data().is_none());
+        let import = block.clone();
+        let private = block.sorted_trie_data();
+        let ready = import.ready_trie_data().unwrap();
+        assert!(Arc::ptr_eq(&private.hashed_state, &ready.hashed_state));
+        assert!(Arc::ptr_eq(&private.trie_updates, &ready.trie_updates));
+        block.hashed_state =
+            Arc::new(reth_trie_common::HashedPostState::default().with_accounts([(
+                alloy_primitives::B256::ZERO,
+                Some(reth_primitives_traits::Account { nonce: 17, ..Default::default() }),
+            )]));
+        assert!(block.ready_trie_data().is_none());
+        assert_ne!(block.sorted_trie_data().hashed_state, private.hashed_state);
+        let mut replaced = import;
+        replaced.trie_updates = Arc::new(Default::default());
+        assert!(replaced.ready_trie_data().is_none());
+    }
 
     #[test]
     fn private_chain_tree_handoff_matches_serial_roots_across_slot_updates() {
@@ -92,7 +120,7 @@ mod tests {
         let mut blocks = Vec::new();
         let address = Address::with_last_byte(7);
         let config = TreeConfig::default().with_has_enough_parallelism(true);
-        for number in 1..=3u64 {
+        for number in 1..=12u64 {
             let next = if number == 3 { U256::ZERO } else { U256::from(number * 11) };
             let info = AccountInfo { nonce: number, balance: U256::from(1), ..Default::default() };
             let bundle = BundleState::builder(number..=number)
@@ -109,21 +137,8 @@ mod tests {
             drop(provider);
             let preserved = cache.take(&parent);
             assert_eq!(preserved.is_some(), number > 1);
-            let preserved = preserved.map(|mut pending| {
-                // Only the test waits to force the ready-cache path. Production always falls
-                // back without waiting when the previous task is still finalizing.
-                let deadline = Instant::now() + Duration::from_secs(5);
-                loop {
-                    match pending.try_into_ready() {
-                        Ok(ready) => break ready,
-                        Err(not_ready) => pending = not_ready,
-                    }
-                    assert!(Instant::now() < deadline);
-                    std::thread::yield_now();
-                }
-            });
             let (mut handle, pending) =
-                spawn_payload_builder_state_root_with_cache::<BscPrimitives, _>(
+                spawn_payload_builder_state_root_with_cache_wait::<BscPrimitives, _>(
                     &runtime,
                     factory_for_parent,
                     parent.clone(),
@@ -131,6 +146,8 @@ mod tests {
                     &config,
                     Some(blocks.iter().rev().cloned().collect()),
                     preserved,
+                    "miner-test",
+                    Some(Duration::from_secs(2)),
                     |factory, anchor, roots| {
                         factory.with_skip_overlay_for_reused_sparse_trie(anchor, roots)
                     },

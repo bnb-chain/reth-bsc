@@ -869,6 +869,7 @@ where
         let execution_outcome =
             BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
         let executed_block = BuiltPayloadExecutedBlock {
+            shared_trie_data: None,
             recovered_block: Arc::new(block.clone()),
             execution_output: Arc::new(execution_outcome),
             hashed_state: Arc::new(hashed_state),

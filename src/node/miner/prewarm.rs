@@ -22,7 +22,7 @@ use std::{
     cell::Cell,
     collections::hash_map::Entry,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, OnceLock,
     },
     time::{Duration, Instant},
@@ -364,6 +364,7 @@ impl<DB: DatabaseRef> DatabaseRef for SharedStateDb<DB> {
 }
 
 pub(crate) fn configure(enabled: bool) {
+    let _ = configured_lookahead();
     // Allocate OS threads during node setup, never on the first miner execution path.
     ENABLED.store(
         enabled && (configured_worker_count() == 0 || workers().is_some()),
@@ -375,17 +376,79 @@ pub(crate) fn cache_for_attempt(parent: B256) -> Option<Arc<SharedStateCache>> {
 }
 
 /// Dropping an attempt stops future speculative transactions without joining a slow EVM call.
-pub(crate) struct PrewarmGuard(Arc<AtomicBool>, Arc<SharedStateCache>, Arc<OnceLock<Instant>>);
+pub(crate) struct PrewarmGuard {
+    stopped: Arc<AtomicBool>,
+    cache: Arc<SharedStateCache>,
+    stop_requested: Arc<OnceLock<Instant>>,
+    admission: Arc<Admission>,
+}
 impl PrewarmGuard {
     pub(crate) fn selected(&self, sender: Address, nonce: u64) {
-        self.1.mark_selected(sender, nonce);
+        if self.admission.lookahead != 0 {
+            self.admission.miner_scanned.fetch_add(1, Ordering::Relaxed);
+        }
+        self.cache.mark_selected(sender, nonce);
+    }
+
+    pub(crate) fn remaining_gas(&self, gas: u64) {
+        if self.admission.lookahead != 0 {
+            self.admission.remaining_gas.store(gas, Ordering::Relaxed);
+        }
     }
 }
+
+/// Admission hints only: the miner never waits or changes transaction validity.
+/// Cursor distances are approximate because the two pool iterators can diverge.
+struct Admission {
+    lookahead: usize,
+    miner_scanned: AtomicUsize,
+    remaining_gas: AtomicU64,
+}
+impl Admission {
+    fn new(lookahead: usize, gas: u64) -> Self {
+        Self { lookahead, miner_scanned: AtomicUsize::new(0), remaining_gas: AtomicU64::new(gas) }
+    }
+    fn ahead(&self, scanned: usize) -> bool {
+        self.lookahead != 0 &&
+            scanned.saturating_sub(self.miner_scanned.load(Ordering::Relaxed)) >= self.lookahead
+    }
+    fn fits(&self, gas: u64) -> bool {
+        self.lookahead == 0 || gas <= self.remaining_gas.load(Ordering::Relaxed)
+    }
+}
+
+fn configured_lookahead() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        // Preserve existing admission unless the operator explicitly enables a bound.
+        let value = std::env::var("BSC_MINING_PREWARM_LOOKAHEAD").ok();
+        let limit = match parse_lookahead(value.as_deref()) {
+            Ok(limit) => limit,
+            Err(reason) => {
+                tracing::warn!(target: "bsc::miner", ?value, reason, "Invalid prewarm lookahead; leaving admission unbounded");
+                0
+            }
+        };
+        metrics::gauge!("bsc.miner_prewarm.configured_lookahead").set(limit as f64);
+        limit
+    })
+}
+
+fn parse_lookahead(value: Option<&str>) -> Result<usize, &'static str> {
+    let limit = value
+        .map_or(Ok(0), |value| value.trim().parse::<usize>())
+        .map_err(|_| "expected a nonnegative integer")?;
+    if limit > 1_000_000 {
+        return Err("lookahead exceeds 1000000");
+    }
+    Ok(limit)
+}
+
 impl Drop for PrewarmGuard {
     fn drop(&mut self) {
-        self.1.execution_finished();
-        self.2.get_or_init(Instant::now);
-        self.0.store(true, Ordering::Relaxed);
+        self.cache.execution_finished();
+        self.stop_requested.get_or_init(Instant::now);
+        self.stopped.store(true, Ordering::Relaxed);
     }
 }
 
@@ -418,6 +481,9 @@ struct CandidateObservation {
     miner_consumed: Cell<u64>,
     tip_filtered: Cell<u64>,
     iterator_wait: Cell<Duration>,
+    ahead_wait: Cell<Duration>,
+    gas_filtered: Cell<u64>,
+    max_lead: Cell<usize>,
 }
 impl Drop for CandidateObservation {
     fn drop(&mut self) {
@@ -426,12 +492,16 @@ impl Drop for CandidateObservation {
             ("parent_consumed", self.parent_consumed.get()),
             ("miner_consumed", self.miner_consumed.get()),
             ("tip_filtered", self.tip_filtered.get()),
+            ("gas_filtered", self.gas_filtered.get()),
         ] {
             if count > 0 {
                 metrics::counter!("bsc.miner_prewarm.candidates_total", "result" => result)
                     .increment(count);
             }
         }
+        metrics::histogram!("bsc.miner_prewarm.max_cursor_lead").record(self.max_lead.get() as f64);
+        metrics::histogram!("bsc.miner_prewarm.lookahead_wait_seconds")
+            .record(self.ahead_wait.get().as_secs_f64());
         metrics::histogram!("bsc.miner_prewarm.iterator_lock_wait_seconds")
             .record(self.iterator_wait.get().as_secs_f64());
     }
@@ -498,7 +568,21 @@ impl ParentState {
         client: impl StateProviderFactory + Clone + 'static,
         hash: B256,
     ) -> Self {
-        Self { open: Arc::new(move || client.state_by_block_hash(hash)), consumed: None }
+        let factory = Arc::new(once_cell::sync::OnceCell::new());
+        Self {
+            open: Arc::new(move || {
+                if super::pipeline::enabled() {
+                    // Capture the parent view once per attempt, shared by all prewarm
+                    // readers. Each invocation still opens its own read transaction.
+                    let factory =
+                        factory.get_or_try_init(|| crate::shared::miner_state_factory(hash))?;
+                    factory()
+                } else {
+                    client.state_by_block_hash(hash)
+                }
+            }),
+            consumed: None,
+        }
     }
 
     pub(crate) fn private(
@@ -550,6 +634,7 @@ pub(crate) fn start<Pool, EvmConfig>(
     base_fee: u64,
     blob_fee: Option<u64>,
     min_tip: u128,
+    remaining_gas: u64,
     cancel: ManualCancel,
     control: Option<super::build_control::BuildControl>,
 ) -> Option<PrewarmGuard>
@@ -569,7 +654,13 @@ where
     metrics::gauge!("bsc.miner_prewarm.active_workers").increment(1.0);
     let stopped = Arc::new(AtomicBool::new(false));
     let stop_requested = Arc::new(OnceLock::new());
-    let guard = PrewarmGuard(stopped.clone(), cache.clone(), stop_requested.clone());
+    let admission = Arc::new(Admission::new(configured_lookahead(), remaining_gas));
+    let guard = PrewarmGuard {
+        stopped: stopped.clone(),
+        cache: cache.clone(),
+        stop_requested: stop_requested.clone(),
+        admission: admission.clone(),
+    };
     let queued = Instant::now();
     workers.pool.spawn(move || {
         let setup_permit = setup_permit;
@@ -587,7 +678,7 @@ where
         metrics::histogram!("bsc.miner_prewarm.iterator_setup_seconds").record(iterator_started.elapsed().as_secs_f64());
         let Some(first) = first else { return };
         if should_stop() { return }
-        let candidates = Arc::new(Mutex::new(std::iter::once(first).chain(best)));
+        let candidates = Arc::new(Mutex::new((std::iter::once(first).chain(best), 0usize)));
         // Transfer capacity from setup to execution jobs in the same independent pool.
         drop(setup_permit);
         env.cfg_env.disable_nonce_check = true;
@@ -608,6 +699,7 @@ where
                 cancel.clone(),
                 control.clone(),
             );
+            let admission = admission.clone();
             let queued = Instant::now();
             let stop_requested = stop_requested.clone();
             workers.pool.spawn(move || {
@@ -634,7 +726,19 @@ where
                     let waiting = Instant::now();
                     let mut iterator = candidates.lock();
                     candidates_observed.iterator_wait.set(candidates_observed.iterator_wait.get() + waiting.elapsed());
-                    let tx = iterator.next();
+                    let lead = iterator.1.saturating_sub(admission.miner_scanned.load(Ordering::Relaxed));
+                    candidates_observed.max_lead.set(candidates_observed.max_lead.get().max(lead));
+                    if admission.ahead(iterator.1) {
+                        drop(iterator);
+                        // Only background workers pause, outside the iterator lock. Recheck
+                        // cancellation/deadline every millisecond; never join from the miner.
+                        let paused = Instant::now();
+                        std::thread::sleep(Duration::from_millis(1));
+                        candidates_observed.ahead_wait.set(candidates_observed.ahead_wait.get() + paused.elapsed());
+                        continue
+                    }
+                    let tx = iterator.0.next();
+                    if tx.is_some() { iterator.1 += 1; }
                     drop(iterator);
                     let tx = tx?;
                     // go-bsc periodically forwards its prefetch iterator to the miner's cursor.
@@ -645,6 +749,10 @@ where
                     }
                     if progress.already_selected(tx.sender(), tx.nonce()) {
                         candidates_observed.miner_consumed.set(candidates_observed.miner_consumed.get() + 1);
+                        continue
+                    }
+                    if !admission.fits(tx.gas_limit()) {
+                        candidates_observed.gas_filtered.set(candidates_observed.gas_filtered.get() + 1);
                         continue
                     }
                     if super::super::pool::tip::meets_tip_floor(tx.effective_tip_per_gas(base_fee), min_tip) {
@@ -744,10 +852,30 @@ mod tests {
     use alloy_consensus::{Signed, TxLegacy};
     use alloy_primitives::{Bytes, Signature, TxKind};
     use reth_primitives_traits::Recovered;
-    use std::{convert::Infallible, sync::atomic::AtomicU64};
+    use std::convert::Infallible;
 
     const SENDER: Address = Address::repeat_byte(0x11);
     const CONTRACT: Address = Address::repeat_byte(0x22);
+
+    #[test]
+    fn admission_is_bounded_and_disabled_setting_restores_legacy() {
+        let admission = Admission::new(2, 100_000);
+        assert!(!admission.ahead(1));
+        assert!(admission.ahead(2));
+        admission.miner_scanned.store(1, Ordering::Relaxed);
+        assert!(!admission.ahead(2));
+        assert!(admission.fits(100_000));
+        assert!(!admission.fits(100_001));
+        admission.remaining_gas.store(30_000, Ordering::Relaxed);
+        assert!(!admission.fits(40_000));
+        let disabled = Admission::new(0, 0);
+        assert!(!disabled.ahead(usize::MAX));
+        assert!(disabled.fits(u64::MAX));
+        assert_eq!(parse_lookahead(None), Ok(0));
+        assert_eq!(parse_lookahead(Some("0")), Ok(0));
+        assert_eq!(parse_lookahead(Some("-1")), Err("expected a nonnegative integer"));
+        assert_eq!(parse_lookahead(Some("1000001")), Err("lookahead exceeds 1000000"));
+    }
 
     #[test]
     fn sampled_handoff_only_counts_formal_use_of_worker_produced_entries() {
@@ -1217,11 +1345,12 @@ mod tests {
     #[test]
     fn dropping_guard_stops_before_selecting_another_transaction() {
         let stop = Arc::new(AtomicBool::new(false));
-        let guard = PrewarmGuard(
-            stop.clone(),
-            SharedStateCache::new(B256::ZERO),
-            Arc::new(OnceLock::new()),
-        );
+        let guard = PrewarmGuard {
+            stopped: stop.clone(),
+            cache: SharedStateCache::new(B256::ZERO),
+            stop_requested: Arc::new(OnceLock::new()),
+            admission: Arc::new(Admission::new(256, 200_000_000)),
+        };
         drop(guard);
         let (cfg, env) = config_and_env();
         let result = warm_transactions(
@@ -1289,6 +1418,7 @@ mod tests {
             0,
             None,
             0,
+            200_000_000,
             ManualCancel::default(),
             None,
         )
@@ -1324,6 +1454,7 @@ mod tests {
             0,
             None,
             0,
+            200_000_000,
             ManualCancel::default(),
             None,
         )

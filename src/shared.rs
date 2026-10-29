@@ -369,11 +369,19 @@ impl PrivateMinerChain {
     pub fn base_hash(&self) -> B256 {
         self.0[0].recovered_block().parent_hash
     }
+    /// Release accepted ancestors before extending the sliding window. Retain the
+    /// latest accepted parent to cover canonical notification/provider visibility races.
+    pub fn rebased_at(&self, accepted: B256) -> Self {
+        match self.0.iter().position(|block| block.recovered_block().hash() == accepted) {
+            Some(index) if index > 0 => Self(Arc::new(self.0[index..].to_vec())),
+            _ => self.clone(),
+        }
+    }
     pub fn appended(
         &self,
         block: reth_chain_state::ExecutedBlock<crate::BscPrimitives>,
     ) -> Option<Self> {
-        if self.0.len() >= 2 ||
+        if self.0.len() > crate::node::miner::pipeline::MAX_DEPTH ||
             block.recovered_block().parent_hash != self.parent().recovered_block().hash() ||
             block.recovered_block().number != self.parent().recovered_block().number + 1
         {
@@ -389,7 +397,7 @@ impl PrivateMinerChain {
 pub type PrivateMinerStateFactory =
     Arc<dyn Fn() -> reth_errors::ProviderResult<reth_provider::StateProviderBox> + Send + Sync>;
 pub type PrivateMinerStateFn = Arc<
-    dyn Fn(PrivateMinerChain) -> reth_errors::ProviderResult<PrivateMinerStateFactory>
+    dyn Fn(B256, Option<PrivateMinerChain>) -> reth_errors::ProviderResult<PrivateMinerStateFactory>
         + Send
         + Sync,
 >;
@@ -403,7 +411,15 @@ pub fn private_miner_state_factory(
     let f = PRIVATE_MINER_STATE.get().ok_or(reth_errors::ProviderError::HeaderNotFound(
         parent.parent().recovered_block().hash().into(),
     ))?;
-    f(parent)
+    f(parent.parent().recovered_block().hash(), Some(parent))
+}
+/// Open the same miner-owned parent view before and after local publication.
+/// The caller uses this only when pipelined mining is enabled.
+pub fn miner_state_factory(parent: B256) -> reth_errors::ProviderResult<PrivateMinerStateFactory> {
+    let f = PRIVATE_MINER_STATE
+        .get()
+        .ok_or(reth_errors::ProviderError::HeaderNotFound(parent.into()))?;
+    f(parent, None)
 }
 pub fn spawn_private_sparse_trie_state_root(
     parent_header: SealedHeader<Header>,

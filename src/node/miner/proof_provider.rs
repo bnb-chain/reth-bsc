@@ -46,6 +46,27 @@ impl MinerProofOverlayCache {
         }
     }
 
+    /// Release only our index ownership of the preceding parent. Live proof
+    /// readers remain valid, but must no longer be kept alive by the cache alone.
+    pub(crate) fn release_parent(&self, parent: B256) {
+        let retired = {
+            let mut entries = self.entries.lock();
+            let mut retired = Vec::new();
+            let mut index = 0;
+            while index < entries.len() {
+                if entries[index].0 .0 == parent {
+                    retired.push(entries.remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+            retired
+        };
+        // The manager still owns the overlay on the normal incremental path. Drop
+        // these references now so a deferred drop cannot manufacture an extra COW.
+        drop(retired);
+    }
+
     fn entry(&self, key: Key, fallback: bool) -> Arc<Entry> {
         let start = Instant::now();
         let mut entries = self.entries.lock();
@@ -293,6 +314,23 @@ mod tests {
         assert!(text.contains("component=\"accounts\""), "{text}");
         // Failed initialization has no item sample; a ready cache hit adds none either.
         assert!(text.contains("bsc_miner_proof_overlay_build_items_count{kind=\"normal\",component=\"accounts\"} 17"), "{text}");
+    }
+
+    #[test]
+    fn advancing_parent_releases_index_ownership_without_invalidating_readers() {
+        let cache = MinerProofOverlayCache::new(Runtime::test());
+        let old = cache.get_or_build(key(1), false, || Ok(value())).unwrap();
+        let expected = root(&old);
+        let retained = Arc::strong_count(&old.input().state);
+        cache.release_parent(key(1).0);
+        assert_eq!(Arc::strong_count(&old.input().state), retained - 1);
+        assert_eq!(root(&old), expected);
+        assert!(cache.entries.lock().is_empty());
+        let new = cache.get_or_build(key(2), false, || Ok(value())).unwrap();
+        cache.release_parent(key(1).0);
+        let again =
+            cache.get_or_build(key(2), false, || panic!("new parent must stay cached")).unwrap();
+        assert!(Arc::ptr_eq(&new.input().state, &again.input().state));
     }
 
     #[test]

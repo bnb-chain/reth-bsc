@@ -894,6 +894,7 @@ where
             base_fee,
             blob_fee.map(|fee| fee as u64),
             min_gas_tip,
+            block_gas_limit.saturating_sub(cumulative_gas_used),
             cancel.clone(),
             build_control.clone(),
         );
@@ -912,7 +913,12 @@ where
             cache.execution_started();
         }
         work.execution_started(exec_start);
+        let mut gas_limit_skips = super::perf_tuning::GasLimitSkips::configured();
+        let mut gas_skip_limit_reached = false;
         loop {
+            if let Some(prewarm) = &prewarm {
+                prewarm.remaining_gas(block_gas_limit.saturating_sub(cumulative_gas_used));
+            }
             work.selection_stage(SelectionStage::Control);
             let iteration_started = std::time::Instant::now();
             if cancel.is_cancelled() ||
@@ -924,11 +930,12 @@ where
             }
             work.selection_stage(SelectionStage::Iterator);
             let Some(pool_tx) = best_tx_list.next() else { break };
-            if parent_state.consumed(pool_tx.sender(), pool_tx.nonce()) {
-                continue
-            }
             if let Some(prewarm) = &prewarm {
                 prewarm.selected(pool_tx.sender(), pool_tx.nonce());
+            }
+            if parent_state.consumed(pool_tx.sender(), pool_tx.nonce()) {
+                gas_limit_skips.reset();
+                continue
             }
             work.selection_stage(SelectionStage::Precheck);
             work.scanned += 1;
@@ -948,6 +955,7 @@ where
                     InvalidPoolTransactionError::other(BlacklistedAddressError()),
                 );
                 work.skip(SkipReason::Blacklisted, iteration_started);
+                gas_limit_skips.reset();
                 continue;
             }
             // filter out tx with min gas tip.
@@ -966,6 +974,7 @@ where
                 );
                 best_tx_list.mark_invalid(&pool_tx, InvalidPoolTransactionError::Underpriced);
                 work.skip(SkipReason::Underpriced, iteration_started);
+                gas_limit_skips.reset();
                 continue;
             }
 
@@ -982,8 +991,14 @@ where
                     ),
                 );
                 work.skip(SkipReason::GasLimit, iteration_started);
+                if gas_limit_skips.rejected() {
+                    gas_skip_limit_reached = true;
+                    break;
+                }
                 continue;
             }
+
+            gas_limit_skips.reset();
 
             let tx = pool_tx.to_consensus();
             if tx.is_eip4844() && !blob_eligible {
@@ -1229,10 +1244,16 @@ where
         work.selection_stage(SelectionStage::Control);
         let exec_duration = exec_start.elapsed();
         read_phase.finish();
+        metrics::histogram!("bsc.miner_gas_limit_skip_streak",
+            "kind" => kind.label(),
+            "turn" => if self.ctx.is_inturn { "inturn" } else { "outofturn" })
+        .record(gas_limit_skips.peak() as f64);
         if let Some(control) = &build_control {
             let now = std::time::Instant::now();
             let reason = if cancel.is_cancelled() {
                 "cancelled"
+            } else if gas_skip_limit_reached {
+                "gas_skip_limit"
             } else if !control.allows_late_finish() && now >= control.finish_until {
                 "completion_deadline"
             } else if now >= control.transactions_until {
@@ -1251,6 +1272,8 @@ where
         } else {
             work.selection_stopped(if cancel.is_cancelled() {
                 "cancelled"
+            } else if gas_skip_limit_reached {
+                "gas_skip_limit"
             } else {
                 "pool_or_gas_limit"
             });
@@ -1381,10 +1404,16 @@ where
         let execution_outcome =
             BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
         let executed_block = BuiltPayloadExecutedBlock {
+            shared_trie_data: None,
             recovered_block: Arc::new(block),
             execution_output: Arc::new(execution_outcome),
             hashed_state: Arc::new(hashed_state),
             trie_updates: Arc::new(trie_updates),
+        };
+        let executed_block = if super::pipeline::enabled() {
+            executed_block.with_shared_trie_data()
+        } else {
+            executed_block
         };
 
         // Read validator/turn-length data transported via sinks from the now-consumed builder.
@@ -1563,6 +1592,7 @@ where
         let execution_outcome =
             BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
         let executed_block = BuiltPayloadExecutedBlock {
+            shared_trie_data: None,
             recovered_block: Arc::new(block),
             execution_output: Arc::new(execution_outcome),
             hashed_state: Arc::new(hashed_state),
@@ -2769,7 +2799,21 @@ where
             let (mut context, mut attributes, mut result, mut parent_publish_at) =
                 (context, attributes, result, parent_publish_at);
             let mut private_context = None;
-            for level in 1..=depth {
+            loop {
+                let parent_hash = ancestry.parent().recovered_block().hash();
+                let Some(level) = pipeline::wait_for_slot(
+                    id,
+                    parent_hash,
+                    context.block_timestamp_ms.saturating_add(2000),
+                )
+                .await
+                else {
+                    pipeline::failed(id);
+                    break
+                };
+                if let Some(accepted) = pipeline::accepted_parent(id) {
+                    ancestry = ancestry.rebased_at(accepted);
+                }
                 if cancel.is_cancelled() {
                     break
                 }
@@ -2809,7 +2853,11 @@ where
                 private_context = Some(Arc::new(crate::node::evm::config::PrivateMiningParent {
                     header: context.parent_header.clone(),
                     snapshot: context.parent_snapshot.clone(),
-                    ancestor: private_context,
+                    ancestor: private_context.and_then(
+                        |parent: Arc<crate::node::evm::config::PrivateMiningParent>| {
+                            parent.retained_from(ancestry.blocks()[0].recovered_block().number)
+                        },
+                    ),
                 }));
                 let args = BscBuildArguments {
                     pipeline_context: private_context.clone(),
@@ -2871,7 +2919,7 @@ where
                     }
                 };
                 compute_phase.complete();
-                pipeline::ready(id, level);
+                pipeline::ready(id, parent_hash);
                 pipeline::depth_event(level, "ready");
                 let now = super::startup_diagnostics::wall_ms();
                 metrics::histogram!("bsc.miner_pipeline_deadline_seconds", "depth" => super::perf_tuning::depth_label(level), "side" => if now > child_publish_at { "late" } else { "early" }).record(now.abs_diff(child_publish_at) as f64 / 1000.0);
@@ -2883,10 +2931,7 @@ where
                 // canonical notification must recognize it while the descendant is running.
                 let successor_phase =
                     super::perf_tuning::Phase::new("pipeline", true, level, "successor_context");
-                let next = if level < depth &&
-                    !cancel.is_cancelled() &&
-                    child_publish_at.saturating_sub(super::startup_diagnostics::wall_ms()) >= 25
-                {
+                let next = if !cancel.is_cancelled() {
                     prepare_pipeline_successor(
                         &payload,
                         &builder.ctx,
@@ -2894,7 +2939,9 @@ where
                         chain_spec.as_ref(),
                     )
                     .and_then(|(parent, context, attrs)| {
-                        let chain = ancestry.appended(executed_pipeline_parent(&parent))?;
+                        let chain = ancestry
+                            .rebased_at(pipeline::accepted_parent(id)?)
+                            .appended(executed_pipeline_parent(&parent))?;
                         let key = pipeline::Key {
                             parent: parent.block().hash(),
                             timestamp_ms: context.block_timestamp_ms,
@@ -2909,16 +2956,11 @@ where
                     None
                 };
                 successor_phase.complete();
-                if level < depth && next.is_none() {
+                if next.is_none() {
                     pipeline::depth_event(
                         level,
                         if cancel.is_cancelled() {
                             "stop_cancelled"
-                        } else if child_publish_at
-                            .saturating_sub(super::startup_diagnostics::wall_ms()) <
-                            25
-                        {
-                            "stop_no_lead"
                         } else {
                             "stop_successor_unavailable"
                         },
@@ -3640,10 +3682,7 @@ fn executed_pipeline_parent(
     reth_chain_state::ExecutedBlock::new(
         parent.executed_block.recovered_block.clone(),
         parent.executed_block.execution_output.clone(),
-        reth_trie_common::SortedTrieData::new(
-            Arc::new(parent.executed_block.hashed_state.as_ref().clone().into_sorted()),
-            Arc::new(parent.executed_block.trie_updates.as_ref().clone().into_sorted()),
-        ),
+        parent.executed_block.sorted_trie_data(),
     )
 }
 
@@ -4465,6 +4504,7 @@ mod tests {
                 exec_duration: Duration::ZERO,
                 trie_root_duration: Duration::ZERO,
                 executed_block: reth_payload_primitives::BuiltPayloadExecutedBlock {
+                    shared_trie_data: None,
                     recovered_block: Arc::new(RecoveredBlock::new_unhashed(
                         executed_block,
                         senders.clone(),

@@ -1,4 +1,5 @@
-//! Miner-owned parent-state cache. Candidate state is never inserted here.
+//! Miner-owned parent-state cache, including completed unpublished parents.
+//! This cache never publishes private state into the engine canonical graph.
 
 use crate::BscPrimitives;
 use alloy_primitives::B256;
@@ -161,6 +162,32 @@ impl MinerOverlayCache {
         metrics::histogram!("bsc_miner_overlay_cache_selection_seconds", "scope" => self.scope)
             .record(started.elapsed().as_secs_f64());
     }
+}
+
+/// Capture the exact normal in-memory ancestry and append only completed local blocks.
+/// Both execution and proof providers use this same BlockState/OverlayBuilder path.
+pub(crate) fn parent_snapshot(
+    parent: B256,
+    private: Option<&crate::shared::PrivateMinerChain>,
+) -> (
+    Vec<ExecutedBlock<BscPrimitives>>,
+    Option<std::sync::Arc<reth_chain_state::BlockState<BscPrimitives>>>,
+) {
+    let base = private.map_or(parent, |chain| chain.base_hash());
+    let mut state =
+        crate::shared::get_canonical_in_memory_state().and_then(|cim| cim.state_by_hash(base));
+    if let Some(chain) = private {
+        for block in chain.blocks() {
+            state = Some(std::sync::Arc::new(reth_chain_state::BlockState::with_parent(
+                block.clone(),
+                state,
+            )));
+        }
+    }
+    let blocks = state
+        .as_ref()
+        .map_or_else(Vec::new, |state| state.chain().map(|state| state.block()).collect());
+    (blocks, state)
 }
 
 #[cfg(test)]
@@ -657,6 +684,26 @@ mod tests {
             }
         });
         assert_eq!(outcome.state_root, expected(2));
+    }
+
+    #[test]
+    fn sliding_private_ancestry_rebases_without_changing_retained_outputs() {
+        let first = block(1, B256::ZERO, 1);
+        let mut chain = crate::shared::PrivateMinerChain::new(first);
+        for number in 2..=40 {
+            let previous = chain.parent().clone();
+            let next = block(number, previous.recovered_block().hash(), number);
+            chain =
+                chain.rebased_at(previous.recovered_block().hash()).appended(next.clone()).unwrap();
+            assert_eq!(chain.blocks().len(), 2);
+            assert_eq!(chain.base_hash(), previous.recovered_block().parent_hash);
+            assert!(Arc::ptr_eq(&chain.parent().execution_output, &next.execution_output));
+            assert!(Arc::ptr_eq(
+                &chain.parent().trie_data().hashed_state,
+                &next.trie_data().hashed_state
+            ));
+            assert!(chain.appended(block(number + 1, B256::repeat_byte(99), 0)).is_none());
+        }
     }
 
     #[test]

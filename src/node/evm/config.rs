@@ -70,6 +70,17 @@ pub struct PrivateMiningParent {
     pub ancestor: Option<Arc<PrivateMiningParent>>,
 }
 impl PrivateMiningParent {
+    /// Keep only unpublished-window metadata. Accepted ancestors are resolved by
+    /// the ordinary snapshot provider; their private snapshots must not grow forever.
+    pub(crate) fn retained_from(&self, number: u64) -> Option<Arc<Self>> {
+        (self.header.number >= number).then(|| {
+            Arc::new(Self {
+                header: self.header.clone(),
+                snapshot: self.snapshot.clone(),
+                ancestor: self.ancestor.as_ref().and_then(|parent| parent.retained_from(number)),
+            })
+        })
+    }
     fn find(&self, hash: &alloy_primitives::B256) -> Option<&Self> {
         let mut current = Some(self);
         while let Some(parent) = current {
@@ -1043,5 +1054,35 @@ mod tests {
         mining_attrs.mode = BscExecutionMode::Mining;
         let ctx = evm_config.context_for_next_block(&parent, mining_attrs).unwrap();
         assert_eq!(ctx.mode, BscExecutionMode::Mining, "mining must still run Parlia finalization");
+    }
+}
+
+#[cfg(test)]
+mod sliding_parent_tests {
+    use super::*;
+
+    #[test]
+    fn private_snapshot_window_releases_old_history() {
+        let snapshot = Arc::new(crate::consensus::parlia::Snapshot::default());
+        let mut previous: Option<Arc<PrivateMiningParent>> = None;
+        for number in 1..=40 {
+            previous = Some(Arc::new(PrivateMiningParent {
+                header: SealedHeader::new(
+                    Header { number, ..Default::default() },
+                    alloy_primitives::B256::with_last_byte(number as u8),
+                ),
+                snapshot: snapshot.clone(),
+                ancestor: previous
+                    .and_then(|parent| parent.retained_from(number.saturating_sub(2))),
+            }));
+            let mut current = previous.as_deref();
+            let mut count = 0;
+            while let Some(parent) = current {
+                count += 1;
+                current = parent.ancestor.as_deref();
+            }
+            assert_eq!(count, number.min(3));
+        }
+        assert!(previous.unwrap().find(&alloy_primitives::B256::with_last_byte(1)).is_none());
     }
 }
