@@ -1212,6 +1212,17 @@ where
         &self.chain_spec
     }
 
+    /// The Parlia-finalized block number of the local canonical head, as sent in
+    /// forkchoice updates. `None` before fast finality or without a snapshot.
+    pub(crate) fn finalized_number(&self) -> Result<Option<u64>, reth_provider::ProviderError> {
+        let best = self.provider.best_block_number()?;
+        Ok(self
+            .provider
+            .header_by_number(best)?
+            .and_then(|head| self.get_finalized_number_and_hash(&head))
+            .map(|(number, _)| number))
+    }
+
     /// Updates the fork choice based on the incoming header.
     ///
     /// This function evaluates whether the incoming header should become the new canonical head
