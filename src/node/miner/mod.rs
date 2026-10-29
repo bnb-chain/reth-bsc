@@ -19,6 +19,7 @@ pub use bsc_miner::BscMiner;
 pub use config::{keystore, MiningConfig};
 
 pub(crate) mod build_diagnostics;
+pub(crate) mod selection_diagnostics;
 
 pub(crate) mod startup_diagnostics;
 

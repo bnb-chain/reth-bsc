@@ -222,3 +222,43 @@ async fn ordinary_build_filter_skips_descendants_without_evicting_them() {
         "build filtering only affects this iterator"
     );
 }
+
+#[test]
+fn removal_metrics_count_actual_entries_and_not_iterator_filtering() {
+    let _guard = TipGuard::new(0);
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    metrics::with_local_recorder(&recorder, || {
+        runtime.block_on(async {
+            let pool = pool();
+            let hash = pool
+                .add_transaction(TransactionOrigin::External, transaction(2, 1, 0, 1000, 10))
+                .await
+                .unwrap()
+                .hash;
+            let mut best = pool.best_transactions();
+            let tx = best.next().unwrap();
+            best.mark_invalid(&tx, InvalidPoolTransactionError::Underpriced);
+            assert!(pool.get(&hash).is_some());
+            assert!(!handle.render().contains("transaction_pool_removal_transactions_total"));
+            let replacement = pool
+                .add_transaction(TransactionOrigin::External, transaction(2, 1, 0, 2000, 20))
+                .await
+                .unwrap()
+                .hash;
+            assert!(pool.get(&hash).is_none());
+            assert_eq!(pool.remove_transactions(vec![hash, replacement, replacement]).len(), 1);
+            assert!(pool.remove_transactions(vec![replacement]).is_empty());
+        })
+    });
+    let text = handle.render();
+    for reason in ["replaced", "explicit_remove"] {
+        assert!(
+            text.lines().any(|l| l.starts_with("transaction_pool_removal_transactions_total{") &&
+                l.contains(&format!("reason=\"{reason}\"")) &&
+                l.ends_with(" 1")),
+            "{text}"
+        );
+    }
+}

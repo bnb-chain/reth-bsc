@@ -28,10 +28,11 @@ fn reserve_on<'a>(
     gate: &'a Semaphore,
     key: Key,
     base: B256,
+    plan: Option<Plan>,
 ) -> Option<Reservation<'a>> {
     // Opportunistic only: never put an unpublished child ahead of queued formal work.
     let local = gate.try_acquire().ok()?;
-    let (id, cancel, sender, worker) = coordinator.reserve(key, base)?;
+    let (id, cancel, sender, worker) = coordinator.reserve_planned(key, base, plan)?;
     Some((id, cancel, sender, BuildLease { _worker: worker, _local: local }))
 }
 
@@ -43,13 +44,50 @@ pub(crate) struct Key {
     pub gas_limit: u64,
     pub min_gas_tip: u128,
 }
+#[derive(Clone, Debug)]
+pub(crate) struct Plan {
+    pub context: super::bsc_miner::MiningContext,
+    pub attributes: reth_node_ethereum::engine::EthPayloadAttributes,
+}
+
+impl Plan {
+    pub(crate) fn valid_for(
+        &self,
+        key: &Key,
+        canonical: &super::bsc_miner::MiningContext,
+        parlia: &crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>,
+    ) -> bool {
+        let Some(header) = self.context.header.as_ref() else { return false };
+        let parent = &canonical.parent_header;
+        canonical.is_inturn &&
+            self.context.is_inturn &&
+            key.parent == parent.hash() &&
+            self.context.parent_header.hash() == parent.hash() &&
+            header.parent_hash == parent.hash() &&
+            header.number == parent.number + 1 &&
+            header.beneficiary == key.beneficiary &&
+            crate::consensus::parlia::util::calculate_millisecond_timestamp(header) ==
+                key.timestamp_ms &&
+            self.context.block_timestamp_ms == key.timestamp_ms &&
+            self.attributes.timestamp == header.timestamp &&
+            self.attributes.suggested_fee_recipient == key.beneficiary &&
+            canonical.parent_snapshot.is_inturn(key.beneficiary) &&
+            !canonical.parent_snapshot.sign_recently(key.beneficiary) &&
+            parlia
+                .block_time_verify_for_ramanujan_fork(&canonical.parent_snapshot, header, parent)
+                .is_ok()
+    }
+}
+
 struct Entry {
+    plan: Option<Plan>,
     depth: usize,
     ready: Arc<std::sync::OnceLock<std::time::Instant>>,
     key: Key,
     receiver: oneshot::Receiver<BuildResult>,
 }
 struct Chain {
+    discard_reason: Arc<std::sync::OnceLock<&'static str>>,
     id: u64,
     base: B256,
     parents: Vec<B256>,
@@ -98,7 +136,7 @@ fn executor(handle: tokio::runtime::Handle) -> std::io::Result<std::sync::mpsc::
 }
 pub(crate) fn configure(handle: tokio::runtime::Handle) -> std::io::Result<()> {
     if !enabled() || EXECUTOR.get().is_some() {
-        return Ok(())
+        return Ok(());
     }
     let _ = EXECUTOR.set(executor(handle)?);
     Ok(())
@@ -125,28 +163,47 @@ pub(crate) fn enabled() -> bool {
 }
 impl Coordinator {
     /// The permit bounds running work, even after its chain was invalidated.
+    #[cfg(test)]
     fn reserve(&self, key: Key, base: B256) -> Option<WorkerReservation> {
+        self.reserve_planned(key, base, None)
+    }
+    fn reserve_planned(
+        &self,
+        key: Key,
+        base: B256,
+        plan: Option<Plan>,
+    ) -> Option<WorkerReservation> {
         let permit = self.worker.clone().try_acquire_owned().ok()?;
         let mut state = self.state.lock();
         if state.chain.is_some() || state.head != Some(base) {
-            return None
+            return None;
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let cancel = ManualCancel::default();
         let (sender, receiver) = oneshot::channel();
         let ready = Arc::new(std::sync::OnceLock::new());
         state.chain = Some(Chain {
+            discard_reason: Arc::new(std::sync::OnceLock::new()),
             id,
             base,
             parents: vec![key.parent],
             ready: vec![ready.clone()],
             cancel: cancel.clone(),
-            entries: VecDeque::from([Entry { key, receiver, depth: 1, ready }]),
+            entries: VecDeque::from([Entry { key, receiver, depth: 1, ready, plan }]),
             running: true,
         });
         Some((id, cancel, sender, permit))
     }
+    #[cfg(test)]
     fn extend(&self, id: u64, key: Key) -> Option<oneshot::Sender<BuildResult>> {
+        self.extend_planned(id, key, None)
+    }
+    fn extend_planned(
+        &self,
+        id: u64,
+        key: Key,
+        plan: Option<Plan>,
+    ) -> Option<oneshot::Sender<BuildResult>> {
         let mut state = self.state.lock();
         let chain = state.chain.as_mut()?;
         if chain.id != id ||
@@ -154,13 +211,13 @@ impl Coordinator {
             !chain.running ||
             chain.parents.len() > self.limit
         {
-            return None
+            return None;
         }
         let (sender, receiver) = oneshot::channel();
         chain.parents.push(key.parent);
         let ready = Arc::new(std::sync::OnceLock::new());
         chain.ready.push(ready.clone());
-        chain.entries.push_back(Entry { key, receiver, depth: chain.parents.len(), ready });
+        chain.entries.push_back(Entry { key, receiver, depth: chain.parents.len(), ready, plan });
         Some(sender)
     }
     fn slot(&self, id: u64, parent: B256) -> Option<(usize, bool)> {
@@ -206,6 +263,7 @@ impl Coordinator {
             }
         };
         if let Some(chain) = retired {
+            retire(&chain, "parent_changed");
             chain.cancel.cancel();
             event("parent_changed");
         }
@@ -221,11 +279,16 @@ impl Coordinator {
             }
         };
         if let Some(chain) = retired {
+            retire(&chain, "candidate_changed");
             chain.cancel.cancel();
             event("candidate_changed");
         }
     }
+    #[cfg(test)]
     fn failed(&self, id: u64) {
+        self.failed_reason(id, "producer_failed");
+    }
+    fn failed_reason(&self, id: u64, reason: &'static str) {
         let retired = {
             let mut state = self.state.lock();
             if state.chain.as_ref().is_some_and(|c| c.id == id) {
@@ -235,24 +298,63 @@ impl Coordinator {
             }
         };
         if let Some(chain) = retired {
+            retire(&chain, reason);
             chain.cancel.cancel();
         }
     }
+    fn claim(
+        &self,
+        parent: B256,
+        validate: impl FnOnce(&Key, &Plan) -> bool,
+    ) -> Option<(Plan, Adoption)> {
+        // Validate outside the coordinator lock. Claim only the exact generation inspected.
+        let (id, key, plan) = {
+            let state = self.state.lock();
+            if state.head != Some(parent) {
+                return None;
+            }
+            let chain = state.chain.as_ref()?;
+            if chain.cancel.is_cancelled() {
+                return None;
+            }
+            let entry = chain.entries.front()?;
+            (chain.id, entry.key.clone(), entry.plan.clone()?)
+        };
+        if key.parent != parent || !validate(&key, &plan) {
+            self.failed_reason(id, "plan_rejected");
+            event("plan_rejected");
+            return None;
+        }
+        self.take_generation(&key, Some(id)).map(|adoption| (plan, adoption))
+    }
+    #[cfg(test)]
     fn take(&self, key: &Key) -> Option<Adoption> {
-        let (entry, cancel, retired) = {
+        self.take_generation(key, None)
+    }
+    fn take_generation(&self, key: &Key, generation: Option<u64>) -> Option<Adoption> {
+        let (entry, cancel, discard_reason, retired) = {
             let mut state = self.state.lock();
             if state.head != Some(key.parent) {
-                return None
+                return None;
             }
             let chain = state.chain.as_mut()?;
+            if generation.is_some_and(|id| id != chain.id) {
+                return None;
+            }
             let entry = chain.entries.pop_front()?;
             let cancel = chain.cancel.clone();
+            let discard_reason = chain.discard_reason.clone();
             let retired = if entry.key != *key || (!chain.running && chain.entries.is_empty()) {
                 state.chain.take()
             } else {
                 None
             };
-            (entry, cancel, retired)
+            if entry.key != *key {
+                if let Some(chain) = &retired {
+                    retire(chain, "parameters_changed");
+                }
+            }
+            (entry, cancel, discard_reason, retired)
         };
         drop(retired);
         if entry.key == *key && !cancel.is_cancelled() {
@@ -264,6 +366,7 @@ impl Coordinator {
                 ready: entry.ready,
                 cancel,
                 accepted: false,
+                discard_reason,
             })
         } else {
             cancel.cancel();
@@ -272,6 +375,24 @@ impl Coordinator {
         }
     }
 }
+fn retire(chain: &Chain, reason: &'static str) {
+    if chain.discard_reason.set(reason).is_ok() {
+        metrics::counter!("bsc.miner_pipeline_invalidated_branches_total", "reason" => reason)
+            .increment(1);
+        metrics::counter!("bsc.miner_pipeline_invalidated_entries_total", "reason" => reason)
+            .increment(chain.entries.len() as u64);
+    }
+}
+
+pub(crate) fn track_candidate(id: u64, payload: &BscBuiltPayload) {
+    if let Some(diagnostics) = &payload.diagnostics {
+        let state = COORDINATOR.state.lock();
+        if let Some(chain) = state.chain.as_ref().filter(|c| c.id == id) {
+            let _ = diagnostics.pipeline_discard_reason.set(chain.discard_reason.clone());
+        }
+    }
+}
+
 // Bounds unpublished state and queued results, not concurrent execution threads.
 pub(crate) const MAX_DEPTH: usize = 8;
 fn parse_depth(value: Option<&str>) -> usize {
@@ -281,8 +402,8 @@ pub(crate) fn depth() -> usize {
     static DEPTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *DEPTH.get_or_init(|| parse_depth(std::env::var("BSC_MINING_PIPELINE_DEPTH").ok().as_deref()))
 }
-pub(crate) fn extend(id: u64, key: Key) -> Option<oneshot::Sender<BuildResult>> {
-    COORDINATOR.extend(id, key)
+pub(crate) fn extend(id: u64, key: Key, plan: Plan) -> Option<oneshot::Sender<BuildResult>> {
+    COORDINATOR.extend_planned(id, key, Some(plan))
 }
 /// A successor receiver is registered before its parent is delivered, so a fast
 /// canonical import can adopt it even while the window is full. Only computation
@@ -295,11 +416,11 @@ pub(crate) async fn wait_for_slot(id: u64, parent: B256, deadline_ms: u64) -> Op
             metrics::histogram!("bsc.miner_pipeline_window_wait_seconds")
                 .record(start.elapsed().as_secs_f64());
             metrics::gauge!("bsc.miner_pipeline_window_used").set(depth as f64);
-            return Some(depth)
+            return Some(depth);
         }
         if super::startup_diagnostics::wall_ms() >= u128::from(deadline_ms) {
             event("window_wait_expired");
-            return None
+            return None;
         }
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
@@ -318,28 +439,28 @@ impl Drop for WorkerCompletion {
 }
 pub(crate) fn can_start(base: B256) -> bool {
     if !enabled() {
-        return false
+        return false;
     }
     if COORDINATOR.worker.available_permits() == 0 {
         depth_event(1, "start_check_worker_busy");
-        return false
+        return false;
     }
     let state = COORDINATOR.state.lock();
     if state.chain.is_some() {
         depth_event(1, "start_check_pending_chain");
-        return false
+        return false;
     }
     if state.head != Some(base) {
         depth_event(1, "start_check_parent_not_head");
-        return false
+        return false;
     }
     true
 }
-pub(crate) fn reserve(key: Key, base: B256) -> Option<Reservation<'static>> {
+pub(crate) fn reserve(key: Key, base: B256, plan: Plan) -> Option<Reservation<'static>> {
     if !enabled() {
-        return None
+        return None;
     }
-    reserve_on(&COORDINATOR, &super::build_control::LOCAL_BUILD_PERMIT, key, base)
+    reserve_on(&COORDINATOR, &super::build_control::LOCAL_BUILD_PERMIT, key, base, Some(plan))
 }
 pub(crate) fn canonical_head(head: B256) {
     if enabled() {
@@ -352,12 +473,13 @@ pub(crate) fn selected_parent(parent: Option<B256>) {
         COORDINATOR.selected_parent(parent);
     }
 }
-pub(crate) fn failed(id: u64) {
-    COORDINATOR.failed(id);
+pub(crate) fn failed(id: u64, reason: &'static str) {
+    COORDINATOR.failed_reason(id, reason);
 }
 
 /// Adopts the same running computation, before taking the ordinary builder's build permit.
 pub(crate) struct Adoption {
+    discard_reason: Arc<std::sync::OnceLock<&'static str>>,
     pub receiver: oneshot::Receiver<BuildResult>,
     pub depth: usize,
     ready: Arc<std::sync::OnceLock<std::time::Instant>>,
@@ -365,6 +487,28 @@ pub(crate) struct Adoption {
     accepted: bool,
 }
 impl Adoption {
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+    pub(crate) async fn wait(
+        &mut self,
+        abort: &mut oneshot::Receiver<()>,
+    ) -> Result<BuildResult, ()> {
+        let cancellation = self.cancel.clone();
+        let result = tokio::select! {
+            biased;
+            _ = abort => return Err(()),
+            _ = async { while !cancellation.is_cancelled() { tokio::time::sleep(std::time::Duration::from_millis(10)).await; } } => {
+                return Ok(Err("pipeline generation cancelled".into()))
+            }
+            result = &mut self.receiver => result,
+        };
+        if self.is_cancelled() {
+            return Ok(Err("pipeline generation cancelled".into()));
+        }
+        Ok(result.unwrap_or_else(|_| Err("pipeline producer disconnected".into())))
+    }
+
     /// Accepting one result must not cancel descendants still using its private state.
     pub(crate) fn accept(&mut self) {
         self.accepted = true;
@@ -377,16 +521,22 @@ impl Adoption {
 impl Drop for Adoption {
     fn drop(&mut self) {
         if !self.accepted {
+            if self.discard_reason.set("adoption_abandoned").is_ok() {
+                metrics::counter!("bsc.miner_pipeline_invalidated_branches_total", "reason" => "adoption_abandoned").increment(1);
+            }
             depth_event(self.depth, "adoption_abandoned");
             self.cancel.clone().cancel();
         }
     }
 }
-pub(crate) fn take(key: &Key) -> Option<Adoption> {
-    if !enabled() {
-        return None
-    }
-    COORDINATOR.take(key)
+pub(crate) fn is_head(parent: B256) -> bool {
+    COORDINATOR.state.lock().head == Some(parent)
+}
+pub(crate) fn claim(
+    parent: B256,
+    validate: impl FnOnce(&Key, &Plan) -> bool,
+) -> Option<(Plan, Adoption)> {
+    enabled().then(|| COORDINATOR.claim(parent, validate)).flatten()
 }
 pub(crate) fn event(outcome: &'static str) {
     metrics::counter!("bsc_miner_pipeline_total", "outcome" => outcome).increment(1);
@@ -430,6 +580,170 @@ mod tests {
     fn reserve(c: &Coordinator) -> WorkerReservation {
         c.reserve(key(), B256::with_last_byte(1)).unwrap()
     }
+    fn planned() -> (Plan, crate::consensus::parlia::Parlia<crate::chainspec::BscChainSpec>, Key) {
+        use crate::consensus::parlia::{util::set_millisecond_part_of_timestamp, Parlia, Snapshot};
+        use alloy_consensus::Header;
+        use reth_primitives_traits::SealedHeader;
+        let parlia = Parlia::new(
+            Arc::new(crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet())),
+            200,
+        );
+        // Deliberately in the past: a late formal job would round this up to now.
+        let parent_ms = parlia.present_millis_timestamp().saturating_sub(2_000) / 1000 * 1000;
+        let mut parent =
+            Header { number: 100_000_000, timestamp: parent_ms / 1000, ..Default::default() };
+        set_millisecond_part_of_timestamp(parent_ms, &mut parent);
+        let parent = SealedHeader::seal_slow(parent);
+        let mut header = Header {
+            number: parent.number + 1,
+            parent_hash: parent.hash(),
+            timestamp: parent.timestamp,
+            beneficiary: Address::ZERO,
+            ..Default::default()
+        };
+        set_millisecond_part_of_timestamp(parent_ms + 450, &mut header);
+        let mut snapshot =
+            Snapshot::new(vec![Address::ZERO], parent.number, parent.hash(), 200, None);
+        snapshot.block_interval = 450;
+        let context = super::super::bsc_miner::MiningContext {
+            header: Some(header),
+            parent_header: parent.clone(),
+            parent_snapshot: Arc::new(snapshot),
+            is_inturn: true,
+            cached_reads: None,
+            block_timestamp_ms: parent_ms + 450,
+            end_mining_timestamp_ms: (parent_ms + 450) as u128,
+            startup_timing: None,
+        };
+        let attributes = reth_node_ethereum::engine::EthPayloadAttributes {
+            timestamp: parent.timestamp,
+            suggested_fee_recipient: Address::ZERO,
+            prev_randao: B256::ZERO,
+            withdrawals: None,
+            parent_beacon_block_root: None,
+            slot_number: None,
+            target_gas_limit: None,
+        };
+        let key = Key { parent: parent.hash(), timestamp_ms: parent_ms + 450, ..key() };
+        (Plan { context, attributes }, parlia, key)
+    }
+
+    #[test]
+    fn cancellation_records_first_reason_once_and_normal_head_does_not_invalidate() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let c = coordinator();
+            let (id, _, _sender, _permit) = reserve(&c);
+            let reason = c.state.lock().chain.as_ref().unwrap().discard_reason.clone();
+            c.canonical_head(key().parent);
+            assert!(reason.get().is_none());
+            c.selected_parent(Some(B256::with_last_byte(99)));
+            c.failed(id);
+            assert_eq!(reason.get(), Some(&"candidate_changed"));
+        });
+        let text = handle.render();
+        let branches: Vec<_> = text
+            .lines()
+            .filter(|l| l.starts_with("bsc_miner_pipeline_invalidated_branches_total{"))
+            .collect();
+        assert_eq!(branches.len(), 1);
+        assert!(branches[0].contains("candidate_changed"));
+        assert!(branches[0].ends_with(" 1"));
+    }
+
+    #[test]
+    fn late_canonical_job_preserves_the_original_valid_timestamp() {
+        let (plan, parlia, key) = planned();
+        assert!(parlia.present_millis_timestamp() > key.timestamp_ms);
+        assert!(plan.valid_for(&key, &plan.context, &parlia));
+        let c = Coordinator::default();
+        let base = B256::repeat_byte(8);
+        c.canonical_head(base);
+        let (_, cancel, _sender, _permit) =
+            c.reserve_planned(key.clone(), base, Some(plan.clone())).unwrap();
+        c.canonical_head(key.parent);
+        let (restored, mut adoption) =
+            c.claim(key.parent, |k, p| p.valid_for(k, &plan.context, &parlia)).unwrap();
+        assert_eq!(restored.attributes.timestamp, plan.attributes.timestamp);
+        assert_eq!(restored.context.block_timestamp_ms, key.timestamp_ms);
+        assert_eq!(restored.context.end_mining_timestamp_ms, plan.context.end_mining_timestamp_ms);
+        adoption.accept();
+        assert!(!cancel.is_cancelled());
+        // Ordinary fallback must derive a new timestamp, not reuse the expired plan.
+        let mut fallback = plan.context.clone();
+        let parent = fallback.parent_header.clone();
+        let attrs = super::super::util::prepare_new_attributes(
+            &mut fallback,
+            Arc::new(parlia),
+            &parent,
+            key.beneficiary,
+        );
+        assert!(fallback.block_timestamp_ms > key.timestamp_ms);
+        assert_eq!(attrs.timestamp, fallback.block_timestamp_ms / 1000);
+    }
+
+    #[test]
+    fn plan_validation_rejects_invalid_time_and_parent() {
+        let (mut plan, parlia, mut key) = planned();
+        let canonical = plan.context.clone();
+        key.timestamp_ms -= 1;
+        plan.context.block_timestamp_ms = key.timestamp_ms;
+        crate::consensus::parlia::util::set_millisecond_part_of_timestamp(
+            key.timestamp_ms,
+            plan.context.header.as_mut().unwrap(),
+        );
+        assert!(!plan.valid_for(&key, &canonical, &parlia), "parent interval remains enforced");
+        let (plan, parlia, mut key) = planned();
+        key.parent = B256::repeat_byte(99);
+        assert!(!plan.valid_for(&key, &plan.context, &parlia));
+    }
+
+    #[test]
+    fn claim_cannot_steal_a_replacement_generation_during_validation() {
+        let (plan, _, key) = planned();
+        let c = Coordinator::default();
+        let base = B256::repeat_byte(8);
+        c.canonical_head(base);
+        let (id, _, _, permit) = c.reserve_planned(key.clone(), base, Some(plan.clone())).unwrap();
+        c.canonical_head(key.parent);
+        let mut replacement = None;
+        assert!(c
+            .claim(key.parent, |_, _| {
+                c.failed(id);
+                drop(permit);
+                replacement = c.reserve_planned(key.clone(), key.parent, Some(plan.clone()));
+                true
+            })
+            .is_none());
+        assert!(replacement.is_some());
+        assert_ne!(c.state.lock().chain.as_ref().unwrap().id, id);
+    }
+
+    #[tokio::test]
+    async fn claimed_task_reports_producer_failure_and_abort_without_hanging() {
+        let c = coordinator();
+        let (_, _, sender, _permit) = reserve(&c);
+        c.canonical_head(key().parent);
+        let mut adoption = c.take(&key()).unwrap();
+        let (_abort, mut abort_rx) = oneshot::channel();
+        sender.send(Err("provider read failed".into())).unwrap();
+        assert_eq!(
+            adoption.wait(&mut abort_rx).await.unwrap().unwrap_err(),
+            "provider read failed"
+        );
+        drop(adoption);
+        let c = coordinator();
+        let (_, cancel, _sender, _permit) = reserve(&c);
+        c.canonical_head(key().parent);
+        let mut adoption = c.take(&key()).unwrap();
+        let (abort, mut abort_rx) = oneshot::channel();
+        abort.send(()).unwrap();
+        assert!(adoption.wait(&mut abort_rx).await.is_err());
+        drop(adoption);
+        assert!(cancel.is_cancelled());
+    }
+
     #[tokio::test]
     async fn execution_uses_its_own_thread_and_async_timers_remain_live() {
         let main = std::thread::current().id();
@@ -452,7 +766,7 @@ mod tests {
         let c = coordinator();
         let gate = Semaphore::new(1);
         let (_, cancel, sender, lease) =
-            reserve_on(&c, &gate, key(), B256::with_last_byte(1)).unwrap();
+            reserve_on(&c, &gate, key(), B256::with_last_byte(1), None).unwrap();
         assert!(gate.try_acquire().is_err());
         c.canonical_head(key().parent);
         let mut adopted = c.take(&key()).unwrap();
@@ -473,17 +787,18 @@ mod tests {
         let c = coordinator();
         let gate = Semaphore::new(1);
         let formal = gate.try_acquire().unwrap();
-        assert!(reserve_on(&c, &gate, key(), B256::with_last_byte(1)).is_none());
+        assert!(reserve_on(&c, &gate, key(), B256::with_last_byte(1), None).is_none());
         assert!(c.state.lock().chain.is_none());
         assert_eq!(c.worker.available_permits(), 1);
         drop(formal);
-        assert!(reserve_on(&c, &gate, key(), B256::with_last_byte(1)).is_some());
+        assert!(reserve_on(&c, &gate, key(), B256::with_last_byte(1), None).is_some());
     }
     #[tokio::test]
     async fn cancellation_does_not_release_the_local_lease_before_the_worker_exits() {
         let c = coordinator();
         let gate = Semaphore::new(1);
-        let (_, cancel, _, lease) = reserve_on(&c, &gate, key(), B256::with_last_byte(1)).unwrap();
+        let (_, cancel, _, lease) =
+            reserve_on(&c, &gate, key(), B256::with_last_byte(1), None).unwrap();
         c.selected_parent(None);
         assert!(cancel.is_cancelled());
         let formal = gate.acquire();
@@ -491,7 +806,7 @@ mod tests {
         assert!(tokio::time::timeout(std::time::Duration::from_millis(5), &mut formal)
             .await
             .is_err());
-        assert!(reserve_on(&c, &gate, key(), B256::with_last_byte(1)).is_none());
+        assert!(reserve_on(&c, &gate, key(), B256::with_last_byte(1), None).is_none());
         drop(lease); // producer finished unwinding, not merely coordinator invalidation
         let permit =
             tokio::time::timeout(std::time::Duration::from_secs(1), formal).await.unwrap().unwrap();
@@ -626,7 +941,7 @@ mod tests {
         let c = coordinator();
         let gate = Semaphore::new(1);
         let (id, cancel, first, lease) =
-            reserve_on(&c, &gate, key(), B256::with_last_byte(1)).unwrap();
+            reserve_on(&c, &gate, key(), B256::with_last_byte(1), None).unwrap();
         let mut next = key();
         next.parent = B256::with_last_byte(3);
         next.timestamp_ms += 450;

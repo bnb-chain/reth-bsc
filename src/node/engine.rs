@@ -38,6 +38,9 @@ pub enum BuildKind {
 /// included into [`BscBlock`].
 #[derive(Debug, Clone)]
 pub struct BscBuiltPayload {
+    /// Selection evidence only; never part of consensus or transaction-pool state.
+    pub(crate) selection_diagnostics:
+        Option<crate::node::miner::selection_diagnostics::SelectionDiagnostics>,
     /// Attempt metadata; deliberately excluded from block contents and consensus.
     pub(crate) diagnostics:
         Option<Arc<crate::node::miner::build_diagnostics::CandidateDiagnostics>>,

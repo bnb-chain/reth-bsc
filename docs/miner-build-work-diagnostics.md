@@ -72,3 +72,62 @@ INFO 日志 `Sampled mining build budget breakdown`：许可等待或准备 ≥2
 诊断：parent_at_notification 偏大→父块提交/导入链路；cache/context/queue/prepare_job/schedule 偏大→矿工内部；原始剩余时间充足但交易窗口小→reserve 或轮次末块上限。时间戳偏移与本机单调时长是两种口径，先看同一条汇总日志对账，再看群体分布。
 
 读取次数、CachedReads 命中/未命中、provider 累计耗时，以及选交易/EVM 子阶段见 [miner-state-read-diagnostics.md](miner-state-read-diagnostics.md)。
+
+## 未满候选的交易选择证据
+
+新增 `reth_bsc_miner_selection_` 前缀。仅增加计数/快照，不改变迭代器、gas 跳过上限或交易截止时间。每笔只更新本地整数，每次退出统一上报；开始/结束读取 pool_size，不遍历交易池。
+
+- `outcomes_total{stage,kind,turn,reason,fill}`：每次循环出口或选中候选一次。reason 为 `transaction_deadline/cancelled/iterator_exhausted/gas_skip_limit`，在实际退出点确定。选中但没有交易循环的候选另标 `empty_fallback/no_selection_metadata`，不猜原因。
+- fill 按 gas used / gas limit 分为 `empty/lt50/50to90/90to95/95to99/ge99`；limit=0 为 unknown。区间左闭右开。
+- stage=selection 是结束了交易循环的构建尝试，之后仍可能失败或被弃用；stage=selected 由共享候选标识去重，clone/流水线接管不重复计数。selected 不是 canonical 上链统计；外部 bid 等不经过此候选诊断路径的不在分母内。
+- `exhausted_total{supply,fill,...}`：仅 iterator_exhausted；supply=`pool_empty/parked_only/pending_present`。pending_present 不能叫“交易不足”：可能包含祖先已消费交易、nonce/其他资格限制。池快照和迭代器不是原子视图。
+- `transactions_total{reason,...}`：iterator_yielded 包括祖先排除；ancestor_excluded 单独记录，executed 为本次成功执行用户交易；其余沿用八个 skip reason。**ancestor_excluded 不计入 gas_skip_limit**。这些值是遇到次数，不是唯一交易数或池删除数。
+- `filtered_attempts_total{reason,fill,...}`：该候选曾发生某类过滤；多类可同时出现，不能相加作为未满块数，也不能单独证明因果。迭代器内部自动隐藏的交易仍不计入显式 skip。
+- `gas_used/gas_remaining/fill_ratio/remaining_seconds/pool_transactions`：直方图；pool_transactions 按 boundary=start/end、pool=pending/queued/basefee/blob 拆分。无 BuildControl 时 remaining_seconds 记0。selection 的 gas 不含收尾系统交易，selected 使用最终块头 gas。
+- selected 且 gas 填充率低于95%时输出 INFO `Selected underfilled candidate selection evidence`，含块号、原始退出原因、两次池快照、yielded/ancestor/executed、八类 skip（顺序同上文 SKIP_REASONS）、剩余窗口。无逐笔日志，无 hash/address/block-number 指标标签。
+
+看每分钟未达到95%填充的选中候选，按原始退出原因拆分：
+
+```promql
+sum by (instance, kind, reason, fill) (
+  increase(reth_bsc_miner_selection_outcomes_total{job=~"$job",instance=~"$instance",stage="selected",fill=~"empty|lt50|50to90|90to95"}[1m])
+)
+```
+
+看平均选中候选 gas used（Mgas；不是严格 canonical 平均）：
+
+```promql
+sum by (instance) (rate(reth_bsc_miner_selection_gas_used_sum{job=~"$job",instance=~"$instance",stage="selected"}[1m]))
+/
+sum by (instance) (rate(reth_bsc_miner_selection_gas_used_count{job=~"$job",instance=~"$instance",stage="selected"}[1m])) / 1e6
+```
+
+严格上链平均仍应对固定时间窗 canonical 区块求 sum(gasUsed)/区块数（含空块），不要累加三个 validator 的重复链数据。
+
+## 50ms 兜底起点
+
+启用原有 `BSC_MINING_ALLOW_LATE_FINISH` 的 in-turn 构建，在状态/provider/迭代器准备完成、真正进入交易执行时，首次将交易截止时间提高到至少 now+50ms；已有更长窗口不缩短。job 创建时保留原调度用预留，避免过期 job 在首个构建派发前就退出，但它不再是实际执行兜底的计时起点。
+
+同一 job 的所有 clone/重建/预热线程共享一次性截止时间，重试不能续杯；关闭开关和 out-of-turn 保持原行为。取消/换父仍生效。内部 finish 截止相应保留配置的收尾 reserve；这不保证50ms内一定有可执行交易，也不保证候选最终上链。
+
+`reth_bsc_miner_execution_floor_total{outcome="extended/unchanged"}` 每个首次进入执行的已启用 job 一次；`reth_bsc_miner_execution_floor_extension_seconds` 为相对原截止时间的增量。已有 execution_window_seconds 现在读取更新后的共享截止时间，job_transaction_window_seconds 仍是任务创建时的初始窗口。
+
+## 交易去向与候选作废
+
+本节需要同时构建本地 Reth 依赖修改；只部署 reth-bsc 的改动不会产生池移除原因指标。
+
+`reth_transaction_pool_removal_transactions_total{reason}` 在实际移除路径计数，不按请求 hash 数计数：
+- canonical_mined：canonical 更新时确实从池中找到并移除的交易，不是全部链上交易。
+- replaced：同 sender/nonce 的旧交易被成功替换。
+- capacity：容量淘汰，包含因此一并移除的后续 nonce 交易。
+- state_update_invalidated：状态更新/入池联动检查导致不再有效而移除，不等同于入口拒收。
+- explicit_remove / explicit_remove_with_descendants / explicit_remove_sender：调用相应移除接口；不能仅凭接口名推断业务原因。
+- explicit_prune：显式按已挖出语义移池，不证明 canonical 上链。
+
+`reth_transaction_pool_removal_context_transactions_total{reason="queued_expired"}` 记录维护任务实际删除的过期交易，是 explicit_remove 的子集，不能再次加到移除总数中。没有额外事件订阅队列或逐笔日志，不增加 hash 标签。已有入池失败/invalid 指标与以上池内移除不是同一个口径。
+
+`reth_bsc_miner_pipeline_invalidated_branches_total{reason}` 记录分支首次作废，原因包括 parent_changed、candidate_changed、parameters_changed、plan_rejected、window_unavailable、compute_error、compute_cancelled、result_receiver_dropped、launch_failed、adoption_abandoned。保留首次原因，后续失败不覆盖。`invalidated_entries_total` 是作废时协调器仍排队的 entry 数，可能尚未完成构建，不是区块数或交易数；接管任务自行放弃时没有该排队快照。
+
+`reth_bsc_miner_unselected_candidates_total{kind,reason}` 与 `reth_bsc_miner_unselected_candidate_transactions_total{kind,reason}` 在已完成候选的最后一个诊断引用释放、且从未被选中时记录一次。交易数包含候选系统交易，不是唯一 hash 数；不同候选可能重用同一交易。流水线候选引用分支的首次作废原因，未获得原因或正常未选中为 not_selected_or_unattributed。只持有少量计数/原因，不额外保留交易和执行状态。运行中的分支在完成前已移除、因而无法关联原因的结果可能落入未归因项。
+
+这些不是“丢交易计数”：候选作废后，其交易可能仍在池内或已被其他块打包；已选中但之后未发布/被 reorg 的区块也不在 unselected 中。确认丢交易仍需 driver 接收成功的 hash 与 receipt、pool、同 nonce 替换对账，并考虑重组重入池。当前矿工的 best iterator mark_invalid 只过滤该迭代器，不直接移池。

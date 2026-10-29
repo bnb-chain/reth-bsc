@@ -357,7 +357,7 @@ fn miner_metrics() -> &'static crate::metrics::BscMinerMetrics {
 
 fn local_rebuild_action(input: LocalRebuildPolicyInput) -> LocalRebuildAction {
     if input.parent_frozen {
-        return LocalRebuildAction::ReturnBestPayload
+        return LocalRebuildAction::ReturnBestPayload;
     }
     let finalize_margin = std::time::Duration::from_millis(FINALIZE_MARGIN_MS);
     if input.remaining_duration < input.last_build_duration.saturating_add(finalize_margin) {
@@ -579,51 +579,6 @@ where
         kind: AttemptKind,
     ) -> Result<BscBuiltPayload, Box<dyn std::error::Error + Send + Sync>> {
         let build_start = std::time::Instant::now();
-        if matches!(kind, AttemptKind::Regular) &&
-            args.pipeline_parent.is_none() &&
-            self.ctx.is_inturn
-        {
-            let key = super::pipeline::Key {
-                parent: args.config.parent_header.hash(),
-                timestamp_ms: args
-                    .config
-                    .attributes
-                    .timestamp
-                    .saturating_mul(1000)
-                    .saturating_add(args.milli_remainder),
-                beneficiary: args.config.attributes.suggested_fee_recipient,
-                gas_limit: self.builder_config.gas_limit(args.config.parent_header.gas_limit),
-                min_gas_tip: args.min_gas_tip,
-            };
-            if let Some(mut adopted) = super::pipeline::take(&key) {
-                let adoption_start = std::time::Instant::now();
-                let adoption_phase = super::perf_tuning::Phase::new(
-                    "pipeline",
-                    true,
-                    adopted.depth,
-                    "adoption_wait",
-                );
-                let result = tokio::select! {
-                    result = &mut adopted.receiver => result,
-                    _ = async { loop { if args.cancel.is_cancelled() { break } tokio::time::sleep(std::time::Duration::from_millis(10)).await; } } => {
-                        return Err(std::io::Error::other("pipelined build cancelled").into());
-                    }
-                };
-                adoption_phase.complete();
-                metrics::histogram!("bsc_miner_pipeline_adoption_wait_seconds")
-                    .record(adoption_start.elapsed().as_secs_f64());
-                if args.cancel.is_cancelled() {
-                    return Err(std::io::Error::other("pipelined build cancelled").into());
-                }
-                if let Ok(Ok(payload)) = result {
-                    // Preserve the original physical computation's timings and identity.
-                    super::pipeline::event("reused");
-                    adopted.accept();
-                    return Ok(payload);
-                }
-                super::pipeline::event("fallback");
-            }
-        }
         let BscBuildArguments {
             mut cached_reads,
             config,
@@ -877,6 +832,10 @@ where
         if !blob_eligible {
             max_blob_count = 0;
         }
+        let selection_pool_start = self.pool.pool_size().into();
+        let mut iterator_yielded = 0u64;
+        let mut ancestor_excluded = 0u64;
+        let selection_exit;
         let mut best_tx_list = self.pool.best_transactions_with_attributes(
             BestTransactionsAttributes::new(base_fee, blob_fee.map(|fee| fee as u64)),
         );
@@ -889,6 +848,26 @@ where
             cfg_env: builder.evm_mut().cfg_env().clone(),
             block_env: builder.evm_mut().block().clone(),
         };
+        selection_setup.complete();
+        let execution_phase = super::perf_tuning::Phase::new(
+            kind.label(),
+            self.ctx.is_inturn,
+            private_depth,
+            "execution",
+        );
+        let exec_start = std::time::Instant::now();
+        // Arm the shared floor once at actual execution entry, after preparation.
+        if let Some(control) = &build_control {
+            control.begin_execution(exec_start).map_err(std::io::Error::other)?;
+            work.refresh_deadlines(control);
+        }
+        // Everything before `exec_start` is treated as "prepare" time for this payload attempt.
+        let prepare_duration = exec_start.duration_since(build_start);
+        read_phase.selection();
+        if let Some(cache) = &prewarm_cache {
+            cache.execution_started();
+        }
+        work.execution_started(exec_start);
         let prewarm = super::prewarm::start(
             prewarm_cache.clone(),
             self.pool.clone(),
@@ -902,21 +881,7 @@ where
             cancel.clone(),
             build_control.clone(),
         );
-        selection_setup.complete();
-        let execution_phase = super::perf_tuning::Phase::new(
-            kind.label(),
-            self.ctx.is_inturn,
-            private_depth,
-            "execution",
-        );
-        let exec_start = std::time::Instant::now();
-        // Everything before `exec_start` is treated as "prepare" time for this payload attempt.
-        let prepare_duration = exec_start.duration_since(build_start);
-        read_phase.selection();
-        if let Some(cache) = &prewarm_cache {
-            cache.execution_started();
-        }
-        work.execution_started(exec_start);
+
         let mut gas_limit_skips = super::perf_tuning::GasLimitSkips::configured();
         let mut gas_skip_limit_reached = false;
         loop {
@@ -930,16 +895,26 @@ where
                     .as_ref()
                     .is_some_and(|control| control.stop_transactions(std::time::Instant::now()))
             {
+                selection_exit = if cancel.is_cancelled() {
+                    super::selection_diagnostics::SelectionExit::Cancelled
+                } else {
+                    super::selection_diagnostics::SelectionExit::Deadline
+                };
                 break;
             }
             work.selection_stage(SelectionStage::Iterator);
-            let Some(pool_tx) = best_tx_list.next() else { break };
+            let Some(pool_tx) = best_tx_list.next() else {
+                selection_exit = super::selection_diagnostics::SelectionExit::IteratorExhausted;
+                break;
+            };
+            iterator_yielded += 1;
             if let Some(prewarm) = &prewarm {
                 prewarm.selected(pool_tx.sender(), pool_tx.nonce());
             }
             if parent_state.consumed(pool_tx.sender(), pool_tx.nonce()) {
+                ancestor_excluded += 1;
                 gas_limit_skips.reset();
-                continue
+                continue;
             }
             work.selection_stage(SelectionStage::Precheck);
             work.scanned += 1;
@@ -997,6 +972,7 @@ where
                 work.skip(SkipReason::GasLimit, iteration_started);
                 if gas_limit_skips.rejected() {
                     gas_skip_limit_reached = true;
+                    selection_exit = super::selection_diagnostics::SelectionExit::GasSkipLimit;
                     break;
                 }
                 continue;
@@ -1240,6 +1216,23 @@ where
                 sidecars_map.insert(*tx.hash(), sidecar);
             }
         }
+        let selection_diagnostics = super::selection_diagnostics::SelectionDiagnostics {
+            block_number: parent_header.number + 1,
+            start: selection_pool_start,
+            end: self.pool.pool_size().into(),
+            exit: selection_exit,
+            yielded: iterator_yielded,
+            ancestor_excluded,
+            executed: work.executed,
+            skipped: work.skipped,
+            gas_used: cumulative_gas_used,
+            gas_limit: block_gas_limit,
+            remaining_seconds: build_control.as_ref().map_or(0.0, |c| {
+                c.transactions_until()
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_secs_f64()
+            }),
+        };
         if let Some(cache) = &prewarm_cache {
             cache.execution_finished();
         }
@@ -1258,9 +1251,9 @@ where
                 "cancelled"
             } else if gas_skip_limit_reached {
                 "gas_skip_limit"
-            } else if !control.allows_late_finish() && now >= control.finish_until {
+            } else if !control.allows_late_finish() && now >= control.finish_until() {
                 "completion_deadline"
-            } else if now >= control.transactions_until {
+            } else if now >= control.transactions_until() {
                 "transaction_deadline"
             } else {
                 "pool_or_gas_limit"
@@ -1270,7 +1263,7 @@ where
             metrics::counter!("bsc_miner_build_stop_total", "turn" => turn, "reason" => reason)
                 .increment(1);
             metrics::histogram!("bsc_miner_execution_budget_overrun_seconds", "turn" => turn)
-                .record(now.saturating_duration_since(control.transactions_until).as_secs_f64());
+                .record(now.saturating_duration_since(control.transactions_until()).as_secs_f64());
             debug!(target: "payload_builder", trace_id, reason, cumulative_gas_used,
                 exec_duration_ms = exec_duration.as_millis(), "Stopped selecting payload transactions");
         } else {
@@ -1285,6 +1278,14 @@ where
         if let Some(control) = &build_control {
             control.check_active(std::time::Instant::now()).map_err(std::io::Error::other)?;
         }
+
+        selection_diagnostics.record(
+            "selection",
+            kind.label(),
+            if self.ctx.is_inturn { "inturn" } else { "outofturn" },
+            selection_diagnostics.gas_used,
+            selection_diagnostics.gas_limit,
+        );
 
         // add system txs to payload.
         let finalize_start = std::time::Instant::now();
@@ -1317,7 +1318,8 @@ where
             .as_ref()
             .filter(|control| control.allows_late_finish() && pipeline_parent.is_none())
         {
-            let overrun = std::time::Instant::now().saturating_duration_since(control.finish_until);
+            let overrun =
+                std::time::Instant::now().saturating_duration_since(control.finish_until());
             if !overrun.is_zero() {
                 // Completed local candidates, not canonical blocks or accepted submissions.
                 metrics::counter!("bsc_miner_late_finish_completed_total").increment(1);
@@ -1425,6 +1427,7 @@ where
         let pending_turn_length = turn_length_sink.lock().unwrap().take();
 
         let payload = BscBuiltPayload {
+            selection_diagnostics: Some(selection_diagnostics),
             pipeline_seal: None,
             diagnostics: None,
             block: sealed_block.clone(),
@@ -1609,6 +1612,7 @@ where
         let pending_turn_length = turn_length_sink.lock().unwrap().take();
 
         let payload = BscBuiltPayload {
+            selection_diagnostics: None,
             pipeline_seal: None,
             diagnostics: None,
             block: sealed_block.clone(),
@@ -1649,6 +1653,7 @@ where
     mining_ctx: MiningContext,
     /// The payload builder instance
     builder: Arc<BscPayloadBuilder<Pool, Client, EvmConfig>>,
+    pipeline_adoption: Option<super::pipeline::Adoption>,
     /// Timeout for payload building
     timeout: std::time::Duration,
     /// Time reserved for system transactions and state-root completion.
@@ -1768,6 +1773,7 @@ where
             parlia,
             mining_ctx,
             builder: Arc::new(builder),
+            pipeline_adoption: None,
             timeout: std::time::Duration::from_millis(mining_delay),
             root_reserve: std::time::Duration::from_millis(effective_reserve),
             try_build_rx,
@@ -1805,6 +1811,10 @@ where
         (job, handle)
     }
 
+    pub(crate) fn adopt_pipeline(&mut self, adoption: super::pipeline::Adoption) {
+        self.pipeline_adoption = Some(adoption);
+    }
+
     pub(crate) fn mark_scheduled(&mut self) {
         if let Some(timing) = &mut self.mining_ctx.startup_timing {
             timing.scheduled();
@@ -1813,6 +1823,57 @@ where
 
     /// Runs the payload job asynchronously with timeout support
     pub async fn start(mut self) -> Result<(), Box<BscPayloadJobError>> {
+        if let Some(mut adoption) = self.pipeline_adoption.take() {
+            let started = std::time::Instant::now();
+            let phase =
+                super::perf_tuning::Phase::new("pipeline", true, adoption.depth, "adoption_wait");
+            let result = match adoption.wait(&mut self.abort_rx).await {
+                Ok(result) => result,
+                Err(()) => {
+                    self.build_args.cancel.clone().cancel();
+                    return Err(Box::new(BscPayloadJobError::JobAborted));
+                }
+            };
+            phase.complete();
+            metrics::histogram!("bsc_miner_pipeline_adoption_wait_seconds")
+                .record(started.elapsed().as_secs_f64());
+            if !adoption.is_cancelled() {
+                if let Ok(payload) = result {
+                    adoption.accept();
+                    super::pipeline::event("reused");
+                    super::pipeline::event("reuse_observed");
+                    self.potential_payloads.push(payload);
+                    return self.try_return_best_payload();
+                }
+            }
+            drop(adoption);
+            // An invalidated generation cannot publish or rebuild against a stale parent.
+            if !super::pipeline::is_head(self.mining_ctx.parent_header.hash()) {
+                return Err(Box::new(BscPayloadJobError::JobAborted));
+            }
+            super::pipeline::event("fallback");
+            // Only an actual failed adoption creates a fresh ordinary job budget and timestamp.
+            let parent = self.mining_ctx.parent_header.clone();
+            self.build_args.config.attributes = super::util::prepare_new_attributes(
+                &mut self.mining_ctx,
+                self.parlia.clone(),
+                &parent,
+                self.build_args.config.attributes.suggested_fee_recipient,
+            );
+            self.build_args.milli_remainder = self.mining_ctx.block_timestamp_ms % 1000;
+            self.build_args.state_root_deadline_ms = Some(
+                self.mining_ctx
+                    .end_mining_timestamp_ms
+                    .saturating_sub(STATE_ROOT_WAIT_MARGIN_MS as u128) as u64,
+            );
+            Arc::make_mut(&mut self.builder).ctx = self.mining_ctx.clone();
+            self.timeout = std::time::Duration::from_millis(self.parlia.delay_for_mining(
+                &self.mining_ctx.parent_snapshot,
+                self.mining_ctx.header.as_ref().expect("refreshed mining header"),
+                self.root_reserve.as_millis() as u64,
+            ));
+        }
+
         // Sparse-trie state-root (`--mining.use-sparse-trie-state-root`):
         // R3 spawns a fresh background task PER build attempt inside `build_payload`
         // (not once here), so every attempt — including value-gated rebuilds — gets the
@@ -1860,7 +1921,7 @@ where
                 std::time::Duration::from_millis(STATE_ROOT_WAIT_MARGIN_MS),
                 self.root_reserve,
                 total_budget,
-                control.transactions_until.saturating_duration_since(start_time),
+                control.transactions_until().saturating_duration_since(start_time),
             );
         }
         // One sample per job (not per retry): slot_remaining is the original slot budget;
@@ -1870,8 +1931,10 @@ where
         metrics::histogram!("bsc.build_diagnostics.job_slot_remaining_seconds", "turn" => turn)
             .record(slot_remaining.as_secs_f64());
         metrics::histogram!("bsc.build_diagnostics.job_transaction_window_seconds", "turn" => turn)
-            .record(control.transactions_until.saturating_duration_since(start_time).as_secs_f64());
-        self.timeout = control.transactions_until.saturating_duration_since(start_time);
+            .record(
+                control.transactions_until().saturating_duration_since(start_time).as_secs_f64(),
+            );
+        self.timeout = control.transactions_until().saturating_duration_since(start_time);
         self.build_args.build_control = Some(control);
         let initial_wait = initial_out_of_turn_build_wait(&self.parlia, &self.mining_ctx);
         if !initial_wait.is_zero() {
@@ -2753,7 +2816,7 @@ where
     fn try_start_next_pipeline(&mut self) {
         use super::pipeline;
         if self.has_frozen_pipeline_parent() {
-            return
+            return;
         }
         if !pipeline::enabled() || !self.mining_ctx.is_inturn || !crate::shared::is_mining_enabled()
         {
@@ -2765,7 +2828,7 @@ where
         let now_ms = super::startup_diagnostics::wall_ms();
         if self.mining_ctx.end_mining_timestamp_ms.saturating_sub(now_ms) < 25 {
             pipeline::depth_event(1, "start_check_no_lead");
-            return
+            return;
         }
         let Some(best_index) = self
             .potential_payloads
@@ -2774,11 +2837,11 @@ where
             .max_by_key(|(_, p)| p.fees())
             .map(|(i, _)| i)
         else {
-            return
+            return;
         };
         let best = &self.potential_payloads[best_index];
         if best.build_kind == BuildKind::EmptyFallback || best.bid_builder.is_some() {
-            return
+            return;
         }
         let mut parent_ready_at = best.diagnostics.as_ref().map(|d| d.ready_at);
         let parent_preparation =
@@ -2789,7 +2852,7 @@ where
             self.parlia.clone(),
             self.builder.chain_spec.as_ref(),
         ) else {
-            return
+            return;
         };
         parent_preparation.complete();
         let parent_header = parent.block().clone_sealed_header();
@@ -2803,9 +2866,12 @@ where
             gas_limit,
             min_gas_tip,
         };
-        let Some((id, cancel, result, permit)) = pipeline::reserve(key, parent_header.parent_hash)
-        else {
-            return
+        let Some((id, cancel, result, permit)) = pipeline::reserve(
+            key,
+            parent_header.parent_hash,
+            pipeline::Plan { context: context.clone(), attributes: attributes.clone() },
+        ) else {
+            return;
         };
         let client = self.builder.client.clone();
         let pool = self.builder.pool.clone();
@@ -2839,14 +2905,14 @@ where
                 )
                 .await
                 else {
-                    pipeline::failed(id);
-                    break
+                    pipeline::failed(id, "window_unavailable");
+                    break;
                 };
                 if let Some(accepted) = pipeline::accepted_parent(id) {
                     ancestry = ancestry.rebased_at(accepted);
                 }
                 if cancel.is_cancelled() {
-                    break
+                    break;
                 }
                 pipeline::depth_event(level, "compute_started");
                 if let Some(ready) = parent_ready_at {
@@ -2932,10 +2998,21 @@ where
                 observation.finish(built.as_mut().ok(), cancel.is_cancelled());
                 metrics::histogram!("bsc_miner_pipeline_compute_seconds")
                     .record(started.elapsed().as_secs_f64());
+                if let Ok(payload) = &built {
+                    pipeline::track_candidate(id, payload);
+                }
                 let mut payload = match built {
                     Ok(payload) if !cancel.is_cancelled() => payload,
-                    _ => {
-                        pipeline::failed(id);
+                    rejected => {
+                        pipeline::failed(
+                            id,
+                            if cancel.is_cancelled() {
+                                "compute_cancelled"
+                            } else {
+                                "compute_error"
+                            },
+                        );
+                        drop(rejected);
                         pipeline::event("compute_failed");
                         pipeline::depth_event(
                             level,
@@ -2946,7 +3023,7 @@ where
                             },
                         );
                         let _ = result.send(Err("private build failed or cancelled".to_owned()));
-                        return
+                        return;
                     }
                 };
                 compute_phase.complete();
@@ -2980,7 +3057,11 @@ where
                             gas_limit: builder_config.gas_limit(parent.block().gas_limit()),
                             min_gas_tip,
                         };
-                        let sender = pipeline::extend(id, key)?;
+                        let sender = pipeline::extend(
+                            id,
+                            key,
+                            pipeline::Plan { context: context.clone(), attributes: attrs.clone() },
+                        )?;
                         // Deliver the same sealed parent used by the successor, not its
                         // unsealed pre-finalization input.
                         payload = parent;
@@ -3001,10 +3082,11 @@ where
                     );
                 }
                 parent_ready_at = payload.diagnostics.as_ref().map(|d| d.ready_at);
-                if result.send(Ok(payload)).is_err() {
+                if let Err(undelivered) = result.send(Ok(payload)) {
                     pipeline::depth_event(level, "result_receiver_dropped");
-                    pipeline::failed(id);
-                    return
+                    pipeline::failed(id, "result_receiver_dropped");
+                    drop(undelivered);
+                    return;
                 }
                 let Some((chain, next_context, attrs, sender)) = next else { break };
                 pipeline::event("extended");
@@ -3016,7 +3098,7 @@ where
             }
         });
         if !launched {
-            pipeline::failed(id);
+            pipeline::failed(id, "launch_failed");
             pipeline::event("launch_failed");
             return;
         }
@@ -3636,7 +3718,7 @@ fn prepare_pipeline_successor(
     chain_spec: &BscChainSpec,
 ) -> Option<(BscBuiltPayload, MiningContext, EthPayloadAttributes)> {
     if best.build_kind == BuildKind::EmptyFallback || best.bid_builder.is_some() {
-        return None
+        return None;
     }
     // Epoch/validator-set transitions need an imported snapshot; do not guess it privately.
     let snap = &ctx.parent_snapshot;
@@ -3649,7 +3731,7 @@ fn prepare_pipeline_successor(
         best.pending_validators.is_some() ||
         best.pending_turn_length.is_some()
     {
-        return None
+        return None;
     }
     let snapshots = crate::shared::get_snapshot_provider()?;
     let mut parent = best.clone();
@@ -3669,7 +3751,7 @@ fn prepare_pipeline_successor(
     .is_err()
     {
         super::pipeline::event("preview_failed");
-        return None
+        return None;
     }
     metrics::histogram!("bsc_miner_pipeline_preview_seconds")
         .record(preview_start.elapsed().as_secs_f64());
@@ -3677,7 +3759,7 @@ fn prepare_pipeline_successor(
     let Ok(attestation) =
         parlia.get_vote_attestation_from_header(parent.block().header(), snap.epoch_num)
     else {
-        return None
+        return None;
     };
     let next_snapshot = snap.apply(
         parent.block().beneficiary(),
@@ -3695,7 +3777,7 @@ fn prepare_pipeline_successor(
     {
         // The turn's final block has a separate, shorter packing cap. Keep it
         // on the unchanged ordinary path rather than borrowing its full slot.
-        return None
+        return None;
     }
     let parent_header = parent.block().clone_sealed_header();
     let mut context = MiningContext {
@@ -3797,13 +3879,13 @@ fn finalize_payload_inner(
         if sealed != payload.block().hash() ||
             sealed != payload.executed_block.recovered_block.hash()
         {
-            return Err(std::io::Error::other("frozen pipeline payload identity changed").into())
+            return Err(std::io::Error::other("frozen pipeline payload identity changed").into());
         }
         if publish_cache {
             publish_payload_caches(payload, parent_header.hash(), sealed);
             super::pipeline::event("frozen_parent_published");
         }
-        return Ok(())
+        return Ok(());
     }
     let senders = payload.executed_block.recovered_block.senders().to_vec();
     let mut plain_block = payload.executed_block.recovered_block.sealed_block().clone_block();
@@ -4589,6 +4671,7 @@ mod tests {
             let mut executed_block = block.clone();
             executed_block.body.sidecars = None;
             let mut payload = super::BscBuiltPayload {
+                selection_diagnostics: None,
                 pipeline_seal: None,
                 diagnostics: None,
                 block: Arc::new(block.into()),

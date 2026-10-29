@@ -695,15 +695,42 @@ where
 
         let parent_header = mining_ctx.parent_header.clone();
         let block_number = parent_header.number() + 1;
-        let attributes = prepare_new_attributes(
-            &mut mining_ctx,
-            self.parlia.clone(),
-            &parent_header,
-            self.validator_address,
-        );
-
-        // Read dynamic config from shared state (updated by miner_* RPC), fall back to init values
+        // Resolve dynamic parameters before claiming any existing computation. A wall-clock
+        // timestamp refresh must not invalidate a still-valid private successor.
         let gas_limit = crate::shared::get_miner_gas_limit().unwrap_or(self.desired_gas_limit);
+        let min_gas_tip = crate::shared::get_miner_gas_tip()
+            .map(|v| v as u128)
+            .unwrap_or(self.desired_min_gas_tip);
+        let effective_gas_limit = EthereumBuilderConfig::new()
+            .with_gas_limit(gas_limit)
+            .gas_limit(parent_header.gas_limit);
+        let claimed = if mining_ctx.is_inturn {
+            super::pipeline::claim(parent_header.hash(), |key, plan| {
+                key.beneficiary == self.validator_address
+                    && key.gas_limit == effective_gas_limit
+                    && key.min_gas_tip == min_gas_tip
+                    && plan.valid_for(key, &mining_ctx, &self.parlia)
+            })
+        } else {
+            None
+        };
+        let (attributes, adoption) = if let Some((plan, adoption)) = claimed {
+            mining_ctx.header = plan.context.header;
+            mining_ctx.block_timestamp_ms = plan.context.block_timestamp_ms;
+            mining_ctx.end_mining_timestamp_ms = plan.context.end_mining_timestamp_ms;
+            super::pipeline::event("planned_context_adopted");
+            (plan.attributes, Some(adoption))
+        } else {
+            (
+                prepare_new_attributes(
+                    &mut mining_ctx,
+                    self.parlia.clone(),
+                    &parent_header,
+                    self.validator_address,
+                ),
+                None,
+            )
+        };
 
         let evm_config = BscEvmConfig::new(self.chain_spec.clone());
         let payload_builder = BscPayloadBuilder::new(
@@ -729,9 +756,7 @@ where
             ),
             cancel: ManualCancel::default(),
             trace_id: crate::node::miner::payload::generate_trace_id(),
-            min_gas_tip: crate::shared::get_miner_gas_tip()
-                .map(|v| v as u128)
-                .unwrap_or(self.desired_min_gas_tip),
+            min_gas_tip,
             // Filled in by BscPayloadJob::start when sparse-trie state-root is enabled
             // and the engine has registered a spawner. Falls back to legacy path when None.
             state_root_precomputed: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -755,6 +780,9 @@ where
             self.payload_tx.clone(),
         );
 
+        if let Some(adoption) = adoption {
+            payload_job.adopt_pipeline(adoption);
+        }
         let start_time = std::time::Instant::now();
         self.running_job_handle = Some(job_handle);
         payload_job.mark_scheduled();
