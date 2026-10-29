@@ -487,6 +487,7 @@ mod parent_block_env {
     use alloy_consensus::Header;
     use alloy_evm::eth::EthBlockExecutionCtx;
     use alloy_primitives::{hex, Address, Bytes, U160};
+    use reth_ethereum_primitives::Transaction;
     use reth_evm_ethereum::RethReceiptBuilder;
     use revm::bytecode::Bytecode;
     use revm::database::InMemoryDB;
@@ -965,5 +966,79 @@ mod parent_block_env {
         assert_eq!(receipts, 1, "the injected tx must get a receipt inline");
         assert_eq!(gas_used, 21_000);
         assert_eq!(queued, 1, "only the deposit is a system tx");
+    }
+
+    /// Queues `block_tx(deposit)` as the block's system tx, then matches the deposit against it.
+    fn match_deposit_against(
+        block_tx: impl FnOnce(Transaction) -> Transaction,
+    ) -> Result<(), reth_evm::execute::BlockExecutionError> {
+        use alloy_evm::block::BlockExecutor;
+        use alloy_primitives::Signature;
+        use reth_ethereum_primitives::TransactionSigned;
+        use reth_primitives_traits::Recovered;
+
+        let mut executor = executor();
+        let coinbase = header_at(EPOCH_BLOCK).beneficiary;
+        let deposit_call = executor.system_contracts.distribute_to_validator(coinbase, 0);
+        let tx = TransactionSigned::new_unhashed(
+            block_tx(deposit_call.clone()),
+            Signature::new(Default::default(), Default::default(), false),
+        );
+        executor
+            .execute_transaction(&Recovered::new_unchecked(tx, coinbase))
+            .expect("the block tx is queued");
+        assert_eq!(executor.system_txs.len(), 1, "the block tx must be queued as a system tx");
+
+        executor.transact_system_tx(deposit_call, coinbase)
+    }
+
+    /// go-bsc matches system txs by `p.signer.Hash`, which hashes a legacy tx with the configured
+    /// chain id even when it is unprotected, so a validator may seal the deposit pre-EIP-155.
+    #[test]
+    fn unprotected_legacy_system_tx_matches_its_eip155_template() {
+        use alloy_consensus::TxLegacy;
+
+        let unprotected = |tx| match tx {
+            Transaction::Legacy(legacy) => {
+                Transaction::Legacy(TxLegacy { chain_id: None, ..legacy })
+            }
+            other => other,
+        };
+        match_deposit_against(unprotected).expect("go-bsc accepts an unprotected system tx");
+        match_deposit_against(|tx| tx).expect("the protected form still matches");
+    }
+
+    /// Only a missing chain id is filled in: a protected tx for another chain, or the same call as
+    /// a typed tx, has a different signing hash on go-bsc too.
+    #[test]
+    fn system_tx_with_another_signing_domain_is_unexpected() {
+        use alloy_consensus::{Transaction as _, TxEip1559, TxLegacy};
+
+        let other_chain = |tx| match tx {
+            Transaction::Legacy(legacy) => {
+                Transaction::Legacy(TxLegacy { chain_id: Some(97), ..legacy })
+            }
+            other => other,
+        };
+        let typed = |tx: Transaction| {
+            Transaction::Eip1559(TxEip1559 {
+                chain_id: 56,
+                nonce: tx.nonce(),
+                gas_limit: tx.gas_limit(),
+                to: tx.kind(),
+                value: tx.value(),
+                input: tx.input().clone(),
+                ..Default::default()
+            })
+        };
+
+        let cases = [
+            ("other chain", match_deposit_against(other_chain)),
+            ("typed", match_deposit_against(typed)),
+        ];
+        for (name, result) in cases {
+            let err = result.expect_err(name);
+            assert!(err.to_string().contains("unexpected system tx"), "{name}: {err}");
+        }
     }
 }
