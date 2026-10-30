@@ -439,6 +439,10 @@ where
     where
         H: alloy_consensus::BlockHeader + Sealable,
     {
+        if !crate::node::startup_recovery::is_ready() {
+            debug!(target: "bsc::miner", "Skip mining: persisted finalized history is not restored");
+            return;
+        }
         // Check if mining is disabled via miner_stop RPC
         if !crate::shared::is_mining_enabled() {
             debug!("Skip mining: mining is disabled via miner_stop RPC");

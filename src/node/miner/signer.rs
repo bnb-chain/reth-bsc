@@ -109,6 +109,12 @@ impl MinerSigner {
         header: &Header,
         chain_id: u64,
     ) -> Result<[u8; EXTRA_SEAL_LEN], SignerError> {
+        // Also protect callers outside the ordinary mining work scheduler.
+        if !crate::node::startup_recovery::is_ready() {
+            return Err(SignerError::SigningFailed(
+                "Persisted finalized history is not restored".to_string(),
+            ));
+        }
         let hash_data = hash_with_chain_id(header, chain_id);
         let message = Message::from_digest(hash_data.0);
         let sk = SecretKey::from_slice(self.secret_bytes.as_slice())

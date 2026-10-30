@@ -44,6 +44,7 @@ pub mod network;
 pub mod pool;
 pub mod primitives;
 mod reorg_metrics;
+pub mod startup_recovery;
 pub mod storage;
 pub mod vote_journal;
 pub mod vote_producer;
