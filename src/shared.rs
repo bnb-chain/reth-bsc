@@ -2,10 +2,7 @@ use crate::{
     consensus::parlia::SnapshotProvider,
     node::{
         engine_api::payload::BscPayloadTypes,
-        network::{
-            block_import::service::{IncomingBidBlock, IncomingBlock, IncomingMinedBlock},
-            BscNetworkPrimitives,
-        },
+        network::{block_import::service::IncomingLocalBlock, BscNetworkPrimitives},
         primitives::BscBlock,
     },
 };
@@ -34,7 +31,10 @@ use std::{
         Arc, OnceLock, RwLock,
     },
 };
-use tokio::sync::{broadcast, mpsc::UnboundedSender};
+use tokio::sync::{
+    broadcast,
+    mpsc::{Sender, UnboundedSender},
+};
 
 /// Public type alias for the BSC engine API sender (replaces private reth EngineApiTx).
 pub type BscEngineApiTx = UnboundedSender<
@@ -50,9 +50,16 @@ type HeaderByNumberFn = Arc<dyn Fn(u64) -> Option<Header> + Send + Sync>;
 /// Global shared access to the snapshot provider for RPC
 static SNAPSHOT_PROVIDER: OnceLock<Arc<dyn SnapshotProvider + Send + Sync>> = OnceLock::new();
 
+/// Select independent normal/fallback worker sessions while sharing parent overlays.
+#[derive(Debug, Clone, Copy)]
+pub enum MinerRootKind {
+    Normal,
+    EmptyFallback,
+}
+
 /// Function type for spawning a sparse-trie state-root background task.
 ///
-/// Takes the parent block's sealed header, returns an opaque handle that the
+/// Takes the parent block's sealed header and worker kind, returns an opaque handle that the
 /// miner can:
 ///   1. attach as a `state_hook` on the BSC executor (streams per-tx state diffs to the task)
 ///   2. block on after execution to receive the precomputed `(state_root, trie_updates)`
@@ -65,7 +72,13 @@ static SNAPSHOT_PROVIDER: OnceLock<Arc<dyn SnapshotProvider + Send + Sync>> = On
 /// `--mining.use-sparse-trie-state-root` is enabled. Returns `None` if the engine
 /// has not been wired (graceful fallback to legacy `state_root_with_updates`).
 pub type SparseTrieSpawnFn = Arc<
-    dyn Fn(SealedHeader<Header>) -> Option<reth_engine_tree::tree::StateRootHandle> + Send + Sync,
+    dyn Fn(
+            SealedHeader<Header>,
+            MinerRootKind,
+            Option<PrivateMinerChain>,
+        ) -> Option<reth_engine_tree::tree::StateRootHandle>
+        + Send
+        + Sync,
 >;
 
 /// Global sparse-trie state-root spawner. See [`SparseTrieSpawnFn`].
@@ -89,15 +102,8 @@ type BestTdFn = Arc<dyn Fn() -> Option<u128> + Send + Sync>;
 /// Global best total difficulty provider
 static BEST_TD_PROVIDER: OnceLock<BestTdFn> = OnceLock::new();
 
-/// Global sender for submitting mined blocks to the import service
-static BLOCK_IMPORT_MINED_SENDER: OnceLock<UnboundedSender<IncomingMinedBlock>> = OnceLock::new();
-
-/// Global sender for submitting built payload to the import service
-static BLOCK_IMPORT_SENDER: OnceLock<UnboundedSender<IncomingBlock>> = OnceLock::new();
-
-/// Global sender for submitting a selected (sealed, unexecuted) BEP-675 BidBlock to the import
-/// service, which broadcasts it then verifies it on import (zero-simulate).
-static BID_BLOCK_IMPORT_SENDER: OnceLock<UnboundedSender<IncomingBidBlock>> = OnceLock::new();
+/// Bounded ingress shared by locally mined, fallback and selected BidBlocks.
+static LOCAL_BLOCK_IMPORT_SENDER: OnceLock<Sender<IncomingLocalBlock>> = OnceLock::new();
 
 /// Global local peer ID for network identification
 static LOCAL_PEER_ID: OnceLock<PeerId> = OnceLock::new();
@@ -336,7 +342,90 @@ pub fn set_sparse_trie_spawn_fn(spawner: SparseTrieSpawnFn) -> Result<(), Sparse
 pub fn spawn_sparse_trie_state_root(
     parent_header: SealedHeader<Header>,
 ) -> Option<reth_engine_tree::tree::StateRootHandle> {
-    SPARSE_TRIE_SPAWN_FN.get().and_then(|f| f(parent_header))
+    SPARSE_TRIE_SPAWN_FN.get().and_then(|f| f(parent_header, MinerRootKind::Normal, None))
+}
+
+/// Reuse miner parent overlays, with independent workers so a normal task waiting for
+/// more transaction updates cannot block the empty candidate's root.
+pub fn spawn_empty_sparse_trie_state_root(
+    parent_header: SealedHeader<Header>,
+) -> Option<reth_engine_tree::tree::StateRootHandle> {
+    SPARSE_TRIE_SPAWN_FN.get().and_then(|f| f(parent_header, MinerRootKind::EmptyFallback, None))
+}
+
+/// One linear, unpublished ancestry, oldest first. Never inserted into canonical state.
+#[derive(Clone, Debug)]
+pub struct PrivateMinerChain(Arc<Vec<reth_chain_state::ExecutedBlock<crate::BscPrimitives>>>);
+impl PrivateMinerChain {
+    pub fn new(block: reth_chain_state::ExecutedBlock<crate::BscPrimitives>) -> Self {
+        Self(Arc::new(vec![block]))
+    }
+    pub fn blocks(&self) -> &[reth_chain_state::ExecutedBlock<crate::BscPrimitives>] {
+        &self.0
+    }
+    pub fn parent(&self) -> &reth_chain_state::ExecutedBlock<crate::BscPrimitives> {
+        self.0.last().expect("private chain is nonempty")
+    }
+    pub fn base_hash(&self) -> B256 {
+        self.0[0].recovered_block().parent_hash
+    }
+    /// Release accepted ancestors before extending the sliding window. Retain the
+    /// latest accepted parent to cover canonical notification/provider visibility races.
+    pub fn rebased_at(&self, accepted: B256) -> Self {
+        match self.0.iter().position(|block| block.recovered_block().hash() == accepted) {
+            Some(index) if index > 0 => Self(Arc::new(self.0[index..].to_vec())),
+            _ => self.clone(),
+        }
+    }
+    pub fn appended(
+        &self,
+        block: reth_chain_state::ExecutedBlock<crate::BscPrimitives>,
+    ) -> Option<Self> {
+        if self.0.len() > crate::node::miner::pipeline::MAX_DEPTH ||
+            block.recovered_block().parent_hash != self.parent().recovered_block().hash() ||
+            block.recovered_block().number != self.parent().recovered_block().number + 1
+        {
+            return None
+        }
+        let mut blocks = self.0.as_ref().clone();
+        blocks.push(block);
+        Some(Self(Arc::new(blocks)))
+    }
+}
+
+/// The factory is shared; each caller opens its own thread-local read transaction.
+pub type PrivateMinerStateFactory =
+    Arc<dyn Fn() -> reth_errors::ProviderResult<reth_provider::StateProviderBox> + Send + Sync>;
+pub type PrivateMinerStateFn = Arc<
+    dyn Fn(B256, Option<PrivateMinerChain>) -> reth_errors::ProviderResult<PrivateMinerStateFactory>
+        + Send
+        + Sync,
+>;
+static PRIVATE_MINER_STATE: OnceLock<PrivateMinerStateFn> = OnceLock::new();
+pub fn set_private_miner_state_fn(f: PrivateMinerStateFn) -> Result<(), PrivateMinerStateFn> {
+    PRIVATE_MINER_STATE.set(f)
+}
+pub fn private_miner_state_factory(
+    parent: PrivateMinerChain,
+) -> reth_errors::ProviderResult<PrivateMinerStateFactory> {
+    let f = PRIVATE_MINER_STATE.get().ok_or(reth_errors::ProviderError::HeaderNotFound(
+        parent.parent().recovered_block().hash().into(),
+    ))?;
+    f(parent.parent().recovered_block().hash(), Some(parent))
+}
+/// Open the same miner-owned parent view before and after local publication.
+/// The caller uses this only when pipelined mining is enabled.
+pub fn miner_state_factory(parent: B256) -> reth_errors::ProviderResult<PrivateMinerStateFactory> {
+    let f = PRIVATE_MINER_STATE
+        .get()
+        .ok_or(reth_errors::ProviderError::HeaderNotFound(parent.into()))?;
+    f(parent, None)
+}
+pub fn spawn_private_sparse_trie_state_root(
+    parent_header: SealedHeader<Header>,
+    parent: PrivateMinerChain,
+) -> Option<reth_engine_tree::tree::StateRootHandle> {
+    SPARSE_TRIE_SPAWN_FN.get().and_then(|f| f(parent_header, MinerRootKind::Normal, Some(parent)))
 }
 
 /// Whether the sparse-trie state-root fast path is wired up.
@@ -452,40 +541,16 @@ pub fn get_best_canonical_td() -> Option<u128> {
     BEST_TD_PROVIDER.get().and_then(|f| f())
 }
 
-/// Store the block import sender globally. Returns an error if it was set before.
-pub fn set_block_import_mined_sender(
-    sender: UnboundedSender<IncomingMinedBlock>,
-) -> Result<(), UnboundedSender<IncomingMinedBlock>> {
-    BLOCK_IMPORT_MINED_SENDER.set(sender)
+/// Store the local block import sender. Returns an error if already initialised.
+pub(crate) fn set_local_block_import_sender(
+    sender: Sender<IncomingLocalBlock>,
+) -> Result<(), Sender<IncomingLocalBlock>> {
+    LOCAL_BLOCK_IMPORT_SENDER.set(sender)
 }
 
-/// Get a reference to the global block import sender, if initialized.
-pub fn get_block_import_mined_sender() -> Option<&'static UnboundedSender<IncomingMinedBlock>> {
-    BLOCK_IMPORT_MINED_SENDER.get()
-}
-
-/// Store the block import sender globally. Returns an error if it was set before.
-pub fn set_block_import_sender(
-    sender: UnboundedSender<IncomingBlock>,
-) -> Result<(), UnboundedSender<IncomingBlock>> {
-    BLOCK_IMPORT_SENDER.set(sender)
-}
-
-/// Get a reference to the global block import sender, if initialized.
-pub fn get_block_import_sender() -> Option<&'static UnboundedSender<IncomingBlock>> {
-    BLOCK_IMPORT_SENDER.get()
-}
-
-/// Store the BidBlock import sender globally. Returns an error if it was set before.
-pub fn set_bid_block_import_sender(
-    sender: UnboundedSender<IncomingBidBlock>,
-) -> Result<(), UnboundedSender<IncomingBidBlock>> {
-    BID_BLOCK_IMPORT_SENDER.set(sender)
-}
-
-/// Get a reference to the global BidBlock import sender, if initialized.
-pub fn get_bid_block_import_sender() -> Option<&'static UnboundedSender<IncomingBidBlock>> {
-    BID_BLOCK_IMPORT_SENDER.get()
+/// The local producer must await capacity or reserve it before spawning a delayed send.
+pub(crate) fn get_local_block_import_sender() -> Option<&'static Sender<IncomingLocalBlock>> {
+    LOCAL_BLOCK_IMPORT_SENDER.get()
 }
 
 /// Store the local peer ID globally. Returns an error if it was set before.
@@ -934,6 +999,9 @@ pub fn get_miner_recommit_interval_ms() -> Option<u64> {
 // --- mining enabled ---
 
 pub fn set_mining_enabled(val: bool) {
+    if !val {
+        crate::node::miner::pipeline::selected_parent(None);
+    }
     if let Some(v) = MINING_ENABLED.get() {
         v.store(val, Ordering::Relaxed);
     }

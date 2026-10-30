@@ -1,0 +1,59 @@
+提前构建：正常资源接管、私有父状态预热与两块深度
+
+分支：codex/perf-task-diagnostics。
+基线：7cdfc6d67dc42cad8608e6cb15224f96bba64247，包含0f65cca提前一块及35e3a4c后台overlay释放。
+Reth：562fa2638d7141bed166962aa459a5d56cc4db03（2.8），未变更。
+本地验证及review说明已提供，用户已确认提交并推送至原分支；尚未部署或发压。原版说明见2026-10-28-one-block-pipeline-review.txt，以下取代其资源安排。
+
+修正内容
+1. 删除pipeline单独的小型proof/overlay runtime；提前构建使用普通miner原有线程池及其worker数量。
+   保留独立的执行线程，仅负责驱动提前构建；没有降低proof并发，也没有复用导入线程池。
+   空块兜底的独立runtime保持原状，避免其根任务排在尚未关闭的正常根流后面。
+2. 提前构建只尝试获取现有LOCAL_BUILD_PERMIT；忙则跳过，不排入正常构建前面。
+   许可由实际计算持有到退出。父块成为canonical后接管同一个任务，在接管前不重复申请许可。
+   换父或重建时取消旧任务；取消标志本身不提前释放许可，防止仍在执行的旧任务与新任务重叠。
+   正常匹配接管路径没有新增等待旧任务退出的屏障；继续等待的是原候选自身的计算。
+3. 私有父块恢复交易投机预热，与普通构建使用相同预热worker、共享读缓存和容量政策。
+   每个worker在自己的线程中打开私有父状态provider；不跨线程传递MDBX事务。
+   正式EVM与预热EVM读取同一个私有父状态；预热写入只在各自journal内，不能写入共享原始读缓存。
+4. 私有父块尚未导入时，其交易可能仍在池中。正式选择和预热都本地跳过父块已消费的sender nonce；
+   不修改全局交易池、不mark_invalid后继交易，下一个nonce仍可参与构建。
+
+保留的边界与成本
+默认仍提前一块，默认开关及按时发布规则不变；保持原有reserve、late-finish、gas等参数。
+私有proof视图/缓存身份保留隔离；本次没有添加投机proof、额外确认深度或重组等待。
+父块被bid替换、重封hash改变或参数不匹配时作废并回退；不能中断正在进行的单次EVM/数据库读取。
+线程池容量相同不等于没有资源竞争，CPU、MDBX及页缓存仍可能竞争，收益必须另行实测。
+用户已确认的两块扩展
+设置 BSC_MINING_PIPELINED_BUILD=1 与 BSC_MINING_PIPELINE_DEPTH=2。
+深度默认1，目前仅支持1/2；数值超界限制在1～2，无法解析则回到1。
+一批顺序计算最多两个后续候选；上一批接管完后才可开启下一批，不是无限延长的滚动私有链。
+没有并行执行相互依赖的两个块；每个块仍使用原预算，私有父状态最多保留两层。
+状态provider一次构造私有祖先overlay工厂，正式执行和预热各自在线程中打开读事务。
+私有header/snapshot祖先链用于finality历史查找，避免向全局缓存注册未发布的祖先。
+第一块被成功接管不会取消第二块；整链换父、参数不匹配、执行失败时取消并丢弃所有剩余结果。
+仍逐块等待精确父hash成为canonical后才接管；原发布/投票刷新逻辑不变，晚到投票导致重封hash变化仍会作废后继。
+轮次、epoch、验证者切换边界不继续提前。若当前候选距离其发布时间不足25ms，不再为后继做额外预览。
+为计算下一个精确parent hash，继续前需要一次私有预览/签名，这是两块方案本身的成本，不计作免费加速。
+新增 bsc_miner_pipeline_target_depth 记录配置深度；pipeline_total{outcome="extended"}记录第二层登记。
+相较一块实现，主要新增有界结果队列、两层私有祖先与逐块接管；涉及多处调用接口，不是单参数改动。
+
+本地验证
+完整串行lib套件：874 passed，0 failed，1 ignored，4 filtered out。
+命令：CARGO_INCREMENTAL=0 cargo test -p reth_bsc --lib --offline -- --test-threads=1 --skip grpc::mev::tests::grpc_listener_ --skip grpc::mev::tests::grpc_timeout_is_bidblock_only_and_releases_admission
+4项gRPC监听测试受本机端口权限限制而跳过；不是本次修改验证通过的部分。
+新增/扩展检查：共享计算许可、忙时不排队、取消至退出仍持许可、两结果顺序接管、接管父块不取消后继、整链作废、深度上限；
+两层私有account/storage覆盖与预热journal隔离、下一个nonce仍可用、canonical未写入；
+两层overlay根与managed/串行根一致、完成及取消后的同runtime根任务可继续；无全局header/snapshot注册的私有祖先查找。
+
+受控调度实验（使用真实协调器、许可和接管通道，EVM耗时以虚拟时钟代替）
+输入：200/200/600ms计算耗时，450ms固定发布时间。
+普通路径发布：450/900/1500ms。
+流水线路径后两个候选算完：400/1000ms；三个块发布：450/900/1350ms。
+最后一个候选计算提前500ms，实际发布提前150ms；没有提前到1000ms发布第三块。
+该测试验证调度与接管，不是实际EVM执行、吞吐或缺页/IO基准。每块持续超过450ms时，有限提前缓冲无法消除积压。
+本地已有go-bsc Parlia.Seal源码仍先等待delayForRamanujanFork再签名/发布；本次保留此发布时间约束，未改变共识时序规则。
+完整测试日志：/tmp/pipeline-depth2-reviewed-tests.log；单项受控计时输出另存本报告同目录。
+CARGO_INCREMENTAL=0 cargo clippy -p reth_bsc --lib --tests --offline -- -D warnings：通过。
+所有修改的Rust文件nightly rustfmt --check及git diff --check：通过。
+本次测试过程中磁盘空间不足，已仅清理本工程可再生成的对象文件/增量缓存后重新完成上述验证。

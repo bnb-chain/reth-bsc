@@ -1,6 +1,9 @@
+use super::startup_diagnostics::StartupTiming;
 use crate::{
     chainspec::BscChainSpec,
-    consensus::parlia::{provider::SnapshotProvider, Parlia},
+    consensus::parlia::{
+        provider::SnapshotProvider, util::calculate_millisecond_timestamp, Parlia,
+    },
     metrics::BscConsensusMetrics,
     node::{
         engine::BscBuiltPayload,
@@ -12,14 +15,9 @@ use crate::{
             signer::init_global_signer_from_k256,
             util::prepare_new_attributes,
         },
-        network::{
-            block_import::service::{IncomingBlock, IncomingMinedBlock},
-            BscNewBlock,
-        },
+        network::{block_import::service::IncomingLocalBlock, BscNewBlock},
     },
-    shared::{
-        get_block_import_mined_sender, get_block_import_sender, get_local_peer_id_or_default,
-    },
+    shared::get_local_block_import_sender,
 };
 use alloy_consensus::BlockHeader;
 use alloy_primitives::{Address, Sealable, U128};
@@ -58,6 +56,8 @@ pub struct MiningContext {
     pub block_timestamp_ms: u64,
     /// End timestamp of the mining job (UNIX epoch ms), computed via `delay_for_ramanujan_fork`.
     pub end_mining_timestamp_ms: u128,
+    /// Per-job startup observation; absent for bid simulation and synthetic test contexts.
+    pub(crate) startup_timing: Option<StartupTiming>,
 }
 
 #[derive(Clone)]
@@ -162,7 +162,12 @@ where
                     mining_queue_tx,
                     consensus,
                 );
-                worker.try_new_work(&tip_header).await;
+                let timing = StartupTiming::new(
+                    tip_header.hash(),
+                    calculate_millisecond_timestamp(tip_header.header()),
+                    "startup",
+                );
+                worker.try_new_work(&tip_header, timing).await;
             });
         }
 
@@ -186,6 +191,8 @@ where
             let event = event; // rebind to avoid move issues
                     let committed = event.committed();
                     let tip = committed.tip();
+                    super::pipeline::canonical_head(tip.hash());
+                    let mut startup_timing = StartupTiming::new(tip.hash(), super::startup_diagnostics::header_ms(tip.header()), "canonical");
                     let is_reorg = matches!(event, CanonStateNotification::Reorg { .. });
                     debug!(
                         target: "bsc::miner",
@@ -278,10 +285,12 @@ where
                         }
                     }
 
+                    let cache_started = std::time::Instant::now();
                     self.cache_for_next(&committed);
+                    startup_timing.cache_finished(cache_started.elapsed());
 
                     self.last_triggered_tip = Some(tip_header.hash());
-                    self.try_new_work(&tip_header).await;
+                    self.try_new_work(&tip_header, startup_timing).await;
                 }
             _ = periodic_tick.tick() => {
                 // Periodic retry: fires when no canonical events have arrived recently.
@@ -303,7 +312,7 @@ where
                         "Periodic sync-gate retry"
                     );
                     self.last_triggered_tip = Some(tip.hash());
-                    self.try_new_work(&tip).await;
+                    self.try_new_work(&tip, StartupTiming::new(tip.hash(), calculate_millisecond_timestamp(tip.header()), "retry")).await;
                     // Clear so the next tick retries if try_new_work was skipped (e.g.
                     // backfill still active). If a canonical event fires before the next
                     // tick it will set last_triggered_tip again, preventing a duplicate.
@@ -412,19 +421,7 @@ where
             reth::providers::Chain<<Provider as reth_provider::NodePrimitivesProvider>::Primitives>,
         >,
     ) {
-        // Build pre-cache from execution outcome
-        let mut cached = reth_revm::cached::CachedReads::default();
-        let new_execution_outcome = committed.execution_outcome();
-
-        for (addr, acc) in new_execution_outcome.bundle_accounts_iter() {
-            if let Some(info) = acc.info.clone() {
-                // Pre-cache existing accounts and their storage
-                // This only includes changed accounts and storage but is better than nothing
-                let storage =
-                    acc.storage.iter().map(|(key, slot)| (*key, slot.present_value)).collect();
-                cached.insert_account(addr, info, storage);
-            }
-        }
+        let cached = super::parent_state::cached_reads(&committed.execution_outcome().bundle);
 
         self.pre_cached = Some(PrecachedState { block: committed.tip().hash(), cached });
     }
@@ -438,10 +435,14 @@ where
         self.pre_cached.as_ref().filter(|pc| pc.block == parent).map(|pc| pc.cached.clone())
     }
 
-    async fn try_new_work<H>(&self, tip: &SealedHeader<H>)
+    async fn try_new_work<H>(&self, tip: &SealedHeader<H>, startup_timing: StartupTiming)
     where
         H: alloy_consensus::BlockHeader + Sealable,
     {
+        if !crate::node::startup_recovery::is_ready() {
+            debug!(target: "bsc::miner", "Skip mining: persisted finalized history is not restored");
+            return;
+        }
         // Check if mining is disabled via miner_stop RPC
         if !crate::shared::is_mining_enabled() {
             debug!("Skip mining: mining is disabled via miner_stop RPC");
@@ -525,7 +526,7 @@ where
         }
 
         let parent_hash = parent_header.hash();
-        let mining_ctx = MiningContext {
+        let mut mining_ctx = MiningContext {
             header: None,
             parent_header,
             parent_snapshot: Arc::new(parent_snapshot),
@@ -533,9 +534,13 @@ where
             cached_reads: self.maybe_pre_cached(parent_hash),
             block_timestamp_ms: 0,
             end_mining_timestamp_ms: 0,
+            startup_timing: Some(startup_timing),
         };
 
         debug!("Queuing mining context, next_block: {}", tip.number() + 1);
+        if let Some(timing) = &mut mining_ctx.startup_timing {
+            timing.queued();
+        }
         if let Err(e) = self.mining_queue_tx.send(mining_ctx) {
             error!("Failed to send mining context to queue due to {}", e);
         }
@@ -609,7 +614,8 @@ where
             tokio::select! {
                 mining_ctx = self.mining_queue_rx.recv() => {
                     match mining_ctx {
-                        Some(ctx) => {
+                        Some(mut ctx) => {
+                            if let Some(timing) = &mut ctx.startup_timing { timing.dequeued(); }
                             let next_block = ctx.parent_header.number() + 1;
                             let parent_hash = ctx.parent_header.hash();
                             if !self.recheck_mining_ctx(&ctx) {
@@ -693,15 +699,42 @@ where
 
         let parent_header = mining_ctx.parent_header.clone();
         let block_number = parent_header.number() + 1;
-        let attributes = prepare_new_attributes(
-            &mut mining_ctx,
-            self.parlia.clone(),
-            &parent_header,
-            self.validator_address,
-        );
-
-        // Read dynamic config from shared state (updated by miner_* RPC), fall back to init values
+        // Resolve dynamic parameters before claiming any existing computation. A wall-clock
+        // timestamp refresh must not invalidate a still-valid private successor.
         let gas_limit = crate::shared::get_miner_gas_limit().unwrap_or(self.desired_gas_limit);
+        let min_gas_tip = crate::shared::get_miner_gas_tip()
+            .map(|v| v as u128)
+            .unwrap_or(self.desired_min_gas_tip);
+        let effective_gas_limit = EthereumBuilderConfig::new()
+            .with_gas_limit(gas_limit)
+            .gas_limit(parent_header.gas_limit);
+        let claimed = if mining_ctx.is_inturn {
+            super::pipeline::claim(parent_header.hash(), |key, plan| {
+                key.beneficiary == self.validator_address
+                    && key.gas_limit == effective_gas_limit
+                    && key.min_gas_tip == min_gas_tip
+                    && plan.valid_for(key, &mining_ctx, &self.parlia)
+            })
+        } else {
+            None
+        };
+        let (attributes, adoption) = if let Some((plan, adoption)) = claimed {
+            mining_ctx.header = plan.context.header;
+            mining_ctx.block_timestamp_ms = plan.context.block_timestamp_ms;
+            mining_ctx.end_mining_timestamp_ms = plan.context.end_mining_timestamp_ms;
+            super::pipeline::event("planned_context_adopted");
+            (plan.attributes, Some(adoption))
+        } else {
+            (
+                prepare_new_attributes(
+                    &mut mining_ctx,
+                    self.parlia.clone(),
+                    &parent_header,
+                    self.validator_address,
+                ),
+                None,
+            )
+        };
 
         let evm_config = BscEvmConfig::new(self.chain_spec.clone());
         let payload_builder = BscPayloadBuilder::new(
@@ -714,6 +747,8 @@ where
             mining_ctx.clone(),
         );
         let build_args = BscBuildArguments {
+            pipeline_parent: None,
+            pipeline_context: None,
             cached_reads: mining_ctx.cached_reads.clone().unwrap_or_default(),
             // `% 1000` matches `set_millisecond_part_of_timestamp`, which seals the same
             // remainder into the header's mix_hash at finalize time.
@@ -725,15 +760,14 @@ where
             ),
             cancel: ManualCancel::default(),
             trace_id: crate::node::miner::payload::generate_trace_id(),
-            min_gas_tip: crate::shared::get_miner_gas_tip()
-                .map(|v| v as u128)
-                .unwrap_or(self.desired_min_gas_tip),
+            min_gas_tip,
             // Filled in by BscPayloadJob::start when sparse-trie state-root is enabled
             // and the engine has registered a spawner. Falls back to legacy path when None.
             state_root_precomputed: std::sync::Arc::new(std::sync::Mutex::new(None)),
             trie_handle: std::sync::Arc::new(std::sync::Mutex::new(None)),
             // R2: bound the sparse-trie state_root() wait to this slot so an in-turn
             // block never blocks past its deadline (then falls back to sync root).
+            build_control: None,
             state_root_deadline_ms: Some(
                 (mining_ctx.end_mining_timestamp_ms as u64)
                     .saturating_sub(crate::node::miner::payload::STATE_ROOT_WAIT_MARGIN_MS),
@@ -741,7 +775,7 @@ where
         };
 
         let parent_hash = mining_ctx.parent_header.hash();
-        let (payload_job, job_handle) = BscPayloadJob::new(
+        let (mut payload_job, job_handle) = BscPayloadJob::new(
             self.parlia.clone(),
             mining_ctx,
             payload_builder,
@@ -750,8 +784,12 @@ where
             self.payload_tx.clone(),
         );
 
+        if let Some(adoption) = adoption {
+            payload_job.adopt_pipeline(adoption);
+        }
         let start_time = std::time::Instant::now();
         self.running_job_handle = Some(job_handle);
+        payload_job.mark_scheduled();
         self.payload_job_join_set.spawn(async move { payload_job.start().await });
         debug!("Succeed to async start payload job, cost_time: {:?}, block_number: {}, parent_hash: 0x{:x}",
             start_time.elapsed(), block_number, parent_hash);
@@ -865,8 +903,22 @@ where
         &self,
         payload: BscBuiltPayload,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let sender =
+            get_local_block_import_sender().ok_or("Local block import sender not initialised")?;
+        // Reserve one local ingress slot; send consumes it and an early return releases it.
+        // Wait in the existing result worker before checking freshness or claiming the
+        // signing slot, so congestion cannot make those checks stale before submission.
+        let wait_started = std::time::Instant::now();
+        let permit = sender.reserve().await.map_err(|_| "Local block import channel closed")?;
+        metrics::histogram!("bsc.block_import.local_admission_wait_seconds")
+            .record(wait_started.elapsed().as_secs_f64());
         let sealed_block = payload.block();
         let block_hash = sealed_block.hash();
+        super::startup_diagnostics::ingress(
+            block_hash,
+            calculate_millisecond_timestamp(sealed_block.header()),
+            "local",
+        );
         let block_number = sealed_block.number();
         let parent_hash = sealed_block.header().parent_hash;
         let best_block_number = self.provider.best_block_number()?;
@@ -1034,36 +1086,15 @@ where
             BscNewBlock(reth_eth_wire::NewBlock { block: sealed_block.clone_block(), td });
         let msg = NewBlockMessage { hash: block_hash, block: Arc::new(new_block) };
 
-        if self.submit_built_payload {
-            if let Some(sender) = get_block_import_mined_sender() {
-                let incoming: IncomingMinedBlock = (payload, msg.clone());
-                if sender.send(incoming).is_err() {
-                    warn!("Failed to send mined block to import service due to channel closed");
-                    return Err(
-                        "Failed to send mined block to import service due to channel closed".into(),
-                    );
-                } else {
-                    debug!("Succeed to send mined block to import service");
-                }
-            } else {
-                warn!("Failed to send mined block due to import sender not initialised");
-                return Err("Failed to send mined block due to import sender not initialised".into());
-            }
-        } else if let Some(sender) = get_block_import_sender() {
-            let peer_id = get_local_peer_id_or_default();
-            let incoming: IncomingBlock = (msg.clone(), peer_id);
-            if sender.send(incoming).is_err() {
-                warn!("Failed to send built block to import service due to channel closed");
-                return Err(
-                    "Failed to send built block to import service due to channel closed".into()
-                );
-            } else {
-                debug!("Succeed to send built block to import service");
-            }
+        let incoming = if self.submit_built_payload {
+            IncomingLocalBlock::Mined(Box::new((payload, msg)))
         } else {
-            warn!("Failed to send built block due to import sender not initialised");
-            return Err("Failed to send built block due to import sender not initialised".into());
-        }
+            IncomingLocalBlock::Unexecuted(msg)
+        };
+        // The permit guarantees capacity, not receipt or propagation. Keep the signing
+        // record even if the receiver shuts down after we reserved the slot.
+        permit.send(incoming);
+        debug!("Submitted local block to import service");
 
         Ok(())
     }

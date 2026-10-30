@@ -290,6 +290,7 @@ where
             cached_reads: None,
             block_timestamp_ms: 0,
             end_mining_timestamp_ms: 0,
+            startup_timing: None,
         };
         let attributes = prepare_new_attributes(
             &mut mining_ctx,
@@ -687,6 +688,9 @@ where
                     state_root_precomputed_sink: None,
                     trie_handle: None,
                     state_root_deadline_ms: None,
+                    build_control: None,
+                    finish_diagnostics: None,
+                    private_parent: None,
                 },
             )
             .map_err(PayloadBuilderError::other)
@@ -865,6 +869,7 @@ where
         let execution_outcome =
             BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
         let executed_block = BuiltPayloadExecutedBlock {
+            shared_trie_data: None,
             recovered_block: Arc::new(block.clone()),
             execution_output: Arc::new(execution_outcome),
             hashed_state: Arc::new(hashed_state),
@@ -876,6 +881,8 @@ where
         let pending_turn_length = bid_turn_length_sink.lock().unwrap().take();
 
         bid_runtime.bsc_payload = Some(BscBuiltPayload {
+            selection_diagnostics: None,
+            pipeline_seal: None,
             diagnostics: None,
             block: sealed_block.clone(),
             fees: bid_runtime.gas_fee,
@@ -1569,6 +1576,7 @@ mod tests {
                 cached_reads: None,
                 block_timestamp_ms: attrs.inner.timestamp * 1000,
                 end_mining_timestamp_ms: 0,
+                startup_timing: None,
             };
             let bid = Bid {
                 builder: other,

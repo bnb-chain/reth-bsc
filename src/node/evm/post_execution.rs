@@ -17,7 +17,6 @@ use crate::{
     node::{
         evm::{
             pre_execution::{CallBlockEnv, TURN_LENGTH_CACHE},
-            util::get_header_by_hash_from_cache,
             ResultAndState,
         },
         miner::signer::{is_signer_initialized, sign_system_transaction},
@@ -679,15 +678,20 @@ where
         // query block header and snapshot by hash from cache.
         let mut target_hash = self.ctx.base.parent_hash;
         for _ in (start..end).rev() {
-            let header = get_header_by_hash_from_cache(&target_hash).ok_or_else(|| {
+            let header = self.ctx.header_by_hash(&target_hash).ok_or_else(|| {
                 BlockExecutionError::msg(format!("Header not found for block hash: {target_hash}"))
             })?;
-            let snap = self
-                .snapshot_provider
-                .as_ref()
-                .ok_or_else(|| BlockExecutionError::msg("Snapshot provider is not available"))?
-                .snapshot_by_hash(&header.parent_hash)
-                .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
+            let snap = if let Some(private) = self.ctx.private_snapshot(&header.parent_hash) {
+                private
+            } else {
+                self.snapshot_provider
+                    .as_ref()
+                    .ok_or_else(|| BlockExecutionError::msg("Snapshot provider is not available"))?
+                    .snapshot_by_hash(&header.parent_hash)
+                    .ok_or(BlockExecutionError::msg(
+                        "Failed to get snapshot from snapshot provider",
+                    ))?
+            };
 
             if let Some(attestation) =
                 self.parlia.get_vote_attestation_from_header(&header, snap.epoch_num).map_err(|err| {
@@ -723,31 +727,33 @@ where
         parent_header: &Header,
         accumulated_weights: &mut std::collections::HashMap<Address, U256>,
     ) -> Result<(), BlockExecutionError> {
-        let justified_header = get_header_by_hash_from_cache(&attestation.data.target_hash)
-            .ok_or_else(|| {
+        let justified_header =
+            self.ctx.header_by_hash(&attestation.data.target_hash).ok_or_else(|| {
                 BlockExecutionError::msg(format!(
                     "Header not found, block_hash: {}",
                     attestation.data.target_hash
                 ))
             })?;
-        let parent =
-            get_header_by_hash_from_cache(&justified_header.parent_hash).ok_or_else(|| {
-                BlockExecutionError::msg(format!(
-                    "Header not found, block_hash: {}",
-                    justified_header.parent_hash
-                ))
-            })?;
-        let snapshot = self
-            .snapshot_provider
-            .as_ref()
-            .ok_or_else(|| BlockExecutionError::msg("Snapshot provider is not available"))?
-            .snapshot_by_hash(&parent.hash_slow())
-            .ok_or_else(|| {
-                BlockExecutionError::msg(format!(
-                    "Snapshot not found for block hash: {}",
-                    parent.hash_slow()
-                ))
-            })?;
+        let parent = self.ctx.header_by_hash(&justified_header.parent_hash).ok_or_else(|| {
+            BlockExecutionError::msg(format!(
+                "Header not found, block_hash: {}",
+                justified_header.parent_hash
+            ))
+        })?;
+        let snapshot = if let Some(private) = self.ctx.private_snapshot(&parent.hash_slow()) {
+            private
+        } else {
+            self.snapshot_provider
+                .as_ref()
+                .ok_or_else(|| BlockExecutionError::msg("Snapshot provider is not available"))?
+                .snapshot_by_hash(&parent.hash_slow())
+                .ok_or_else(|| {
+                    BlockExecutionError::msg(format!(
+                        "Snapshot not found for block hash: {}",
+                        parent.hash_slow()
+                    ))
+                })?
+        };
         let validators = &snapshot.validators;
         let mut validators_bit_set = BitSet::new();
         let vote_address_set = attestation.vote_address_set;

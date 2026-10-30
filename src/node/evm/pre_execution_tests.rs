@@ -651,6 +651,9 @@ mod parent_block_env {
             state_root_precomputed_sink: None,
             trie_handle: None,
             state_root_deadline_ms: None,
+            build_control: None,
+            finish_diagnostics: None,
+            private_parent: None,
         };
 
         let mut executor = BscBlockExecutor::new(
@@ -663,6 +666,81 @@ mod parent_block_env {
         );
         executor.inner_ctx.parent_header = Some(header_at(EPOCH_BLOCK - 1));
         executor
+    }
+
+    #[test]
+    fn private_mining_parent_needs_no_global_header_or_snapshot_registration() {
+        use crate::{
+            consensus::parlia::Snapshot,
+            node::evm::{config::PrivateMiningParent, util::HEADER_CACHE_READER},
+        };
+        use alloy_evm::Evm;
+        use reth_primitives_traits::SealedHeader;
+
+        let mut executor = executor();
+        let ancestor = SealedHeader::seal_slow(header_at(EPOCH_BLOCK - 2));
+        let ancestor_snap = Snapshot::new(
+            vec![Address::with_last_byte(1)],
+            ancestor.number,
+            ancestor.hash(),
+            200,
+            None,
+        );
+        let mut header = header_at(EPOCH_BLOCK - 1);
+        header.parent_hash = ancestor.hash();
+        header.extra_data = alloy_primitives::B256::random().as_slice().to_vec().into();
+        let parent = SealedHeader::seal_slow(header);
+        let snap = Snapshot::new(
+            vec![Address::with_last_byte(1)],
+            parent.number,
+            parent.hash(),
+            200,
+            None,
+        );
+        executor.ctx.mode = BscExecutionMode::Mining;
+        executor.ctx.base.parent_hash = parent.hash();
+        executor.ctx.private_parent = Some(Arc::new(PrivateMiningParent {
+            header: parent.clone(),
+            snapshot: Arc::new(snap),
+            ancestor: Some(Arc::new(PrivateMiningParent {
+                header: ancestor.clone(),
+                snapshot: Arc::new(ancestor_snap),
+                ancestor: None,
+            })),
+        }));
+        executor.snapshot_provider = None;
+        let block = executor.evm.block().clone();
+        executor.prepare_new_block(&block).unwrap();
+        assert_eq!(executor.inner_ctx.parent_header.as_ref().unwrap(), parent.header());
+        assert_eq!(executor.inner_ctx.snap.as_ref().unwrap().block_hash, parent.hash());
+        assert!(HEADER_CACHE_READER
+            .lock()
+            .unwrap()
+            .cached_header_by_hash(&parent.hash())
+            .is_none());
+
+        assert_eq!(
+            executor.ctx.header_by_hash(&ancestor.hash()).unwrap(),
+            ancestor.header().clone()
+        );
+        let private_snap = executor.ctx.private_snapshot(&ancestor.hash()).unwrap();
+        assert_eq!(private_snap.block_hash, ancestor.hash());
+        assert!(HEADER_CACHE_READER
+            .lock()
+            .unwrap()
+            .cached_header_by_hash(&ancestor.hash())
+            .is_none());
+        let mut justified_snap = executor.inner_ctx.snap.as_ref().unwrap().clone();
+        justified_snap.vote_data.target_hash = ancestor.hash();
+        justified_snap.vote_data.target_number = ancestor.number;
+        assert_eq!(
+            executor.get_justified_header(&justified_snap).unwrap(),
+            ancestor.header().clone()
+        );
+
+        executor.ctx.base.parent_hash = alloy_primitives::B256::random();
+        let error = executor.prepare_new_block(&block).unwrap_err().to_string();
+        assert!(error.contains("Private mining parent context mismatch"), "{error}");
     }
 
     fn touched(address: Address) -> revm::state::EvmState {

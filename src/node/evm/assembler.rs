@@ -13,7 +13,7 @@ use crate::{
 };
 use alloy_consensus::{proofs, BlockBody, Header, Transaction, TxReceipt, EMPTY_OMMER_ROOT_HASH};
 use alloy_eips::merge::BEACON_NONCE;
-use alloy_primitives::{keccak256, Bytes, B256};
+use alloy_primitives::{keccak256, Bloom, Bytes, B256};
 use alloy_rpc_types::Withdrawals;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_ethereum_primitives::{Receipt, TransactionSigned};
@@ -26,7 +26,47 @@ use reth_evm::{
 use reth_primitives_traits::{logs_bloom, SealedHeader};
 use reth_provider::{BlockExecutionResult, StateProvider};
 use revm::{context_interface::block::Block, database::BundleState};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+
+// Independent, bounded workers: finite body-root work must not queue behind a streaming
+// miner/import state-root task. Reuse these workers instead of spawning threads per block.
+static BODY_ROOT_POOL: LazyLock<Option<rayon::ThreadPool>> = LazyLock::new(|| {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .thread_name(|i| format!("bsc-body-root-{i}"))
+        .build()
+        .map_err(|err| tracing::warn!(%err, "Body-root workers unavailable; using serial roots"))
+        .ok()
+});
+
+fn body_roots_and_bloom(
+    transactions: &[TransactionSigned],
+    receipts: &[Receipt],
+) -> (B256, B256, Bloom) {
+    let transaction_root = || {
+        // TODO(perf): cache canonical EIP-2718 transaction bytes across pool/build attempts
+        // and use ordered_trie_root_encoded to avoid repeated serialization. Blob network
+        // wrappers/sidecars are not the canonical bytes committed by the transaction root.
+        proofs::calculate_transaction_root(transactions)
+    };
+    let receipt_root_and_bloom = || {
+        let receipts_with_bloom =
+            receipts.iter().map(TxReceipt::with_bloom_ref).collect::<Vec<_>>();
+        let root = alloy_consensus::proofs::calculate_receipt_root(&receipts_with_bloom);
+        let bloom = receipts_with_bloom.iter().fold(Bloom::ZERO, |bloom, r| bloom | r.bloom_ref());
+        (root, bloom)
+    };
+    // Empty/system-only fallback blocks are cheap; avoid dispatching work to the pool.
+    let (transactions_root, (receipts_root, logs_bloom)) =
+        if transactions.len() <= 1 && receipts.len() <= 1 {
+            (transaction_root(), receipt_root_and_bloom())
+        } else if let Some(pool) = BODY_ROOT_POOL.as_ref() {
+            pool.install(|| rayon::join(transaction_root, receipt_root_and_bloom))
+        } else {
+            (transaction_root(), receipt_root_and_bloom())
+        };
+    (transactions_root, receipts_root, logs_bloom)
+}
 
 /// BSC block assembler input that mirrors BlockAssemblerInput but is not #[non_exhaustive]
 ///
@@ -101,16 +141,9 @@ where
 
         let eth_ctx = ctx.as_eth_context();
         let timestamp = evm_env.block_env.timestamp().saturating_to();
-        let transactions_root = proofs::calculate_transaction_root(&transactions);
+        let (transactions_root, receipts_root, logs_bloom) =
+            body_roots_and_bloom(&transactions, receipts);
         let block_number = evm_env.block_env.number().saturating_to();
-
-        let receipts_with_bloom =
-            receipts.iter().map(TxReceipt::with_bloom_ref).collect::<Vec<_>>();
-        let receipts_root = alloy_consensus::proofs::calculate_receipt_root(&receipts_with_bloom);
-
-        let logs_bloom = receipts_with_bloom
-            .iter()
-            .fold(alloy_primitives::Bloom::ZERO, |bloom, r| bloom | r.bloom_ref());
 
         let mut withdrawals_root = None;
         let mut withdrawals = None;
@@ -371,5 +404,53 @@ impl<ChainSpec> std::fmt::Debug for BscBlockAssembler<ChainSpec> {
             .field("extra_data", &self.extra_data)
             .field("parlia", &"Arc<Parlia<ChainSpec>>")
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod body_root_tests {
+    use super::*;
+    use alloy_consensus::{TxLegacy, TxType};
+    use alloy_primitives::{Address, Log, Signature, TxKind, U256};
+
+    #[test]
+    fn parallel_body_roots_match_serial_with_logs_and_index_boundaries() {
+        for len in [0, 1, 2, 127, 128, 129, 2048] {
+            let transactions: Vec<_> = (0..len)
+                .map(|i| {
+                    TransactionSigned::new_unhashed(
+                        TxLegacy {
+                            nonce: i as u64,
+                            gas_limit: 100_000,
+                            gas_price: 1,
+                            to: TxKind::Call(Address::repeat_byte(0x42)),
+                            input: Bytes::from(vec![i as u8; 80]),
+                            ..Default::default()
+                        }
+                        .into(),
+                        Signature::new(U256::from(1), U256::from(2), false),
+                    )
+                })
+                .collect();
+            let receipts: Vec<_> = (0..len)
+                .map(|i| Receipt {
+                    tx_type: TxType::Legacy,
+                    success: true,
+                    cumulative_gas_used: (i as u64 + 1) * 21_000,
+                    logs: vec![Log::new_unchecked(
+                        Address::repeat_byte(0x12),
+                        vec![B256::repeat_byte(i as u8)],
+                        Bytes::from_static(b"body-root-test"),
+                    )],
+                })
+                .collect();
+            let with_bloom: Vec<_> = receipts.iter().map(TxReceipt::with_bloom_ref).collect();
+            let expected = (
+                proofs::calculate_transaction_root(&transactions),
+                alloy_consensus::proofs::calculate_receipt_root(&with_bloom),
+                with_bloom.iter().fold(Bloom::ZERO, |bloom, r| bloom | r.bloom_ref()),
+            );
+            assert_eq!(body_roots_and_bloom(&transactions, &receipts), expected, "len={len}");
+        }
     }
 }

@@ -61,6 +61,38 @@ pub type ValidatorCacheSink = Arc<Mutex<Option<(Vec<Address>, Vec<VoteAddress>)>
 pub type StateRootPrecomputedSink =
     Arc<Mutex<Option<(alloy_primitives::B256, reth_trie_common::updates::TrieUpdates)>>>;
 
+/// Parent data owned by one unpublished mining computation. Never inserted in the
+/// global header/snapshot caches, which may persist snapshots at checkpoints.
+#[derive(Debug, Clone)]
+pub struct PrivateMiningParent {
+    pub header: SealedHeader<Header>,
+    pub snapshot: Arc<crate::consensus::parlia::Snapshot>,
+    pub ancestor: Option<Arc<PrivateMiningParent>>,
+}
+impl PrivateMiningParent {
+    /// Keep only unpublished-window metadata. Accepted ancestors are resolved by
+    /// the ordinary snapshot provider; their private snapshots must not grow forever.
+    pub(crate) fn retained_from(&self, number: u64) -> Option<Arc<Self>> {
+        (self.header.number >= number).then(|| {
+            Arc::new(Self {
+                header: self.header.clone(),
+                snapshot: self.snapshot.clone(),
+                ancestor: self.ancestor.as_ref().and_then(|parent| parent.retained_from(number)),
+            })
+        })
+    }
+    fn find(&self, hash: &alloy_primitives::B256) -> Option<&Self> {
+        let mut current = Some(self);
+        while let Some(parent) = current {
+            if parent.header.hash() == *hash {
+                return Some(parent)
+            }
+            current = parent.ancestor.as_deref();
+        }
+        None
+    }
+}
+
 /// What the executor is doing with the block it is running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BscExecutionMode {
@@ -116,6 +148,14 @@ pub struct BscNextBlockEnvAttributes {
     /// blocks unboundedly past its slot. `None` = legacy unbounded blocking wait
     /// (out-of-turn / bid-sim / import paths).
     pub state_root_deadline_ms: Option<u64>,
+    /// Monotonic local-build budget and cancellation; absent for import and RPC.
+    pub build_control: Option<crate::node::miner::build_control::BuildControl>,
+    /// Miner-only bounded (attempt kind, consensus turn, private depth) labels for
+    /// execution/finish diagnostics. None for import, RPC and bid simulation; never infer kind
+    /// from transaction count.
+    pub finish_diagnostics: Option<(&'static str, &'static str, usize)>,
+    /// Exact unpublished parent context; absent for canonical mining, import and RPC.
+    pub private_parent: Option<Arc<PrivateMiningParent>>,
     /// Sub-second millisecond remainder (BEP-520) of the block being built, consumed by
     /// [`BscBlockEnv`] and the BEP-706 precompile. The miner and bid simulator fill it
     /// with `block_timestamp_ms % 1000` (the planned millisecond timestamp that is
@@ -140,6 +180,9 @@ impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
             state_root_precomputed_sink: None,
             trie_handle: None,
             state_root_deadline_ms: None,
+            build_control: None,
+            finish_diagnostics: None,
+            private_parent: None,
             // RPC pending/simulate blocks have no millisecond source — second precision
             // (`Time*1000`), like go-bsc's zero-MixDigest synthetic headers.
             milli_remainder: 0,
@@ -215,9 +258,31 @@ pub struct BscBlockExecutionCtx<'a> {
     /// See [`BscNextBlockEnvAttributes::state_root_deadline_ms`]. Bounds the
     /// sparse-trie `state_root()` wait in `finish`.
     pub state_root_deadline_ms: Option<u64>,
+    /// Monotonic local-build budget and cancellation; absent for import and RPC.
+    pub build_control: Option<crate::node::miner::build_control::BuildControl>,
+    /// Miner-only bounded (attempt kind, consensus turn, private depth) labels for
+    /// execution/finish diagnostics. None for import, RPC and bid simulation; never infer kind
+    /// from transaction count.
+    pub finish_diagnostics: Option<(&'static str, &'static str, usize)>,
+    /// Exact unpublished parent context; absent for canonical mining, import and RPC.
+    pub private_parent: Option<Arc<PrivateMiningParent>>,
 }
 
 impl<'a> BscBlockExecutionCtx<'a> {
+    pub(crate) fn header_by_hash(&self, hash: &alloy_primitives::B256) -> Option<Header> {
+        self.private_parent
+            .as_ref()
+            .and_then(|p| p.find(hash))
+            .map(|p| p.header.header().clone())
+            .or_else(|| super::util::get_header_by_hash_from_cache(hash))
+    }
+    pub(crate) fn private_snapshot(
+        &self,
+        hash: &alloy_primitives::B256,
+    ) -> Option<crate::consensus::parlia::Snapshot> {
+        self.private_parent.as_ref().and_then(|p| p.find(hash)).map(|p| p.snapshot.as_ref().clone())
+    }
+
     /// Convert to EthBlockExecutionCtx for compatibility with existing BlockAssembler.
     pub fn as_eth_context(&self) -> &EthBlockExecutionCtx<'a> {
         &self.base
@@ -608,6 +673,9 @@ where
             state_root_precomputed_sink: None,
             trie_handle: None,
             state_root_deadline_ms: None,
+            build_control: None,
+            finish_diagnostics: None,
+            private_parent: None,
         })
     }
 
@@ -642,6 +710,9 @@ where
             state_root_precomputed_sink: attributes.state_root_precomputed_sink,
             trie_handle: attributes.trie_handle,
             state_root_deadline_ms: attributes.state_root_deadline_ms,
+            build_control: attributes.build_control,
+            finish_diagnostics: attributes.finish_diagnostics,
+            private_parent: attributes.private_parent,
         })
     }
 
@@ -713,6 +784,9 @@ where
             state_root_precomputed_sink: None,
             trie_handle: None,
             state_root_deadline_ms: None,
+            build_control: None,
+            finish_diagnostics: None,
+            private_parent: None,
         })
     }
 
@@ -980,5 +1054,35 @@ mod tests {
         mining_attrs.mode = BscExecutionMode::Mining;
         let ctx = evm_config.context_for_next_block(&parent, mining_attrs).unwrap();
         assert_eq!(ctx.mode, BscExecutionMode::Mining, "mining must still run Parlia finalization");
+    }
+}
+
+#[cfg(test)]
+mod sliding_parent_tests {
+    use super::*;
+
+    #[test]
+    fn private_snapshot_window_releases_old_history() {
+        let snapshot = Arc::new(crate::consensus::parlia::Snapshot::default());
+        let mut previous: Option<Arc<PrivateMiningParent>> = None;
+        for number in 1..=40 {
+            previous = Some(Arc::new(PrivateMiningParent {
+                header: SealedHeader::new(
+                    Header { number, ..Default::default() },
+                    alloy_primitives::B256::with_last_byte(number as u8),
+                ),
+                snapshot: snapshot.clone(),
+                ancestor: previous
+                    .and_then(|parent| parent.retained_from(number.saturating_sub(2))),
+            }));
+            let mut current = previous.as_deref();
+            let mut count = 0;
+            while let Some(parent) = current {
+                count += 1;
+                current = parent.ancestor.as_deref();
+            }
+            assert_eq!(count, number.min(3));
+        }
+        assert!(previous.unwrap().find(&alloy_primitives::B256::with_last_byte(1)).is_none());
     }
 }

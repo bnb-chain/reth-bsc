@@ -1,0 +1,36 @@
+私有父状态交接与连续 miner sparse trie 复用
+分支：reth-bsc codex/perf-task-diagnostics；基线9dcb820。
+Reth仍为2.8.0，依赖d035d96c7352f75002e5b1da974f13132ed3d159，提交在既有codex/pr584-proof-sessions-v2.8分支。
+用户授权：实现、推送、三台编译；不重启、不发压、不创建PR、不备份二进制、不改节点配置。
+
+改动一：私有构建与普通构建共用父执行结果预缓存生成逻辑。
+只使用父块执行后最终账户及已知storage值；未覆盖槽位/删除账户通过准确私有父provider读取，不继承更旧父状态的原始缓存。
+私有EVM状态视图、私有root视图分别持有独立的有界MinerOverlayCache，按精确祖先关系扩展，不写入engine canonical图。
+缓存复用度量新增scope=normal/private_state/pipeline，避免多个cache的gauge互相覆盖。manager复用不等于flattened overlay命中。
+
+改动二：连续miner块的sparse trie单次所有权交接。
+Reth新增spawn_payload_builder_state_root_with_cache及PayloadBuilderTrieCache；既有fresh接口及engine导入行为不变。
+缓存按生成尝试的父hash和已完成root筛选，再绑定下一次构建准确的sealed parent hash；重签但状态不变也能验证复用。
+跨父链或root不符不能取走句柄；成功交接一次后即移除。候选尚未产出root时立即miss。
+若树仍在完成finalization/pruning，则立即fresh回退并把旧句柄交给既有drop worker，不在正式构建线程等待。
+命中时沿用Reth的复用proof factory adapter及storage roots，避免重复装配被树覆盖的overlay。
+保留在内存块范围内的树节点，按当前祖先范围请求prune；不克隆完整树、不引入投机proof扫描或新线程池。
+miner最多保留4个待取输出句柄，淘汰在cache锁外异步释放；这是句柄数量上限，不是字节内存上限。复用树的RSS和页缓存影响仍需实测。
+空块fallback走独立fresh路径，不抢占普通候选的树。
+
+配置
+BSC_MINER_SPARSE_REUSE_CANONICAL=1 现在在该版本重新有读取点，开启已完成miner父块的树交接。
+这不是旧版的import全局canonical快照环读取实现，不会拿走engine的preserved trie。
+BSC_MINING_PIPELINED_BUILD=1、BSC_MINING_PIPELINE_DEPTH=2仍只控制提前构建；父缓存优化独立生效。
+参数不自动修改；仅编译完成不代表当前进程已经启用新实现。
+
+验证
+Reth chain-state交接4项测试通过；engine state-root策略13项测试通过。
+新增/扩展测试覆盖：未就绪/断开的producer不阻塞，错误root不消费匹配候选，单次交接，连续树root与串行一致，private链storage覆盖及清零，正确父缓存值/未覆盖槽位/删除账户fallback，私有manager复用不污染canonical DB。
+BSC完整库878通过、1忽略、4个需监听权限的既有gRPC测试过滤；BSC及涉及Reth包Clippy -D warnings通过。
+Reth全workspace/all-features检查因缺少llvm-config/LLVM22未完成；本次maxperf-musl特性不启用revmc LLVM。
+Reth全workspace fmt --check通过，改动BSC文件nightly rustfmt及git diff --check通过。
+Cargo.toml、EF测试manifest与Cargo.lock统一固定Reth新SHA，没有同时保留两套Reth依赖或升级无关registry包。
+尚无本次改动的线上吞吐、root_wait收益实测，不承诺可回收全部准备阶段差额。
+
+构建证据在工作区performance/deployments/2026-10-28-parent-state-root-reuse/。

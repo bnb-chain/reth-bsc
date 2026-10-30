@@ -114,10 +114,12 @@ where
         // multi-block eth_simulateV1 the parent is the previous in-memory simulated
         // block, so seed it here — by hash only, to leave the canonical block-number
         // index intact. Re-seeding an already-canonical parent is a no-op.
-        crate::node::evm::util::insert_header_to_cache_hash_only(
-            self.parent.header().clone(),
-            self.parent.hash(),
-        );
+        if self.ctx.private_parent.is_none() {
+            crate::node::evm::util::insert_header_to_cache_hash_only(
+                self.parent.header().clone(),
+                self.parent.hash(),
+            );
+        }
         self.executor.apply_pre_execution_changes()
     }
 
@@ -155,10 +157,19 @@ where
             self.precomputed_state_root = state_root_precomputed;
         }
         let finish_start = std::time::Instant::now();
+        let mut stages = super::finish_metrics::FinishObservation::new(
+            self.ctx.finish_diagnostics,
+            self.ctx.build_control.clone(),
+        );
+        let build_control = self.ctx.build_control.clone();
+        if let Some(control) = &build_control {
+            control.check_active(finish_start).map_err(BlockExecutionError::msg)?;
+        }
         // `executor.finish()` runs BSC's post-execution system txs (slash spoiled
         // validator, distribute fees / finality rewards, breathe-block validator-set
         // updates). The sparse-trie `state_hook` is installed on the DB (v2.4.1), so it
         // captures those commits here too.
+        stages.enter("system_transactions");
         let (evm, result) = self.executor.finish()?;
         let (db, evm_env) = evm.finish();
 
@@ -167,7 +178,11 @@ where
         // Clearing drops the `StateRootUpdateHook`, which signals end-of-updates so the
         // background task can finalize and `state_root()` below returns. Without this the task
         // waits forever for more updates and the miner falls back after the slot deadline.
+        stages.enter("close_state_stream");
         db.set_state_hook(None);
+        if let Some(control) = &build_control {
+            control.check_active(std::time::Instant::now()).map_err(BlockExecutionError::msg)?;
+        }
 
         // Sparse-trie state-root collection: now that the update stream is finished, the
         // background task has all updates and is finalizing. Take the handle from ctx, block on
@@ -177,59 +192,87 @@ where
         // logged at WARN. A failure here is non-fatal but indicates the task panicked
         // or its channel was dropped; investigate via the trace target below.
         if let Some(handle_slot) = self.ctx.trie_handle.take() {
+            stages.enter("root_wait");
             if let Some(mut handle) = handle_slot.lock().unwrap().take() {
                 let wait_start = std::time::Instant::now();
+                let mut wait_observation = super::finish_metrics::RootWaitObservation::new(
+                    self.ctx.finish_diagnostics,
+                    build_control.clone(),
+                    self.parent.number + 1,
+                    self.parent.hash(),
+                    handle.diagnostics().id(),
+                );
                 // R2: bound the wait by the slot deadline (if set) so an in-turn block
                 // never blocks unboundedly past its slot. On timeout/error we leave the
                 // sink empty, so the MDBX branch below falls back to the synchronous
                 // `state_root_with_updates` (bounded, correct). `None` deadline keeps the
                 // legacy blocking wait (out-of-turn / bid-sim / import paths).
-                let delivered = match self.ctx.state_root_deadline_ms {
-                    Some(deadline_ms) => {
-                        let now_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as u64)
-                            .unwrap_or(0);
-                        let budget =
-                            std::time::Duration::from_millis(deadline_ms.saturating_sub(now_ms));
-                        match handle.take_state_root_rx().recv_timeout(budget) {
-                            Ok(Ok(outcome)) => Some(outcome),
-                            Ok(Err(err)) => {
+                let delivered = if let Some(control) = &build_control {
+                    let rx = handle.take_state_root_rx();
+                    loop {
+                        let budget = control
+                            .root_wait(std::time::Instant::now())
+                            .map_err(BlockExecutionError::msg)?;
+                        match rx.recv_timeout(budget) {
+                            Ok(Ok(outcome)) => break Some(outcome),
+                            Ok(Err(_)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                break None
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                        }
+                    }
+                } else {
+                    match self.ctx.state_root_deadline_ms {
+                        Some(deadline_ms) => {
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0);
+                            let budget = std::time::Duration::from_millis(
+                                deadline_ms.saturating_sub(now_ms),
+                            );
+                            match handle.take_state_root_rx().recv_timeout(budget) {
+                                Ok(Ok(outcome)) => Some(outcome),
+                                Ok(Err(err)) => {
+                                    tracing::warn!(
+                                        target: "bsc::builder",
+                                        parent_hash = %self.parent.hash(),
+                                        block_number = %(self.parent.number + 1),
+                                        %err,
+                                        "Sparse-trie task error post-finish(); falling back to state_root_with_updates"
+                                    );
+                                    None
+                                }
+                                Err(_timeout) => {
+                                    tracing::warn!(
+                                        target: "bsc::builder",
+                                        parent_hash = %self.parent.hash(),
+                                        block_number = %(self.parent.number + 1),
+                                        wait_ms = wait_start.elapsed().as_millis(),
+                                        "Sparse-trie state-root not ready before slot deadline; falling back to state_root_with_updates"
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        None => match handle.state_root() {
+                            Ok(outcome) => Some(outcome),
+                            Err(err) => {
                                 tracing::warn!(
                                     target: "bsc::builder",
                                     parent_hash = %self.parent.hash(),
                                     block_number = %(self.parent.number + 1),
                                     %err,
-                                    "Sparse-trie task error post-finish(); falling back to state_root_with_updates"
+                                    "Sparse-trie task failed post-finish(); falling back to state_root_with_updates"
                                 );
                                 None
                             }
-                            Err(_timeout) => {
-                                tracing::warn!(
-                                    target: "bsc::builder",
-                                    parent_hash = %self.parent.hash(),
-                                    block_number = %(self.parent.number + 1),
-                                    wait_ms = wait_start.elapsed().as_millis(),
-                                    "Sparse-trie state-root not ready before slot deadline; falling back to state_root_with_updates"
-                                );
-                                None
-                            }
-                        }
+                        },
                     }
-                    None => match handle.state_root() {
-                        Ok(outcome) => Some(outcome),
-                        Err(err) => {
-                            tracing::warn!(
-                                target: "bsc::builder",
-                                parent_hash = %self.parent.hash(),
-                                block_number = %(self.parent.number + 1),
-                                %err,
-                                "Sparse-trie task failed post-finish(); falling back to state_root_with_updates"
-                            );
-                            None
-                        }
-                    },
                 };
+                wait_observation.returned(delivered.is_some());
+                drop(wait_observation);
+                stages.enter("root_result");
                 if let Some(outcome) = delivered {
                     let updates = std::sync::Arc::try_unwrap(outcome.trie_updates)
                         .unwrap_or_else(|arc| (*arc).clone());
@@ -253,6 +296,7 @@ where
             }
         }
 
+        stages.enter("merge_state");
         let assembled_system_txs = {
             let mut inner = self.shared_ctx.inner.borrow_mut();
             std::mem::take(&mut inner.assembled_system_txs)
@@ -261,9 +305,14 @@ where
         db.merge_transitions(BundleRetention::Reverts);
 
         let state_root_start = std::time::Instant::now();
+        if let Some(control) = &build_control {
+            control.check_active(state_root_start).map_err(BlockExecutionError::msg)?;
+        }
+        stages.enter("hash_state");
         let hashed_state =
             state.hashed_post_state(&db.bundle_state).map_err(BlockExecutionError::other)?;
 
+        stages.enter("root_select");
         let (state_root, trie_updates) = if let Some((root, updates)) = self
             .ctx
             .state_root_precomputed_sink
@@ -291,6 +340,7 @@ where
             );
             (root, updates)
         } else {
+            stages.enter("sync_root");
             // Fix #1: bound the synchronous state-root fallback by the slot deadline.
             //
             // When the sparse-trie precomputed root is unavailable (recv_timeout expired, or no
@@ -331,12 +381,21 @@ where
                     )));
                 }
             }
+            if let Some(control) = &build_control {
+                control
+                    .check_active(std::time::Instant::now())
+                    .map_err(BlockExecutionError::msg)?;
+            }
             state
                 .state_root_with_updates(hashed_state.clone())
                 .map_err(BlockExecutionError::other)?
         };
         let state_root_duration = state_root_start.elapsed();
+        if let Some(control) = &build_control {
+            control.check_active(std::time::Instant::now()).map_err(BlockExecutionError::msg)?;
+        }
 
+        stages.enter("assemble");
         let user_tx_len = self.transactions.len();
         let system_tx_len = assembled_system_txs.len();
         self.transactions.extend(assembled_system_txs);
@@ -397,6 +456,7 @@ where
         );
 
         let block = RecoveredBlock::new_unhashed(block, senders);
+        stages.complete();
         Ok(BlockBuilderOutcome {
             execution_result: result,
             hashed_state,
