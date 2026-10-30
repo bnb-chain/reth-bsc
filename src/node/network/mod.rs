@@ -32,7 +32,7 @@ use reth_ethereum_primitives::{PooledTransactionVariant, TransactionSigned};
 use reth_network::{NetworkConfig, NetworkHandle, NetworkManager, PeersConfig, SessionsConfig};
 use reth_network_api::PeersInfo;
 use reth_network_peers::NodeRecord;
-use reth_provider::{BlockNumReader, HeaderProvider, StateProviderFactory};
+use reth_provider::{HeaderProvider, StateProviderFactory};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
@@ -364,11 +364,18 @@ impl BscNetworkBuilder {
             }
         });
 
-        // TODO: update network with the latest canonical head, but has a fork id issue, can fix it
-        // later.
+        // Use the database head for both status and the fork filter. The chainspec's
+        // static head can have a zero hash and does not describe the available block
+        // range required by eth/70+. Upstream initializes TD to zero, so load Parlia's
+        // TD at the same height rather than mixing different heads in the status.
+        let mut head = ctx.head();
+        head.total_difficulty =
+            ctx.provider().header_td_by_number(head.number)?.ok_or_else(|| {
+                eyre::eyre!("Missing total difficulty for network head {}", head.number)
+            })?;
         let mut network_builder = network_builder
             .boot_nodes(ctx.chain_spec().bootnodes().unwrap_or_default())
-            .set_head(ctx.chain_spec().head())
+            .set_head(head)
             .with_pow()
             .block_import(Box::new(BscBlockImport::new(handle)))
             .eth_rlpx_handshake(Arc::new(BscHandshake::default()))
@@ -409,11 +416,6 @@ impl BscNetworkBuilder {
             );
         }
 
-        let provider = ctx.provider();
-        if let Ok(number) = provider.best_block_number() {
-            let td = provider.header_td_by_number(number).unwrap_or_default();
-            network_config.status.total_difficulty = td;
-        }
         debug!(
             target: "bsc::net",
             peer_id = peer_id_to_node_id(peer_id),
