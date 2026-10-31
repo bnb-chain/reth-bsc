@@ -364,10 +364,17 @@ impl BscNetworkBuilder {
             }
         });
 
-        // TODO: update network with the latest canonical head, but has a fork id issue, can fix it later.
+        // Advertise the real launch head (genesis on a fresh DB) in the initial
+        // Status message. `BscChainSpec::head()` carries hardcoded future heads
+        // with a zero blockhash, which fails the eth/69+ handshake
+        // (`BlockhashZero`) and deadlocks fresh/private networks. `ctx.head()`
+        // is fetched from the database at launch (`lookup_head`), matching
+        // upstream reth's genesis default and go-bsc (real head hash).
+        // Fork filter and fork id below are derived from the same head, so they
+        // stay consistent with the advertised status.
         let mut network_builder = network_builder
             .boot_nodes(ctx.chain_spec().bootnodes().unwrap_or_default())
-            .set_head(ctx.chain_spec().head())
+            .set_head(ctx.head())
             .with_pow()
             .block_import(Box::new(BscBlockImport::new(handle)))
             .eth_rlpx_handshake(Arc::new(BscHandshake::default()))
