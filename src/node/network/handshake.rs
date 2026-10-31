@@ -1,9 +1,13 @@
-use super::upgrade_status::{UpgradeStatus, UpgradeStatusExtension};
+use super::{
+    status::BscStatus,
+    upgrade_status::{UpgradeStatus, UpgradeStatusExtension},
+};
 use alloy_rlp::Decodable;
 use futures::SinkExt;
 use reth_eth_wire::{
     errors::{EthHandshakeError, EthStreamError},
     handshake::{EthRlpxHandshake, EthereumEthHandshake, UnauthEth},
+    message::MAX_MESSAGE_SIZE,
     UnifiedStatus,
 };
 use reth_eth_wire_types::{DisconnectReason, EthVersion};
@@ -19,12 +23,45 @@ use tracing::debug;
 pub struct BscHandshake;
 
 impl BscHandshake {
+    /// Exchange BSC status without the legacy UpgradeStatus round trip.
+    async fn status_handshake(
+        unauth: &mut dyn UnauthEth,
+        status: UnifiedStatus,
+        fork_filter: ForkFilter,
+    ) -> Result<UnifiedStatus, EthStreamError> {
+        let local = BscStatus::from(status);
+        unauth.send(local.encode_message()).await?;
+        let message = match unauth.next().await {
+            Some(message) => message?,
+            None => {
+                unauth.disconnect(DisconnectReason::DisconnectRequested).await?;
+                return Err(EthHandshakeError::NoResponse.into());
+            }
+        };
+
+        let remote = (|| {
+            if message.len() > MAX_MESSAGE_SIZE {
+                return Err(EthStreamError::MessageTooBig(message.len()));
+            }
+            let remote = BscStatus::decode_message(&message)?;
+            remote.validate(&local, &fork_filter)?;
+            Ok(remote)
+        })();
+        match remote {
+            Ok(remote) => Ok(remote.into()),
+            Err(error) => {
+                unauth.disconnect(DisconnectReason::ProtocolBreach).await?;
+                Err(error)
+            }
+        }
+    }
+
     /// Negotiate the upgrade status message.
     pub async fn upgrade_status(
         unauth: &mut dyn UnauthEth,
         negotiated_status: UnifiedStatus,
     ) -> Result<UnifiedStatus, EthStreamError> {
-        if negotiated_status.version > EthVersion::Eth66 {
+        if matches!(negotiated_status.version, EthVersion::Eth67 | EthVersion::Eth68) {
             // Send upgrade status message. When EVN is enabled, we ask peers
             // to NOT broadcast transactions to us (disable peer tx broadcast).
             // This mirrors the BSC EVN behavior where validator/sentry nodes
@@ -124,6 +161,9 @@ impl EthRlpxHandshake for BscHandshake {
     ) -> Pin<Box<dyn Future<Output = Result<UnifiedStatus, EthStreamError>> + 'a + Send>> {
         Box::pin(async move {
             let fut = async {
+                if matches!(status.version, EthVersion::Eth70 | EthVersion::Eth71) {
+                    return Self::status_handshake(unauth, status, fork_filter).await;
+                }
                 let negotiated_status =
                     EthereumEthHandshake(unauth).eth_handshake(status, fork_filter).await?;
                 Self::upgrade_status(unauth, negotiated_status).await
@@ -132,3 +172,6 @@ impl EthRlpxHandshake for BscHandshake {
         })
     }
 }
+
+#[cfg(test)]
+mod tests;
