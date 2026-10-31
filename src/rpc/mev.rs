@@ -5,6 +5,7 @@ use crate::node::miner::bid_block::BidBlockArgs;
 use crate::node::miner::bid_simulator::Bid;
 use crate::node::miner::config::keystore;
 use crate::node::miner::config::MiningConfig;
+use crate::node::miner::payload::DELAY_LEFT_OVER;
 use alloy_consensus::BlobTransactionSidecar;
 use alloy_consensus::Transaction;
 use alloy_consensus::{transaction::RlpEcdsaDecodableTx, TxEip4844WithSidecar};
@@ -369,6 +370,22 @@ fn bid_better_before_ms(
 ) -> u128 {
     bid_must_before_ms(parent_timestamp_ms, block_interval_ms, delay_left_over_ms)
         .saturating_sub(bid_simulation_left_over_ms as u128)
+}
+
+/// `BidSimulationLeftOver` as builders must read it from this client.
+///
+/// Builders time BEP-322 bids by `BidBetterBefore = block time - DelayLeftOver -
+/// BidSimulationLeftOver`. go-bsc's bid simulator works up to `DelayLeftOver` (15 ms) before the
+/// block time, but this one starts no simulation with less than [`DELAY_LEFT_OVER`] (120 ms) left
+/// (see `bid_simulator.rs`), so a bid timed by the configured values arrives after it stopped
+/// simulating and can never win. The difference is reported as simulation time. `DelayLeftOver`
+/// itself stays as configured: it is also the BidBlock deadline (`BidMustBefore`), and BidBlocks
+/// are not simulated.
+fn effective_bid_simulation_left_over_ms(
+    bid_simulation_left_over_ms: u64,
+    delay_left_over_ms: u64,
+) -> u64 {
+    bid_simulation_left_over_ms + DELAY_LEFT_OVER.saturating_sub(delay_left_over_ms)
 }
 
 fn unix_now_ms() -> u128 {
@@ -1239,7 +1256,10 @@ impl BscMevApiServer for MevApiImpl {
         Ok(MevParams {
             validator_commission: self.validator_commission,
             // Convert milliseconds to nanoseconds (1ms = 1,000,000 ns)
-            bid_simulation_left_over: self.bid_simulation_left_over * 1_000_000,
+            bid_simulation_left_over: effective_bid_simulation_left_over_ms(
+                self.bid_simulation_left_over,
+                self.delay_left_over,
+            ) * 1_000_000,
             no_interrupt_left_over: self.no_interrupt_left_over * 1_000_000,
             delay_left_over: self.delay_left_over * 1_000_000,
             max_bids_per_builder: self.max_bids_per_builder,
@@ -1298,6 +1318,55 @@ mod bid_block_param_tests {
         // geth parity: the field is exposed as "BidBlockEnabled".
         assert_eq!(json.get("BidBlockEnabled"), Some(&serde_json::Value::Bool(true)));
         assert_eq!(json.get("GRPCEnabled"), Some(&serde_json::Value::Bool(true)));
+    }
+
+    /// Snapshot provider for an API whose `params` never reads a snapshot.
+    struct NoSnapshots;
+    impl SnapshotProvider for NoSnapshots {
+        fn snapshot_by_hash(&self, _block_hash: &B256) -> Option<Snapshot> {
+            None
+        }
+        fn insert(&self, _snapshot: Snapshot) {}
+    }
+
+    fn api_with_left_overs(bid_simulation_left_over: u64, delay_left_over: u64) -> MevApiImpl {
+        MevApiImpl {
+            snapshot_provider: Arc::new(NoSnapshots),
+            chain_spec: Arc::new(BscChainSpec::from(crate::chainspec::bsc_testnet())),
+            validator_address: Address::ZERO,
+            validator_commission: 100,
+            bid_simulation_left_over,
+            no_interrupt_left_over: 400,
+            delay_left_over,
+            max_bids_per_builder: 3,
+            gas_ceil: 0,
+            min_gas_price: U256::ZERO,
+            builder_fee_ceil: U256::ZERO,
+            bid_block_enabled: false,
+            grpc_enabled: false,
+            version: "test".to_string(),
+            allowed_builders: Arc::new(RwLock::new(HashSet::new())),
+            pending_bids: Arc::new(RwLock::new(PendingBids::new())),
+        }
+    }
+
+    #[tokio::test]
+    async fn mev_params_times_bids_by_the_simulators_cutoff() {
+        // A builder sends its last bid at BidBetterBefore = block time - DelayLeftOver -
+        // BidSimulationLeftOver. The simulator starts nothing with less than DELAY_LEFT_OVER
+        // left, so with go-bsc's defaults (15 ms, 20 ms) that deadline must be 120 + 20 ms.
+        let ms = 1_000_000;
+        let params = api_with_left_overs(20, 15).params().await.unwrap();
+        assert_eq!(params.delay_left_over, 15 * ms, "DelayLeftOver is still the BidBlock deadline");
+        assert_eq!(params.bid_simulation_left_over, 125 * ms);
+        assert_eq!(
+            params.delay_left_over + params.bid_simulation_left_over,
+            (DELAY_LEFT_OVER + 20) * ms
+        );
+
+        // A DelayLeftOver configured past the cutoff needs nothing added.
+        let params = api_with_left_overs(20, 150).params().await.unwrap();
+        assert_eq!(params.bid_simulation_left_over, 20 * ms);
     }
 
     #[test]
