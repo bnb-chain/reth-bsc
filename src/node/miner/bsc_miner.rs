@@ -1121,7 +1121,19 @@ where
                             // A finished simulation may produce a recommit request
                             // (go-bsc simBid defer): the follow-up simulation of a
                             // better bid that was parked during this run.
-                            if let Some(req) = self.simulator.bid_simulate(bid_runtime) {
+                            //
+                            // Simulation is synchronous, and the recommit probe keeps
+                            // this branch ready until the simulator's cutoff, so this
+                            // task does not yield for the whole window. block_in_place
+                            // first hands this worker's queued tasks to another thread:
+                            // a task woken on this worker (its LIFO slot is never
+                            // stolen) would otherwise wait for the probe to stop, such
+                            // as the mev_sendBid of a builder's later bid, which then
+                            // arrives after the simulator stopped simulating.
+                            let simulator = &self.simulator;
+                            let recommit =
+                                tokio::task::block_in_place(|| simulator.bid_simulate(bid_runtime));
+                            if let Some(req) = recommit {
                                 if let Err(e) = self.bid_simulate_req_tx.send(req) {
                                     error!("Failed to send recommit bid simulate request due to channel closed: {}", e);
                                 }
