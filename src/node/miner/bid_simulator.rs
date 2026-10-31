@@ -82,6 +82,18 @@ fn can_be_interrupted(block_time_ms: u64, now_ms: u64, no_interrupt_left_over_ms
     block_time_ms.saturating_sub(now_ms) >= no_interrupt_left_over_ms
 }
 
+/// Whether a better bid may stop the in-flight simulation. A re-simulation of the best bid (the
+/// recommit probe) always may: `best_bid` already holds that bid's result, so stopping it loses
+/// nothing. Any other simulation only while [`can_be_interrupted`].
+fn may_preempt(
+    reruns_best_bid: bool,
+    block_time_ms: u64,
+    now_ms: u64,
+    no_interrupt_left_over_ms: u64,
+) -> bool {
+    reruns_best_bid || can_be_interrupted(block_time_ms, now_ms, no_interrupt_left_over_ms)
+}
+
 /// Per-block tally of simulations preempted by a higher-value bid, keyed by parent hash. Carries
 /// the block number so [`BidSimulator::clear`] can prune it alongside the bid maps.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -169,6 +181,9 @@ pub struct BidSimulator<Client, Pool> {
     /// Simulations preempted per parent hash, so the seal path can tell whether an interrupt
     /// actually bought a better block. See [`Self::take_interrupt_count`].
     interrupt_counts: Arc<RwLock<HashMap<B256, InterruptTally>>>,
+    /// Admits one bid at a time, as go-bsc's single `newBidLoop` does. New bids arrive on the
+    /// bid intake task while the recommit probe runs on the simulation task.
+    admission: parking_lot::Mutex<()>,
 
     // MEV metrics
     mev_metrics: crate::metrics::BscMevMetrics,
@@ -216,6 +231,7 @@ where
             greedy_merge,
             no_interrupt_left_over,
             interrupt_counts: Arc::new(RwLock::new(HashMap::new())),
+            admission: parking_lot::Mutex::new(()),
         }
     }
 
@@ -249,6 +265,12 @@ where
     // newBidLoop). The probe re-enters with a bid that is already in pending_bid, so
     // it must skip commit_new_bid's dedup — go-bsc has no dedup on the newBidCh path.
     fn commit_bid_inner(&self, bid: Bid) -> Option<BidRuntime<Pool, BscEvmConfig>> {
+        let _admission = self.admission.lock();
+        self.admit(bid)
+    }
+
+    /// [`Self::commit_bid_inner`], with the admission lock held.
+    fn admit(&self, bid: Bid) -> Option<BidRuntime<Pool, BscEvmConfig>> {
         let final_block_number = match self.client.finalized_block_number() {
             Ok(Some(final_block_number)) => final_block_number,
             Ok(None) => return None,
@@ -349,19 +371,29 @@ where
                 .write()
                 .insert(_bid_runtime.bid.parent_hash, _bid_runtime.bid.clone());
 
-            if let Some(simulating_bid) = self.simulating_bid.read().get(&bid.parent_hash).cloned()
-            {
+            let simulating_bid = self.simulating_bid.read().get(&bid.parent_hash).cloned();
+            if let Some(simulating_bid) = simulating_bid {
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as u64;
-                if can_be_interrupted(
+                let reruns_best_bid = self
+                    .best_bid
+                    .read()
+                    .get(&bid.parent_hash)
+                    .is_some_and(|best| best.bid.bid_hash == simulating_bid.bid_hash);
+                if may_preempt(
+                    reruns_best_bid,
                     mining_ctx.block_timestamp_ms,
                     now_ms,
                     self.no_interrupt_left_over,
                 ) {
                     simulating_bid.interrupt_flag.store(true, Ordering::Relaxed);
-                    self.record_interrupt(bid.parent_hash, bid.block_number);
+                    // Stopping a re-simulation is not the gamble that the
+                    // no-interrupt window and its metrics are about.
+                    if !reruns_best_bid {
+                        self.record_interrupt(bid.parent_hash, bid.block_number);
+                    }
                     let bid_simulate_req = self.commit_bid(5, _bid_runtime);
                     return Some(bid_simulate_req);
                 } else {
@@ -479,6 +511,11 @@ where
     ) -> BidRuntime<Pool, BscEvmConfig> {
         debug!("bid committed reason:{}, bid hash:{}", reason, bid_runtime.bid.bid_hash);
         bid_runtime.bid.committed = true;
+        // Each simulation gets its own interrupt flag, as go-bsc gives each commit its own
+        // interruptCh. Every clone of a bid (best_bid_to_run, best_bid) shares the flag's Arc,
+        // so after one interrupt every later re-simulation of the bid would stop at its first
+        // transaction.
+        bid_runtime.bid.interrupt_flag = Arc::new(AtomicBool::new(false));
         // go-bsc shares one *types.Bid between bestBidToRun and the dispatched runtime,
         // so Commit() marks both. Our map holds a clone inserted before this call —
         // mark it too, or best_bid_to_run never reads as committed and admission would
@@ -537,7 +574,7 @@ where
         // Aborted simulations keep their site-specific debug logs; metrics and the
         // recommit probe only apply to simulations that ran to completion.
         if outcome.is_err() {
-            return None;
+            return self.commit_parked_bid(parent_hash);
         }
 
         // Update metrics after simulation
@@ -589,6 +626,20 @@ where
         }
         let recommit = self.best_bid.read().get(&parent_hash).map(|rt| rt.bid.clone())?;
         self.commit_bid_inner(recommit)
+    }
+
+    /// Commits the bid that admission parked in best_bid_to_run while a simulation was too close
+    /// to the block to interrupt. A clean simulation leaves it to the recommit probe; after a
+    /// failed one, nothing else would simulate it.
+    fn commit_parked_bid(&self, parent_hash: B256) -> Option<BidRuntime<Pool, BscEvmConfig>> {
+        let _admission = self.admission.lock();
+        let parked = self
+            .best_bid_to_run
+            .read()
+            .get(&parent_hash)
+            .filter(|bid| !bid.is_committed())
+            .cloned()?;
+        self.admit(parked)
     }
 
     fn simulate_bid_inner(
@@ -1412,6 +1463,17 @@ mod tests {
         assert!(!can_be_interrupted(10_000, 10_100, 240));
         // Unknown block target disables the check (go-bsc `targetTime == 0`).
         assert!(can_be_interrupted(0, 10_000, 240));
+    }
+
+    #[test]
+    fn a_better_bid_stops_a_re_simulation_of_the_best_bid_at_any_time() {
+        // A builder's last bid arrives ~190ms before the block, inside the 240ms window.
+        assert!(may_preempt(true, 10_000, 9_810, 240));
+        assert!(!may_preempt(false, 10_000, 9_810, 240));
+        // Outside the window any simulation may be stopped.
+        assert!(may_preempt(false, 10_000, 9_760, 240));
+        // Past the block time too: admission's own checks drop a bid that late.
+        assert!(may_preempt(true, 10_000, 10_100, 240));
     }
 
     fn bid_block_task_at(number: u64, parent_hash: B256) -> BidBlockTask {

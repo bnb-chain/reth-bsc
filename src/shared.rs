@@ -111,6 +111,9 @@ static LOCAL_PEER_ID: OnceLock<PeerId> = OnceLock::new();
 static BID_PACKAGE_QUEUE: OnceLock<Arc<Mutex<VecDeque<crate::node::miner::bid_simulator::Bid>>>> =
     OnceLock::new();
 
+/// Wakes the bid intake when a bid package is queued.
+static BID_PACKAGE_QUEUED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
 /// Global BidBlock builder permission manager (BEP-675). Shared between the `mev_sendBidBlock`
 /// admission path (which rejects revoked builders) and the miner, which revokes builders after a
 /// failed BidBlock verification.
@@ -511,10 +514,17 @@ pub fn push_bid_package(
 ) -> Result<(), &'static str> {
     if let Some(queue) = BID_PACKAGE_QUEUE.get() {
         queue.lock().push_back(package);
+        BID_PACKAGE_QUEUED.notify_one();
         Ok(())
     } else {
         Err("Bid package queue not initialized")
     }
+}
+
+/// Wait until a bid package is queued. A package queued while nobody waits ends the next wait
+/// at once, so a caller that drains the queue after each wait misses none.
+pub async fn bid_package_queued() {
+    BID_PACKAGE_QUEUED.notified().await
 }
 
 /// Pop a bid package from the global queueBid
