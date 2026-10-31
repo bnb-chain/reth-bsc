@@ -46,7 +46,7 @@ use reth_provider::StateProviderFactory;
 use reth_revm::cached::CachedReads;
 use reth_revm::cancelled::ManualCancel;
 use reth_revm::{database::StateProviderDatabase, db::State};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
@@ -1245,6 +1245,10 @@ where
     result_tx: mpsc::UnboundedSender<SubmitContext>,
     /// Potential payloads vector for selecting the best one
     potential_payloads: Vec<BscBuiltPayload>,
+    /// Bid hashes of the BEP-322 bids already pushed into `potential_payloads`. The bid store is
+    /// sampled twice per job (see `try_return_best_payload`), and a bid seen both times must stay
+    /// a single candidate.
+    taken_bids: HashSet<alloy_primitives::B256>,
     /// Best (sealed, unexecuted) BEP-675 BidBlock for this parent, collected from the simulator.
     /// Competes against `potential_payloads` by fee; if it wins it is broadcast first and verified
     /// on import (zero-simulate), so it is intentionally kept out of `potential_payloads`.
@@ -1354,6 +1358,7 @@ where
             is_aborted: false,
             result_tx,
             potential_payloads: Vec::new(),
+            taken_bids: HashSet::new(),
             bid_block_candidate: None,
             build_args,
             retries: 0,
@@ -1879,8 +1884,8 @@ where
         }
     }
 
-    /// Fetch the best bid for the current parent block, push it into `potential_payloads`,
-    /// and return its block hash (or `None` if no valid bid exists).
+    /// Fetch the best bid for the current parent block and push its payload into
+    /// `potential_payloads`, unless an earlier sample of this job already did.
     fn collect_best_bid(&mut self) {
         let Some(best_bid) = self.simulator.get_best_bid(self.mining_ctx.parent_header.hash())
         else {
@@ -1888,6 +1893,10 @@ where
         };
         let bid_info = best_bid.bid;
         if let Some(bsc_payload) = best_bid.bsc_payload {
+            if !take_bid_candidate(&mut self.taken_bids, bid_info.bid_hash) {
+                // Already a candidate: this job's earlier sample took it.
+                return;
+            }
             info!(
                 target: "bsc::miner::payload",
                 trace_id = self.trace_id,
@@ -2266,6 +2275,12 @@ where
         // local build finished and no background tasks remain (the empty-mempool case), so without
         // the wait this decision is made at t≈0 and no bid can ever be seen.
         self.wait_for_submission_deadline()?;
+        // Sample the BEP-322 store again too, as go-bsc does after its wait (`GetBestBid` right
+        // before `GetBestBidBlock` in `commitWork`). The sample at the top of this function runs at
+        // t≈0 of the job, before any builder can answer: a builder bids on a block it built after
+        // this slot started, so its `mev_sendBid` arrives hundreds of milliseconds in. Sampled only
+        // then, every bid is admitted and simulated but never becomes a candidate.
+        self.collect_best_bid();
         self.collect_best_bid_block();
 
         // BEP-675 zero-simulate selection (go-bsc `selectBidBlock`): if the unexecuted BidBlock's
@@ -2893,12 +2908,22 @@ fn finalize_payload(
     Ok(())
 }
 
+/// Records a BEP-322 bid as a candidate of the payload job. False if an earlier sample of the
+/// job already took it: the bid store is sampled twice per job, and the best bid may not have
+/// changed in between.
+fn take_bid_candidate(
+    taken: &mut HashSet<alloy_primitives::B256>,
+    bid_hash: alloy_primitives::B256,
+) -> bool {
+    taken.insert(bid_hash)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         bid_block_broadcast_delay, initial_out_of_turn_build_wait, local_rebuild_action,
-        refresh_and_reseal_bid_block, send_bid_block_after_delay, validate_bsc_sidecar,
-        LocalRebuildAction, LocalRebuildPolicyInput,
+        refresh_and_reseal_bid_block, send_bid_block_after_delay, take_bid_candidate,
+        validate_bsc_sidecar, LocalRebuildAction, LocalRebuildPolicyInput,
     };
     use crate::chainspec::BscChainSpec;
     use crate::consensus::parlia::Parlia;
@@ -2914,8 +2939,21 @@ mod tests {
     use alloy_primitives::{Address, B256, U256};
     use reth::transaction_pool::error::Eip4844PoolTransactionError;
     use reth_primitives_traits::{RecoveredBlock, SealedHeader};
+    use std::collections::HashSet;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn a_resampled_bid_is_taken_once() {
+        let mut taken = HashSet::new();
+        let early = B256::with_last_byte(1);
+        // First sample (t≈0): the best bid so far.
+        assert!(take_bid_candidate(&mut taken, early));
+        // After the deadline wait no better bid arrived: the same bid, not a second candidate.
+        assert!(!take_bid_candidate(&mut taken, early));
+        // A better bid that arrived in the meantime is a new candidate.
+        assert!(take_bid_candidate(&mut taken, B256::with_last_byte(2)));
+    }
 
     /// A won BidBlock must not be released before its own header timestamp.
     ///
