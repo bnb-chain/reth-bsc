@@ -465,6 +465,7 @@ where
             attributes,
             self.chain_spec.clone(),
             mining_ctx,
+            crate::shared::get_miner_gas_limit(),
         );
         let expected_block_reward = _bid.gas_fee;
         let mut expected_validator_reward =
@@ -1080,13 +1081,13 @@ where
         attributes: EthPayloadAttributes,
         chain_spec: Arc<BscChainSpec>,
         mining_ctx: MiningContext,
+        miner_gas_limit: Option<u64>,
     ) -> Self {
         // Convert un_revertible array to HashSet for fast lookup
         let un_revertible_set: std::collections::HashSet<B256> =
             bid.un_revertible.iter().copied().collect();
 
-        let gas_ceil =
-            bid_gas_ceil(crate::shared::get_miner_gas_limit(), mining_ctx.parent_header.gas_limit);
+        let gas_ceil = bid_gas_ceil(miner_gas_limit, mining_ctx.parent_header.gas_limit);
         Self {
             bid,
             pool,
@@ -1413,19 +1414,59 @@ mod tests {
     use reth_primitives_traits::RecoveredBlock;
 
     /// A private network's chain (from an e2e run): gas ceiling 40M, parent block at
-    /// 39_418_034. The bid's block must move towards the ceiling, as a local block does, and
-    /// leave room for a bid filled to `GasCeil`.
+    /// 39_418_034. A bid's block must move towards the miner's ceiling, as a local block does,
+    /// and leave room for a bid filled to `GasCeil`. With reth's `EthereumBuilderConfig`
+    /// default it aimed at 30M and went down instead.
     #[test]
     fn a_bid_block_follows_the_miners_gas_ceiling() {
-        let parent = 39_418_034;
-        let config =
-            EthereumBuilderConfig::new().with_gas_limit(bid_gas_ceil(Some(40_000_000), parent));
-        assert_eq!(config.gas_limit(parent), parent + parent / 1024 - 1);
-        // The Ethereum default this replaces moved every bid block towards 30M instead.
-        assert_eq!(EthereumBuilderConfig::default().gas_limit(parent), parent - parent / 1024 + 1);
+        use alloy_consensus::Header;
+        use reth::transaction_pool::noop::NoopTransactionPool;
+
+        let spec = Arc::new(BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet()));
+        let parent =
+            SealedHeader::seal_slow(Header { gas_limit: 39_418_034, ..Default::default() });
+        let runtime = |miner_gas_limit| {
+            let mining_ctx = MiningContext {
+                header: Some(Header { number: 1, ..Default::default() }),
+                parent_header: parent.clone(),
+                parent_snapshot: Arc::default(),
+                is_inturn: true,
+                cached_reads: None,
+                block_timestamp_ms: 0,
+                end_mining_timestamp_ms: 0,
+            };
+            let bid = Bid {
+                builder: Address::repeat_byte(0xbb),
+                block_number: 1,
+                parent_hash: parent.hash(),
+                txs: vec![],
+                blob_sidecars: HashMap::new(),
+                un_revertible: vec![],
+                gas_used: 0,
+                gas_fee: U256::ZERO,
+                builder_fee: U256::ZERO,
+                committed: false,
+                bid_hash: B256::ZERO,
+                interrupt_flag: Arc::new(AtomicBool::new(false)),
+            };
+            BidRuntime::new(
+                bid,
+                NoopTransactionPool::default(),
+                BscEvmConfig::new(spec.clone()),
+                EthPayloadAttributes::default(),
+                spec.clone(),
+                mining_ctx,
+                miner_gas_limit,
+            )
+        };
+        let parent_limit = parent.gas_limit;
+        // The miner's ceiling: up, as for a local block (the old default: 39_379_541, down).
+        assert_eq!(
+            runtime(Some(40_000_000)).builder_config.gas_limit(parent_limit),
+            parent_limit + parent_limit / 1024 - 1
+        );
         // Before the miner starts there is no ceiling: keep the parent's gas limit.
-        let config = EthereumBuilderConfig::new().with_gas_limit(bid_gas_ceil(None, parent));
-        assert_eq!(config.gas_limit(parent), parent);
+        assert_eq!(runtime(None).builder_config.gas_limit(parent_limit), parent_limit);
     }
 
     #[test]
@@ -1607,6 +1648,7 @@ mod tests {
                 EthPayloadAttributes { timestamp: attrs.inner.timestamp, ..Default::default() },
                 spec,
                 mining_ctx,
+                None,
             );
             let mut db = InMemoryDB::default();
             for address in [sender, other] {
