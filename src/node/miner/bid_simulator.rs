@@ -48,6 +48,14 @@ use tracing::{debug, trace, warn};
 const PAY_BID_TX_GAS_LIMIT: u64 = 25000;
 const TX_GAS: u64 = 21000;
 
+/// The gas ceiling a bid's block is built towards: the miner's, as for its local blocks and
+/// the `GasCeil` that `mev_params` reports (go-bsc builds a bid's header with
+/// `CalcGasLimit(parent, GasCeil)` like its own work). Before the miner starts, the parent's
+/// gas limit is kept.
+fn bid_gas_ceil(miner_gas_limit: Option<u64>, parent_gas_limit: u64) -> u64 {
+    miner_gas_limit.unwrap_or(parent_gas_limit)
+}
+
 #[derive(Clone)]
 pub struct Bid {
     pub builder: Address,
@@ -945,7 +953,7 @@ where
             debug!("BidBlock: no snapshot for parent {parent_hash}");
             return;
         };
-        let gas_ceil = crate::shared::get_miner_gas_limit().unwrap_or(parent.gas_limit);
+        let gas_ceil = bid_gas_ceil(crate::shared::get_miner_gas_limit(), parent.gas_limit);
         let expected_gas_limit =
             EthereumBuilderConfig::new().with_gas_limit(gas_ceil).gas_limit(parent.gas_limit);
         // Use the operator-configured extra (`miner_setExtra`) as the block vanity, mirroring
@@ -1077,11 +1085,13 @@ where
         let un_revertible_set: std::collections::HashSet<B256> =
             bid.un_revertible.iter().copied().collect();
 
+        let gas_ceil =
+            bid_gas_ceil(crate::shared::get_miner_gas_limit(), mining_ctx.parent_header.gas_limit);
         Self {
             bid,
             pool,
             evm_config,
-            builder_config: EthereumBuilderConfig::default(),
+            builder_config: EthereumBuilderConfig::new().with_gas_limit(gas_ceil),
             bsc_payload: None,
             expected_block_reward: U256::ZERO,
             expected_validator_reward: U256::ZERO,
@@ -1401,6 +1411,22 @@ mod tests {
     use super::*;
     use crate::node::primitives::{BscBlock, BscBlockBody};
     use reth_primitives_traits::RecoveredBlock;
+
+    /// A private network's chain (from an e2e run): gas ceiling 40M, parent block at
+    /// 39_418_034. The bid's block must move towards the ceiling, as a local block does, and
+    /// leave room for a bid filled to `GasCeil`.
+    #[test]
+    fn a_bid_block_follows_the_miners_gas_ceiling() {
+        let parent = 39_418_034;
+        let config =
+            EthereumBuilderConfig::new().with_gas_limit(bid_gas_ceil(Some(40_000_000), parent));
+        assert_eq!(config.gas_limit(parent), parent + parent / 1024 - 1);
+        // The Ethereum default this replaces moved every bid block towards 30M instead.
+        assert_eq!(EthereumBuilderConfig::default().gas_limit(parent), parent - parent / 1024 + 1);
+        // Before the miner starts there is no ceiling: keep the parent's gas limit.
+        let config = EthereumBuilderConfig::new().with_gas_limit(bid_gas_ceil(None, parent));
+        assert_eq!(config.gas_limit(parent), parent);
+    }
 
     #[test]
     fn can_be_interrupted_requires_full_simulation_window() {

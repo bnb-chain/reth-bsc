@@ -1243,7 +1243,9 @@ impl BscMevApiServer for MevApiImpl {
             no_interrupt_left_over: self.no_interrupt_left_over * 1_000_000,
             delay_left_over: self.delay_left_over * 1_000_000,
             max_bids_per_builder: self.max_bids_per_builder,
-            gas_ceil: self.gas_ceil,
+            // The ceiling blocks are built towards now: `miner_setGasLimit` changes it after
+            // startup (go-bsc reports `worker.config.GasCeil`, which `SetGasCeil` updates).
+            gas_ceil: crate::shared::get_miner_gas_limit().unwrap_or(self.gas_ceil),
             gas_price: self.min_gas_price,
             builder_fee_ceil: self.builder_fee_ceil,
             bid_block_enabled,
