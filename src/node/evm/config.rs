@@ -34,11 +34,11 @@ use reth_evm_ethereum::RethReceiptBuilder;
 use reth_primitives_traits::{
     constants::MAX_TX_GAS_LIMIT_OSAKA, BlockTy, HeaderTy, SealedBlock, SealedHeader,
 };
-use reth_revm::State;
 use reth_rpc_eth_api::helpers::pending_block::BuildPendingEnv;
 use revm::{
     context::{BlockEnv, CfgEnv},
     context_interface::block::BlobExcessGasAndPrice,
+    database::State,
     primitives::hardfork::SpecId,
     Inspector,
 };

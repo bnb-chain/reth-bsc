@@ -35,12 +35,13 @@ use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_ethereum_primitives::TransactionSigned;
 use reth_evm::{
+    database::StateProviderDatabase,
     execute::{BlockBuilder, BlockBuilderOutcome},
     ConfigureEvm, NextBlockEnvAttributes,
 };
 use reth_primitives_traits::SealedHeader;
 use reth_provider::{EvmStateProviderAdapter, StateProviderFactory};
-use reth_revm::{database::StateProviderDatabase, db::State};
+use revm::database::State;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 

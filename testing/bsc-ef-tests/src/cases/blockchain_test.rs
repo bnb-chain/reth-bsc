@@ -19,7 +19,7 @@ use reth_bsc::chainspec::BscChainSpec;
 use reth_chainspec::ChainSpec;
 use reth_db_common::init::{insert_genesis_hashes, insert_genesis_history, insert_genesis_state};
 use reth_ethereum_primitives::Block;
-use reth_evm::{execute::Executor, ConfigureEvm};
+use reth_evm::{database::StateProviderDatabase, execute::Executor, ConfigureEvm};
 use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives_traits::{RecoveredBlock, SealedBlock};
 use reth_provider::{
@@ -27,11 +27,11 @@ use reth_provider::{
     EvmStateProviderAdapter, ExecutionOutcome, HistoryWriter, OriginalValuesKnown,
     StateWriteConfig, StateWriter, StaticFileProviderFactory, StaticFileSegment, StaticFileWriter,
 };
-use reth_revm::{database::StateProviderDatabase, State};
 use reth_trie::{HashedPostState, KeccakKeyHasher, StateRoot};
 use reth_trie_db::{
     DatabaseHashedCursorFactory, DatabaseStateRoot, DatabaseTrieCursorFactory, LegacyKeyAdapter,
 };
+use revm::database::State;
 use std::{
     collections::BTreeMap,
     fs,

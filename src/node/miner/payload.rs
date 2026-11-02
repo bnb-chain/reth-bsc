@@ -46,6 +46,8 @@ use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_ethereum_primitives::TransactionSigned;
 use reth_evm::{
     block::{BlockExecutionError, BlockValidationError},
+    cached::CachedReads,
+    database::StateProviderDatabase,
     execute::{BlockBuilder, BlockBuilderOutcome},
     ConfigureEvm, NextBlockEnvAttributes,
 };
@@ -57,9 +59,8 @@ use reth_primitives_traits::{
     SealedBlock, SealedHeader, SignerRecoverable,
 };
 use reth_provider::{EvmStateProviderAdapter, StateProviderFactory};
-use reth_revm::{cached::CachedReads, database::StateProviderDatabase, db::State};
 use reth_tasks::ManualCancel;
-use revm::context_interface::Block as EvmBlock;
+use revm::{context_interface::Block as EvmBlock, database::State};
 use std::{
     collections::HashMap,
     sync::{

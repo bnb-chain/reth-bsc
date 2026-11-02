@@ -10,14 +10,15 @@ use alloy_primitives::{
 };
 use parking_lot::{Mutex, RwLock};
 use reth_ethereum_primitives::TransactionSigned;
-use reth_evm::{ConfigureEvm, Evm, EvmEnvFor};
+use reth_evm::{database::StateProviderDatabase, ConfigureEvm, Evm, EvmEnvFor};
 use reth_provider::{EvmStateProviderAdapter, StateProviderFactory};
-use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_tasks::ManualCancel;
 use reth_transaction_pool::{
     BestTransactions, BestTransactionsAttributes, PoolTransaction, TransactionPool,
 };
-use revm::{bytecode::Bytecode, state::AccountInfo, Database, DatabaseCommit, DatabaseRef};
+use revm::{
+    bytecode::Bytecode, database::State, state::AccountInfo, Database, DatabaseCommit, DatabaseRef,
+};
 use std::{
     cell::Cell,
     collections::hash_map::Entry,
@@ -1068,7 +1069,7 @@ mod tests {
         let mut cold = State::builder().with_database_ref(parent.clone()).build();
         let cold_result =
             cfg.evm_with_env(&mut cold, env.clone()).transact(transaction(0)).unwrap();
-        let mut local = reth_revm::cached::CachedReads::default();
+        let mut local = reth_evm::cached::CachedReads::default();
         let (observed, _) = super::super::state_read_diagnostics::ObservedStateDb::new(
             &mut local,
             parent.clone(),

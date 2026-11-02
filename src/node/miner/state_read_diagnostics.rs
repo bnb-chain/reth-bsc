@@ -3,7 +3,7 @@
 
 use super::build_diagnostics::AttemptKind;
 use alloy_primitives::{Address, B256, U256};
-use reth_revm::cached::{CachedReads, CachedReadsDbMut};
+use reth_evm::cached::{CachedReads, CachedReadsDbMut};
 use revm::{bytecode::Bytecode, state::AccountInfo, Database, DatabaseRef};
 use std::{
     cell::Cell,

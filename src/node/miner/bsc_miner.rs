@@ -51,7 +51,7 @@ pub struct MiningContext {
     pub parent_header: reth_primitives_traits::SealedHeader,
     pub parent_snapshot: Arc<crate::consensus::parlia::snapshot::Snapshot>,
     pub is_inturn: bool,
-    pub cached_reads: Option<reth_revm::cached::CachedReads>,
+    pub cached_reads: Option<reth_evm::cached::CachedReads>,
     /// Block timestamp in milliseconds, computed via `block_time_for_ramanujan_fork`.
     pub block_timestamp_ms: u64,
     /// End timestamp of the mining job (UNIX epoch ms), computed via `delay_for_ramanujan_fork`.
@@ -431,7 +431,7 @@ where
     fn maybe_pre_cached(
         &self,
         parent: alloy_primitives::B256,
-    ) -> Option<reth_revm::cached::CachedReads> {
+    ) -> Option<reth_evm::cached::CachedReads> {
         self.pre_cached.as_ref().filter(|pc| pc.block == parent).map(|pc| pc.cached.clone())
     }
 
@@ -710,10 +710,10 @@ where
             .gas_limit(parent_header.gas_limit);
         let claimed = if mining_ctx.is_inturn {
             super::pipeline::claim(parent_header.hash(), |key, plan| {
-                key.beneficiary == self.validator_address
-                    && key.gas_limit == effective_gas_limit
-                    && key.min_gas_tip == min_gas_tip
-                    && plan.valid_for(key, &mining_ctx, &self.parlia)
+                key.beneficiary == self.validator_address &&
+                    key.gas_limit == effective_gas_limit &&
+                    key.min_gas_tip == min_gas_tip &&
+                    plan.valid_for(key, &mining_ctx, &self.parlia)
             })
         } else {
             None

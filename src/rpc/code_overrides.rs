@@ -16,12 +16,11 @@ use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use reth_chainspec::{ChainSpecProvider, EthChainSpec};
 use reth_errors::RethError;
 use reth_evm::{
-    block::BlockExecutor, env::BlockEnvironment, execute::BlockBuilder, ConfigureEvm, Evm,
-    EvmFactory,
+    block::BlockExecutor, database::StateProviderDatabase, env::BlockEnvironment,
+    execute::BlockBuilder, ConfigureEvm, Evm, EvmFactory,
 };
 use reth_primitives_traits::BlockBody;
 use reth_provider::{BlockIdReader, EvmStateProviderAdapter, ProviderError};
-use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_rpc_convert::RpcTypes;
 use reth_rpc_eth_api::{
     helpers::{estimate::EstimateCall, EthCall},
@@ -33,7 +32,12 @@ use reth_rpc_eth_types::{
     BlockOverridesExt, EthApiError,
 };
 use reth_tasks::CancelOnDrop;
-use revm::{context::Block, context_interface::Cfg, database::InMemoryDB, DatabaseCommit};
+use revm::{
+    context::Block,
+    context_interface::Cfg,
+    database::{InMemoryDB, State},
+    DatabaseCommit,
+};
 use revm_inspectors::transfer::TransferInspector;
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -265,11 +265,12 @@ fn publish_env(chain_spec: Arc<BscChainSpec>) {
 fn trusted_local_build_produces_block() {
     use reth_bsc::node::evm::config::{BscEvmConfig, BscExecutionMode, BscNextBlockEnvAttributes};
     use reth_evm::{
+        database::StateProviderDatabase,
         execute::{BlockBuilder, BlockBuilderOutcome},
         ConfigureEvm, NextBlockEnvAttributes,
     };
     use reth_provider::DatabaseProviderFactory;
-    use reth_revm::{database::StateProviderDatabase, db::State};
+    use revm::database::State;
 
     let chain_spec = signable_test_chain_spec();
     let factory = create_test_provider_factory_with_chain_spec(Arc::new(chain_spec.inner.clone()));
@@ -339,16 +340,17 @@ fn round_trip_build_finalize_reexecute_agree() {
         },
     };
     use reth_evm::{
+        database::StateProviderDatabase,
         execute::{BlockBuilder, BlockBuilderOutcome, Executor},
         ConfigureEvm, NextBlockEnvAttributes,
     };
     use reth_primitives_traits::RecoveredBlock;
     use reth_provider::DatabaseProviderFactory;
-    use reth_revm::{database::StateProviderDatabase, db::State};
     use reth_trie::{HashedPostState, KeccakKeyHasher, StateRoot};
     use reth_trie_db::{
         DatabaseHashedCursorFactory, DatabaseStateRoot, DatabaseTrieCursorFactory, LegacyKeyAdapter,
     };
+    use revm::database::State;
 
     let chain_spec = signable_test_chain_spec();
     let factory = create_test_provider_factory_with_chain_spec(Arc::new(chain_spec.inner.clone()));
@@ -478,6 +480,7 @@ fn execution_gate_round_trip() {
     };
     use reth_ethereum_primitives::TransactionSigned;
     use reth_evm::{
+        database::StateProviderDatabase,
         execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutionOutput, Executor},
         ConfigureEvm, NextBlockEnvAttributes,
     };
@@ -487,11 +490,11 @@ fn execution_gate_round_trip() {
         DatabaseProviderFactory, ExecutionOutcome, OriginalValuesKnown, StateWriteConfig,
         StateWriter, StaticFileProviderFactory, StaticFileWriter,
     };
-    use reth_revm::{database::StateProviderDatabase, db::State};
     use reth_trie::{HashedPostState, KeccakKeyHasher, StateRoot};
     use reth_trie_db::{
         DatabaseHashedCursorFactory, DatabaseStateRoot, DatabaseTrieCursorFactory, LegacyKeyAdapter,
     };
+    use revm::database::State;
 
     let chain_spec = kepler_signable_chain_spec();
     let factory = create_test_provider_factory_with_node_types::<BscNode>(chain_spec.clone());
@@ -760,6 +763,7 @@ fn jenner_payment_lane_chain_round_trips() {
         },
     };
     use reth_evm::{
+        database::StateProviderDatabase,
         execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutionOutput, Executor},
         ConfigureEvm, NextBlockEnvAttributes,
     };
@@ -769,7 +773,7 @@ fn jenner_payment_lane_chain_round_trips() {
         DatabaseProviderFactory, ExecutionOutcome, HistoryWriter, OriginalValuesKnown,
         StateWriteConfig, StateWriter, StaticFileProviderFactory, StaticFileWriter,
     };
-    use reth_revm::{database::StateProviderDatabase, db::State};
+    use revm::database::State;
 
     let chain_spec = jenner_lane_chain_spec();
     let factory = create_test_provider_factory_with_node_types::<BscNode>(chain_spec.clone());

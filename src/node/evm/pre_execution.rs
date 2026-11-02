@@ -28,15 +28,16 @@ use blst::{
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use reth_ethereum_primitives::TransactionSigned;
 use reth_evm::{
-    eth::receipt_builder::ReceiptBuilder, execute::BlockExecutionError, Database, Evm, EvmFactory,
-    FromRecoveredTx, FromTxWithEncoded, IntoTxEnv,
+    database::StateProviderDatabase, eth::receipt_builder::ReceiptBuilder,
+    execute::BlockExecutionError, Database, Evm, EvmFactory, FromRecoveredTx, FromTxWithEncoded,
+    IntoTxEnv,
 };
 use reth_primitives_traits::{GotExpected, SealedHeader};
 use reth_provider::EvmStateProvider;
-use reth_revm::{database::StateProviderDatabase, db::State};
 use revm::{
     context::{result::ExecutionResult, BlockEnv, TxEnv},
     context_interface::block::Block,
+    database::State,
     primitives::{Address, Bytes, TxKind, U256},
 };
 use schnellru::{ByLength, LruMap};

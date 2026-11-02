@@ -7,16 +7,15 @@ use alloy_evm::overrides::apply_state_overrides;
 use alloy_primitives::U256;
 use alloy_rpc_types_eth::{state::StateOverride, TransactionRequest};
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
-use reth_evm::{BlockEnvFor, EvmFactory, TransactionEnvMut};
+use reth_evm::{database::StateProviderDatabase, BlockEnvFor, EvmFactory, TransactionEnvMut};
 use reth_provider::EvmStateProviderAdapter;
-use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_rpc_convert::RpcTypes;
 use reth_rpc_eth_api::{
     helpers::{EthCall, Trace},
     FromEvmError,
 };
 use reth_rpc_eth_types::{error::FromEthApiError, BlockOverridesExt};
-use revm::{context::Block, context_interface::Transaction};
+use revm::{context::Block, context_interface::Transaction, database::State};
 use revm_inspectors::access_list::AccessListInspector;
 
 #[rpc(server, namespace = "eth")]

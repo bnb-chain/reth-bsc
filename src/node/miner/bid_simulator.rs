@@ -32,6 +32,7 @@ use reth_chainspec::EthChainSpec;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_ethereum_primitives::TransactionSigned;
 use reth_evm::{
+    database::StateProviderDatabase,
     execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutionError, BlockValidationError},
     ConfigureEvm, NextBlockEnvAttributes,
 };
@@ -42,8 +43,7 @@ use reth_primitives_traits::{SealedHeader, SignerRecoverable};
 use reth_provider::{
     BlockHashReader, EvmStateProviderAdapter, HeaderProvider, StateProviderFactory,
 };
-use reth_revm::{database::StateProviderDatabase, db::State};
-use revm::{context_interface::Block as EvmBlock, Database};
+use revm::{context_interface::Block as EvmBlock, database::State, Database};
 use std::{
     collections::HashMap,
     sync::{
