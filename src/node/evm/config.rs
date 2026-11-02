@@ -116,6 +116,12 @@ pub struct BscNextBlockEnvAttributes {
     /// blocks unboundedly past its slot. `None` = legacy unbounded blocking wait
     /// (out-of-turn / bid-sim / import paths).
     pub state_root_deadline_ms: Option<u64>,
+    /// Monotonic local-build budget and cancellation; absent for import and RPC.
+    pub build_control: Option<crate::node::miner::build_control::BuildControl>,
+    /// Miner-only bounded (attempt kind, consensus turn) labels for
+    /// execution/finish diagnostics. None for import, RPC and bid simulation; never infer kind
+    /// from transaction count.
+    pub finish_diagnostics: Option<(&'static str, &'static str)>,
     /// Sub-second millisecond remainder (BEP-520) of the block being built, consumed by
     /// [`BscBlockEnv`] and the BEP-706 precompile. The miner and bid simulator fill it
     /// with `block_timestamp_ms % 1000` (the planned millisecond timestamp that is
@@ -140,6 +146,8 @@ impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
             state_root_precomputed_sink: None,
             trie_handle: None,
             state_root_deadline_ms: None,
+            build_control: None,
+            finish_diagnostics: None,
             // RPC pending/simulate blocks have no millisecond source — second precision
             // (`Time*1000`), like go-bsc's zero-MixDigest synthetic headers.
             milli_remainder: 0,
@@ -215,9 +223,19 @@ pub struct BscBlockExecutionCtx<'a> {
     /// See [`BscNextBlockEnvAttributes::state_root_deadline_ms`]. Bounds the
     /// sparse-trie `state_root()` wait in `finish`.
     pub state_root_deadline_ms: Option<u64>,
+    /// Monotonic local-build budget and cancellation; absent for import and RPC.
+    pub build_control: Option<crate::node::miner::build_control::BuildControl>,
+    /// Miner-only bounded (attempt kind, consensus turn) labels for
+    /// execution/finish diagnostics. None for import, RPC and bid simulation; never infer kind
+    /// from transaction count.
+    pub finish_diagnostics: Option<(&'static str, &'static str)>,
 }
 
 impl<'a> BscBlockExecutionCtx<'a> {
+    pub(crate) fn header_by_hash(&self, hash: &alloy_primitives::B256) -> Option<Header> {
+        super::util::get_header_by_hash_from_cache(hash)
+    }
+
     /// Convert to EthBlockExecutionCtx for compatibility with existing BlockAssembler.
     pub fn as_eth_context(&self) -> &EthBlockExecutionCtx<'a> {
         &self.base
@@ -608,6 +626,8 @@ where
             state_root_precomputed_sink: None,
             trie_handle: None,
             state_root_deadline_ms: None,
+            build_control: None,
+            finish_diagnostics: None,
         })
     }
 
@@ -642,6 +662,8 @@ where
             state_root_precomputed_sink: attributes.state_root_precomputed_sink,
             trie_handle: attributes.trie_handle,
             state_root_deadline_ms: attributes.state_root_deadline_ms,
+            build_control: attributes.build_control,
+            finish_diagnostics: attributes.finish_diagnostics,
         })
     }
 
@@ -713,6 +735,8 @@ where
             state_root_precomputed_sink: None,
             trie_handle: None,
             state_root_deadline_ms: None,
+            build_control: None,
+            finish_diagnostics: None,
         })
     }
 

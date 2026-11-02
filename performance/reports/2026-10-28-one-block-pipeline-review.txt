@@ -1,0 +1,58 @@
+提前一块计算、保持原发布时间：本地 review 说明
+
+分支：codex/perf-task-diagnostics。基于 22e81c7，Reth 562fa2638d7141bed166962aa459a5d56cc4db03（2.8）不变。
+阶段：本地实验实现；默认关闭。没有提交、推送、部署或发压。
+启用：进程启动时设置 BSC_MINING_PIPELINED_BUILD=1；关闭后回到原构建路径。
+
+目的与边界
+原路径在父块候选完成后等待发布时间，再等 canonical 通知启动子块。实验利用这段空闲提前构建一个子块。
+不改变450ms区块间隔、当前收尾预留、迟完成开关或网络发布时机；不提前推进canonical。
+最多一个后台构建；即使失效取消尚未完成，也不放行另一个后台构建。
+只尝试连续本地in-turn普通块；排除空回退、外部bid候选、epoch/验证者切换边界和子块为本轮最后一块的情况。
+
+状态隔离与接管
+将父块执行结果通过Reth现有state_with_block_appended构成私有state provider。
+单独传入私有header/snapshot；不走普通构建的全局header播种及snapshot重建/持久化路径。
+私有父块不插入engine/canonical图。私有proof overlay manager及proof缓存与正常miner分开。
+父块实际成为canonical后，普通构建才可接管同一个正在运行或已完成的子块。
+接管要求父hash、目标毫秒时间、beneficiary、gas limit、min gas tip完全匹配。
+父块替换、重组、配置不匹配或停止挖矿会取消/丢弃；构建失败或结果通道关闭回退普通构建。
+
+资源与副作用
+预计算使用启动时创建的独立执行线程、有界通道和独立proof/overlay工作池。
+不占普通LOCAL_BUILD_PERMIT，不让父块重建排队等待子块；预计算不再启动额外交易投机预热线程。
+数据库环境/文件、页缓存、CPU/内存带宽和磁盘仍共享，不能据此声称没有资源竞争。
+为了确定子块parent hash，实验会先在私有副本上组装attestation并签名父候选。
+这是一次额外的本地签名，不广播，不占正常发布的double-sign记录；需要在本地review重点核对。
+预览不继承payment-lane元数据、不更新validator/turn-length发布缓存。
+到发布时间仍按原路径选择bid、获取最新attestation并签名；不冻结投票或bid。
+若最终hash改变，子块必须作废；因此复用率可能较低，不能提前承诺性能收益。
+普通执行中的其他只读元数据缓存仍按原实现工作，不能把全部缓存统称为完全私有。
+
+监控
+bsc_miner_pipeline_total{outcome}：started/adopted/reused/fallback，以及parent_changed/candidate_changed/parameters_changed/compute_failed/launch_failed等。
+bsc_miner_pipeline_preview_seconds：父候选私有预览成本（当前仍在父job线程上）。
+bsc_miner_pipeline_start_lead_seconds：后台计算实际开始时，距父块计划发布的正向剩余时间。
+bsc_miner_pipeline_compute_seconds：整个后台计算耗时。
+bsc_miner_pipeline_ready_lead_seconds / ready_late_seconds：子候选完成相对其计划发布时间的提前/迟到量（两者之一为0）。
+bsc_miner_pipeline_adoption_wait_seconds：canonical构建接管后仍需等待的时间。
+bsc.build_diagnostics与state_reads/finish的kind=pipeline单独记录物理工作。
+接管保留原候选计时和标识，避免把同一次执行再作为普通执行计一次；普通run仍包括接管等待。
+底层没有kind标签的聚合指标可能包含后台工作，分析时需配合这些分层指标。
+候选完成/复用均不等于上链；最终仍以canonical吞吐、空块、difficulty1和发布时间为准。
+
+800ms长尾与提前两块
+800ms相对450ms周期多350ms。在额外覆盖发布/切换开销的前提下，真实提前量达到约350ms，提前一块也可能覆盖这次孤立长尾。
+提前两块可扩大最大缓冲，但不会使依赖链并行独立，也不会把单块800ms算得更快。
+例如快块每块总计算350ms，理想情况下每次最多攒100ms，需连续数个快块才能攒够350ms；实际还有发布时间、轮次、接管和作废损耗。
+若持续每块计算超过450ms，任何有限缓冲都会耗尽。更深缓冲还增加状态保留、级联作废和交易新鲜度问题。
+本版仍限制提前一块；后续根据真实提前量分布、复用率及长尾聚集性决定是否扩至两块。
+
+验证记录
+cargo test -p reth_bsc --lib node::miner --offline：最终版本212 passed，0 failed；包括7项协调器/执行线程测试、私有父块读取及根输入对照、预览不更新发布缓存。
+cargo test -p reth_bsc --lib private_mining_parent_needs --offline：最终版本1 passed，0 failed；无全局header注册、无snapshot provider也能使用私有上下文，错误hash被拒绝。
+cargo clippy -p reth_bsc --lib --tests --offline -- -D warnings：最终版本通过。
+对所有修改的Rust文件逐一执行nightly rustfmt --check：通过。git diff --check通过。
+完整并行套件曾出现4项本机gRPC监听权限错误，以及6项现有投票全局状态并行干扰；本改动新增的预览检查还暴露一个测试fixture同hash问题，已用不同vanity区分两个case后修复。
+串行复核（跳过4项受监听权限限制的gRPC测试）：862 passed，0 failed，1 ignored，4 filtered；当时尚未加入最后一项独立执行线程测试，随后已纳入最终212项miner测试通过。
+本机端口权限受限的4项gRPC测试未验证通过；没有远端性能数据，尚不具备收益结论。

@@ -290,10 +290,9 @@ where
             .clone()
             .ok_or_else(|| BlockExecutionError::msg("Missing header in execution context"))?;
 
-        let parent_header = crate::node::evm::util::get_header_by_hash_from_cache(
-            &header.parent_hash,
-        )
-        .ok_or(BlockExecutionError::msg("Failed to get parent header from global header reader"))?;
+        let parent_header = self.ctx.header_by_hash(&header.parent_hash).ok_or(
+            BlockExecutionError::msg("Failed to get parent header from global header reader"),
+        )?;
         self.inner_ctx.parent_header = Some(parent_header.clone());
 
         let snap = self
@@ -644,11 +643,9 @@ where
                     is_match = true;
                     break;
                 }
-                ancestor =
-                    crate::node::evm::util::get_header_by_hash_from_cache(&ancestor.parent_hash())
-                        .ok_or_else(|| BscBlockExecutionError::UnknownHeader {
-                            block_hash: ancestor.parent_hash(),
-                        })?;
+                ancestor = self.ctx.header_by_hash(&ancestor.parent_hash()).ok_or_else(|| {
+                    BscBlockExecutionError::UnknownHeader { block_hash: ancestor.parent_hash() }
+                })?;
                 tracing::debug!("ancestor: {:?}", ancestor);
             }
 
@@ -876,11 +873,9 @@ where
             });
         }
 
-        crate::node::evm::util::get_header_by_hash_from_cache(&snap.vote_data.target_hash)
-            .ok_or_else(|| {
-                BscBlockExecutionError::UnknownHeader { block_hash: snap.vote_data.target_hash }
-                    .into()
-            })
+        self.ctx.header_by_hash(&snap.vote_data.target_hash).ok_or_else(|| {
+            BscBlockExecutionError::UnknownHeader { block_hash: snap.vote_data.target_hash }.into()
+        })
     }
 
     /// prepare some intermediate data for produce new block.
@@ -888,11 +883,9 @@ where
         &mut self,
         block: &BlockEnv,
     ) -> Result<(), BlockExecutionError> {
-        let parent_header =
-            crate::node::evm::util::get_header_by_hash_from_cache(&self.ctx.base.parent_hash)
-                .ok_or(BlockExecutionError::msg(
-                    "Failed to get parent header from global header reader",
-                ))?;
+        let parent_header = self.ctx.header_by_hash(&self.ctx.base.parent_hash).ok_or(
+            BlockExecutionError::msg("Failed to get parent header from global header reader"),
+        )?;
         self.inner_ctx.parent_header = Some(parent_header.clone());
 
         // Only the Parlia finalization in `finish` reads the snapshot, and simulation skips

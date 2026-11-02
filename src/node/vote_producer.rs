@@ -64,6 +64,11 @@ pub fn maybe_produce_and_broadcast_for_head(
     snapshot_provider: &dyn SnapshotProvider,
     head: &Header,
 ) {
+    if !crate::node::startup_recovery::is_ready() {
+        BLOCKS_SINCE_MINING.store(0, Ordering::Relaxed);
+        tracing::debug!(target: "bsc::vote", reason = "startup-recovery", "skip vote production");
+        return;
+    }
     // Only vote when mining is enabled (similar to geth behavior)
     let mining_enabled = crate::node::miner::config::get_global_mining_config()
         .map(|c| c.is_mining_enabled())
