@@ -690,7 +690,6 @@ where
                     state_root_deadline_ms: None,
                     build_control: None,
                     finish_diagnostics: None,
-                    private_parent: None,
                 },
             )
             .map_err(PayloadBuilderError::other)
@@ -882,7 +881,6 @@ where
 
         bid_runtime.bsc_payload = Some(BscBuiltPayload {
             selection_diagnostics: None,
-            pipeline_seal: None,
             diagnostics: None,
             block: sealed_block.clone(),
             fees: bid_runtime.gas_fee,

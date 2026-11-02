@@ -33,7 +33,7 @@ class Tests(unittest.TestCase):
                          {'workingset_refault_file': 12, 'workingset_activate': 4, 'pgscan_kswapd': 1})
         self.assertIsNone(schedstat(None))
         self.assertIsNone(schedstat('0 0'))
-        self.assertEqual(role('miner-pipeline-'), 'miner_pipeline')
+        self.assertIsNone(role('miner-pipeline-'))
         old = dict(stat(proc_stat()), role='miner_prewarm', io={}, sched=schedstat('100 20 3'))
         new = dict(stat(proc_stat()), role='miner_prewarm', io={}, sched=schedstat('180 30 5'))
         group = thread_delta({'1': new}, {'1': old})['miner_prewarm']
@@ -75,7 +75,7 @@ class Tests(unittest.TestCase):
             (process / 'cmdline').write_text('\0'.join([
                 'reth-bsc', 'node', '--engine.cross-block-cache-size', '16384',
                 '--mining.keystore-password', 'secret-password']))
-            (process / 'environ').write_text('BSC_MINING_PIPELINE_DEPTH=2\0PASSWORD=other-secret\0')
+            (process / 'environ').write_text('BSC_MINING_ALLOW_LATE_FINISH=1\0PASSWORD=other-secret\0')
             (process / 'status').write_text('Cpus_allowed_list:\t0-15\n')
             os.symlink('/bin/reth-bsc', process / 'exe')
             (task / 'comm').write_text('miner-prewarm-0\n')
@@ -83,7 +83,7 @@ class Tests(unittest.TestCase):
             collector = Collector(root)
             first = collector.process()
             self.assertEqual(first['metadata']['flags']['--engine.cross-block-cache-size'], '16384')
-            self.assertEqual(first['metadata']['env']['BSC_MINING_PIPELINE_DEPTH'], '2')
+            self.assertEqual(first['metadata']['env']['BSC_MINING_ALLOW_LATE_FINISH'], '1')
             self.assertNotIn('secret', json.dumps(first))
             second = collector.process()
             self.assertEqual(second['thread_groups']['miner_prewarm']['matched_threads'], 1)

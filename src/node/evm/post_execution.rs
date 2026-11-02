@@ -681,17 +681,12 @@ where
             let header = self.ctx.header_by_hash(&target_hash).ok_or_else(|| {
                 BlockExecutionError::msg(format!("Header not found for block hash: {target_hash}"))
             })?;
-            let snap = if let Some(private) = self.ctx.private_snapshot(&header.parent_hash) {
-                private
-            } else {
-                self.snapshot_provider
-                    .as_ref()
-                    .ok_or_else(|| BlockExecutionError::msg("Snapshot provider is not available"))?
-                    .snapshot_by_hash(&header.parent_hash)
-                    .ok_or(BlockExecutionError::msg(
-                        "Failed to get snapshot from snapshot provider",
-                    ))?
-            };
+            let snap = self
+                .snapshot_provider
+                .as_ref()
+                .ok_or_else(|| BlockExecutionError::msg("Snapshot provider is not available"))?
+                .snapshot_by_hash(&header.parent_hash)
+                .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
 
             if let Some(attestation) =
                 self.parlia.get_vote_attestation_from_header(&header, snap.epoch_num).map_err(|err| {
@@ -740,20 +735,17 @@ where
                 justified_header.parent_hash
             ))
         })?;
-        let snapshot = if let Some(private) = self.ctx.private_snapshot(&parent.hash_slow()) {
-            private
-        } else {
-            self.snapshot_provider
-                .as_ref()
-                .ok_or_else(|| BlockExecutionError::msg("Snapshot provider is not available"))?
-                .snapshot_by_hash(&parent.hash_slow())
-                .ok_or_else(|| {
-                    BlockExecutionError::msg(format!(
-                        "Snapshot not found for block hash: {}",
-                        parent.hash_slow()
-                    ))
-                })?
-        };
+        let snapshot = self
+            .snapshot_provider
+            .as_ref()
+            .ok_or_else(|| BlockExecutionError::msg("Snapshot provider is not available"))?
+            .snapshot_by_hash(&parent.hash_slow())
+            .ok_or_else(|| {
+                BlockExecutionError::msg(format!(
+                    "Snapshot not found for block hash: {}",
+                    parent.hash_slow()
+                ))
+            })?;
         let validators = &snapshot.validators;
         let mut validators_bit_set = BitSet::new();
         let vote_address_set = attestation.vote_address_set;

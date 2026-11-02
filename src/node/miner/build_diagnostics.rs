@@ -15,7 +15,6 @@ use std::{
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum AttemptKind {
     Speculative,
-    Pipeline,
     Regular,
     Rebuild,
     Empty,
@@ -24,7 +23,6 @@ impl AttemptKind {
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Speculative => "speculative",
-            Self::Pipeline => "pipeline",
             Self::Regular => "regular",
             Self::Rebuild => "rebuild",
             Self::Empty => "empty",
@@ -300,10 +298,8 @@ impl Drop for BuildWorkObservation {
 /// Metadata follows a candidate through cloning and finalization; it retains no task resources.
 #[derive(Debug)]
 pub(crate) struct CandidateDiagnostics {
-    pub(crate) pipeline_discard_reason: std::sync::OnceLock<Arc<std::sync::OnceLock<&'static str>>>,
     selection: Option<super::selection_diagnostics::SelectionDiagnostics>,
     gas_limit: u64,
-    pub(crate) ready_at: Instant,
     pub(crate) id: u64,
     pub(crate) kind: &'static str,
     turn: &'static str,
@@ -335,12 +331,7 @@ impl CandidateDiagnostics {
 impl Drop for CandidateDiagnostics {
     fn drop(&mut self) {
         if !self.selected.load(Ordering::Relaxed) {
-            let reason = self
-                .pipeline_discard_reason
-                .get()
-                .and_then(|r| r.get())
-                .copied()
-                .unwrap_or("not_selected_or_unattributed");
+            let reason = "not_selected_or_unattributed";
             metrics::counter!("bsc.miner_unselected_candidates_total", "kind" => self.kind, "reason" => reason).increment(1);
             metrics::counter!("bsc.miner_unselected_candidate_transactions_total", "kind" => self.kind, "reason" => reason).increment(self.transactions as u64);
 
@@ -392,25 +383,14 @@ impl AttemptObservation {
         };
         metrics::counter!("bsc.build_diagnostics.finished_total", "kind" => self.kind, "turn" => self.turn, "outcome" => outcome).increment(1);
         if let Some(payload) = payload {
-            if self.kind != "pipeline" &&
-                payload.diagnostics.as_ref().is_some_and(|d| d.kind == "pipeline")
-            {
-                // Adoption waits for an existing physical computation. Final selection
-                // must credit that computation, not count its execution again.
-                metrics::counter!("bsc_miner_pipeline_total", "outcome" => "reuse_observed")
-                    .increment(1);
-                return;
-            }
             static NEXT_ID: AtomicU64 = AtomicU64::new(1);
             metrics::histogram!("bsc.build_diagnostics.execution_seconds", "kind" => self.kind, "turn" => self.turn).record(payload.exec_duration.as_secs_f64());
             metrics::histogram!("bsc.build_diagnostics.root_seconds", "kind" => self.kind, "turn" => self.turn).record(payload.trie_root_duration.as_secs_f64());
             metrics::histogram!("bsc.build_diagnostics.transactions", "kind" => self.kind, "turn" => self.turn).record(payload.block.body().transaction_count() as f64);
             metrics::histogram!("bsc.build_diagnostics.gas", "kind" => self.kind, "turn" => self.turn).record(payload.block.header().gas_used() as f64);
             payload.diagnostics = Some(Arc::new(CandidateDiagnostics {
-                pipeline_discard_reason: Default::default(),
                 selection: payload.selection_diagnostics,
                 gas_limit: payload.block.header().gas_limit(),
-                ready_at: Instant::now(),
                 id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
                 kind: self.kind,
                 turn: self.turn,
@@ -582,16 +562,16 @@ mod tests {
             expired.executing = Some(Instant::now());
         });
         let rendered = handle.render();
-        assert!(rendered
-            .lines()
-            .any(|l| l.starts_with("bsc_build_diagnostics_execution_window_seconds_sum") &&
+        assert!(rendered.lines().any(|l| {
+            l.starts_with("bsc_build_diagnostics_execution_window_seconds_sum") &&
                 l.contains("regular") &&
-                l.ends_with(" 0.08")));
-        assert!(rendered
-            .lines()
-            .any(|l| l.starts_with("bsc_build_diagnostics_execution_window_seconds_sum") &&
+                l.ends_with(" 0.08")
+        }));
+        assert!(rendered.lines().any(|l| {
+            l.starts_with("bsc_build_diagnostics_execution_window_seconds_sum") &&
                 l.contains("rebuild") &&
-                l.ends_with(" 0")));
+                l.ends_with(" 0")
+        }));
     }
 
     #[test]
@@ -663,10 +643,8 @@ mod tests {
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, || {
             let candidate = Arc::new(CandidateDiagnostics {
-                pipeline_discard_reason: Default::default(),
                 selection: Some(super::super::selection_diagnostics::tests::sample()),
                 gas_limit: 200,
-                ready_at: Instant::now(),
                 id: 1,
                 kind: "speculative",
                 turn: "outofturn",
@@ -681,10 +659,8 @@ mod tests {
             drop(candidate);
             drop(clone);
             let candidate = Arc::new(CandidateDiagnostics {
-                pipeline_discard_reason: Default::default(),
                 selection: None,
                 gas_limit: 200,
-                ready_at: Instant::now(),
                 id: 2,
                 kind: "speculative",
                 turn: "outofturn",
@@ -693,9 +669,6 @@ mod tests {
                 gas: 100,
                 transactions: 2,
             });
-            let reason = Arc::new(std::sync::OnceLock::new());
-            candidate.pipeline_discard_reason.set(reason.clone()).unwrap();
-            reason.set("parent_changed").unwrap();
             let clone = candidate.clone();
             drop(candidate);
             drop(clone);
@@ -704,11 +677,11 @@ mod tests {
         assert!(rendered.lines().any(|l| l.starts_with("bsc_miner_selection_outcomes_total{") &&
             l.contains("selected") &&
             l.ends_with(" 1")));
-        assert!(rendered
-            .lines()
-            .any(|l| l.starts_with("bsc_miner_unselected_candidate_transactions_total{") &&
-                l.contains("parent_changed") &&
-                l.ends_with(" 2")));
+        assert!(rendered.lines().any(|l| {
+            l.starts_with("bsc_miner_unselected_candidate_transactions_total{") &&
+                l.contains("not_selected_or_unattributed") &&
+                l.ends_with(" 2")
+        }));
         for name in ["selected_total", "unselected_completed_total"] {
             let prefix = format!("bsc_build_diagnostics_{name}{{");
             let line = rendered.lines().find(|l| l.starts_with(&prefix)).unwrap();
