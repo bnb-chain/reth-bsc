@@ -42,6 +42,8 @@ jobs:
   udeps:
     name: udeps
     runs-on: ubuntu-latest
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
