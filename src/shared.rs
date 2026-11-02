@@ -72,11 +72,7 @@ pub enum MinerRootKind {
 /// `--mining.use-sparse-trie-state-root` is enabled. Returns `None` if the engine
 /// has not been wired (graceful fallback to legacy `state_root_with_updates`).
 pub type SparseTrieSpawnFn = Arc<
-    dyn Fn(
-            SealedHeader<Header>,
-            MinerRootKind,
-            Option<PrivateMinerChain>,
-        ) -> Option<reth_engine_tree::tree::StateRootHandle>
+    dyn Fn(SealedHeader<Header>, MinerRootKind) -> Option<reth_engine_tree::tree::StateRootHandle>
         + Send
         + Sync,
 >;
@@ -342,7 +338,7 @@ pub fn set_sparse_trie_spawn_fn(spawner: SparseTrieSpawnFn) -> Result<(), Sparse
 pub fn spawn_sparse_trie_state_root(
     parent_header: SealedHeader<Header>,
 ) -> Option<reth_engine_tree::tree::StateRootHandle> {
-    SPARSE_TRIE_SPAWN_FN.get().and_then(|f| f(parent_header, MinerRootKind::Normal, None))
+    SPARSE_TRIE_SPAWN_FN.get().and_then(|f| f(parent_header, MinerRootKind::Normal))
 }
 
 /// Reuse miner parent overlays, with independent workers so a normal task waiting for
@@ -350,66 +346,7 @@ pub fn spawn_sparse_trie_state_root(
 pub fn spawn_empty_sparse_trie_state_root(
     parent_header: SealedHeader<Header>,
 ) -> Option<reth_engine_tree::tree::StateRootHandle> {
-    SPARSE_TRIE_SPAWN_FN.get().and_then(|f| f(parent_header, MinerRootKind::EmptyFallback, None))
-}
-
-/// One linear, unpublished ancestry, oldest first. Never inserted into canonical state.
-#[derive(Clone, Debug)]
-pub struct PrivateMinerChain(Arc<Vec<reth_chain_state::ExecutedBlock<crate::BscPrimitives>>>);
-impl PrivateMinerChain {
-    pub fn new(block: reth_chain_state::ExecutedBlock<crate::BscPrimitives>) -> Self {
-        Self(Arc::new(vec![block]))
-    }
-    pub fn blocks(&self) -> &[reth_chain_state::ExecutedBlock<crate::BscPrimitives>] {
-        &self.0
-    }
-    pub fn parent(&self) -> &reth_chain_state::ExecutedBlock<crate::BscPrimitives> {
-        self.0.last().expect("private chain is nonempty")
-    }
-    pub fn base_hash(&self) -> B256 {
-        self.0[0].recovered_block().parent_hash
-    }
-    pub fn appended(
-        &self,
-        block: reth_chain_state::ExecutedBlock<crate::BscPrimitives>,
-    ) -> Option<Self> {
-        if self.0.len() >= 2 ||
-            block.recovered_block().parent_hash != self.parent().recovered_block().hash() ||
-            block.recovered_block().number != self.parent().recovered_block().number + 1
-        {
-            return None
-        }
-        let mut blocks = self.0.as_ref().clone();
-        blocks.push(block);
-        Some(Self(Arc::new(blocks)))
-    }
-}
-
-/// The factory is shared; each caller opens its own thread-local read transaction.
-pub type PrivateMinerStateFactory =
-    Arc<dyn Fn() -> reth_errors::ProviderResult<reth_provider::StateProviderBox> + Send + Sync>;
-pub type PrivateMinerStateFn = Arc<
-    dyn Fn(PrivateMinerChain) -> reth_errors::ProviderResult<PrivateMinerStateFactory>
-        + Send
-        + Sync,
->;
-static PRIVATE_MINER_STATE: OnceLock<PrivateMinerStateFn> = OnceLock::new();
-pub fn set_private_miner_state_fn(f: PrivateMinerStateFn) -> Result<(), PrivateMinerStateFn> {
-    PRIVATE_MINER_STATE.set(f)
-}
-pub fn private_miner_state_factory(
-    parent: PrivateMinerChain,
-) -> reth_errors::ProviderResult<PrivateMinerStateFactory> {
-    let f = PRIVATE_MINER_STATE.get().ok_or(reth_errors::ProviderError::HeaderNotFound(
-        parent.parent().recovered_block().hash().into(),
-    ))?;
-    f(parent)
-}
-pub fn spawn_private_sparse_trie_state_root(
-    parent_header: SealedHeader<Header>,
-    parent: PrivateMinerChain,
-) -> Option<reth_engine_tree::tree::StateRootHandle> {
-    SPARSE_TRIE_SPAWN_FN.get().and_then(|f| f(parent_header, MinerRootKind::Normal, Some(parent)))
+    SPARSE_TRIE_SPAWN_FN.get().and_then(|f| f(parent_header, MinerRootKind::EmptyFallback))
 }
 
 /// Whether the sparse-trie state-root fast path is wired up.
@@ -983,9 +920,6 @@ pub fn get_miner_recommit_interval_ms() -> Option<u64> {
 // --- mining enabled ---
 
 pub fn set_mining_enabled(val: bool) {
-    if !val {
-        crate::node::miner::pipeline::selected_parent(None);
-    }
     if let Some(v) = MINING_ENABLED.get() {
         v.store(val, Ordering::Relaxed);
     }

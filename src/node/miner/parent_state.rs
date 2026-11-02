@@ -1,4 +1,4 @@
-//! Parent post-state reads shared by canonical and unpublished-child construction.
+//! Parent post-state reads for canonical construction.
 use reth_revm::cached::CachedReads;
 use revm::database::BundleState;
 

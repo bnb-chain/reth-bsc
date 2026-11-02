@@ -79,7 +79,7 @@ mod tests {
     };
 
     #[test]
-    fn private_chain_tree_handoff_matches_serial_roots_across_slot_updates() {
+    fn completed_parent_tree_handoff_matches_serial_roots_across_slot_updates() {
         let factory = reth_provider::test_utils::create_test_provider_factory_with_chain_spec(
             Arc::new(reth_chainspec::ChainSpec::default()),
         );

@@ -34,29 +34,20 @@ pub(crate) fn prewarm_threads(default: usize) -> usize {
 pub(crate) fn storage_proof_threads(default: usize) -> usize {
     configured("BSC_MINING_STORAGE_PROOF_THREADS", default, false)
 }
-pub(crate) const fn depth_label(depth: usize) -> &'static str {
-    match depth {
-        0 => "0",
-        1 => "1",
-        _ => "2",
-    }
-}
 /// One entered phase; early return/unwind is distinct from a completed phase.
 /// Outer totals and inner phases overlap and must not be added together.
 pub(crate) struct Phase {
     kind: &'static str,
     turn: &'static str,
-    depth: &'static str,
     phase: &'static str,
     start: Instant,
     completed: bool,
 }
 impl Phase {
-    pub(crate) fn new(kind: &'static str, inturn: bool, depth: usize, phase: &'static str) -> Self {
+    pub(crate) fn new(kind: &'static str, inturn: bool, phase: &'static str) -> Self {
         Self {
             kind,
             turn: if inturn { "inturn" } else { "outofturn" },
-            depth: depth_label(depth),
             phase,
             start: Instant::now(),
             completed: false,
@@ -68,7 +59,7 @@ impl Phase {
 }
 impl Drop for Phase {
     fn drop(&mut self) {
-        metrics::histogram!("bsc.miner_build_phase_seconds", "kind" => self.kind, "turn" => self.turn, "depth" => self.depth, "phase" => self.phase, "outcome" => if self.completed { "completed" } else { "early_exit" }).record(self.start.elapsed().as_secs_f64());
+        metrics::histogram!("bsc.miner_build_phase_seconds", "kind" => self.kind, "turn" => self.turn, "phase" => self.phase, "outcome" => if self.completed { "completed" } else { "early_exit" }).record(self.start.elapsed().as_secs_f64());
     }
 }
 #[cfg(test)]
@@ -86,20 +77,18 @@ mod tests {
         }
     }
     #[test]
-    fn phase_metrics_keep_depth_and_early_exit_separate() {
+    fn phase_metrics_keep_completion_and_early_exit_separate() {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, || {
-            Phase::new("pipeline", true, 1, "root_setup").complete();
-            drop(Phase::new("pipeline", true, 2, "root_setup"));
+            Phase::new("local", true, "root_setup").complete();
+            drop(Phase::new("local", true, "root_setup"));
         });
         let text = handle.render();
         assert!(text.lines().any(|line| line.contains("miner_build_phase_seconds_count") &&
-            line.contains("depth=\"1\"") &&
             line.contains("outcome=\"completed\"") &&
             line.ends_with(" 1")));
         assert!(text.lines().any(|line| line.contains("miner_build_phase_seconds_count") &&
-            line.contains("depth=\"2\"") &&
             line.contains("outcome=\"early_exit\"") &&
             line.ends_with(" 1")));
         assert!(!text.contains("block_hash="));
