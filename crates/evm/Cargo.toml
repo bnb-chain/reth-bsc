@@ -1,0 +1,20 @@
+[package]
+name = "reth-bsc-evm"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.96"
+license = "MIT"
+
+[dependencies]
+alloy-consensus = "2.5.0"
+alloy-primitives = "1.6.1"
+evm2 = { git = "https://github.com/alloy-rs/evm2", rev = "f93318f120f6300599b21170d6c7bef81ed63d87", default-features = false, features = ["std", "secp256k1"] }
+
+alloy-rpc-types-eth = "2.5.0"
+reth-evm = { git = "https://github.com/bnb-chain/reth.git", rev = "44276799094ff1cd40d4a7a3f62ba2b65b47499e" }
+
+[dev-dependencies]
+alloy-eips = "2.5.0"
+alloy-trie = "0.9.8"
+reth-execution-types = { git = "https://github.com/bnb-chain/reth.git", rev = "44276799094ff1cd40d4a7a3f62ba2b65b47499e" }
+reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", rev = "44276799094ff1cd40d4a7a3f62ba2b65b47499e" }
