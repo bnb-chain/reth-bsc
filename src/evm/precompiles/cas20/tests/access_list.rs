@@ -116,7 +116,7 @@ async fn rpc_collects_native_balance_slot_and_replays_with_the_list() {
         .unwrap();
     assert_eq!(U256::from(replay.result.tx_gas_used()), result.gas_used);
     assert!(replay.result.is_success());
-    assert_eq!(U256::from_be_slice(replay.result.output().unwrap()), U256::from(123));
+    assert_eq!(U256::from_be_slice(&replay.result.output), U256::from(123));
 }
 
 #[tokio::test]

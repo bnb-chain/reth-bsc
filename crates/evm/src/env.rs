@@ -1,8 +1,9 @@
 //! Block and request-local execution data for the native BSC EVM.
 
-use alloy_primitives::{Address, U256};
+use crate::{hardfork::BscHardfork, types::BscEvmTypes};
+use alloy_primitives::{Address, B256, U256};
 use alloy_rpc_types_eth::{state::StateOverride, BlockOverrides};
-use evm2::{env::BlockEnv, BaseEvmTypes, EvmFeatures, SpecId, Version};
+use evm2::{env::BlockEnv, EvmFeatures, Version};
 use reth_evm::{
     BlockOverridesExt, EvmEnv, EvmTransactionValidationGasRules, EvmTransactionValidationLimits,
 };
@@ -15,28 +16,43 @@ use std::collections::BTreeSet;
 #[derive(Clone, Debug)]
 pub struct BscEvmEnv {
     /// Inherited Ethereum instruction specification, selected by the BSC fork schedule.
-    pub spec: SpecId,
+    pub spec: BscHardfork,
     /// Runtime gas rules and validation flags.
     pub version: Version,
     /// Opcode-visible block fields.
-    pub block: BlockEnv<BaseEvmTypes>,
+    pub block: BlockEnv<BscEvmTypes>,
+    /// Header fields remain distinct from the opcode representation selected by fork rules.
+    pub header_difficulty: U256,
+    /// Raw mix hash used when assembling synthetic headers.
+    pub header_mix_hash: B256,
     /// Sub-second timestamp component carried by the BSC header's mix hash.
     pub milli_remainder: u64,
     /// Addresses whose explicit code overrides take precedence over dynamic precompiles.
     pub code_overrides: BTreeSet<Address>,
+    /// Whether RPC supplied the blob fee explicitly, including zero.
+    pub blob_base_fee_overridden: bool,
 }
 
 impl BscEvmEnv {
     /// Resolves a BSC environment from already validated block data.
     pub fn new(
-        spec: SpecId,
-        block: BlockEnv<BaseEvmTypes>,
+        spec: BscHardfork,
+        block: BlockEnv<BscEvmTypes>,
         chain_id: u64,
         milli_remainder: u64,
     ) -> Self {
-        let mut version = Version::new(spec);
+        let mut version = Version::new(spec.into());
         version.chain_id = chain_id;
-        Self { spec, version, block, milli_remainder, code_overrides: BTreeSet::new() }
+        Self {
+            spec,
+            version,
+            header_difficulty: block.difficulty,
+            header_mix_hash: B256::from(U256::from(milli_remainder)),
+            block,
+            milli_remainder,
+            code_overrides: BTreeSet::new(),
+            blob_base_fee_overridden: false,
+        }
     }
 
     /// Computes milliseconds from the live seconds field with go-bsc's uint64 wrapping behavior.
@@ -58,11 +74,17 @@ impl BlockOverridesExt for BscEvmEnv {
                 return Err(format!("block override \"prevRandao\" on BSC carries the millisecond remainder of the block timestamp (BEP-520/BEP-706) and must be less than 1000, got {value}"));
             }
         }
+        self.blob_base_fee_overridden |= overrides.blob_base_fee.is_some();
         if overrides.time.is_some() {
             self.milli_remainder = 0;
+            self.header_mix_hash = B256::ZERO;
         }
         if let Some(value) = remainder {
             self.milli_remainder = value.to();
+            self.header_mix_hash = B256::from(value);
+        }
+        if let Some(difficulty) = overrides.difficulty {
+            self.header_difficulty = difficulty;
         }
         // The selected instruction table reads difficulty before Paris and prevrandao after it.
         // Explicit overrides must have the same opcode-0x44 meaning in both cases.
@@ -84,18 +106,18 @@ impl BlockOverridesExt for BscEvmEnv {
 }
 
 impl EvmEnv for BscEvmEnv {
-    type EvmTypes = BaseEvmTypes;
+    type EvmTypes = BscEvmTypes;
 
-    fn spec_id(&self) -> SpecId {
+    fn spec_id(&self) -> BscHardfork {
         self.spec
     }
     fn chain_id(&self) -> u64 {
         self.version.chain_id
     }
-    fn block_env(&self) -> &BlockEnv<BaseEvmTypes> {
+    fn block_env(&self) -> &BlockEnv<BscEvmTypes> {
         &self.block
     }
-    fn block_env_mut(&mut self) -> &mut BlockEnv<BaseEvmTypes> {
+    fn block_env_mut(&mut self) -> &mut BlockEnv<BscEvmTypes> {
         &mut self.block
     }
     fn version(&self) -> &Version {
@@ -150,8 +172,8 @@ mod tests {
 
     fn env() -> BscEvmEnv {
         BscEvmEnv::new(
-            SpecId::OSAKA,
-            BlockEnv::<BaseEvmTypes> {
+            BscHardfork::Osaka,
+            BlockEnv::<BscEvmTypes> {
                 timestamp: U256::from(1_790_000_000u64),
                 ..Default::default()
             },

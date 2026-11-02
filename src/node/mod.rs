@@ -78,13 +78,16 @@ pub type BscRpcConverterFor<N> = reth_rpc_convert::RpcConverter<
 impl<N> EthApiBuilder<N> for BscEthApiBuilder
 where
     N: FullNodeComponents<
-        Types: NodeTypes<ChainSpec: Hardforks + EthereumHardforks>,
+        Types: NodeTypes<Primitives = BscPrimitives, ChainSpec: Hardforks + EthereumHardforks>,
         Evm = evm::config::BscEvmConfig,
     >,
     BscRpcConverterFor<N>:
         RpcConvert<Primitives = PrimitivesTy<N::Types>, Error = EthApiError, Evm = N::Evm>,
 {
-    type EthApi = EthApi<N, BscRpcConverterFor<N>>;
+    type EthApi = EthApi<
+        reth_rpc_eth_api::node::RpcNodeCoreAdapter<N::Provider, N::Pool, N::Network, N::Evm>,
+        BscRpcConverterFor<N>,
+    >;
 
     async fn build_eth_api(self, ctx: EthApiCtx<'_, N>) -> eyre::Result<Self::EthApi> {
         let tx_env_converter =

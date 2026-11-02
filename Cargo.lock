@@ -2208,7 +2208,6 @@ dependencies = [
  "reth-trie",
  "reth-trie-db",
  "reth_bsc",
- "revm",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -8413,9 +8412,13 @@ dependencies = [
  "alloy-rpc-types-eth",
  "alloy-trie",
  "evm2",
+ "reth-chainspec",
+ "reth-ethereum-forks",
  "reth-evm",
  "reth-execution-types",
  "reth-trie-common",
+ "revm-primitives",
+ "serde",
 ]
 
 [[package]]
@@ -11041,6 +11044,7 @@ dependencies = [
  "alloy-chains",
  "alloy-consensus",
  "alloy-dyn-abi",
+ "alloy-eip7928",
  "alloy-eips",
  "alloy-evm",
  "alloy-genesis",
@@ -11151,7 +11155,6 @@ dependencies = [
  "revm-bytecode",
  "revm-database",
  "revm-database-interface",
- "revm-inspectors",
  "revm-interpreter",
  "revm-primitives",
  "revm-state",
@@ -11308,25 +11311,6 @@ dependencies = [
  "revm-state",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "revm-inspectors"
-version = "0.44.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d578c9a58c30ce3736b30b5e99368376605c1f7cc34360a91834fb83f673afca"
-dependencies = [
- "alloy-eip2930",
- "alloy-primitives",
- "alloy-rpc-types-eth",
- "alloy-rpc-types-trace",
- "alloy-sol-types",
- "anstyle",
- "colorchoice",
- "revm",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
 ]
 
 [[package]]

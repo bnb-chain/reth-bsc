@@ -4,7 +4,7 @@ use crate::evm::{
     transaction::BscTxEnv,
 };
 
-use reth_evm::Database;
+use alloy_evm::Database;
 use revm::{
     context::ContextSetters,
     context_interface::{

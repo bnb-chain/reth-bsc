@@ -33,11 +33,9 @@ reth-primitives-traits = { version = "0.8.2", default-features = false }
 reth-provider = { git = "https://github.com/bnb-chain/reth.git", rev = "44276799094ff1cd40d4a7a3f62ba2b65b47499e", features = [
     "test-utils",
 ] }
-revm = "43.0.3"
 reth-tracing = { git = "https://github.com/bnb-chain/reth.git", rev = "44276799094ff1cd40d4a7a3f62ba2b65b47499e" }
 reth-trie = { git = "https://github.com/bnb-chain/reth.git", rev = "44276799094ff1cd40d4a7a3f62ba2b65b47499e" }
 reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", rev = "44276799094ff1cd40d4a7a3f62ba2b65b47499e" }
-# revm
 
 # alloy
 alloy-consensus = "2.5.0"

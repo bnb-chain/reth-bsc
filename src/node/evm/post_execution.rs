@@ -2,7 +2,7 @@ use super::{
     config::{revm_spec_by_timestamp_and_block_number, BscExecutionMode},
     error::{BscBlockExecutionError, BscBlockValidationError},
     executor::BscBlockExecutor,
-    util::set_nonce,
+    util::{set_nonce, NativeBlockEnv},
 };
 use crate::{
     consensus::{
@@ -13,12 +13,9 @@ use crate::{
         },
         MAX_SYSTEM_REWARD, SYSTEM_ADDRESS, SYSTEM_REWARD_PERCENT,
     },
-    evm::{precompiles, transaction::BscTxEnv},
+    evm::precompiles,
     node::{
-        evm::{
-            pre_execution::{CallBlockEnv, TURN_LENGTH_CACHE},
-            ResultAndState,
-        },
+        evm::pre_execution::{CallBlockEnv, TURN_LENGTH_CACHE},
         miner::signer::{is_signer_initialized, sign_system_transaction},
     },
     system_contracts::{
@@ -28,23 +25,20 @@ use crate::{
         SLASH_CONTRACT, STAKE_HUB_CONTRACT, SYSTEM_REWARD_CONTRACT,
     },
 };
-use alloy_consensus::{Header, SignableTransaction, Transaction as AlloyTransaction, TxReceipt};
+use alloy_consensus::{
+    transaction::Recovered, Header, SignableTransaction, Transaction as AlloyTransaction, TxLegacy,
+    TxReceipt,
+};
 use alloy_primitives::{hex, Address, BlockNumber, TxKind, U256};
 use bit_set::BitSet;
+use evm2::{ethereum::TxEnvelope, TxResultWithState};
+use reth_bsc_evm::types::BscEvmTypes;
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use reth_ethereum_primitives::{Transaction, TransactionSigned};
-use reth_evm::{
-    eth::receipt_builder::{ReceiptBuilder, ReceiptBuilderCtx},
-    execute::BlockExecutionError,
-    Evm, FromRecoveredTx, FromTxWithEncoded, IntoTxEnv,
-};
+use reth_evm::{BlockExecutionError, Evm, ReceiptBuilder, ReceiptBuilderCtx};
+type BlockEnv = evm2::env::BlockEnv<BscEvmTypes>;
 use reth_primitives_traits::{GotExpected, SignerRecoverable};
-use revm::{
-    context::{BlockEnv, TxEnv},
-    context_interface::block::Block,
-    state::{Account as RevmAccount, EvmState},
-    Database as _, DatabaseCommit,
-};
+
 use std::collections::HashMap;
 use tracing::warn;
 
@@ -59,15 +53,8 @@ fn turn_length_matches(
     )
 }
 
-impl<'a, EVM, Spec, R: ReceiptBuilder> BscBlockExecutor<'a, EVM, Spec, R>
+impl<'a, Spec, R: ReceiptBuilder> BscBlockExecutor<'a, Spec, R>
 where
-    EVM: Evm<
-        DB: alloy_evm::block::StateDB,
-        Tx: FromRecoveredTx<R::Transaction>
-                + FromRecoveredTx<TransactionSigned>
-                + FromTxWithEncoded<TransactionSigned>,
-        BlockEnv = crate::evm::block_env::BscBlockEnv,
-    >,
     Spec: EthereumHardforks
         + crate::hardforks::BscHardforks
         + EthChainSpec
@@ -75,10 +62,6 @@ where
         + Clone
         + 'static,
     R: ReceiptBuilder<Transaction = TransactionSigned, Receipt: TxReceipt>,
-    <R as ReceiptBuilder>::Transaction: Unpin + From<TransactionSigned>,
-    <EVM as alloy_evm::Evm>::Tx: FromTxWithEncoded<<R as ReceiptBuilder>::Transaction>,
-    BscTxEnv: IntoTxEnv<<EVM as alloy_evm::Evm>::Tx>,
-    R::Transaction: Into<TransactionSigned>,
 {
     /// post check the new block, post check some parlia field and the system txs.
     /// depends on parlia, header and snapshot.
@@ -387,12 +370,8 @@ where
         // Start timing for system contract duration
         let start_time = std::time::Instant::now();
 
-        let account = self
-            .evm
-            .db_mut()
-            .basic(sender)
-            .map_err(BlockExecutionError::other)?
-            .unwrap_or_default();
+        let account =
+            self.evm.account_info(&sender).map_err(BlockExecutionError::other)?.unwrap_or_default();
 
         let transaction = set_nonce(transaction, account.nonce);
 
@@ -483,27 +462,20 @@ where
         let tx_selector =
             if tx_input.len() >= 4 { Some(hex::encode(&tx_input[..4])) } else { None };
         let tx_input_len = tx_input.len();
-        let tx_env = BscTxEnv {
-            base: TxEnv {
-                caller: sender,
-                kind: TxKind::Call(
+        let tx_env = Recovered::new_unchecked(
+            TxEnvelope::Legacy(TxLegacy {
+                to: TxKind::Call(
                     tx_to.ok_or_else(|| BlockExecutionError::msg("System tx has no recipient"))?,
                 ),
                 nonce: account.nonce,
                 gas_limit: u64::MAX / 2,
                 value: transaction.value(),
-                data: tx_input.clone(),
+                input: tx_input.clone(),
                 gas_price: 0,
                 chain_id: Some(self.spec.chain().id()),
-                gas_priority_fee: None,
-                access_list: Default::default(),
-                blob_hashes: Vec::new(),
-                max_fee_per_blob_gas: 0,
-                tx_type: 0,
-                authorization_list: Default::default(),
-            },
-            is_system_transaction: true,
-        };
+            }),
+            sender,
+        );
 
         let block_number = self.evm.block().number().to::<u64>();
         let timestamp = self.evm.block().timestamp().to::<u64>();
@@ -531,8 +503,8 @@ where
         let _precompile_trace_pop_guard = PrecompileTracePopGuard;
 
         let result_and_state =
-            self.evm.transact(tx_env.into_tx_env()).map_err(BlockExecutionError::other)?;
-        let ResultAndState { result, state } = result_and_state;
+            self.evm.transact_system_transaction(&tx_env).map_err(BlockExecutionError::other)?;
+        let TxResultWithState { result, pending_state: state, .. } = result_and_state;
         // NOTE(reth-v2.4.1): manual state-hook streaming removed; state hook is DB-level now.
 
         let gas_used = result.tx_gas_used();
@@ -545,11 +517,9 @@ where
             use alloy_consensus::TxType;
             signed_tx.as_ref().map(|tx| tx.tx_type()).unwrap_or(TxType::Legacy)
         };
-        self.receipts.push(self.receipt_builder.build_receipt(ReceiptBuilderCtx {
+        self.receipts.push(self.receipt_builder.build_receipt::<BscEvmTypes>(ReceiptBuilderCtx {
             tx_type,
-            evm: &self.evm,
             result,
-            state: &state,
             cumulative_gas_used: self.gas_used,
         }));
         self.commit_state(state);
@@ -564,8 +534,7 @@ where
     fn distribute_incoming(&mut self, validator: Address) -> Result<(), BlockExecutionError> {
         let system_info = self
             .evm
-            .db_mut()
-            .basic(SYSTEM_ADDRESS)
+            .account_info(&SYSTEM_ADDRESS)
             .map_err(BlockExecutionError::other)?
             .unwrap_or_default();
         let mut block_reward = system_info.balance.to::<u128>();
@@ -574,42 +543,14 @@ where
             return Ok(());
         }
 
-        // Zero out SYSTEM_ADDRESS balance.
-        //
-        // These balance writes bypass the EVM, so - like the system-contract upgrades in
-        // `executor.rs` - they must reach the state hook. The DB-level state hook streams every
-        // `commit` to the incremental state-root computation (sparse trie / `StateRootTask`), so
-        // `db.commit` alone carries them into the committed root.
-        {
-            let mut system_account = RevmAccount::from(system_info);
-            system_account.mark_touch();
-            system_account.info.balance = U256::ZERO;
-            let mut changes: EvmState = Default::default();
-            changes.insert(SYSTEM_ADDRESS, system_account);
-            self.evm.db_mut().commit(changes);
-        }
-
-        // Credit validator with the block reward
-        {
-            let validator_info = self
-                .evm
-                .db_mut()
-                .basic(validator)
-                .map_err(BlockExecutionError::other)?
-                .unwrap_or_default();
-            let mut validator_account = RevmAccount::from(validator_info);
-            validator_account.mark_touch();
-            validator_account.info.balance =
-                validator_account.info.balance.saturating_add(U256::from(block_reward));
-            let mut changes: EvmState = Default::default();
-            changes.insert(validator, validator_account);
-            self.evm.db_mut().commit(changes);
-        }
+        self.update_account(SYSTEM_ADDRESS, |account| account.balance = U256::ZERO)?;
+        self.update_account(validator, |account| {
+            account.balance = account.balance.saturating_add(U256::from(block_reward))
+        })?;
 
         let system_reward_balance = self
             .evm
-            .db_mut()
-            .basic(SYSTEM_REWARD_CONTRACT)
+            .account_info(&SYSTEM_REWARD_CONTRACT)
             .map_err(BlockExecutionError::other)?
             .unwrap_or_default()
             .balance;

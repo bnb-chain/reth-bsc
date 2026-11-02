@@ -270,7 +270,6 @@ fn trusted_local_build_produces_block() {
         ConfigureEvm, NextBlockEnvAttributes,
     };
     use reth_provider::DatabaseProviderFactory;
-    use revm::database::State;
 
     let chain_spec = signable_test_chain_spec();
     let factory = create_test_provider_factory_with_chain_spec(Arc::new(chain_spec.inner.clone()));
@@ -282,7 +281,7 @@ fn trusted_local_build_produces_block() {
     let provider = factory.database_provider_rw().expect("rw provider");
     let state_provider = provider.latest();
     let sp_db = StateProviderDatabase::new(EvmStateProviderAdapter(&state_provider));
-    let mut db = State::builder().with_database(sp_db).with_bundle_update().build();
+    let mut db = sp_db;
 
     let evm_config = BscEvmConfig::new(chain_spec.clone());
     let mut builder = evm_config
@@ -350,7 +349,6 @@ fn round_trip_build_finalize_reexecute_agree() {
     use reth_trie_db::{
         DatabaseHashedCursorFactory, DatabaseStateRoot, DatabaseTrieCursorFactory, LegacyKeyAdapter,
     };
-    use revm::database::State;
 
     let chain_spec = signable_test_chain_spec();
     let factory = create_test_provider_factory_with_chain_spec(Arc::new(chain_spec.inner.clone()));
@@ -368,7 +366,7 @@ fn round_trip_build_finalize_reexecute_agree() {
     let block = {
         let state_provider = provider.latest();
         let sp_db = StateProviderDatabase::new(EvmStateProviderAdapter(&state_provider));
-        let mut db = State::builder().with_database(sp_db).with_bundle_update().build();
+        let mut db = sp_db;
         let evm_config = BscEvmConfig::new(chain_spec.clone());
         let mut builder = evm_config
             .builder_for_next_block(
@@ -494,7 +492,6 @@ fn execution_gate_round_trip() {
     use reth_trie_db::{
         DatabaseHashedCursorFactory, DatabaseStateRoot, DatabaseTrieCursorFactory, LegacyKeyAdapter,
     };
-    use revm::database::State;
 
     let chain_spec = kepler_signable_chain_spec();
     let factory = create_test_provider_factory_with_node_types::<BscNode>(chain_spec.clone());
@@ -535,7 +532,7 @@ fn execution_gate_round_trip() {
         let provider = factory.database_provider_rw().unwrap();
         let state_provider = provider.latest();
         let sp_db = StateProviderDatabase::new(EvmStateProviderAdapter(&state_provider));
-        let mut db = State::builder().with_database(sp_db).with_bundle_update().build();
+        let mut db = sp_db;
         let evm_config = BscEvmConfig::new(chain_spec.clone());
         let diff = calculate_difficulty(&genesis_snap, *TEST_VALIDATOR);
         let mut builder = evm_config
@@ -547,7 +544,7 @@ fn execution_gate_round_trip() {
             .expect("builder b1");
         builder.apply_pre_execution_changes().expect("pre-exec b1");
         let out = builder.finish(&state_provider, None).expect("finish b1");
-        let BlockBuilderOutcome { execution_result, block, .. } = out;
+        let BlockBuilderOutcome { execution_result, execution_state, block, .. } = out;
         let senders = block.senders().to_vec();
         let mut plain = block.sealed_block().clone_block();
         finalize_new_header(
@@ -560,7 +557,7 @@ fn execution_gate_round_trip() {
             None,
         ) // not an epoch block
         .expect("finalize b1");
-        let output = BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
+        let output = BlockExecutionOutput { state: execution_state, result: execution_result };
         (RecoveredBlock::new_unhashed(plain, senders), output)
     };
     let block1_sealed = SealedHeader::new(block1.header().clone(), block1.header().hash_slow());
@@ -608,7 +605,7 @@ fn execution_gate_round_trip() {
         let provider = factory.database_provider_rw().unwrap();
         let state_provider = provider.latest();
         let sp_db = StateProviderDatabase::new(EvmStateProviderAdapter(&state_provider));
-        let mut db = State::builder().with_database(sp_db).with_bundle_update().build();
+        let mut db = sp_db;
         let evm_config = BscEvmConfig::new(chain_spec.clone());
         let diff = calculate_difficulty(&block1_snap, *TEST_VALIDATOR);
         let mut builder = evm_config
@@ -623,8 +620,8 @@ fn execution_gate_round_trip() {
             .execute_transaction(user.clone().try_into_recovered().expect("recover user"))
             .expect("exec user");
         let out = builder.finish(&state_provider, None).expect("finish b2");
-        let BlockBuilderOutcome { execution_result, block, .. } = out;
-        let output = BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
+        let BlockBuilderOutcome { execution_result, execution_state, block, .. } = out;
+        let output = BlockExecutionOutput { state: execution_state, result: execution_result };
         (block, output)
     };
     let reference_root = block2_ref.header().state_root;
@@ -773,7 +770,6 @@ fn jenner_payment_lane_chain_round_trips() {
         DatabaseProviderFactory, ExecutionOutcome, HistoryWriter, OriginalValuesKnown,
         StateWriteConfig, StateWriter, StaticFileProviderFactory, StaticFileWriter,
     };
-    use revm::database::State;
 
     let chain_spec = jenner_lane_chain_spec();
     let factory = create_test_provider_factory_with_node_types::<BscNode>(chain_spec.clone());
@@ -819,10 +815,7 @@ fn jenner_payment_lane_chain_round_trips() {
         let (block, output, hashed_state) = {
             let provider = factory.database_provider_rw().unwrap();
             let state_provider = provider.latest();
-            let mut db = State::builder()
-                .with_database(StateProviderDatabase::new(EvmStateProviderAdapter(&state_provider)))
-                .with_bundle_update()
-                .build();
+            let mut db = StateProviderDatabase::new(EvmStateProviderAdapter(&state_provider));
             let diff = calculate_difficulty(&parent_snap, *TEST_VALIDATOR);
             let attrs = BscNextBlockEnvAttributes {
                 inner: NextBlockEnvAttributes {
@@ -869,15 +862,16 @@ fn jenner_payment_lane_chain_round_trips() {
                     .expect_err("a general tx that would eat the reservation must be refused");
                 // Distinguish lane rejection from EIP-7825, which also returns InvalidTx.
                 assert!(
-                    format!("{refused:?}").contains("CallerGasLimitMoreThanBlock"),
+                    format!("{refused:?}").contains("GasLimitMoreThanBlock"),
                     "expected the lane's own drop, got {refused:?}"
                 );
                 builder
                     .execute_transaction(tx(nonce, BAND, payment))
                     .expect("the same gas limit on the payment side must still be admitted");
             }
-            let BlockBuilderOutcome { execution_result, block, hashed_state, .. } =
-                builder.finish(&state_provider, None).expect("finish");
+            let BlockBuilderOutcome {
+                execution_result, execution_state, block, hashed_state, ..
+            } = builder.finish(&state_provider, None).expect("finish");
             let senders = block.senders().to_vec();
             let mut plain = block.sealed_block().clone_block();
             finalize_new_header(
@@ -890,7 +884,7 @@ fn jenner_payment_lane_chain_round_trips() {
                 None,
             )
             .expect("finalize");
-            let out = BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
+            let out = BlockExecutionOutput { state: execution_state, result: execution_result };
             (RecoveredBlock::new_unhashed(plain, senders), out, hashed_state)
         };
 

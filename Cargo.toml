@@ -64,8 +64,8 @@ reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", rev = "44276
 reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", rev = "44276799094ff1cd40d4a7a3f62ba2b65b47499e" }
 reth-tasks = { git = "https://github.com/bnb-chain/reth.git", rev = "44276799094ff1cd40d4a7a3f62ba2b65b47499e" }
 reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", rev = "44276799094ff1cd40d4a7a3f62ba2b65b47499e" }
-# Retained until the BSC handler and precompiles are ported; not an evm2 compatibility layer.
-revm = "43.0.3"
+# Used by BSC pure precompile implementations and the reference EVM test fixtures.
+revm = { version = "43.0.3", features = ["optional_balance_check"] }
 evm2 = { git = "https://github.com/alloy-rs/evm2", rev = "f93318f120f6300599b21170d6c7bef81ed63d87", default-features = false }
 evm2-inspectors = { git = "https://github.com/alloy-rs/evm2", rev = "f93318f120f6300599b21170d6c7bef81ed63d87", default-features = false }
 revm-database = "43.0.0"
@@ -73,7 +73,6 @@ revm-bytecode = "43.0.0"
 revm-state = "43.0.0"
 revm-primitives = { version = "43.0.0", default-features = false }
 revm-interpreter = "43.0.0"
-revm-inspectors = "0.44.3"
 revm-database-interface = "43.0.0"
 
 # alloy dependencies
@@ -82,6 +81,7 @@ alloy-evm = { version = "0.39.0", features = ["rpc", "overrides"] }
 alloy-genesis = "2.5.0"
 alloy-consensus = "2.5.0"
 alloy-eips = "2.5.0"
+alloy-eip7928 = "0.4.2"
 alloy-network = "2.5.0"
 alloy-rpc-types = { version = "2.5.0", features = ["eth", "trace"] }
 alloy-rpc-types-eth = "2.5.0"
@@ -200,6 +200,7 @@ asm-keccak = [
 ]
 
 serde = [
+    "reth-bsc-evm/serde",
     "alloy-chains/serde",
     "alloy-consensus/serde",
     "alloy-eips/serde",

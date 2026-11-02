@@ -282,10 +282,11 @@ mod tests {
     #[test]
     fn private_parent_overlay_matches_managed_parent_without_canonical_writes() {
         use alloy_primitives::{keccak256, Address, U256};
+        use evm2::evm::AccountInfo;
+        use reth_evm::BundleState;
         use reth_execution_types::BlockExecutionOutput;
         use reth_provider::{AccountReader, DatabaseProviderROFactory, StateProvider};
         use reth_storage_overlay::OverlayStateProviderFactory;
-        use revm::{database::BundleState, state::AccountInfo};
 
         let factory = reth_provider::test_utils::create_test_provider_factory_with_chain_spec(
             Arc::new(reth_chainspec::ChainSpec::default()),
@@ -578,8 +579,8 @@ mod tests {
         };
         let mut normal_hook = normal.take_execution_hook();
         let mut empty_hook = empty.take_execution_hook();
-        normal_hook.on_state(update(3));
-        empty_hook.on_state(update(2));
+        normal_hook.on_state(crate::node::evm::test_utils::update(update(3)));
+        empty_hook.on_state(crate::node::evm::test_utils::update(update(2)));
         drop(empty_hook);
         let expected = |nonce| {
             serial_root(
@@ -629,7 +630,7 @@ mod tests {
         let cancelled_hook = cancelled.take_execution_hook();
         let mut fallback = spawn(&empty_manager, &empty_runtime, true);
         let mut hook = fallback.take_execution_hook();
-        hook.on_state(update(2));
+        hook.on_state(crate::node::evm::test_utils::update(update(2)));
         drop(hook);
         drop(cancelled_hook);
         drop(cancelled);
@@ -645,7 +646,7 @@ mod tests {
         for cancel_first in [false, true] {
             let mut previous = spawn(&normal_manager, &runtime, false);
             let mut hook = previous.take_execution_hook();
-            hook.on_state(update(3));
+            hook.on_state(crate::node::evm::test_utils::update(update(3)));
             drop(hook);
             if !cancel_first {
                 assert_eq!(
@@ -663,7 +664,7 @@ mod tests {
             private_manager.insert_block(parent.clone());
             let mut child = spawn(&private_manager, &runtime, false);
             let mut hook = child.take_execution_hook();
-            hook.on_state(update(4));
+            hook.on_state(crate::node::evm::test_utils::update(update(4)));
             drop(hook);
             assert_eq!(
                 child

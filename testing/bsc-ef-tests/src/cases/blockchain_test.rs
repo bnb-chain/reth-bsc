@@ -31,7 +31,6 @@ use reth_trie::{HashedPostState, KeccakKeyHasher, StateRoot};
 use reth_trie_db::{
     DatabaseHashedCursorFactory, DatabaseStateRoot, DatabaseTrieCursorFactory, LegacyKeyAdapter,
 };
-use revm::database::State;
 use std::{
     collections::BTreeMap,
     fs,
@@ -226,7 +225,7 @@ fn run_case(
 
         // Execute with state closure to get the full output including state
         let output = executor
-            .execute_with_state_closure_always(&(*block).clone(), |_state: &State<_>| {
+            .execute_with_state_closure_always(&(*block).clone(), |_state| {
                 // State recorded for witness generation if needed
             })
             .map_err(|err| Error::block_failed(block_number, program_inputs.clone(), err))?;

@@ -4,32 +4,29 @@ use crate::{
         assembler::{BscBlockAssembler, BscBlockAssemblerInput},
         config::{BscBlockExecutionCtx, BscBlockExecutorFactory, BscExecutionSharedCtx},
         executor::BscBlockExecutor,
-        factory::BscEvmFactory,
     },
     BscPrimitives,
 };
-use alloy_evm::{
-    block::{BlockExecutor, GasOutput},
-    eth::receipt_builder::ReceiptBuilder,
-};
+use reth_bsc_evm::{env::BscEvmEnv, types::BscEvmTypes};
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
-use reth_evm::execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutionError, ExecutorTx};
-use reth_primitives_traits::{
-    HeaderTy, NodePrimitives, Recovered, RecoveredBlock, SealedHeader, SignerRecoverable, TxTy,
+use reth_evm::{
+    execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutionError, ExecutorTx},
+    BlockExecutor, CommitChanges, GasOutput, ReceiptBuilder, RecoveredTx,
 };
+use reth_primitives_traits::{HeaderTy, Recovered, RecoveredBlock, SealedHeader, TxTy};
 use reth_provider::StateProvider;
 use reth_trie_common::updates::TrieUpdates;
-use revm::database::{states::bundle_state::BundleRetention, State};
 
 /// rewrite BasicBlockBuilder, mainly about the finish() trait.
 /// add system txs to sealed block.
-pub struct BscBlockBuilder<'a, EVM, Spec, R>
+pub struct BscBlockBuilder<'a, Spec, R>
 where
     R: ReceiptBuilder,
     Spec: EthChainSpec + EthereumHardforks + BscHardforks + Hardforks + Clone,
 {
     /// The block executor used to execute transactions.
-    pub executor: BscBlockExecutor<'a, EVM, Spec, R>,
+    pub executor: BscBlockExecutor<'a, Spec, R>,
+    pub evm_env: BscEvmEnv,
     /// The transactions executed in this block.
     pub transactions: Vec<Recovered<TxTy<BscPrimitives>>>,
     /// The parent block execution context.
@@ -50,13 +47,14 @@ where
     pub precomputed_state_root: Option<(alloy_primitives::B256, TrieUpdates)>,
 }
 
-impl<'a, EVM, Spec, R> BscBlockBuilder<'a, EVM, Spec, R>
+impl<'a, Spec, R> BscBlockBuilder<'a, Spec, R>
 where
     R: ReceiptBuilder,
     Spec: EthChainSpec + EthereumHardforks + BscHardforks + Hardforks + Clone,
 {
     pub fn new(
-        executor: BscBlockExecutor<'a, EVM, Spec, R>,
+        executor: BscBlockExecutor<'a, Spec, R>,
+        evm_env: BscEvmEnv,
         ctx: BscBlockExecutionCtx<'a>,
         shared_ctx: BscExecutionSharedCtx,
         assembler: &'a BscBlockAssembler<crate::chainspec::BscChainSpec>,
@@ -64,6 +62,7 @@ where
     ) -> Self {
         Self {
             executor,
+            evm_env,
             transactions: Vec::new(),
             ctx,
             shared_ctx,
@@ -87,26 +86,26 @@ where
     }
 }
 
-impl<'a, DB, EVM, Spec, R> BlockBuilder for BscBlockBuilder<'a, EVM, Spec, R>
+impl<'a, Spec, R> BlockBuilder for BscBlockBuilder<'a, Spec, R>
 where
-    BscBlockExecutor<'a, EVM, Spec, R>: alloy_evm::block::BlockExecutor<
-        Evm = EVM,
-        Transaction = <BscPrimitives as NodePrimitives>::SignedTx,
-        Receipt = <BscPrimitives as NodePrimitives>::Receipt,
+    Spec: EthChainSpec + EthereumHardforks + BscHardforks + Hardforks + Clone + 'static,
+    R: ReceiptBuilder<
+        Transaction = reth_ethereum_primitives::TransactionSigned,
+        Receipt = reth_ethereum_primitives::Receipt,
     >,
-    EVM: alloy_evm::Evm<
-        Spec = <BscEvmFactory as reth_evm::EvmFactory>::Spec,
-        HaltReason = <BscEvmFactory as reth_evm::EvmFactory>::HaltReason,
-        DB = &'a mut State<DB>,
-        BlockEnv = crate::evm::block_env::BscBlockEnv,
-    >,
-    DB: reth_evm::Database + 'a,
-    R: ReceiptBuilder<Transaction = <BscPrimitives as NodePrimitives>::SignedTx>,
-    Spec: EthChainSpec + EthereumHardforks + BscHardforks + Hardforks + Clone,
-    R::Transaction: Clone + SignerRecoverable,
 {
     type Primitives = BscPrimitives;
-    type Executor = BscBlockExecutor<'a, EVM, Spec, R>;
+    type Executor = BscBlockExecutor<'a, Spec, R>;
+    type EvmEnv = BscEvmEnv;
+    fn evm_env(&self) -> &BscEvmEnv {
+        &self.evm_env
+    }
+    fn set_state_hook(
+        &mut self,
+        hook: impl FnMut(reth_execution_types::StateUpdate) + Send + 'static,
+    ) -> bool {
+        self.executor.set_state_hook(hook)
+    }
 
     fn apply_pre_execution_changes(&mut self) -> Result<(), BlockExecutionError> {
         // Parlia pre-execution and the snapshot rebuild resolve the parent by hash via
@@ -126,19 +125,32 @@ where
     fn execute_transaction_with_commit_condition(
         &mut self,
         tx: impl ExecutorTx<Self::Executor>,
-        f: impl FnOnce(
-            &<Self::Executor as alloy_evm::block::BlockExecutor>::Result,
-        ) -> alloy_evm::block::CommitChanges,
+        f: impl FnOnce(&evm2::TxResult<BscEvmTypes>) -> CommitChanges,
     ) -> Result<Option<GasOutput>, BlockExecutionError> {
         let (tx_env, recovered) = tx.into_parts();
         if let Some(gas_output) =
             self.executor.execute_transaction_with_commit_condition((tx_env, &recovered), f)?
         {
-            self.transactions.push(recovered);
+            self.transactions
+                .push(Recovered::new_unchecked(recovered.tx().clone(), *recovered.signer()));
             Ok(Some(gas_output))
         } else {
             Ok(None)
         }
+    }
+
+    fn execute_transaction_with_result_closure(
+        &mut self,
+        tx: impl ExecutorTx<Self::Executor>,
+        f: impl FnOnce(&<Self::Executor as BlockExecutor>::TransactionResultWithState),
+    ) -> Result<GasOutput, BlockExecutionError> {
+        let (tx_env, recovered) = tx.into_parts();
+        let output = self.executor.execute_transaction_without_commit((tx_env, &recovered))?;
+        f(&output);
+        let gas = self.executor.commit_transaction(output)?;
+        self.transactions
+            .push(Recovered::new_unchecked(recovered.tx().clone(), *recovered.signer()));
+        Ok(gas)
     }
 
     /// Finalize the block and compute the state root.
@@ -148,14 +160,16 @@ where
     /// `state_root_precomputed` parameter) to skip the blocking
     /// `state_root_with_updates` call when a sparse-trie task has already computed
     /// the root concurrently with execution.
-    fn finish(
+    fn finish_with_state_root(
         mut self,
         state: impl StateProvider,
-        state_root_precomputed: Option<(alloy_primitives::B256, TrieUpdates)>,
+        state_root: impl FnOnce(
+            &reth_execution_types::BlockExecutionOutput<reth_ethereum_primitives::Receipt>,
+        ) -> Result<
+            Option<(alloy_primitives::B256, TrieUpdates)>,
+            BlockExecutionError,
+        >,
     ) -> Result<BlockBuilderOutcome<BscPrimitives>, BlockExecutionError> {
-        if state_root_precomputed.is_some() {
-            self.precomputed_state_root = state_root_precomputed;
-        }
         let finish_start = std::time::Instant::now();
         let mut stages = super::finish_metrics::FinishObservation::new(
             self.ctx.finish_diagnostics,
@@ -167,19 +181,17 @@ where
         }
         // `executor.finish()` runs BSC's post-execution system txs (slash spoiled
         // validator, distribute fees / finality rewards, breathe-block validator-set
-        // updates). The sparse-trie `state_hook` is installed on the DB (v2.4.1), so it
-        // captures those commits here too.
+        // updates). The executor streams these commits through the same state hook as
+        // ordinary transactions, before closing the sparse-trie update stream.
         stages.enter("system_transactions");
-        let (evm, result) = self.executor.finish()?;
-        let (db, evm_env) = evm.finish();
-
-        // Finish the sparse-trie update stream. The hook lives on the DB (which outlives the
-        // executor), so it is NOT dropped by `executor.finish()`; we must clear it explicitly.
-        // Clearing drops the `StateRootUpdateHook`, which signals end-of-updates so the
-        // background task can finalize and `state_root()` below returns. Without this the task
-        // waits forever for more updates and the miner falls back after the slot deadline.
+        let output = self.executor.finish()?;
+        if let Some(root) = state_root(&output)? {
+            self.precomputed_state_root = Some(root);
+        }
+        let reth_execution_types::BlockExecutionOutput { result, state: execution_state } = output;
+        let evm_env = self.evm_env;
+        // Finishing consumes the executor and drops its state hook before waiting for the root.
         stages.enter("close_state_stream");
-        db.set_state_hook(None);
         if let Some(control) = &build_control {
             control.check_active(std::time::Instant::now()).map_err(BlockExecutionError::msg)?;
         }
@@ -302,7 +314,6 @@ where
             std::mem::take(&mut inner.assembled_system_txs)
         };
         // merge all transitions into bundle state
-        db.merge_transitions(BundleRetention::Reverts);
 
         let state_root_start = std::time::Instant::now();
         if let Some(control) = &build_control {
@@ -310,7 +321,7 @@ where
         }
         stages.enter("hash_state");
         let hashed_state =
-            state.hashed_post_state(&db.bundle_state).map_err(BlockExecutionError::other)?;
+            state.hashed_post_state(&execution_state).map_err(BlockExecutionError::other)?;
 
         stages.enter("root_select");
         let (state_root, trie_updates) = if let Some((root, updates)) = self
@@ -417,7 +428,7 @@ where
                 parent: self.parent,
                 transactions,
                 output: &result,
-                bundle_state: &db.bundle_state,
+                bundle_state: &execution_state,
                 state_provider: &state,
                 state_root,
             };
@@ -459,6 +470,7 @@ where
         stages.complete();
         Ok(BlockBuilderOutcome {
             execution_result: result,
+            execution_state,
             hashed_state,
             trie_updates,
             block,

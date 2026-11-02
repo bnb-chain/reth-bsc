@@ -5,6 +5,10 @@
 //! and authorization rules.
 
 pub mod env;
+pub mod evm;
+pub mod hardfork;
+pub mod system;
+pub mod types;
 
 use alloy_consensus::Transaction;
 use alloy_primitives::{address, Address, U256};

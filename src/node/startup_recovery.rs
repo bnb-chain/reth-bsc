@@ -118,16 +118,22 @@ impl StartupRecovery {
             };
             tracing::warn!(target: "bsc::startup_recovery", checkpoint = ?self.checkpoint,
                 "Waiting to restore persisted finalized history; mining and voting disabled");
-            match tokio::time::timeout(ENGINE_TIMEOUT, engine.fork_choice_updated(target, None)).await {
+            match tokio::time::timeout(ENGINE_TIMEOUT, engine.fork_choice_updated(target, None))
+                .await
+            {
                 Ok(Ok(response)) => match response.payload_status.status {
-                    PayloadStatusEnum::Invalid { validation_error } => eyre::bail!(
-                        "BSC startup recovery: Engine rejected finalized recovery: {validation_error}"
-                    ),
+                    PayloadStatusEnum::Invalid { validation_error } => {
+                        eyre::bail!("BSC startup recovery: Engine rejected finalized recovery: {validation_error}");
+                    }
                     // VALID acknowledges an FCU. Re-read execution and finality before signing.
-                    PayloadStatusEnum::Valid if self.recovery_target(&provider)?.is_none() => continue,
+                    PayloadStatusEnum::Valid if self.recovery_target(&provider)?.is_none() => {
+                        continue
+                    }
                     _ => {}
                 },
-                Ok(Err(error)) => eyre::bail!("BSC startup recovery: Engine request failed: {error}"),
+                Ok(Err(error)) => {
+                    eyre::bail!("BSC startup recovery: Engine request failed: {error}");
+                }
                 Err(_) => tracing::warn!(target: "bsc::startup_recovery",
                     "Finalized recovery request timed out; mining and voting remain disabled"),
             }

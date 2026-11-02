@@ -1,6 +1,7 @@
 use super::{
     config::{revm_spec_by_timestamp_and_block_number, BscBlockExecutionCtx, BscExecutionMode},
     patch::HertzPatchManager,
+    util::NativeBlockEnv,
 };
 use crate::{
     consensus::{
@@ -14,7 +15,6 @@ use crate::{
     evm::{
         blacklist::{self, BlacklistedAddressError},
         precompiles,
-        transaction::BscTxEnv,
     },
     hardforks::BscHardforks,
     metrics::{
@@ -36,50 +36,37 @@ use alloy_eips::{
     eip7685::Requests,
     Encodable2718,
 };
-use alloy_evm::{
-    block::{ExecutableTx, GasOutput, TxResult},
-    eth::receipt_builder::ReceiptBuilderCtx,
+use alloy_primitives::{hex, uint, Address, BlockNumber, Bytes, U256};
+use evm2::{
+    bytecode::Bytecode,
+    evm::{AccountInfo, Bal, PendingState},
+    TxResultWithState,
 };
-use alloy_primitives::{hex, keccak256, uint, Address, BlockNumber, Bytes, U256};
+use reth_bsc_evm::{evm::BscEvm, types::BscEvmTypes};
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use reth_ethereum_primitives::TransactionSigned;
 use reth_evm::{
-    block::BlockValidationError,
-    eth::receipt_builder::ReceiptBuilder,
-    execute::{BlockExecutionError, BlockExecutor},
-    system_calls::SystemCaller,
-    Evm, FromRecoveredTx, FromTxWithEncoded, IntoTxEnv,
+    BlockExecutionError, BlockExecutor, BlockTransactionResult, BlockValidationError, Evm,
+    ExecutorTx, GasOutput, ReceiptBuilder, ReceiptBuilderCtx, RecoveredTx,
 };
+use reth_execution_types::{BlockExecutionOutput, BlockState, StateUpdate};
 use reth_primitives_traits::Recovered;
 use reth_provider::BlockExecutionResult;
-use revm::{
-    context::result::{ExecutionResult, Output, ResultAndState, ResultGas, SuccessReason},
-    context_interface::{block::Block, result::InvalidTransaction},
-    state::{Account as RevmAccount, Bytecode, EvmState},
-    Database as _, DatabaseCommit,
-};
 use std::{collections::HashMap, sync::Arc};
 use tracing::{debug, error, info, trace, warn};
 
 /// Result of executing a single BSC transaction.
-pub struct BscTxResult<H> {
-    pub inner: ResultAndState<H>,
+pub struct BscTxResult {
+    pub inner: TxResultWithState<BscEvmTypes>,
     pub blob_gas_used: u64,
     pub tx_type: TxType,
     pub tx: TransactionSigned,
     pub is_system: bool,
     pub lane_type: LaneType,
 }
-
-impl<H: Send + 'static> TxResult for BscTxResult<H> {
-    type HaltReason = H;
-
-    fn result(&self) -> &ResultAndState<H> {
+impl BlockTransactionResult<BscEvmTypes> for BscTxResult {
+    fn result(&self) -> &TxResultWithState<BscEvmTypes> {
         &self.inner
-    }
-
-    fn into_result(self) -> ResultAndState<H> {
-        self.inner
     }
 }
 
@@ -96,14 +83,14 @@ pub(crate) struct InnerExecutionContext {
     pub(crate) parent_header: Option<Header>,
 }
 
-pub struct BscBlockExecutor<'a, EVM, Spec, R: ReceiptBuilder>
+pub struct BscBlockExecutor<'a, Spec, R: ReceiptBuilder>
 where
     Spec: EthChainSpec,
 {
     /// Reference to the specification object.
     pub(super) spec: Spec,
     /// Inner EVM.
-    pub(super) evm: EVM,
+    pub(super) evm: BscEvm<'a>,
     /// Gas used in the block.
     pub(super) gas_used: u64,
     /// Whether the DB still holds the parent's post-state, i.e. nothing in this block has been
@@ -130,7 +117,8 @@ where
     /// Context for block execution.
     pub(super) ctx: BscBlockExecutionCtx<'a>,
     /// Utility to call system caller.
-    pub(super) system_caller: SystemCaller<Spec>,
+    pub(super) block_state: BlockState,
+    state_hook: Option<Box<dyn FnMut(StateUpdate) + Send>>,
     /// Snapshot provider for accessing Parlia validator snapshots.
     pub(super) snapshot_provider: Option<Arc<dyn SnapshotProvider + Send + Sync>>,
     /// Parlia consensus instance.
@@ -149,30 +137,22 @@ where
     pub(super) executor_metrics: BscExecutorMetrics,
     /// Rewards metrics for tracking reward distributions.
     pub(super) rewards_metrics: BscRewardsMetrics,
-    /// Deferred error from commit_transaction (e.g. hertz patch), returned from finish().
-    pub(super) deferred_error: Option<BlockExecutionError>,
     execution_diagnostics: crate::node::miner::state_read_diagnostics::ExecutionObservation,
 }
 
-impl<'a, EVM, Spec, R: ReceiptBuilder> BscBlockExecutor<'a, EVM, Spec, R>
+impl<'a, Spec, R: ReceiptBuilder> BscBlockExecutor<'a, Spec, R>
 where
-    EVM: Evm<
-        DB: alloy_evm::block::StateDB,
-        Tx: FromRecoveredTx<R::Transaction>
-                + FromRecoveredTx<TransactionSigned>
-                + FromTxWithEncoded<TransactionSigned>,
-        BlockEnv = crate::evm::block_env::BscBlockEnv,
-    >,
-    Spec: EthereumHardforks + BscHardforks + EthChainSpec + Hardforks + Clone + 'static,
+    Spec: EthereumHardforks
+        + crate::hardforks::BscHardforks
+        + EthChainSpec
+        + Hardforks
+        + Clone
+        + 'static,
     R: ReceiptBuilder<Transaction = TransactionSigned, Receipt: TxReceipt>,
-    <R as ReceiptBuilder>::Transaction: Unpin + From<TransactionSigned>,
-    <EVM as alloy_evm::Evm>::Tx: FromTxWithEncoded<<R as ReceiptBuilder>::Transaction>,
-    BscTxEnv: IntoTxEnv<<EVM as alloy_evm::Evm>::Tx>,
-    R::Transaction: Into<TransactionSigned>,
 {
     /// Creates a new BscBlockExecutor.
     pub(crate) fn new(
-        evm: EVM,
+        evm: BscEvm<'a>,
         ctx: BscBlockExecutionCtx<'a>,
         shared_ctx: BscExecutionSharedCtx,
         spec: Spec,
@@ -196,7 +176,7 @@ where
         }
 
         let parlia = Arc::new(Parlia::new(Arc::new(spec.clone()), 200));
-        let spec_clone = spec.clone();
+        let _spec_clone = spec.clone();
         let execution_diagnostics =
             crate::node::miner::state_read_diagnostics::ExecutionObservation::new(
                 ctx.finish_diagnostics.map(|(kind, turn, _)| (kind, turn)),
@@ -217,7 +197,8 @@ where
             hertz_patch_manager,
             ctx,
             shared_ctx,
-            system_caller: SystemCaller::new(spec_clone),
+            block_state: BlockState::default(),
+            state_hook: None,
             snapshot_provider: crate::shared::get_snapshot_provider().cloned(),
             parlia,
             inner_ctx: InnerExecutionContext {
@@ -234,7 +215,6 @@ where
             vote_metrics: BscVoteMetrics::default(),
             executor_metrics: BscExecutorMetrics::default(),
             rewards_metrics: BscRewardsMetrics::default(),
-            deferred_error: None,
         }
     }
 
@@ -365,156 +345,89 @@ where
         Ok(())
     }
 
-    /// Replaces the code of a system contract in state.
-    fn upgrade_system_contract(
+    /// Applies a protocol account update and sends the same change to both root paths.
+    pub(super) fn update_account(
         &mut self,
         address: Address,
-        code: Bytecode,
+        update: impl FnOnce(&mut AccountInfo),
     ) -> Result<(), BlockExecutionError> {
-        let info = self
-            .evm
-            .db_mut()
-            .basic(address)
-            .map_err(BlockExecutionError::other)?
-            .unwrap_or_default();
-        // Build the account from the PRE-upgrade info and mutate afterwards.
-        // `impl From<AccountInfo> for Account` snapshots the value it is given into
-        // `original_info`, and reth's `evm_state_to_hashed_post_state` decides whether an
-        // account changed with `info != original_info()`. Mutating before the conversion makes
-        // those two equal, so the state-root task silently drops the new code hash while
-        // the commit below still applies it -- the sparse root then disagrees with the serial
-        // one and the block seals an invalid state root.
-        let mut account = RevmAccount::from(info);
-        account.info.code_hash = code.hash_slow();
-        account.info.code = Some(code);
-        account.mark_touch();
-        let mut changes: EvmState = Default::default();
-        changes.insert(address, account);
-
-        // The upgraded account's new `code_hash` must reach the incremental state-root
-        // computation, or the block commits a root describing the un-upgraded contract (this
-        // split bsc-qanet at the Pasteur transition, block 21323714: geth computed the true root
-        // and rejected the block while every reth node agreed on the stale one). The DB-level
-        // state hook streams every `commit` to the state-root task, so committing alone suffices.
+        let original = self.evm.account_info(&address)?;
+        let mut current = original.clone().unwrap_or_default();
+        update(&mut current);
+        let mut changes = PendingState::default();
+        changes.insert_account(address, original, Some(current));
         self.commit_state(changes);
         Ok(())
     }
 
-    /// Plants the CAS20 registries' account sentinels (BEP-702 3.16), the way go-bsc's
-    /// `SeedCAS20Activation` does at the Jenner transition. An account that already
-    /// carries code is left alone: overwriting it would destroy it.
+    fn upgrade_system_contract(
+        &mut self,
+        address: Address,
+        code: revm::state::Bytecode,
+    ) -> Result<(), BlockExecutionError> {
+        let code = Bytecode::new_legacy(code.original_bytes());
+        self.update_account(address, |info| {
+            info.code_hash = code.hash_slow();
+            info.code = Some(code);
+        })
+    }
+
     pub(crate) fn seed_cas20_registries(
         &mut self,
         block_number: BlockNumber,
     ) -> Result<(), BlockExecutionError> {
         use crate::evm::precompiles::cas20;
-
         for address in [cas20::ACTIVATION_REGISTRY_ADDRESS, cas20::POLICY_REGISTRY_ADDRESS] {
-            let db = self.evm.db_mut();
-            let old_info = db.basic(address).map_err(BlockExecutionError::other)?;
-            let info = old_info.unwrap_or_default();
-            if info.code_hash != revm::primitives::KECCAK_EMPTY &&
-                info.code_hash != alloy_primitives::B256::ZERO
-            {
-                error!(
-                    target: "bsc::executor::cas20",
-                    block_number,
-                    ?address,
-                    code_hash = ?info.code_hash,
-                    "CAS20 registry already carries code"
-                );
+            let info = self.evm.account_info(&address)?.unwrap_or_default();
+            if info.code_hash != KECCAK_EMPTY && info.code_hash != alloy_primitives::B256::ZERO {
+                error!(target: "bsc::executor::cas20", block_number, ?address, code_hash = ?info.code_hash, "CAS20 registry already carries code");
                 continue;
             }
-            let code = cas20::marker_bytecode();
-            // Build from the pre-seed info and mutate afterwards: `From<AccountInfo>` snapshots
-            // its input into `original_info`, and the state-root task skips accounts whose
-            // `info == original_info()`, so mutating first would drop the sentinel from the
-            // sealed root while `commit` still applies it.
-            let mut account = RevmAccount::from(info);
-            account.info.code_hash = code.hash_slow();
-            account.info.code = Some(code);
-            account.mark_touch();
-            let mut changes: EvmState = Default::default();
-            changes.insert(address, account);
-            // As for every other block-begin write, the DB-level state hook streams this
-            // commit to the incremental state-root task.
-            db.commit(changes);
-            info!(target: "bsc::executor::cas20", block_number, ?address, "Seeded CAS20 registry sentinel (Jenner transition)");
+            self.upgrade_system_contract(address, cas20::marker_bytecode())?;
         }
         Ok(())
     }
 
     pub(crate) fn apply_history_storage_account(
         &mut self,
-        block_number: BlockNumber,
+        _block_number: BlockNumber,
     ) -> Result<bool, BlockExecutionError> {
-        info!(
-            target: "bsc::executor::prague",
-            block_number,
-            address = ?HISTORY_STORAGE_ADDRESS,
-            "Deploying HistoryStorageAddress contract (Prague transition)"
-        );
-
-        let db = self.evm.db_mut();
-        let old_info = db.basic(HISTORY_STORAGE_ADDRESS).map_err(|err| {
-            error!(
-                target: "bsc::executor::prague",
-                block_number,
-                error = ?err,
-                "Failed to load HistoryStorageAddress account",
-            );
-            BlockExecutionError::other(err)
+        let code = Bytecode::new_legacy(Bytes::from_static(&HISTORY_STORAGE_CODE));
+        self.update_account(HISTORY_STORAGE_ADDRESS, |info| {
+            info.code_hash = code.hash_slow();
+            info.code = Some(code);
+            info.nonce = 1;
+            info.balance = U256::ZERO;
         })?;
-        debug!(
-            target: "bsc::executor::prague",
-            block_number,
-            old_nonce = ?old_info.as_ref().map(|i| i.nonce),
-            old_code_hash = ?old_info.as_ref().map(|i| i.code_hash),
-            "HistoryStorageAddress account before deployment"
-        );
-
-        // Same ordering requirement as `upgrade_system_contract`: construct from the
-        // pre-deployment info so `original_info` holds the old value, then mutate. Building
-        // from the already-mutated info makes `info == original_info()` and the deployment
-        // never reaches the incremental state-root computation.
-        let mut account = RevmAccount::from(old_info.unwrap_or_default());
-        account.info.code_hash = keccak256(HISTORY_STORAGE_CODE.clone());
-        account.info.code = Some(Bytecode::new_raw(Bytes::from_static(&HISTORY_STORAGE_CODE)));
-        account.info.nonce = 1_u64;
-        account.info.balance = U256::ZERO;
-        account.mark_touch();
-        let mut changes: EvmState = Default::default();
-        changes.insert(HISTORY_STORAGE_ADDRESS, account);
-        // Same reasoning as `upgrade_system_contract`: the DB-level state hook streams this
-        // deployment to the incremental state-root pipeline on `commit`, so the Prague transition
-        // block commits a root that includes it.
-        self.commit_state(changes);
-
-        info!(
-            target: "bsc::executor::prague",
-            block_number,
-            "Successfully deployed HistoryStorageAddress contract"
-        );
         Ok(true)
     }
-    /// Commits state, preserving lane metadata across read-only calls.
-    pub(super) fn commit_state(&mut self, changes: EvmState) {
-        self.db_at_parent_state = false;
-        if let Some(account) = changes
-            .get(&PAYMENT_LANE_CONTRACT)
-            .filter(|account| !self.lane_contract_changed && account.is_touched())
-        {
-            self.lane_contract_changed = account.is_created() ||
-                account.is_selfdestructed() ||
-                account.changed_storage_slots().next().is_some() ||
-                // Upgrades can populate `original_info` with the new code.
-                match self.evm.db_mut().basic(PAYMENT_LANE_CONTRACT) {
-                    Ok(before) => before.map(|b| b.code_hash) != Some(account.info.code_hash),
-                    // An unreadable old account must disable reuse.
-                    Err(_) => true,
-                };
+
+    /// Protocol updates and transaction updates share one accumulator and one streaming hook.
+    pub(super) fn commit_state(&mut self, changes: PendingState) {
+        let mut update = StateUpdate::default();
+        for change in changes.account_changes() {
+            if change.address == PAYMENT_LANE_CONTRACT {
+                self.lane_contract_changed |= change.created ||
+                    change.selfdestructed ||
+                    change.original.map(|info| info.code_hash) !=
+                        change.current.map(|info| info.code_hash) ||
+                    change.is_changed();
+            }
+            if change.is_changed() {
+                self.db_at_parent_state = false;
+            }
+            self.block_state
+                .commit_account_changes(change, self.state_hook.as_ref().map(|_| &mut update));
         }
-        self.evm.db_mut().commit(changes);
+        if !update.is_empty() {
+            self.db_at_parent_state = false;
+        }
+        self.evm.commit_state(&changes);
+        if let Some(hook) = self.state_hook.as_mut() {
+            if !update.is_empty() {
+                hook(update);
+            }
+        }
     }
 
     /// Remaining producer gas after Parlia's system reserve and executed transactions.
@@ -584,15 +497,19 @@ where
     }
 }
 
-impl<E, Spec, R> LaneLiveState for BscBlockExecutor<'_, E, Spec, R>
+impl<Spec, R> LaneLiveState for BscBlockExecutor<'_, Spec, R>
 where
-    E: Evm<DB: alloy_evm::block::StateDB>,
-    Spec: EthChainSpec,
-    R: ReceiptBuilder,
+    Spec: EthereumHardforks
+        + crate::hardforks::BscHardforks
+        + EthChainSpec
+        + Hardforks
+        + Clone
+        + 'static,
+    R: ReceiptBuilder<Transaction = TransactionSigned, Receipt: TxReceipt>,
 {
     fn lane_code_is_empty(&mut self, addr: Address) -> Result<bool, LaneError> {
         let block = self.evm.block().number().to::<u64>();
-        match self.evm.db_mut().basic(addr) {
+        match self.evm.state_db_mut().get_account(&addr) {
             Ok(None) => Ok(true),
             Ok(Some(acc)) => Ok(acc.code_hash.is_zero() || acc.code_hash == KECCAK_EMPTY),
             Err(err) => {
@@ -620,11 +537,15 @@ pub trait LaneAdmission {
     ) -> Result<bool, BlockExecutionError>;
 }
 
-impl<E, Spec, R> BscBlockExecutor<'_, E, Spec, R>
+impl<Spec, R> BscBlockExecutor<'_, Spec, R>
 where
-    E: Evm<DB: alloy_evm::block::StateDB>,
-    Spec: EthChainSpec,
-    R: ReceiptBuilder,
+    Spec: EthereumHardforks
+        + crate::hardforks::BscHardforks
+        + EthChainSpec
+        + Hardforks
+        + Clone
+        + 'static,
+    R: ReceiptBuilder<Transaction = TransactionSigned, Receipt: TxReceipt>,
 {
     fn lane_admits(&self, tx: &TransactionSigned, lane_type: LaneType, shared: u64) -> bool {
         if self.lane.admits(shared, lane_type, tx.gas_limit()) {
@@ -646,11 +567,15 @@ where
     }
 }
 
-impl<E, Spec, R> LaneAdmission for BscBlockExecutor<'_, E, Spec, R>
+impl<Spec, R> LaneAdmission for BscBlockExecutor<'_, Spec, R>
 where
-    E: Evm<DB: alloy_evm::block::StateDB>,
-    Spec: EthChainSpec,
-    R: ReceiptBuilder,
+    Spec: EthereumHardforks
+        + crate::hardforks::BscHardforks
+        + EthChainSpec
+        + Hardforks
+        + Clone
+        + 'static,
+    R: ReceiptBuilder<Transaction = TransactionSigned, Receipt: TxReceipt>,
 {
     fn lane_admits_pool_tx(
         &mut self,
@@ -664,29 +589,64 @@ where
     }
 }
 
-impl<'a, E, Spec, R> BlockExecutor for BscBlockExecutor<'a, E, Spec, R>
+impl<'a, Spec, R> BlockExecutor for BscBlockExecutor<'a, Spec, R>
 where
-    E: Evm<
-        DB: alloy_evm::block::StateDB,
-        Tx: FromRecoveredTx<R::Transaction>
-                + FromRecoveredTx<TransactionSigned>
-                + FromTxWithEncoded<TransactionSigned>,
-        BlockEnv = crate::evm::block_env::BscBlockEnv,
-    >,
-    Spec: EthereumHardforks + BscHardforks + EthChainSpec + Hardforks + 'static,
+    Spec: EthereumHardforks
+        + crate::hardforks::BscHardforks
+        + EthChainSpec
+        + Hardforks
+        + Clone
+        + 'static,
     R: ReceiptBuilder<Transaction = TransactionSigned, Receipt: TxReceipt>,
-    <R as ReceiptBuilder>::Transaction: Unpin + From<TransactionSigned>,
-    <E as alloy_evm::Evm>::Tx: FromTxWithEncoded<<R as ReceiptBuilder>::Transaction>,
-    BscTxEnv: IntoTxEnv<<E as alloy_evm::Evm>::Tx>,
-    R::Transaction: Into<TransactionSigned>,
 {
     type Transaction = TransactionSigned;
     type Receipt = R::Receipt;
-    type Evm = E;
-    type Result = BscTxResult<E::HaltReason>;
+    type Evm = BscEvm<'a>;
+    type TransactionResultWithState = BscTxResult;
+    type BlockAccessList = Bal;
+
+    fn set_state_hook(&mut self, hook: impl FnMut(StateUpdate) + Send + 'static) -> bool {
+        self.state_hook = Some(Box::new(hook));
+        true
+    }
+    fn convert_block_access_list(
+        bal: &alloy_eip7928::BlockAccessList,
+    ) -> Result<Bal, BlockExecutionError> {
+        Bal::try_from(bal.as_slice()).map_err(BlockExecutionError::other)
+    }
+    fn set_block_access_list(&mut self, bal: Arc<Bal>) {
+        self.evm.inner.state_mut().set_bal(bal);
+    }
+    fn set_block_access_index(&mut self, index: alloy_eip7928::BlockAccessIndex) {
+        self.evm.inner.state_mut().set_bal_index(index);
+    }
+    fn enable_block_access_list_builder(&mut self) {
+        self.evm.inner.state_mut().enable_bal_builder();
+        self.evm.inner.state_mut().reset_bal_index();
+    }
+    fn take_block_access_list(&mut self) -> Option<alloy_eip7928::BlockAccessList> {
+        self.evm.inner.state_mut().take_bal_builder().map(Into::into)
+    }
+    fn into_state(self) -> reth_trie_common::bundle_state::BundleState {
+        self.block_state.into_bundle()
+    }
+    fn validate_transaction_gas_limit(
+        &mut self,
+        gas_limit: u64,
+    ) -> Result<(), BlockExecutionError> {
+        let block_available_gas = self.evm.block().gas_limit().saturating_sub(self.gas_used);
+        if gas_limit > block_available_gas {
+            return Err(BlockValidationError::TransactionGasLimitMoreThanAvailableBlockGas {
+                transaction_gas_limit: gas_limit,
+                block_available_gas,
+            }
+            .into());
+        }
+        Ok(())
+    }
 
     fn apply_pre_execution_changes(&mut self) -> Result<(), BlockExecutionError> {
-        let block_env = self.evm.block().clone();
+        let block_env = *self.evm.block();
         trace!(
             target: "bsc::executor",
             block_id = %block_env.number(),
@@ -731,8 +691,16 @@ where
                 parent_hash = ?self.ctx.base.parent_hash,
                 "Calling apply_blockhashes_contract_call (Prague active)"
             );
-            self.system_caller
-                .apply_blockhashes_contract_call(self.ctx.base.parent_hash, &mut self.evm)?;
+            let output = self
+                .evm
+                .inner
+                .system_call(evm2::evm::SystemTx::new(
+                    HISTORY_STORAGE_ADDRESS,
+                    Bytes::copy_from_slice(self.ctx.base.parent_hash.as_slice()),
+                ))
+                .map_err(reth_evm::execute::map_handler_error)?
+                .detach();
+            self.commit_state(output.pending_state);
         }
 
         Ok(())
@@ -740,12 +708,10 @@ where
 
     fn execute_transaction_without_commit(
         &mut self,
-        tx: impl ExecutableTx<Self>,
-    ) -> Result<BscTxResult<E::HaltReason>, BlockExecutionError> {
+        tx: impl ExecutorTx<Self>,
+    ) -> Result<BscTxResult, BlockExecutionError> {
         let started = self.execution_diagnostics.start();
         let result = (|| {
-            use alloy_evm::RecoveredTx as _;
-
             let (tx_env, recovered) = tx.into_parts();
             let signer = *recovered.signer();
             let tx_signed: TransactionSigned = recovered.tx().clone();
@@ -759,15 +725,10 @@ where
                 self.lane.clone().classify(self, is_system, &tx_signed).map_err(lane_reject)?;
 
             if is_system {
-                self.system_txs.push(tx_signed.clone());
-                let dummy = ResultAndState {
-                    result: ExecutionResult::Success {
-                        reason: SuccessReason::Stop,
-                        gas: ResultGas::default(),
-                        logs: vec![],
-                        output: Output::Call(Bytes::new()),
-                    },
-                    state: Default::default(),
+                let dummy = TxResultWithState::<BscEvmTypes> {
+                    result: evm2::TxResult::<BscEvmTypes> { status: true, ..Default::default() },
+                    pending_state: PendingState::default(),
+                    ..Default::default()
                 };
                 return Ok(BscTxResult {
                     inner: dummy,
@@ -808,7 +769,9 @@ where
             // The Hertz patches replay historical state fixes, so they only apply to a block that
             // already exists.
             if self.ctx.mode == BscExecutionMode::Import {
-                self.hertz_patch_manager.patch_before_tx(&tx_signed, self.evm.db_mut())?;
+                let changes =
+                    self.hertz_patch_manager.native_patch(&tx_signed, true, &mut self.evm.inner)?;
+                self.commit_state(changes);
             }
 
             let block_available_gas = self.evm.block().gas_limit() - self.gas_used;
@@ -841,7 +804,12 @@ where
             {
                 return Err(BlockValidationError::InvalidTx {
                     hash: tx_hash,
-                    error: Box::new(InvalidTransaction::CallerGasLimitMoreThanBlock),
+                    error: Box::new(super::error::InvalidNativeTransaction(
+                        evm2::registry::HandlerError::GasLimitMoreThanBlock {
+                            gas_limit: tx_gas_limit,
+                            block_gas_limit: U256::from(block_available_gas),
+                        },
+                    )),
                 }
                 .into());
             }
@@ -874,9 +842,10 @@ where
                 };
 
             let started = self.execution_diagnostics.start();
-            let result = self.evm.transact(tx_env);
+            let result = self.evm.transact(&tx_env);
             self.execution_diagnostics.record(1, started);
-            let inner = result.map_err(|err| BlockExecutionError::evm(err, tx_hash))?;
+            let inner =
+                result.map_err(|error| super::error::with_transaction_hash(error, tx_hash))?;
 
             Ok(BscTxResult {
                 inner,
@@ -891,19 +860,17 @@ where
         result
     }
 
-    fn commit_transaction(&mut self, output: BscTxResult<E::HaltReason>) -> GasOutput {
+    fn commit_transaction(
+        &mut self,
+        output: BscTxResult,
+    ) -> Result<GasOutput, BlockExecutionError> {
         if output.is_system {
-            return GasOutput::new(0);
+            self.system_txs.push(output.tx);
+            return Ok(GasOutput::new(0, 0));
         }
 
         let started = self.execution_diagnostics.start();
-        let ResultAndState { result, state } = output.inner;
-
-        // NOTE(reth-v2.4.1): previously streamed post-tx state (excluding SYSTEM_ADDRESS) to the
-        // state-root task via `system_caller.on_state(..)`. v2.4.1 installs the state hook at the
-        // DB level and streams automatically on `commit`, so the manual call is removed; the final
-        // state root is computed over the full committed state regardless. Re-introduce the
-        // SYSTEM_ADDRESS exclusion via the DB hook if it turns out to be required for BSC.
+        let TxResultWithState { result, pending_state: state, .. } = output.inner;
 
         let gas_used = result.tx_gas_used();
         self.gas_used += gas_used;
@@ -911,34 +878,31 @@ where
         self.lane.record_used(output.lane_type, gas_used);
         self.blob_gas_used = self.blob_gas_used.saturating_add(output.blob_gas_used);
 
-        self.receipts.push(self.receipt_builder.build_receipt(ReceiptBuilderCtx {
+        self.receipts.push(self.receipt_builder.build_receipt::<BscEvmTypes>(ReceiptBuilderCtx {
             tx_type: output.tx_type,
-            evm: &self.evm,
             result,
-            state: &state,
             cumulative_gas_used: self.gas_used,
         }));
 
         self.commit_state(state);
 
-        // commit_transaction cannot return errors in the new API, so defer any error to finish().
         if self.ctx.mode == BscExecutionMode::Import {
-            if let Err(e) = self.hertz_patch_manager.patch_after_tx(&output.tx, self.evm.db_mut()) {
-                self.deferred_error = Some(e);
-            }
+            let changes =
+                self.hertz_patch_manager.native_patch(&output.tx, false, &mut self.evm.inner)?;
+            self.commit_state(changes);
         }
 
         self.execution_diagnostics.record(2, started);
-        GasOutput::new(gas_used)
+        Ok(GasOutput::new(gas_used, 0))
     }
 
-    fn finish(
+    fn finish_with_block_access_list(
         mut self,
-    ) -> Result<(Self::Evm, BlockExecutionResult<R::Receipt>), BlockExecutionError> {
-        if let Some(err) = self.deferred_error.take() {
-            return Err(err);
-        }
-        let block_env = self.evm.block().clone();
+    ) -> Result<
+        (BlockExecutionOutput<R::Receipt>, Option<alloy_eip7928::BlockAccessList>),
+        BlockExecutionError,
+    > {
+        let block_env = *self.evm.block();
         debug!(
             target: "bsc::executor",
             block_id = %block_env.number(),
@@ -997,11 +961,11 @@ where
         match self.ctx.mode {
             // Finalize system transactions, then apply the importer's lane rule.
             BscExecutionMode::Mining | BscExecutionMode::BidSimulation => {
-                self.finalize_new_block(&self.evm.block().clone())?;
+                self.finalize_new_block(&block_env)?;
                 self.verify_payment_lane(self.gas_used)?;
             }
             // Validate the received system transactions and total lane budget.
-            BscExecutionMode::Import => self.post_check_new_block(&self.evm.block().clone())?,
+            BscExecutionMode::Import => self.post_check_new_block(&block_env)?,
             // Neither: return the executed block as-is, matching BSC geth's simulation path.
             BscExecutionMode::Simulation => {
                 trace!(
@@ -1036,7 +1000,7 @@ where
 
         // Record the block timestamp interval, including BSC's sub-second component.
         if let Some(parent_header) = &self.inner_ctx.parent_header {
-            let current_timestamp_ms = self.evm.block().milli_timestamp();
+            let current_timestamp_ms = self.evm.env.milli_timestamp();
             let parent_timestamp_ms = calculate_millisecond_timestamp(parent_header);
             let time_diff_ms = current_timestamp_ms as i128 - parent_timestamp_ms as i128;
             self.blockchain_metrics
@@ -1049,15 +1013,14 @@ where
         // - sync.execution.gas_per_second (can be converted to MGas/s)
         // - sync.execution.execution_duration
 
-        Ok((
-            self.evm,
-            BlockExecutionResult {
-                receipts: self.receipts,
-                requests: Requests::default(),
-                gas_used: self.gas_used,
-                blob_gas_used: self.blob_gas_used,
-            },
-        ))
+        let bal = self.take_block_access_list();
+        let result = BlockExecutionResult {
+            receipts: self.receipts,
+            requests: Requests::default(),
+            gas_used: self.gas_used,
+            blob_gas_used: self.blob_gas_used,
+        };
+        Ok((BlockExecutionOutput::new(result, self.block_state.into_bundle()), bal))
     }
 
     fn evm_mut(&mut self) -> &mut Self::Evm {
@@ -1084,12 +1047,10 @@ mod tests {
         system_contracts::VALIDATOR_CONTRACT,
     };
     use alloy_consensus::{Header, TxLegacy};
-    use alloy_evm::block::{BlockExecutionError, BlockExecutor, BlockValidationError};
     use alloy_primitives::{address, Address, Signature, TxKind};
     use reth_ethereum_primitives::{Transaction, TransactionSigned};
-    use reth_evm::ConfigureEvm;
+    use reth_evm::{BlockExecutionError, BlockExecutor, BlockValidationError, ConfigureEvm, Evm};
     use reth_primitives_traits::{Recovered, SealedBlock};
-    use revm::database::{InMemoryDB, State};
 
     const NANO_BLOCK: u64 = 100;
     const CANCUN_TIME: u64 = 1_000;
@@ -1103,7 +1064,6 @@ mod tests {
     fn miner_observation_preserves_execution_gas_state_and_validation_error() {
         use crate::node::miner::state_read_diagnostics::ExecutionObservation;
         use metrics_exporter_prometheus::PrometheusBuilder;
-        use revm::Database;
 
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
@@ -1120,7 +1080,7 @@ mod tests {
                 body: Default::default(),
             });
             let config = BscEvmConfig::bsc(spec);
-            let mut db = State::builder().with_database(InMemoryDB::default()).build();
+            let mut db = evm2::evm::InMemoryDB::default();
             let mut executor = config.executor_for_block(&mut db, &block).unwrap();
             executor.execution_diagnostics =
                 ExecutionObservation::new(enabled.then_some(("regular", "inturn")));
@@ -1134,15 +1094,15 @@ mod tests {
             );
             let tx = Recovered::new_unchecked(tx, NORMAL);
             let output = executor.execute_transaction_without_commit(tx.clone()).unwrap();
-            let gas = executor.commit_transaction(output).tx_gas_used();
+            let gas = executor.commit_transaction(output).unwrap().tx_gas_used();
             let error = executor
                 .execute_transaction_without_commit(tx)
                 .err()
                 .expect("reused nonce must fail")
                 .to_string();
             let receipts = executor.receipts.clone();
+            let account = executor.evm_mut().account_info(&NORMAL).unwrap();
             drop(executor);
-            let account = db.basic(NORMAL).unwrap();
             (gas, error, receipts, account)
         };
         metrics::with_local_recorder(&recorder, || {
@@ -1205,7 +1165,7 @@ mod tests {
             };
             set_millisecond_part_of_timestamp(current_ms, &mut header);
             let block = SealedBlock::seal_slow(BscBlock { header, body: Default::default() });
-            let mut db = State::builder().with_database(InMemoryDB::default()).build();
+            let mut db = evm2::evm::InMemoryDB::default();
             let mut executor = evm_config.executor_for_block(&mut db, &block).unwrap();
             executor.inner_ctx.parent_header = Some(parent);
             // Exercise finish's metric emission without requiring Parlia system transactions.
@@ -1260,7 +1220,7 @@ mod tests {
             body: Default::default(),
         });
         let evm_config = BscEvmConfig::bsc(spec);
-        let mut db = State::builder().with_database(InMemoryDB::default()).build();
+        let mut db = evm2::evm::InMemoryDB::default();
         let mut executor = evm_config.executor_for_block(&mut db, &block).unwrap();
         for &(from, to) in txs {
             let tx = TransactionSigned::new_unhashed(
@@ -1271,7 +1231,7 @@ mod tests {
                 }),
                 Signature::test_signature(),
             );
-            executor.execute_transaction_without_commit(Recovered::new_unchecked(tx, from))?;
+            executor.execute_transaction(Recovered::new_unchecked(tx, from))?;
         }
         Ok(())
     }
@@ -1306,7 +1266,8 @@ mod tests {
 #[cfg(test)]
 mod original_info_ordering_tests {
     use super::*;
-    use revm::state::AccountInfo;
+    use alloy_primitives::keccak256;
+    use revm::state::{Account as RevmAccount, AccountInfo};
 
     /// `impl From<AccountInfo> for Account` snapshots whatever it is handed into
     /// `original_info`, and reth's `evm_state_to_hashed_post_state` decides whether an account

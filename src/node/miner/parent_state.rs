@@ -1,6 +1,5 @@
 //! Parent post-state reads shared by canonical and unpublished-child construction.
-use reth_evm::cached::CachedReads;
-use revm::database::BundleState;
+use reth_evm::{cached::CachedReads, BundleState};
 
 /// Seed only the parent's final changed values. Untouched slots and absent/deleted accounts
 /// remain provider reads; never inherit an older parent's original values through a wipe.
@@ -20,25 +19,25 @@ pub(crate) fn cached_reads(state: &BundleState) -> CachedReads {
 mod tests {
     use super::*;
     use alloy_primitives::{Address, U256};
-    use revm::{state::AccountInfo, Database, DatabaseRef};
+    use evm2::evm::{AccountInfo, Database};
     use std::convert::Infallible;
     #[derive(Debug)]
     struct Parent;
-    impl DatabaseRef for Parent {
+    impl Database for Parent {
         type Error = Infallible;
-        fn basic_ref(&self, _: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        fn get_account(&mut self, _: &Address) -> Result<Option<AccountInfo>, Self::Error> {
             Ok(None)
         }
-        fn storage_ref(&self, _: Address, _: U256) -> Result<U256, Self::Error> {
+        fn get_storage(&mut self, _: &Address, _: &U256) -> Result<U256, Self::Error> {
             Ok(U256::from(99))
         }
-        fn code_by_hash_ref(
-            &self,
-            _: alloy_primitives::B256,
-        ) -> Result<revm::bytecode::Bytecode, Self::Error> {
+        fn get_code_by_hash(
+            &mut self,
+            _: &alloy_primitives::B256,
+        ) -> Result<evm2::bytecode::Bytecode, Self::Error> {
             Ok(Default::default())
         }
-        fn block_hash_ref(&self, _: u64) -> Result<alloy_primitives::B256, Self::Error> {
+        fn get_block_hash(&mut self, _: &U256) -> Result<alloy_primitives::B256, Self::Error> {
             Ok(Default::default())
         }
     }
@@ -63,11 +62,11 @@ mod tests {
         let mut cached = cached_reads(&state);
         assert!(!cached.accounts.contains_key(&deleted));
         let mut db = cached.as_db_mut(Parent);
-        assert_eq!(db.basic(address).unwrap().unwrap().nonce, 4);
-        assert_eq!(db.storage(address, slot).unwrap(), U256::from(20));
-        assert_eq!(db.storage(address, U256::from(8)).unwrap(), U256::from(99));
-        assert_eq!(db.storage(address, U256::from(9)).unwrap(), U256::ZERO);
-        assert!(db.basic(Address::with_last_byte(2)).unwrap().is_none());
-        assert!(db.basic(deleted).unwrap().is_none());
+        assert_eq!(db.get_account(&address).unwrap().unwrap().nonce, 4);
+        assert_eq!(db.get_storage(&address, &slot).unwrap(), U256::from(20));
+        assert_eq!(db.get_storage(&address, &U256::from(8)).unwrap(), U256::from(99));
+        assert_eq!(db.get_storage(&address, &U256::from(9)).unwrap(), U256::ZERO);
+        assert!(db.get_account(&Address::with_last_byte(2)).unwrap().is_none());
+        assert!(db.get_account(&deleted).unwrap().is_none());
     }
 }

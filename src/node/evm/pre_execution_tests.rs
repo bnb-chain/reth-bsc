@@ -457,7 +457,6 @@ mod parent_block_env {
     use crate::{
         chainspec::{bsc::bsc_mainnet, BscChainSpec},
         consensus::parlia::snapshot::MAXWELL_EPOCH_LENGTH,
-        evm::api::BscEvm,
         node::evm::{
             config::{
                 evm_env_for_header, BscBlockExecutionCtx, BscExecutionMode, BscExecutionSharedCtx,
@@ -468,12 +467,9 @@ mod parent_block_env {
         system_contracts::{SystemContract, VALIDATOR_CONTRACT},
     };
     use alloy_consensus::Header;
-    use alloy_evm::eth::EthBlockExecutionCtx;
     use alloy_primitives::{hex, Address, Bytes, U160};
-    use reth_evm_ethereum::RethReceiptBuilder;
-    use revm::{
-        bytecode::Bytecode, database::InMemoryDB, inspector::NoOpInspector, state::AccountInfo,
-    };
+    use reth_evm_ethereum::{EthBlockExecutionCtx, RethReceiptBuilder};
+    use revm::{bytecode::Bytecode, database::InMemoryDB, state::AccountInfo};
     use std::sync::Arc;
 
     /// Hard-coded interval used by the mock validator contract below.
@@ -571,9 +567,9 @@ mod parent_block_env {
         }
 
         fn parent_state() -> ParentState {
-            let code = PrimitivesBytecode(Bytecode::new_raw(Bytes::from_static(
-                WINDOW_REPORTING_VALIDATOR_SET,
-            )));
+            let code = PrimitivesBytecode(evm2::bytecode::Bytecode::new_legacy(
+                Bytes::from_static(WINDOW_REPORTING_VALIDATOR_SET),
+            ));
             ParentState { code: Some(code) }
         }
 
@@ -600,12 +596,7 @@ mod parent_block_env {
         }
     }
 
-    type TestExecutor = BscBlockExecutor<
-        'static,
-        BscEvm<InMemoryDB, NoOpInspector>,
-        Arc<BscChainSpec>,
-        RethReceiptBuilder,
-    >;
+    type TestExecutor = BscBlockExecutor<'static, Arc<BscChainSpec>, RethReceiptBuilder>;
 
     /// An executor positioned on `EPOCH_BLOCK`, with the mock installed at `ValidatorSet` and
     /// `parent_header` set as `check_new_block` sets it.
@@ -623,15 +614,18 @@ mod parent_block_env {
         db
     }
 
-    fn executor_over<DB: alloy_evm::block::StateDB>(
+    fn executor_over<
+        DB: revm::Database<Error: std::error::Error + Send + Sync + 'static> + 'static,
+    >(
         db: DB,
-    ) -> BscBlockExecutor<'static, BscEvm<DB, NoOpInspector>, Arc<BscChainSpec>, RethReceiptBuilder>
-    {
+    ) -> BscBlockExecutor<'static, Arc<BscChainSpec>, RethReceiptBuilder> {
         let spec = Arc::new(BscChainSpec::from(bsc_mainnet()));
         let header = header_at(EPOCH_BLOCK);
 
-        let evm =
-            BscEvm::new(evm_env_for_header(&spec, &header), db, NoOpInspector {}, false, false);
+        let evm = crate::node::evm::factory::BscEvmFactory.create_evm(
+            evm2::evm::Db::new(crate::node::evm::test_utils::LegacyDb(db)),
+            evm_env_for_header(&spec, &header),
+        );
 
         let ctx = BscBlockExecutionCtx {
             base: EthBlockExecutionCtx {
@@ -674,7 +668,7 @@ mod parent_block_env {
             consensus::parlia::Snapshot,
             node::evm::{config::PrivateMiningParent, util::HEADER_CACHE_READER},
         };
-        use alloy_evm::Evm;
+
         use reth_primitives_traits::SealedHeader;
 
         let mut executor = executor();
@@ -709,7 +703,7 @@ mod parent_block_env {
             })),
         }));
         executor.snapshot_provider = None;
-        let block = executor.evm.block().clone();
+        let block = *executor.evm.block();
         executor.prepare_new_block(&block).unwrap();
         assert_eq!(executor.inner_ctx.parent_header.as_ref().unwrap(), parent.header());
         assert_eq!(executor.inner_ctx.snap.as_ref().unwrap().block_hash, parent.hash());
@@ -756,14 +750,17 @@ mod parent_block_env {
             state::LaneState,
             Budget, PAYMENT_LANE_CONTRACT,
         };
-        use alloy_evm::Evm as _;
         use alloy_primitives::{B256, U256};
         use revm::state::{Account, EvmState, EvmStorageSlot};
 
         let code = Bytecode::new_raw(Bytes::from_static(&[0x00]));
         let deployed = AccountInfo::default().with_code(code);
         let mut executor = executor();
-        executor.evm.db_mut().insert_account_info(PAYMENT_LANE_CONTRACT, deployed.clone());
+        executor
+            .update_account(PAYMENT_LANE_CONTRACT, |info| {
+                *info = crate::node::evm::test_utils::account(deployed.clone())
+            })
+            .unwrap();
         executor.lane = LaneState::for_test(
             LaneMeta { ratio: 500, listed: Default::default() },
             Budget::default(),
@@ -771,7 +768,8 @@ mod parent_block_env {
         );
 
         let shape = |info: AccountInfo, slot: Option<EvmStorageSlot>| {
-            let mut account = Account::from(info);
+            let mut account = Account::from(deployed.clone());
+            account.info = info;
             account.mark_touch();
             account.storage.extend(slot.map(|slot| (U256::ZERO, slot)));
             EvmState::from_iter([(PAYMENT_LANE_CONTRACT, account)])
@@ -780,7 +778,7 @@ mod parent_block_env {
             executor.lane_contract_changed = false;
             executor.ctx.header_hash = Some(B256::repeat_byte(tag));
             for state in states {
-                executor.commit_state(state);
+                executor.commit_state(crate::node::evm::test_utils::pending(state));
             }
             executor.verify_payment_lane(0).expect("an empty block cannot violate");
             cache_get(B256::repeat_byte(tag)).is_some()
@@ -810,7 +808,7 @@ mod parent_block_env {
                         )),
                     ),
                     shape(
-                        deployed,
+                        deployed.clone(),
                         Some(EvmStorageSlot::new(U256::from(1), revm::state::TransactionId::ZERO))
                     ),
                 ]
@@ -831,8 +829,8 @@ mod parent_block_env {
     #[test]
     fn lane_getters_leave_no_bundle_record() {
         use crate::consensus::payment_lane::{LaneParentState, PAYMENT_LANE_CONTRACT};
-        use alloy_evm::Evm as _;
-        use revm::database::{states::bundle_state::BundleRetention, State};
+
+        use revm::database::State;
 
         let mut db = validator_set_db();
         // PUSH1 0x20 PUSH1 0x00 RETURN: one zero word.
@@ -849,9 +847,7 @@ mod parent_block_env {
             .expect("the getter returns a word");
         assert_eq!(ret.len(), 32);
 
-        let db = executor.evm.db_mut();
-        db.merge_transitions(BundleRetention::Reverts);
-        assert!(db.take_bundle().account(&PAYMENT_LANE_CONTRACT).is_none());
+        assert!(executor.block_state.into_bundle().account(&PAYMENT_LANE_CONTRACT).is_none());
     }
 
     #[test]

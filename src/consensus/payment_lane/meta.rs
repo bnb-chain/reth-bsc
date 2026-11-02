@@ -6,7 +6,7 @@ use super::{
 };
 use alloy_primitives::{map::HashSet, Address, BlockHash, Bytes, U256};
 use alloy_sol_types::{sol, SolCall};
-use revm::database::BundleState;
+use reth_evm::BundleState;
 use schnellru::{ByLength, LruMap};
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -328,42 +328,34 @@ mod tests {
     #[test]
     fn a_built_block_inherits_unless_the_block_changed_the_contract() {
         use alloy_primitives::B256;
-        use revm::{
-            database::{states::bundle_state::BundleRetention, InMemoryDB, State},
-            state::{Account, AccountInfo, EvmState, EvmStorageSlot},
-            Database, DatabaseCommit,
+        use evm2::{
+            bytecode::Bytecode,
+            evm::{AccountInfo, PendingState},
         };
-
-        // A read-only call to the deployed contract, then one transaction per written value of
-        // slot 0, which starts at zero.
+        use reth_execution_types::BlockState;
+        // Include the initial read-only touch, then preserve each committed write, even
+        // when later transactions restore the original value.
         let bundle_after = |writes: &[u64]| {
-            let mut db = InMemoryDB::default();
-            db.insert_account_info(
-                PAYMENT_LANE_CONTRACT,
-                AccountInfo::default()
-                    .with_code(revm::bytecode::Bytecode::new_raw(Bytes::from_static(&[0x00]))),
-            );
-            let mut state = State::builder().with_database(db).with_bundle_update().build();
-            let info = state.basic(PAYMENT_LANE_CONTRACT).unwrap().unwrap();
-            let commit = |state: &mut State<InMemoryDB>, slot: Option<EvmStorageSlot>| {
-                let mut account = Account::from(info.clone());
-                account.mark_touch();
-                account.storage.extend(slot.map(|slot| (U256::ZERO, slot)));
-                state.commit(EvmState::from_iter([(PAYMENT_LANE_CONTRACT, account)]));
-            };
-            commit(&mut state, None);
-            let mut previous = 0;
-            for &value in writes {
-                let slot = EvmStorageSlot::new_changed(
-                    U256::from(previous),
-                    U256::from(value),
-                    revm::state::TransactionId::ZERO,
+            let mut state = BlockState::default();
+            let info =
+                AccountInfo::default().with_code(Bytecode::new_legacy(Bytes::from_static(&[0x00])));
+            let mut previous = U256::ZERO;
+            for value in std::iter::once(None).chain(writes.iter().map(|v| Some(U256::from(*v)))) {
+                let mut pending = PendingState::default();
+                pending.insert_account(
+                    PAYMENT_LANE_CONTRACT,
+                    Some(info.clone()),
+                    Some(info.clone()),
                 );
-                commit(&mut state, Some(slot));
-                previous = value;
+                if let Some(value) = value {
+                    pending.insert_storage(PAYMENT_LANE_CONTRACT, U256::ZERO, previous, value);
+                    previous = value;
+                }
+                for change in pending.account_changes() {
+                    state.commit_account_changes(change, None);
+                }
             }
-            state.merge_transitions(BundleRetention::Reverts);
-            state.take_bundle()
+            state.into_bundle()
         };
         let listed = Arc::new([Address::repeat_byte(9)].into_iter().collect());
         let meta = LaneMeta { ratio: 700, listed };

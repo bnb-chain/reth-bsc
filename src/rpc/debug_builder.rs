@@ -41,7 +41,7 @@ use reth_evm::{
 };
 use reth_primitives_traits::SealedHeader;
 use reth_provider::{EvmStateProviderAdapter, StateProviderFactory};
-use revm::database::State;
+
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -182,7 +182,7 @@ where
         .state_by_block_hash(parent_hash)
         .map_err(|e| internal_err(format!("state provider: {e}")))?;
     let sp_db = StateProviderDatabase::new(EvmStateProviderAdapter(&state_provider));
-    let mut db = State::builder().with_database(sp_db).with_bundle_update().build();
+    let mut db = sp_db;
 
     let evm_config = BscEvmConfig::new(chain_spec.clone());
     let parent_beacon_block_root = BscHardforks::is_bohr_active_at_timestamp(

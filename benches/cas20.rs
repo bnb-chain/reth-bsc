@@ -8,7 +8,7 @@
 //!
 //! `cargo bench --bench cas20 --features bench-test`
 
-use alloy_evm::precompiles::PrecompileLookup;
+use alloy_evm::{precompiles::PrecompileLookup, EvmEnv};
 use alloy_primitives::{keccak256, Address, B256, U256};
 use criterion::{criterion_group, criterion_main, Criterion};
 use reth_bsc::{
@@ -22,7 +22,6 @@ use reth_bsc::{
     },
     hardforks::bsc::BscHardfork,
 };
-use reth_evm::EvmEnv;
 use revm::{
     context::{
         result::{ExecutionResult, Output},

@@ -4,7 +4,7 @@
 
 use crate::{
     chainspec::{parser::parse_genesis_json, BscChainSpec},
-    evm::{api::BscEvm, precompiles::cas20},
+    evm::precompiles::cas20,
     hardforks::BscHardforks,
     node::evm::{
         config::{
@@ -15,13 +15,11 @@ use crate::{
     system_contracts::SystemContract,
 };
 use alloy_consensus::Header;
-use alloy_evm::{block::BlockExecutor, eth::EthBlockExecutionCtx};
 use alloy_primitives::{Bytes, B256};
-use reth_evm::Evm;
-use reth_evm_ethereum::RethReceiptBuilder;
+use reth_evm::{BlockExecutor, Evm};
+use reth_evm_ethereum::{EthBlockExecutionCtx, RethReceiptBuilder};
 use revm::{
-    bytecode::Bytecode, database::InMemoryDB, inspector::NoOpInspector, primitives::KECCAK_EMPTY,
-    state::AccountInfo, Database,
+    bytecode::Bytecode, database::InMemoryDB, primitives::KECCAK_EMPTY, state::AccountInfo,
 };
 use std::sync::Arc;
 
@@ -52,16 +50,14 @@ fn header_at(number: u64, timestamp: u64) -> Header {
     }
 }
 
-type TestExecutor = BscBlockExecutor<
-    'static,
-    BscEvm<InMemoryDB, NoOpInspector>,
-    Arc<BscChainSpec>,
-    RethReceiptBuilder,
->;
+type TestExecutor = BscBlockExecutor<'static, Arc<BscChainSpec>, RethReceiptBuilder>;
 
 fn executor(db: InMemoryDB, header: Header) -> TestExecutor {
     let spec = spec();
-    let evm = BscEvm::new(evm_env_for_header(&spec, &header), db, NoOpInspector {}, false, false);
+    let evm = crate::node::evm::factory::BscEvmFactory.create_evm(
+        evm2::evm::Db::new(crate::node::evm::test_utils::LegacyDb(db)),
+        evm_env_for_header(&spec, &header),
+    );
     let ctx = BscBlockExecutionCtx {
         base: EthBlockExecutionCtx {
             parent_hash: header.parent_hash,
@@ -116,20 +112,21 @@ fn seeding_plants_the_sentinel_on_both_registries_and_leaves_foreign_code_alone(
 
     executor.seed_cas20_registries(10).expect("seeding succeeds");
 
-    let db = executor.evm_mut().db_mut();
-    let activation = db.basic(cas20::ACTIVATION_REGISTRY_ADDRESS).unwrap().expect("account exists");
+    let db = executor.evm_mut().state_db_mut();
+    let activation =
+        db.get_account(&cas20::ACTIVATION_REGISTRY_ADDRESS).unwrap().expect("account exists");
     assert_eq!(activation.code_hash, cas20::marker_bytecode().hash_slow());
     assert_eq!(
-        activation.code.as_ref().map(|c: &Bytecode| c.original_bytes()),
+        Some(db.get_code_by_hash(&activation.code_hash).unwrap().original_bytes()),
         Some(Bytes::from_static(&cas20::MARKER_CODE))
     );
-    let policy = db.basic(cas20::POLICY_REGISTRY_ADDRESS).unwrap().expect("account exists");
+    let policy = db.get_account(&cas20::POLICY_REGISTRY_ADDRESS).unwrap().expect("account exists");
     assert_eq!(policy.code_hash, foreign.hash_slow(), "foreign code is not overwritten");
 
     // Seeding again is a no-op: the marker is left as it is.
     executor.seed_cas20_registries(10).expect("second seeding succeeds");
-    let db = executor.evm_mut().db_mut();
-    let activation = db.basic(cas20::ACTIVATION_REGISTRY_ADDRESS).unwrap().unwrap();
+    let db = executor.evm_mut().state_db_mut();
+    let activation = db.get_account(&cas20::ACTIVATION_REGISTRY_ADDRESS).unwrap().unwrap();
     assert_eq!(activation.code_hash, cas20::marker_bytecode().hash_slow());
     assert_ne!(activation.code_hash, KECCAK_EMPTY);
 }

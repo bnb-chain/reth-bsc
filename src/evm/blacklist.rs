@@ -33,3 +33,9 @@ pub fn check_tx_basic_blacklist(from: Address, to: Option<Address>) -> bool {
     }
     false
 }
+
+impl reth_evm::InvalidTxError for BlacklistedAddressError {
+    fn as_any(&self) -> &(dyn std::any::Any + 'static) {
+        self
+    }
+}

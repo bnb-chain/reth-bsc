@@ -211,33 +211,35 @@ fn canonical_environments_and_rpc_configuration_are_preserved() {
         (70_000_000, NOW),
     ] {
         let env = config.evm_env(&header(number, time)).unwrap();
-        assert_eq!(config.with_block_rules(env.clone()), env);
+        assert_eq!(format!("{:?}", config.with_block_rules(env.clone())), format!("{env:?}"));
     }
     for cap in [123_456, u64::MAX] {
         let mut env = config.evm_env(&header(35_400_000, KEPLER - 1)).unwrap();
-        env.cfg_env.tx_gas_limit_cap = Some(cap);
-        env.cfg_env.disable_eip3607 = true;
-        env.cfg_env.disable_base_fee = true;
-        env.cfg_env.disable_block_gas_limit = true;
-        env.cfg_env.disable_nonce_check = true;
-        env.cfg_env.disable_fee_charge = true;
-        env.cfg_env.memory_limit = 12_345_678;
-        env.cfg_env.max_blobs_per_tx = Some(2);
-        env.block_env.gas_limit = 765_432;
-        env.block_env.basefee = 123;
-        env.block_env.disabled_cas20.insert(TOKEN);
-        env.block_env.timestamp = U256::from(NOW);
-        let cfg = env.cfg_env.clone();
+        use evm2::EvmFeatures as F;
+        env.version.tx_gas_limit_cap = cap;
+        let disabled = F::EIP3607 |
+            F::BASE_FEE_CHECK |
+            F::BLOCK_GAS_LIMIT_CHECK |
+            F::NONCE_CHECK |
+            F::FEE_CHARGE;
+        env.version.features.remove(disabled);
+        env.version.memory_limit = 12_345_678;
+        env.version.max_blobs_per_tx = 2;
+        env.block.gas_limit = U256::from(765_432);
+        env.block.basefee = U256::from(123);
+        env.code_overrides.insert(TOKEN);
+        env.block.timestamp = U256::from(NOW);
         let updated = config.with_block_rules(env);
-        let mut expected = cfg;
-        expected.set_spec_and_mainnet_gas_params(updated.cfg_env.spec);
-        assert_eq!(updated.cfg_env, expected);
-        assert_eq!(updated.block_env.gas_limit, 765_432);
-        assert_eq!(updated.block_env.basefee, 123);
-        assert!(updated.block_env.disabled_cas20.contains(&TOKEN));
+        assert_eq!(updated.version.tx_gas_limit_cap, cap);
+        assert!(!updated.version.features.intersects(disabled));
+        assert_eq!(updated.version.memory_limit, 12_345_678);
+        assert_eq!(updated.version.max_blobs_per_tx, 2);
+        assert_eq!(updated.block.gas_limit, U256::from(765_432));
+        assert_eq!(updated.block.basefee, U256::from(123));
+        assert!(updated.code_overrides.contains(&TOKEN));
         assert_eq!(
-            config.with_block_rules(updated.clone()),
-            updated,
+            format!("{:?}", config.with_block_rules(updated.clone())),
+            format!("{updated:?}"),
             "normalization is idempotent"
         );
     }
@@ -480,15 +482,15 @@ fn reversing_forks_retains_overridden_blob_fees_and_opcode_values() {
         blob_base_fee: Some(U256::ZERO),
         ..Default::default()
     };
-    apply_block_overrides(ov.clone(), &mut InMemoryDB::default(), env.block_env.inner_mut());
-    env.block_env.apply_block_overrides_ext(&ov).unwrap();
+    apply_block_overrides(ov.clone(), &mut evm2::evm::InMemoryDB::default(), &mut env);
+    env.apply_block_overrides_ext(&ov).unwrap();
     env = config.with_block_rules(env);
-    assert_eq!(env.block_env.difficulty, U256::ZERO);
-    env.block_env.timestamp = U256::from(CANCUN);
+    assert_eq!(env.block.difficulty, U256::ZERO);
+    env.block.timestamp = U256::from(CANCUN);
     env = config.with_block_rules(env);
-    assert_eq!(Block::prevrandao(&env.block_env), Some(B256::ZERO));
-    assert_eq!(env.block_env.blob_excess_gas_and_price.unwrap().blob_gasprice, 0);
-    assert_eq!(env.cfg_env.max_blobs_per_tx, Some(6));
+    assert_eq!(env.block.prevrandao, U256::ZERO);
+    assert_eq!(env.block.blob_basefee, U256::ZERO);
+    assert_eq!(env.version.max_blobs_per_tx, 6);
 }
 
 #[tokio::test]
