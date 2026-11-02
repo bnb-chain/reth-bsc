@@ -1199,6 +1199,12 @@ where
             "Updating fork choice with incoming header"
         );
 
+        let source =
+            crate::node::miner::startup_diagnostics::handoff_source(incoming_header.hash_slow());
+        let preparation = crate::node::miner::startup_diagnostics::HandoffStage::new(
+            "forkchoice_prepare",
+            source,
+        );
         let current_number = self.provider.chain_info()?.best_number;
         tracing::trace!(target: "bsc::forkchoice", "Best canonical number: {:?}, new_header = {:?}", current_number, incoming_header);
 
@@ -1252,6 +1258,9 @@ where
             "Fork choice updated"
         );
 
+        drop(preparation);
+        let fcu_roundtrip =
+            crate::node::miner::startup_diagnostics::HandoffStage::new("fcu_roundtrip", source);
         let outcome = match self.engine_handle.fork_choice_updated(state, None).await {
             Ok(response) => match response.payload_status.status {
                 PayloadStatusEnum::Invalid { validation_error } => {
@@ -1262,6 +1271,7 @@ where
             Err(err) => Err(ParliaConsensusErr::ForkChoiceUpdateError(err.to_string())),
         };
 
+        drop(fcu_roundtrip);
         // Promote future votes now that the block is canonical. This is the
         // import event go-bsc gets from `highestVerifiedBlock`, and vote arrival
         // cannot stand in for it: the vote that would trigger promotion may
