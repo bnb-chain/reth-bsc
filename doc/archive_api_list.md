@@ -4,6 +4,10 @@
 
 ⚠️ **`pending` tag is planned, temporarily not supported**
 
+For `eth_getBlockByNumber`, `eth_getHeaderByNumber`, `eth_getTransactionsByBlockNumber`, and
+`eth_getBlobSidecars`, `earliest` selects genesis (block `0x0`), even after history pruning.
+It has the same data availability and error behavior as an explicit `0x0` request.
+
 | API | Status | Notes |
 |----------|------|------|
 | `eth_blockNumber` | Support |  |

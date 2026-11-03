@@ -3,6 +3,7 @@ pub mod admin;
 #[cfg(test)]
 mod block_overrides_tests;
 pub mod blob;
+pub mod block;
 pub mod code_overrides;
 pub mod debug_builder;
 pub mod eth_config;
