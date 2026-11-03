@@ -1110,7 +1110,7 @@ where
             warn!("MEV running status already set: {:?}", e);
         }
 
-        let mut send_bid_interval = tokio::time::interval(Duration::from_millis(20));
+        let mut bid_block_interval = tokio::time::interval(Duration::from_millis(20));
         let mut clear_bid_interval = tokio::time::interval(Duration::from_millis(1000));
 
         loop {
@@ -1121,7 +1121,20 @@ where
                             // A finished simulation may produce a recommit request
                             // (go-bsc simBid defer): the follow-up simulation of a
                             // better bid that was parked during this run.
-                            if let Some(req) = self.simulator.bid_simulate(bid_runtime) {
+                            //
+                            // Simulation is synchronous, and the recommit probe keeps
+                            // this branch ready until the simulator's cutoff, so this
+                            // task does not yield for the whole window. block_in_place
+                            // first hands this worker's queued tasks to another thread:
+                            // a task woken on this worker (its LIFO slot is never
+                            // stolen) would otherwise wait for the probe to stop, such
+                            // as the mev_sendBid of a builder's later bid or the bid
+                            // intake that admits it, which then arrives after the
+                            // simulator stopped simulating.
+                            let simulator = &self.simulator;
+                            let recommit =
+                                tokio::task::block_in_place(|| simulator.bid_simulate(bid_runtime));
+                            if let Some(req) = recommit {
                                 if let Err(e) = self.bid_simulate_req_tx.send(req) {
                                     error!("Failed to send recommit bid simulate request due to channel closed: {}", e);
                                 }
@@ -1134,10 +1147,9 @@ where
                     }
                 }
 
-                // Interval for checking bid packages
-                _ = send_bid_interval.tick() => {
-                    // Attempt to send bids
-                    self.get_bid_and_send();
+                // Interval for checking BidBlock packages. Bids have their own
+                // task, BidIntakeWorker.
+                _ = bid_block_interval.tick() => {
                     // Process any admitted BEP-675 BidBlocks.
                     self.process_bid_block();
                 }
@@ -1150,19 +1162,11 @@ where
         }
     }
 
-    /// Send a bid to the miner's bid simulator (reads from global queue)
-    fn get_bid_and_send(&self) {
-        // Read bid packages from the global queue
-        if let Some(bid_package) = crate::shared::pop_bid_package() {
-            debug!(
-                "Popped bid package from queue, block: {}, committing to simulator",
-                bid_package.block_number
-            );
-            if let Some(req) = self.simulator.commit_new_bid(bid_package) {
-                if let Err(e) = self.bid_simulate_req_tx.send(req) {
-                    error!("Failed to send bid simulate request due to channel closed: {}", e);
-                }
-            }
+    /// The task that admits bids into this worker's simulations.
+    pub fn bid_intake(&self) -> BidIntakeWorker<Provider, Pool> {
+        BidIntakeWorker {
+            simulator: self.simulator.clone(),
+            bid_simulate_req_tx: self.bid_simulate_req_tx.clone(),
         }
     }
 
@@ -1180,6 +1184,45 @@ where
     }
 }
 
+/// Admits bids from `mev_sendBid` as they arrive (go-bsc `newBidLoop`). It runs beside
+/// [`MevWorkWorker`] so that a better bid can interrupt the simulation running there: admitted
+/// between simulations, a bid can only wait for the running one to end.
+pub struct BidIntakeWorker<Provider, Pool> {
+    simulator: Arc<BidSimulator<Provider, Pool>>,
+    bid_simulate_req_tx: mpsc::UnboundedSender<BidRuntime<Pool, BscEvmConfig>>,
+}
+
+impl<Provider, Pool> BidIntakeWorker<Provider, Pool>
+where
+    Provider: HeaderProvider<Header = alloy_consensus::Header>
+        + BlockNumReader
+        + reth_provider::StateProviderFactory
+        + CanonStateSubscriptions
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>> + 'static,
+{
+    pub async fn run(self) {
+        info!("Starting BidIntakeWorker");
+        loop {
+            crate::shared::bid_package_queued().await;
+            while let Some(bid_package) = crate::shared::pop_bid_package() {
+                debug!(
+                    "Popped bid package from queue, block: {}, committing to simulator",
+                    bid_package.block_number
+                );
+                if let Some(req) = self.simulator.commit_new_bid(bid_package) {
+                    if let Err(e) = self.bid_simulate_req_tx.send(req) {
+                        error!("Failed to send bid simulate request due to channel closed: {}", e);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Miner that handles block production for BSC.
 pub struct BscMiner<Pool, Provider> {
     validator_address: Address,
@@ -1188,6 +1231,7 @@ pub struct BscMiner<Pool, Provider> {
     main_work_worker: MainWorkWorker<Pool, Provider>,
     result_work_worker: ResultWorkWorker<Provider>,
     mev_work_worker: MevWorkWorker<Provider, Pool>,
+    bid_intake_worker: BidIntakeWorker<Provider, Pool>,
     task_executor: TaskExecutor,
 }
 
@@ -1280,6 +1324,7 @@ where
         );
 
         let mev_work_worker = MevWorkWorker::new(simulator.clone(), provider.clone());
+        let bid_intake_worker = mev_work_worker.bid_intake();
 
         let miner = Self {
             validator_address,
@@ -1288,6 +1333,7 @@ where
             main_work_worker,
             result_work_worker,
             mev_work_worker,
+            bid_intake_worker,
             task_executor,
         };
         info!("Succeed to new miner, address: {}", validator_address);
@@ -1305,6 +1351,7 @@ where
 
     fn spawn_workers(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.task_executor.spawn_critical_task("mev_work_worker", self.mev_work_worker.run());
+        self.task_executor.spawn_critical_task("bid_intake_worker", self.bid_intake_worker.run());
         self.task_executor.spawn_critical_task("new_work_worker", self.new_work_worker.run());
         self.task_executor.spawn_critical_task("main_work_worker", self.main_work_worker.run());
         self.task_executor.spawn_critical_task("result_work_worker", self.result_work_worker.run());
