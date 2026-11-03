@@ -19,6 +19,8 @@ pub(super) enum RelayValidation {
     /// Local ancestry or snapshot data is unavailable. Import/recovery may proceed,
     /// but forwarding must wait for an authoritative successful validation.
     Deferred,
+    /// The local clock has not reached the header timestamp. Delay import as well as relay.
+    AwaitingClock,
 }
 
 /// Runs on the blocking pool because snapshot reconstruction may access the database.
@@ -32,7 +34,9 @@ pub(super) fn validate_for_relay<P: HeaderProvider<Header = Header>>(
     match consensus.validate_header(block.sealed_header()) {
         // A clock difference is not proof of a bad peer. Leave handling to import,
         // without authorizing early relay.
-        Err(ConsensusError::TimestampIsInFuture { .. }) => return Ok(RelayValidation::Deferred),
+        Err(ConsensusError::TimestampIsInFuture { .. }) => {
+            return Ok(RelayValidation::AwaitingClock)
+        }
         result => result?,
     }
     // A signed header alone must not authorize forwarding an unrelated body.

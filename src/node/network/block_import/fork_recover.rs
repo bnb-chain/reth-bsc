@@ -707,7 +707,9 @@ where
         let sealed = block.seal_unchecked(block_hash);
         let payload = BscPayloadTypes::block_to_payload(sealed);
 
-        match engine.new_payload(payload).await {
+        match super::future_payload::submit(&engine, payload, &forkchoice_engine.future_payloads)
+            .await
+        {
             Ok(status) => match status.status {
                 PayloadStatusEnum::Valid => {
                     tracing::debug!(
@@ -1749,6 +1751,14 @@ mod tests {
             syncing_at: Vec<u64>,
             td: impl Fn(u64, B256) -> u64 + Send + 'static,
         ) -> (ConsensusEngineHandle<BscPayloadTypes>, Submissions, Fcus) {
+            recording_engine_with_retry(syncing_at, td, None)
+        }
+
+        fn recording_engine_with_retry(
+            syncing_at: Vec<u64>,
+            td: impl Fn(u64, B256) -> u64 + Send + 'static,
+            mut accepted_at: Option<u64>,
+        ) -> (ConsensusEngineHandle<BscPayloadTypes>, Submissions, Fcus) {
             let (to_engine, mut from_engine) =
                 tokio::sync::mpsc::unbounded_channel::<BeaconEngineMessage<BscPayloadTypes>>();
             let handle = ConsensusEngineHandle::new(to_engine);
@@ -1762,7 +1772,10 @@ mod tests {
                         BeaconEngineMessage::NewPayload { payload, tx } => {
                             let (num, hash) = (payload.block_number(), payload.block_hash());
                             recorder.lock().unwrap().push((num, hash));
-                            let status = if syncing_at.contains(&num) {
+                            let status = if accepted_at == Some(num) {
+                                accepted_at = None;
+                                PayloadStatusEnum::Accepted
+                            } else if syncing_at.contains(&num) {
                                 PayloadStatusEnum::Syncing
                             } else {
                                 PayloadStatusEnum::Valid
@@ -2597,6 +2610,30 @@ mod tests {
                 expected.as_slice(),
                 "an FCU per imported block, plus the terminal commit",
             );
+        }
+
+        #[tokio::test]
+        async fn accepted_ancestor_is_retried_before_descendants_and_forkchoice() {
+            let (provider, fetcher, heads) = scenario(100, 3);
+            let (engine, submissions, fcus) =
+                recording_engine_with_retry(vec![], |number, _| number, Some(102));
+            let (head_hash, head_num) = heads[2];
+            let fce = BscForkChoiceEngine::new(provider.clone(), engine.clone(), chain_spec());
+            recover_ancestors(
+                fake_peer(),
+                RecoverTarget::single_pair(head_hash, head_num),
+                provider,
+                engine,
+                fce,
+                fetcher.as_ref(),
+                &(),
+            )
+            .await
+            .unwrap();
+            let imported: Vec<_> =
+                submissions.lock().unwrap().iter().map(|(n, _)| *n).collect();
+            assert_eq!(imported, vec![101, 102, 102, 103]);
+            assert_eq!(*fcus.lock().unwrap(), vec![heads[0].0, heads[1].0, head_hash, head_hash]);
         }
 
         /// A `Syncing` part-way through Phase 2 used to abort the recovery and
