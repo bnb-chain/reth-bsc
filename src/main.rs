@@ -572,9 +572,11 @@ fn main() -> eyre::Result<()> {
 
                         // Remove the default unimplemented eth_coinbase before registering our version
                         ctx.modules.remove_method_from_configured("eth_coinbase");
+                        let rpc_health = reth_bsc::rpc::health::RpcHealth::default();
                         let eth_ext_api = BscEthExtApiImpl::new(
                             ctx.provider().clone(),
                             ctx.registry.eth_api().blocking_io_task_guard().clone(),
+                            rpc_health.clone(),
                         );
                         ctx.modules.merge_if_module_configured(RethRpcModule::Eth, eth_ext_api.into_rpc())?;
                         tracing::info!("Succeed to register BSC Eth extension API");
@@ -642,6 +644,8 @@ fn main() -> eyre::Result<()> {
                         );
                         ctx.modules.merge_if_module_configured(RethRpcModule::Eth, eth_config.into_rpc())?;
                         tracing::info!("Succeed to register eth_config (EIP-7910) API");
+
+                        rpc_health.instrument(ctx.modules)?;
 
                         // Bind only after all RPC module registration succeeded, so a later merge
                         // error cannot leave a detached gRPC listener behind during failed startup.
