@@ -242,15 +242,8 @@ where
         };
 
         if self.cfg.spec >= BscHardfork::Pasteur && hits_coinbase {
-            // Ported from go-bsc (core/vm: "coinbase address cannot be used as contract
-            // address"): refuse to execute any bytecode whose storage/self context is the
-            // block's coinbase, whether reached via CALL/DELEGATECALL to pre-existing code
-            // or freshly deployed via CREATE/CREATE2. Without this, a contract could run
-            // "as" the coinbase and be mistaken for the validator itself by callers that
-            // gate on `caller == coinbase` (e.g. system transaction detection), or otherwise
-            // interfere with fee-distribution invariants that assume the coinbase never
-            // carries code. This mirrors go-ethereum's error-code semantics: burn the
-            // frame's remaining gas and revert its state changes, same as any other halt.
+            // Reject bytecode execution in the coinbase's context from Pasteur.
+            // Halt the frame, consuming its remaining gas and reverting its state changes.
             let (ctx, _, _, frame_stack) = self.all_mut();
             let frame = frame_stack.get();
             let mut gas = frame.interpreter.gas;
