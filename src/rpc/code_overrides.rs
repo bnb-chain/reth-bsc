@@ -5,8 +5,7 @@ use crate::{
     node::evm::config::BscEvmConfig,
 };
 use alloy_consensus::BlockHeader;
-use alloy_evm::overrides::{apply_block_overrides, apply_state_overrides};
-use alloy_network::TransactionBuilder;
+use alloy_evm::overrides::{apply_block_overrides, apply_state_overrides, OverrideBlockHashes};
 use alloy_primitives::{Address, Bytes, B256, U256};
 use alloy_rpc_types_eth::{
     simulate::{SimBlock, SimulatePayload, SimulatedBlock},
@@ -14,6 +13,7 @@ use alloy_rpc_types_eth::{
     BlockId, BlockOverrides, Bundle, EthCallResponse, StateContext, TransactionRequest,
 };
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
+use reth_chainspec::{ChainSpecProvider, EthChainSpec};
 use reth_errors::RethError;
 use reth_evm::{
     block::BlockExecutor, env::BlockEnvironment, execute::BlockBuilder, ConfigureEvm, Evm,
@@ -21,7 +21,7 @@ use reth_evm::{
 };
 use reth_primitives_traits::BlockBody;
 use reth_provider::{BlockIdReader, ProviderError};
-use reth_revm::cancelled::CancelOnDrop;
+use reth_revm::{cancelled::CancelOnDrop, database::StateProviderDatabase, db::State};
 use reth_rpc_convert::RpcTypes;
 use reth_rpc_eth_api::{
     helpers::{estimate::EstimateCall, EthCall},
@@ -32,9 +32,9 @@ use reth_rpc_eth_types::{
     simulate::{self, EthSimulateError},
     BlockOverridesExt, EthApiError,
 };
-use revm::{context::Block, database::InMemoryDB, DatabaseCommit};
+use revm::{context::Block, context_interface::Cfg, database::InMemoryDB, DatabaseCommit};
 use revm_inspectors::transfer::TransferInspector;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) fn code_overridden_addresses(overrides: Option<&StateOverride>) -> BTreeSet<Address> {
     overrides
@@ -144,7 +144,15 @@ where
         }
         self.0
             .spawn_with_state(Some(at), move |eth, provider| {
-                EstimateCall::estimate_gas_with(&eth, env, request, provider, state)
+                // Block overrides are already in `env`; blockHash overrides are ignored, as in
+                // go-bsc.
+                EstimateCall::estimate_gas_with(
+                    &eth,
+                    env,
+                    request,
+                    provider,
+                    EvmOverrides::state(state),
+                )
             })
             .await
             .map_err(Into::into)
@@ -181,7 +189,7 @@ where
         block: Option<BlockId>,
     ) -> Result<Vec<SimulatedBlock<RpcBlock<Eth::NetworkTypes>>>, Eth::Error> {
         if payload.block_state_calls.len() > self.0.max_simulate_blocks() as usize {
-            return Err(EthApiError::other(EthSimulateError::TooManyBlocks).into());
+            return Err(EthApiError::other(EthSimulateError::TooManyBlocks).into())
         }
 
         let block = block.unwrap_or_default();
@@ -194,45 +202,54 @@ where
         } = payload;
 
         if block_state_calls.is_empty() {
-            return Err(EthApiError::InvalidParams(String::from("calls are empty.")).into());
+            return Err(EthApiError::InvalidParams(String::from("calls are empty.")).into())
         }
 
-        let base_block =
-            self.0.recovered_block(block).await?.ok_or(EthApiError::HeaderNotFound(block))?;
-        let mut parent = base_block.sealed_header().clone();
+        let _permit = self.0.acquire_owned_blocking_io().await;
 
-        self.0.spawn_with_state_at_block(block, move |this, mut db| {
+        let base_block = self
+            .0
+            .recovered_block(block)
+            .await?
+            .ok_or_else(|| EthApiError::other(EthSimulateError::BlockNotFound { block }))?;
+        let parent = base_block.sealed_header().clone();
+        let max_simulate_blocks = self.0.max_simulate_blocks();
+
+        self.0
+            .spawn_with_state_at_block(block, move |this, db| {
+                let state_provider = db.database.0 .0;
+                let mut db = State::builder()
+                    .with_database(StateProviderDatabase::new(&state_provider))
+                    .with_bundle_update()
+                    .build();
+                let mut parent = parent;
+
+                let chain_id = this.provider().chain_spec().chain_id();
+
+                // Validate block ordering and fill gaps with empty blocks so every entry has an
+                // explicit `number` and `time` override and the chain is contiguous (see the
+                // execution-apis spec note: "If the block number is increased more than 1 compared
+                // to the previous block, new empty blocks are generated in between.").
+                let block_state_calls = simulate::sanitize_chain(
+                    block_state_calls,
+                    &parent,
+                    chain_id,
+                    max_simulate_blocks,
+                )?;
+
                 let mut blocks: Vec<SimulatedBlock<RpcBlock<Eth::NetworkTypes>>> =
                     Vec::with_capacity(block_state_calls.len());
 
-                let mut prev_block_number = parent.number();
-                let mut prev_timestamp = parent.timestamp();
+                let call_gas_limit = this.call_gas_limit();
+                let mut remaining_call_gas_limit = (call_gas_limit > 0).then_some(call_gas_limit);
 
                 for block in block_state_calls {
-                    if let Some(number) = block.block_overrides.as_ref().and_then(|o| o.number) {
-                        let number: u64 = number.try_into().unwrap_or(u64::MAX);
-                        if number <= prev_block_number {
-                            return Err(EthApiError::other(EthSimulateError::BlockNumberInvalid {
-                                got: number,
-                                parent: prev_block_number,
-                            })
-                            .into());
-                        }
-                    }
-                    if let Some(time) = block
-                        .block_overrides
-                        .as_ref()
-                        .and_then(|o| o.time)
-                        .filter(|&t| t <= prev_timestamp)
-                    {
-                        return Err(EthApiError::other(EthSimulateError::BlockTimestampInvalid {
-                            got: time,
-                            parent: prev_timestamp,
-                        })
-                        .into());
-                    }
+                    let SimBlock { block_overrides, state_overrides, calls } = block;
 
-                    let attributes = this.next_env_attributes(&parent)?;
+                    let attributes = this
+                        .pending_env_builder()
+                        .pending_env_attributes(&parent, block_overrides.as_ref())
+                        .map_err(Eth::Error::from_eth_err)?;
 
                     let mut evm_env = this
                         .evm_config()
@@ -240,23 +257,34 @@ where
                         .map_err(RethError::other)
                         .map_err(Eth::Error::from_eth_err)?;
 
+                    // Always disable EIP-3607
                     evm_env.cfg_env.disable_eip3607 = true;
 
+                    // EIP-7825's transaction gas cap is only active with Amsterdam's
+                    // regular/state-gas accounting.
+                    if !evm_env.cfg_env.is_amsterdam_eip8037_enabled() {
+                        evm_env.cfg_env.tx_gas_limit_cap = Some(u64::MAX);
+                    }
+
                     if !validation {
+                        // If not explicitly required, we disable nonce check <https://github.com/paradigmxyz/reth/issues/16108>
                         evm_env.cfg_env.disable_nonce_check = true;
                         evm_env.cfg_env.disable_base_fee = true;
-                        evm_env.cfg_env.tx_gas_limit_cap = Some(u64::MAX);
                         evm_env.block_env.inner_mut().basefee = 0;
                     }
 
-                    let SimBlock { block_overrides, state_overrides, calls } = block;
-
+                    // Set prevrandao to zero for simulated blocks by default,
+                    // matching spec behavior where MixDigest is zero-initialized.
+                    // If user provides an override, it will be applied by apply_block_overrides.
                     evm_env.block_env.inner_mut().prevrandao = Some(B256::ZERO);
+                    // Unlike upstream, the parent difficulty is not carried over: BSC never
+                    // activates Paris, and the synthetic header keeps the requested difficulty.
 
                     if let Some(block_overrides) = block_overrides {
-                        if block_overrides.gas_limit.is_some_and(|limit|
-                            limit > evm_env.block_env.gas_limit() && limit > this.call_gas_limit())
-                        {
+                        // ensure we don't allow uncapped gas limit per block
+                        if block_overrides.gas_limit.is_some_and(|limit| {
+                            limit > evm_env.block_env.gas_limit() && limit > this.call_gas_limit()
+                        }) {
                             return Err(EthApiError::other(EthSimulateError::GasLimitReached).into())
                         }
                         apply_block_overrides(
@@ -264,12 +292,18 @@ where
                             &mut db,
                             evm_env.block_env.inner_mut(),
                         );
+                        // Let chain-specific block environments observe the overrides
+                        // (no-op for the standard `BlockEnv`).
                         evm_env
                             .block_env
                             .apply_block_overrides_ext(&block_overrides)
                             .map_err(EthApiError::InvalidParams)?;
                     }
                     if let Some(ref state_overrides) = state_overrides {
+                        evm_env
+                            .block_env
+                            .apply_state_overrides_ext(state_overrides)
+                            .map_err(EthApiError::InvalidParams)?;
                         apply_state_overrides(state_overrides.clone(), &mut db)
                             .map_err(Eth::Error::from_eth_err)?;
                     }
@@ -279,35 +313,7 @@ where
                     evm_env.block_env.disabled_cas20 =
                         code_overridden_addresses(state_overrides.as_ref());
 
-                    let block_gas_limit = evm_env.block_env.gas_limit();
                     let chain_id = evm_env.cfg_env.chain_id;
-
-                    let default_gas_limit = {
-                        let total_specified_gas =
-                            calls.iter().filter_map(|tx| tx.as_ref().gas_limit()).sum::<u64>();
-                        let txs_without_gas_limit =
-                            calls.iter().filter(|tx| tx.as_ref().gas_limit().is_none()).count();
-
-                        if total_specified_gas > block_gas_limit {
-                            return Err(EthApiError::Other(Box::new(
-                                EthSimulateError::BlockGasLimitExceeded,
-                            ))
-                            .into())
-                        }
-
-                        if txs_without_gas_limit > 0 {
-                            let gas_per_tx = (block_gas_limit - total_specified_gas) /
-                                txs_without_gas_limit as u64;
-                            let call_gas_limit = this.call_gas_limit();
-                            if call_gas_limit > 0 {
-                                gas_per_tx.min(call_gas_limit)
-                            } else {
-                                gas_per_tx
-                            }
-                        } else {
-                            0
-                        }
-                    };
 
                     let ctx = this
                         .evm_config()
@@ -322,6 +328,8 @@ where
                     };
 
                     let (result, results) = if trace_transfers {
+                        // prepare inspector to capture transfer inside the evm so they are recorded
+                        // and included in logs
                         let inspector = TransferInspector::new(false).with_logs(true);
                         let evm = this
                             .evm_config()
@@ -338,9 +346,11 @@ where
 
                         simulate::execute_transactions(
                             builder,
+                            &state_provider,
                             calls,
-                            default_gas_limit,
+                            &mut remaining_call_gas_limit,
                             chain_id,
+                            this.compute_state_root_for_eth_simulate(),
                             this.converter(),
                         )
                         .map_err(map_err)?
@@ -358,18 +368,22 @@ where
 
                         simulate::execute_transactions(
                             builder,
+                            &state_provider,
                             calls,
-                            default_gas_limit,
+                            &mut remaining_call_gas_limit,
                             chain_id,
+                            this.compute_state_root_for_eth_simulate(),
                             this.converter(),
                         )
                         .map_err(map_err)?
                     };
 
-                    parent = result.block.clone_sealed_header();
-
-                    prev_block_number = parent.number();
-                    prev_timestamp = parent.timestamp();
+                    let simulated_header = result.block.clone_sealed_header();
+                    db.override_block_hashes(BTreeMap::from([(
+                        simulated_header.number(),
+                        simulated_header.hash(),
+                    )]));
+                    parent = simulated_header;
 
                     let block = simulate::build_simulated_block::<Eth::Error, _>(
                         result.block,
@@ -385,6 +399,7 @@ where
             })
             .await
     }
+
     async fn many(
         &self,
         bundles: Vec<Bundle<TransactionRequest>>,

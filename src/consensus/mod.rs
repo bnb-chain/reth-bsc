@@ -1,5 +1,5 @@
 use alloy_consensus::constants::ETH_TO_WEI;
-use alloy_primitives::{Address, B256, address};
+use alloy_primitives::{address, Address, B256};
 use reth_provider::ProviderError;
 
 pub const SYSTEM_ADDRESS: Address = address!("0xfffffffffffffffffffffffffffffffffffffffe");

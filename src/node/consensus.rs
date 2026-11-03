@@ -3,8 +3,7 @@ use crate::{
     consensus::{
         eip4844::should_recalculate_excess_blob_gas,
         parlia::{
-            provider::EnhancedDbSnapshotProvider, util::calculate_millisecond_timestamp,
-            vote_pool,
+            provider::EnhancedDbSnapshotProvider, util::calculate_millisecond_timestamp, vote_pool,
             BscForkChoiceRule, HeaderForForkchoice, Parlia,
         },
         ParliaConsensusErr,
@@ -32,8 +31,11 @@ use reth::{
 use reth_chainspec::EthChainSpec;
 use reth_engine_primitives::ConsensusEngineHandle;
 use reth_ethereum_primitives::Receipt;
-use reth_primitives_traits::{receipt::gas_spent_by_transactions, GotExpected};
-use reth_primitives_traits::constants::{GAS_LIMIT_BOUND_DIVISOR, MINIMUM_GAS_LIMIT};
+use reth_primitives_traits::{
+    constants::{GAS_LIMIT_BOUND_DIVISOR, MINIMUM_GAS_LIMIT},
+    receipt::gas_spent_by_transactions,
+    GotExpected,
+};
 use reth_provider::{BlockNumReader, CanonStateSubscriptions, HeaderProvider};
 use std::sync::Arc;
 
@@ -70,6 +72,11 @@ where
                 ctx.provider().subscribe_to_canonical_state(),
                 crate::metrics::BscBlockchainMetrics::default(),
             ),
+        );
+
+        ctx.task_executor().spawn_critical_task(
+            "bsc-finalized-turn-metrics",
+            super::reorg_metrics::run_finalized(ctx.provider().clone()),
         );
 
         Ok(Arc::new(BscConsensus::new(ctx.chain_spec())))
@@ -110,12 +117,12 @@ fn validate_bsc_gas_limit_against_parent<ChainSpec: BscHardforks>(
     }
 
     let diff = parent.gas_limit.abs_diff(header.gas_limit);
-    let bound_divisor = if chain_spec.is_lorentz_active_at_timestamp(header.number, header.timestamp)
-    {
-        GAS_LIMIT_BOUND_DIVISOR
-    } else {
-        GAS_LIMIT_BOUND_DIVISOR_BEFORE_LORENTZ
-    };
+    let bound_divisor =
+        if chain_spec.is_lorentz_active_at_timestamp(header.number, header.timestamp) {
+            GAS_LIMIT_BOUND_DIVISOR
+        } else {
+            GAS_LIMIT_BOUND_DIVISOR_BEFORE_LORENTZ
+        };
     let limit = parent.gas_limit / bound_divisor;
 
     if diff >= limit || header.gas_limit < MINIMUM_GAS_LIMIT {
@@ -191,8 +198,8 @@ impl<ChainSpec: EthChainSpec + BscHardforks + 'static> HeaderValidator<Header>
             header.header().timestamp,
         ) {
             if let Some(blob_params) = self.chain_spec.blob_params_at_timestamp(header.timestamp) {
-                if self.chain_spec.is_mendel_active_at_timestamp(header.number, header.timestamp)
-                    && !should_recalculate_excess_blob_gas(
+                if self.chain_spec.is_mendel_active_at_timestamp(header.number, header.timestamp) &&
+                    !should_recalculate_excess_blob_gas(
                         &*self.chain_spec,
                         header.number,
                         header.timestamp,
@@ -245,7 +252,8 @@ impl<ChainSpec: EthChainSpec<Header = Header> + BscHardforks + 'static> Consensu
         &self,
         block: &SealedBlock<BscBlock>,
     ) -> Result<(), ConsensusError> {
-        // tracing::debug!("Validating block pre-execution, block_number: {:?}", block.header().number);
+        // tracing::debug!("Validating block pre-execution, block_number: {:?}",
+        // block.header().number);
         self.parlia.validate_block_pre_execution(block)?;
         Ok(())
     }
@@ -260,6 +268,7 @@ impl<ChainSpec: EthChainSpec<Header = Header> + BscHardforks + 'static> FullCons
         block: &RecoveredBlock<BscBlock>,
         result: &BlockExecutionResult<Receipt>,
         _receipt_root_bloom: Option<ReceiptRootBloom>,
+        _block_access_list_hash: Option<alloy_primitives::B256>,
     ) -> Result<(), ConsensusError> {
         let receipts = &result.receipts;
         let chain_spec = &self.chain_spec;
@@ -311,18 +320,22 @@ impl<ChainSpec: EthChainSpec<Header = Header> + BscHardforks + 'static> FullCons
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consensus::parlia::{
-        provider::SnapshotProvider, vote_pool, Snapshot, VoteAddress, VoteData, VoteEnvelope,
-        VoteSignature,
+    use crate::{
+        consensus::parlia::{
+            provider::SnapshotProvider, vote_pool, Snapshot, VoteAddress, VoteData, VoteEnvelope,
+            VoteSignature,
+        },
+        hardforks::bsc::BscHardfork,
     };
-    use crate::hardforks::bsc::BscHardfork;
     use alloy_consensus::Header;
     use alloy_primitives::{Address, B256};
     use reth_chainspec::{ChainInfo, ChainSpecBuilder, ForkCondition};
     use reth_engine_primitives::BeaconEngineMessage;
     use reth_provider::{BlockHashReader, BlockNumReader, HeaderProvider};
-    use std::collections::HashMap;
-    use std::sync::{Arc, RwLock};
+    use std::{
+        collections::HashMap,
+        sync::{Arc, RwLock},
+    };
     use tokio::sync::mpsc;
 
     #[derive(Clone, Default)]
@@ -367,7 +380,10 @@ mod tests {
             Ok(None)
         }
 
-        fn header_by_number(&self, _num: u64) -> reth_provider::ProviderResult<Option<Self::Header>> {
+        fn header_by_number(
+            &self,
+            _num: u64,
+        ) -> reth_provider::ProviderResult<Option<Self::Header>> {
             Ok(None)
         }
 
@@ -381,7 +397,8 @@ mod tests {
         fn sealed_header(
             &self,
             _number: u64,
-        ) -> reth_provider::ProviderResult<Option<reth_primitives_traits::SealedHeader<Self::Header>>> {
+        ) -> reth_provider::ProviderResult<Option<reth_primitives_traits::SealedHeader<Self::Header>>>
+        {
             Ok(None)
         }
 
@@ -389,7 +406,8 @@ mod tests {
             &self,
             _range: impl core::ops::RangeBounds<u64>,
             _predicate: impl FnMut(&reth_primitives_traits::SealedHeader<Self::Header>) -> bool,
-        ) -> reth_provider::ProviderResult<Vec<reth_primitives_traits::SealedHeader<Self::Header>>> {
+        ) -> reth_provider::ProviderResult<Vec<reth_primitives_traits::SealedHeader<Self::Header>>>
+        {
             Ok(Vec::new())
         }
     }
@@ -413,9 +431,7 @@ mod tests {
 
     fn test_chain_spec_with_lorentz(fork_condition: ForkCondition) -> BscChainSpec {
         BscChainSpec::from(
-            ChainSpecBuilder::mainnet()
-                .with_fork(BscHardfork::Lorentz, fork_condition)
-                .build(),
+            ChainSpecBuilder::mainnet().with_fork(BscHardfork::Lorentz, fork_condition).build(),
         )
     }
 
@@ -438,7 +454,9 @@ mod tests {
             gas_used: 0,
             ..Default::default()
         };
-        assert!(validate_bsc_gas_limit_against_parent(&over_capacity, &parent, &chain_spec).is_err());
+        assert!(
+            validate_bsc_gas_limit_against_parent(&over_capacity, &parent, &chain_spec).is_err()
+        );
 
         let gas_used_over_limit = Header {
             number: LONDON_ACTIVE_BLOCK + 1,
@@ -542,31 +560,19 @@ mod tests {
                 .build(),
         ));
 
-        let (tx, _rx) =
-            mpsc::unbounded_channel::<BeaconEngineMessage<BscPayloadTypes>>();
-        let engine = BscForkChoiceEngine::new(
-            TestProvider,
-            ConsensusEngineHandle::new(tx),
-            chain_spec,
-        );
+        let (tx, _rx) = mpsc::unbounded_channel::<BeaconEngineMessage<BscPayloadTypes>>();
+        let engine =
+            BscForkChoiceEngine::new(TestProvider, ConsensusEngineHandle::new(tx), chain_spec);
 
         let parent = Header { number: 9, timestamp: 1, ..Default::default() };
         let parent_hash = parent.hash_slow();
 
-        let head = Header {
-            number: 10,
-            timestamp: 2,
-            parent_hash,
-            ..Default::default()
-        };
+        let head = Header { number: 10, timestamp: 2, parent_hash, ..Default::default() };
         let head_hash = head.hash_slow();
 
         let fallback_hash = B256::from([7u8; 32]);
-        let validators = vec![
-            Address::from([1u8; 20]),
-            Address::from([2u8; 20]),
-            Address::from([3u8; 20]),
-        ];
+        let validators =
+            vec![Address::from([1u8; 20]), Address::from([2u8; 20]), Address::from([3u8; 20])];
 
         let mut snap = Snapshot::new(validators.clone(), head.number, head_hash, 200, None);
         snap.vote_data = VoteData {
@@ -633,29 +639,18 @@ mod tests {
         ));
 
         let (tx, _rx) = mpsc::unbounded_channel::<BeaconEngineMessage<BscPayloadTypes>>();
-        let engine = BscForkChoiceEngine::new(
-            TestProvider,
-            ConsensusEngineHandle::new(tx),
-            chain_spec,
-        );
+        let engine =
+            BscForkChoiceEngine::new(TestProvider, ConsensusEngineHandle::new(tx), chain_spec);
 
         let parent = Header { number: 9, timestamp: 1, ..Default::default() };
         let parent_hash = parent.hash_slow();
 
-        let head = Header {
-            number: 10,
-            timestamp: 2,
-            parent_hash,
-            ..Default::default()
-        };
+        let head = Header { number: 10, timestamp: 2, parent_hash, ..Default::default() };
         let head_hash = head.hash_slow();
 
         let fallback_hash = B256::from([7u8; 32]);
-        let validators = vec![
-            Address::from([1u8; 20]),
-            Address::from([2u8; 20]),
-            Address::from([3u8; 20]),
-        ];
+        let validators =
+            vec![Address::from([1u8; 20]), Address::from([2u8; 20]), Address::from([3u8; 20])];
         let mut snap = Snapshot::new(validators.clone(), head.number, head_hash, 200, None);
         snap.vote_data = VoteData {
             source_number: 7,
@@ -710,29 +705,18 @@ mod tests {
         ));
 
         let (tx, _rx) = mpsc::unbounded_channel::<BeaconEngineMessage<BscPayloadTypes>>();
-        let engine = BscForkChoiceEngine::new(
-            TestProvider,
-            ConsensusEngineHandle::new(tx),
-            chain_spec,
-        );
+        let engine =
+            BscForkChoiceEngine::new(TestProvider, ConsensusEngineHandle::new(tx), chain_spec);
 
         let parent = Header { number: 9, timestamp: 1, ..Default::default() };
         let parent_hash = parent.hash_slow();
 
-        let head = Header {
-            number: 10,
-            timestamp: 2,
-            parent_hash,
-            ..Default::default()
-        };
+        let head = Header { number: 10, timestamp: 2, parent_hash, ..Default::default() };
         let head_hash = head.hash_slow();
 
         let fallback_hash = B256::from([7u8; 32]);
-        let validators = vec![
-            Address::from([1u8; 20]),
-            Address::from([2u8; 20]),
-            Address::from([3u8; 20]),
-        ];
+        let validators =
+            vec![Address::from([1u8; 20]), Address::from([2u8; 20]), Address::from([3u8; 20])];
         let mut snap = Snapshot::new(validators.clone(), head.number, head_hash, 200, None);
         snap.vote_data = VoteData {
             source_number: 7,
@@ -793,29 +777,18 @@ mod tests {
         ));
 
         let (tx, _rx) = mpsc::unbounded_channel::<BeaconEngineMessage<BscPayloadTypes>>();
-        let engine = BscForkChoiceEngine::new(
-            TestProvider,
-            ConsensusEngineHandle::new(tx),
-            chain_spec,
-        );
+        let engine =
+            BscForkChoiceEngine::new(TestProvider, ConsensusEngineHandle::new(tx), chain_spec);
 
         let parent = Header { number: 9, timestamp: 1, ..Default::default() };
         let parent_hash = parent.hash_slow();
 
-        let head = Header {
-            number: 10,
-            timestamp: 2,
-            parent_hash,
-            ..Default::default()
-        };
+        let head = Header { number: 10, timestamp: 2, parent_hash, ..Default::default() };
         let head_hash = head.hash_slow();
 
         let fallback_hash = B256::from([7u8; 32]);
-        let validators = vec![
-            Address::from([1u8; 20]),
-            Address::from([2u8; 20]),
-            Address::from([3u8; 20]),
-        ];
+        let validators =
+            vec![Address::from([1u8; 20]), Address::from([2u8; 20]), Address::from([3u8; 20])];
         let mut snap = Snapshot::new(validators.clone(), head.number, head_hash, 200, None);
         snap.vote_data = VoteData {
             source_number: 7,
@@ -878,22 +851,16 @@ mod tests {
         ));
 
         let (tx, _rx) = mpsc::unbounded_channel::<BeaconEngineMessage<BscPayloadTypes>>();
-        let engine = BscForkChoiceEngine::new(
-            TestProvider,
-            ConsensusEngineHandle::new(tx),
-            chain_spec,
-        );
+        let engine =
+            BscForkChoiceEngine::new(TestProvider, ConsensusEngineHandle::new(tx), chain_spec);
 
         // Head is at 12
         let head = Header { number: 12, timestamp: 2, ..Default::default() };
         let head_hash = head.hash_slow();
 
         let fallback_hash = B256::from([7u8; 32]);
-        let validators = vec![
-            Address::from([1u8; 20]),
-            Address::from([2u8; 20]),
-            Address::from([3u8; 20]),
-        ];
+        let validators =
+            vec![Address::from([1u8; 20]), Address::from([2u8; 20]), Address::from([3u8; 20])];
         let mut snap = Snapshot::new(validators, head.number, head_hash, 200, None);
         snap.vote_data = VoteData {
             source_number: 7,
@@ -935,7 +902,11 @@ mod tests {
 
         // Finality should NOT advance because head.number - 1 (11) != current_justified_number (9)
         let finalized = engine.get_finalized_number_and_hash(&head).unwrap();
-        assert_eq!(finalized, (7, fallback_hash), "should not advance when head is not direct child");
+        assert_eq!(
+            finalized,
+            (7, fallback_hash),
+            "should not advance when head is not direct child"
+        );
 
         vote_pool::drain();
     }
@@ -953,29 +924,19 @@ mod tests {
         ));
 
         let (tx, _rx) = mpsc::unbounded_channel::<BeaconEngineMessage<BscPayloadTypes>>();
-        let engine = BscForkChoiceEngine::new(
-            TestProvider,
-            ConsensusEngineHandle::new(tx),
-            chain_spec,
-        );
+        let engine =
+            BscForkChoiceEngine::new(TestProvider, ConsensusEngineHandle::new(tx), chain_spec);
 
         let parent = Header { number: 99, timestamp: 1, ..Default::default() };
         let parent_hash = parent.hash_slow();
 
-        let head = Header {
-            number: 100,
-            timestamp: 2,
-            parent_hash,
-            ..Default::default()
-        };
+        let head = Header { number: 100, timestamp: 2, parent_hash, ..Default::default() };
         let head_hash = head.hash_slow();
 
         let fallback_hash = B256::from([7u8; 32]);
 
         // 21 validators
-        let validators: Vec<Address> = (1..=21)
-            .map(|i| Address::from([i as u8; 20]))
-            .collect();
+        let validators: Vec<Address> = (1..=21).map(|i| Address::from([i as u8; 20])).collect();
 
         let mut snap = Snapshot::new(validators.clone(), head.number, head_hash, 200, None);
         snap.vote_data = VoteData {
@@ -1064,18 +1025,18 @@ mod tests {
         // EIP-7685 commitment, so it must be accepted without content validation.
         let tagged = b256!("0000000000000000000000016c98eb21139f6e12db5b78a4aed4d8eba147fb7b");
         assert!(consensus
-            .validate_block_post_execution(&block_with(Some(tagged)), &result, None)
+            .validate_block_post_execution(&block_with(Some(tagged)), &result, None, None)
             .is_ok());
 
         // Locally built blocks keep the empty requests hash, sha256("").
         let empty = b256!("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
         assert!(consensus
-            .validate_block_post_execution(&block_with(Some(empty)), &result, None)
+            .validate_block_post_execution(&block_with(Some(empty)), &result, None, None)
             .is_ok());
 
         // The field itself is still mandatory after Prague.
         assert!(matches!(
-            consensus.validate_block_post_execution(&block_with(None), &result, None),
+            consensus.validate_block_post_execution(&block_with(None), &result, None, None),
             Err(ConsensusError::RequestsHashMissing)
         ));
     }
@@ -1182,6 +1143,8 @@ pub struct BscForkChoiceEngine<P> {
     >,
     /// Finality metrics
     finality_metrics: BscFinalityMetrics,
+    /// Consensus metrics (forkchoice failures)
+    consensus_metrics: crate::metrics::BscConsensusMetrics,
 }
 
 impl<P> BscForkChoiceEngine<P>
@@ -1203,6 +1166,7 @@ where
                 schnellru::ByLength::new(128),
             ))),
             finality_metrics: BscFinalityMetrics::default(),
+            consensus_metrics: crate::metrics::BscConsensusMetrics::default(),
         }
     }
 
@@ -1222,7 +1186,8 @@ where
     ///
     /// # Returns
     ///
-    /// Returns `Ok(())` if the fork choice was successfully updated, or an error if the update failed.
+    /// Returns `Ok(())` if the fork choice was successfully updated, or an error if the update
+    /// failed.
     pub async fn update_forkchoice(
         &self,
         incoming_header: &Header,
@@ -1243,7 +1208,15 @@ where
             .ok_or(ParliaConsensusErr::HeadHashNotFound)?;
 
         // Determine if we need to reorg using fork choice rules
-        let need_reorg = self.is_need_reorg(incoming_header, &current_head).await?;
+        let need_reorg = match self.is_need_reorg(incoming_header, &current_head).await {
+            Ok(need_reorg) => need_reorg,
+            Err(e) => {
+                // Bailing here means no forkchoice update is sent and the canonical head stays
+                // put, so this must be visible in metrics — callers only log it at warn.
+                self.consensus_metrics.forkchoice_update_errors_total.increment(1);
+                return Err(e);
+            }
+        };
 
         // A preferred head may simply extend the current chain by several blocks.
         // Reorg metrics are recorded from the engine's canonical notifications instead.
@@ -1279,11 +1252,7 @@ where
             "Fork choice updated"
         );
 
-        let outcome = match self
-            .engine_handle
-            .fork_choice_updated(state, None)
-            .await
-        {
+        let outcome = match self.engine_handle.fork_choice_updated(state, None).await {
             Ok(response) => match response.payload_status.status {
                 PayloadStatusEnum::Invalid { validation_error } => {
                     Err(ParliaConsensusErr::ForkChoiceUpdateError(validation_error))
@@ -1404,14 +1373,13 @@ where
                     // incorrect thresholds during epoch validator-set transitions.
                     if let Some(parent_snap) = sp.snapshot_by_hash(&header.parent_hash) {
                         if !parent_snap.validators.is_empty() {
-                            let quorum =
-                                usize::div_ceil(parent_snap.validators.len() * 2, 3);
+                            let quorum = usize::div_ceil(parent_snap.validators.len() * 2, 3);
                             let eligible_votes =
                                 vote_pool::fetch_vote_by_block_hash(header.hash_slow())
                                     .into_iter()
                                     .filter(|vote| {
-                                        vote.data.source_number == current_justified_number
-                                            && vote.data.target_number == header.number
+                                        vote.data.source_number == current_justified_number &&
+                                            vote.data.target_number == header.number
                                     })
                                     .count();
                             if eligible_votes >= quorum {
@@ -1453,37 +1421,84 @@ where
     ) -> Result<(Option<alloy_primitives::U256>, Option<alloy_primitives::U256>), ParliaConsensusErr>
     {
         let current_td = self.header_td(engine, current.number, current.hash_slow()).await?;
-        let incoming_td = match self.header_td(engine, incoming.number, incoming.hash_slow()).await
+
+        // The incoming block is typically not imported yet, so its own hash won't resolve a TD
+        // (`header_td` would return `Ok(None)`). Derive it from the parent's TD plus the incoming
+        // block's own difficulty — the parent is the current head or an already-imported ancestor,
+        // so its TD is computable. Fall back to a direct lookup only if the parent is unknown.
+        let incoming_td = match self
+            .header_td(engine, incoming.number.saturating_sub(1), incoming.parent_hash)
+            .await?
         {
-            Ok(td) => td,
-            Err(e) => {
-                tracing::debug!(target: "bsc::forkchoice", "Failed to get incoming header TD: {:?}, try to query parent block TD", e);
-                match self.header_td(engine, incoming.number - 1, incoming.parent_hash).await? {
-                    Some(td) => Some(td + incoming.difficulty),
-                    None => {
-                        tracing::debug!(target: "bsc::forkchoice", "Failed to get parent header TD, return None");
-                        None
-                    }
-                }
+            Some(parent_td) => Some(parent_td + incoming.difficulty),
+            None => {
+                tracing::debug!(
+                    target: "bsc::forkchoice",
+                    incoming_number = incoming.number,
+                    "parent TD unknown; trying incoming block's own TD"
+                );
+                self.header_td(engine, incoming.number, incoming.hash_slow()).await?
             }
         };
         Ok((incoming_td, current_td))
     }
 
-    /// Gets the total difficulty for a specific header.
+    /// Gets the total difficulty for a specific header, keyed by hash.
     ///
-    /// This private method queries the TD from the engine and caches it for future use.
+    /// Reads the TD from the provider's `header_td` hook, which serves the persisted per-block TD
+    /// from the `HeaderTerminalDifficulties` table (written in `save_blocks`) and extends it over
+    /// any not-yet-persisted in-memory tail. Results are cached here for the sequential queries
+    /// fork choice makes.
     async fn header_td(
         &self,
-        engine: &ConsensusEngineHandle<BscPayloadTypes>,
-        number: u64,
+        _engine: &ConsensusEngineHandle<BscPayloadTypes>,
+        _number: u64,
         hash: B256,
     ) -> Result<Option<alloy_primitives::U256>, ParliaConsensusErr> {
         if let Some(td) = self.header_td_cache.write().get(&hash) {
             return Ok(*td);
         }
-        let td = engine.query_td(number, hash).await.map_err(ParliaConsensusErr::internal)?;
-        self.header_td_cache.write().insert(hash, td);
+        let td = self.provider.header_td(&hash).map_err(ParliaConsensusErr::internal)?;
+        // Only memoize resolved values. Caching a `None` makes a transient failure permanent for
+        // that hash: TD becomes resolvable once the block is persisted or a common ancestor
+        // appears, but a cached `None` means we would never ask again.
+        if td.is_some() {
+            self.header_td_cache.write().insert(hash, td);
+        }
         Ok(td)
+    }
+
+    /// Precomputes and caches total difficulties for a freshly fork-recovered
+    /// chain so fork choice can resolve them.
+    ///
+    /// Fork blocks live in the engine tree, not on the canonical chain, so the
+    /// provider-backed [`Self::header_td`] (which only sees canonical + DB
+    /// blocks) returns `None` for them — the cause of `Unknown total difficulty`
+    /// FCU failures after v2.5 dropped the block-carried TD (`NewBlockMessage.td`).
+    /// Given the imported fork headers oldest→newest, the base TD is taken from
+    /// the fork point (the parent of the oldest block, which is canonical and
+    /// therefore resolvable) and each block's TD is `parent_td + difficulty`,
+    /// inserted by hash into the shared cache that `header_td` consults first.
+    ///
+    /// Best-effort: a no-op if `headers` is empty or the fork point's TD is not
+    /// resolvable, in which case the existing `header_td` fallback still applies.
+    pub(crate) fn prime_fork_chain_tds<'a, I>(&self, headers: I) -> Result<(), ParliaConsensusErr>
+    where
+        I: IntoIterator<Item = &'a Header>,
+    {
+        let mut iter = headers.into_iter().peekable();
+        let Some(first) = iter.peek() else { return Ok(()) };
+        let Some(mut running) =
+            self.provider.header_td(&first.parent_hash).map_err(ParliaConsensusErr::internal)?
+        else {
+            // Fork point TD unknown; leave resolution to the header_td fallback.
+            return Ok(());
+        };
+        let mut cache = self.header_td_cache.write();
+        for h in iter {
+            running += h.difficulty;
+            cache.insert(h.hash_slow(), Some(running));
+        }
+        Ok(())
     }
 }

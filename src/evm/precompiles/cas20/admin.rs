@@ -150,9 +150,9 @@ impl Token<'_, '_> {
 
     pub(crate) fn revoke_role(&mut self, role: B256, account: Address) -> R<()> {
         self.ensure_role_mutable(role)?;
-        if role == ROLE_DEFAULT_ADMIN
-            && self.s().has_role(role, account)
-            && self.s().admin_count() == U256::from(1)
+        if role == ROLE_DEFAULT_ADMIN &&
+            self.s().has_role(role, account) &&
+            self.s().admin_count() == U256::from(1)
         {
             return Err(rev(ERR_LAST_ADMIN_CANNOT_RENOUNCE, &[]));
         }
@@ -170,9 +170,9 @@ impl Token<'_, '_> {
         if confirmation != caller {
             return Err(rev(ERR_AC_BAD_CONFIRMATION, &[]));
         }
-        if role == ROLE_DEFAULT_ADMIN
-            && self.s().has_role(role, caller)
-            && self.s().admin_count() == U256::from(1)
+        if role == ROLE_DEFAULT_ADMIN &&
+            self.s().has_role(role, caller) &&
+            self.s().admin_count() == U256::from(1)
         {
             return Err(rev(ERR_LAST_ADMIN_CANNOT_RENOUNCE, &[]));
         }

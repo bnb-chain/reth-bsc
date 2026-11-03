@@ -12,30 +12,24 @@ use crate::{
 use alloy_consensus::{BlockBody, Header};
 use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{Address, B256, U128, U256};
-use reth_primitives_traits::SealedBlock;
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
 use futures::{future::Either, stream::FuturesUnordered, StreamExt};
 use parking_lot::RwLock;
-use reth::consensus::HeaderValidator;
-use reth::network::cache::LruCache;
+use reth::{consensus::HeaderValidator, network::cache::LruCache};
 use reth_engine_primitives::{ConsensusEngineHandle, EngineTypes};
 use reth_engine_tree::engine::EngineApiRequest;
 use reth_eth_wire::{BlockHashNumber, GetBlockHeaders, NewBlock};
 use reth_eth_wire_types::broadcast::NewBlockHashes;
 use reth_network::{
     import::{BlockImportError, BlockImportEvent, BlockImportOutcome, BlockValidation},
-    message::{NewBlockMessage, PeerMessage},
-};
-use reth_network::{
-    message::{BlockRequest, PeerResponse},
+    message::{BlockRequest, NewBlockMessage, PeerMessage, PeerResponse},
     FetchClient, NetworkHandle,
 };
 use reth_network_api::{PeerId, Peers, ReputationChangeKind};
 use reth_node_ethereum::EthEngineTypes;
 use reth_payload_builder_primitives::Events;
 use reth_payload_primitives::{BuiltPayload, PayloadTypes};
-use reth_primitives_traits::NodePrimitives;
-use reth_primitives_traits::{AlloyBlockHeader, Block};
+use reth_primitives_traits::{AlloyBlockHeader, Block, NodePrimitives, SealedBlock};
 use reth_provider::{
     BlockHashReader, BlockNumReader, BlockReaderIdExt, HeaderProvider, ReceiptProvider,
 };
@@ -283,7 +277,7 @@ where
 
             let sealed_block = block.block.0.block.clone().seal_unchecked(block_hash);
             let header = sealed_block.header().clone();
-            let payload = BscPayloadTypes::block_to_payload(sealed_block);
+            let payload = BscPayloadTypes::block_to_payload(sealed_block, None);
             match engine.new_payload(payload).await {
                 Ok(payload_status) => match payload_status.status {
                     PayloadStatusEnum::Valid => {
@@ -462,10 +456,7 @@ where
         // delay; for a block we just produced locally the sample would actually reflect local
         // mining/finalize latency and would pollute cross-region diagnosis. Mirrors geth-bsc,
         // which only sets `RecvNewBlockTime` inside `handleBlockBroadcast` (the network path).
-        crate::consensus::parlia::block_stats::register_self_mined_block(
-            block_hash,
-            &block.header,
-        );
+        crate::consensus::parlia::block_stats::register_self_mined_block(block_hash, &block.header);
 
         // send to EVN peers first
         if let Err(e) = self.transfer_to_evn_peers(block_msg.clone()) {
@@ -558,7 +549,8 @@ where
     }
 
     /// Broadcast a selected BEP-675 BidBlock, then validate it through `new_payload`.
-    /// `Valid` advances fork choice; `Invalid` revokes the builder unless validation failed locally.
+    /// `Valid` advances fork choice; `Invalid` revokes the builder unless validation failed
+    /// locally.
     fn on_new_bid_block(
         &mut self,
         sealed: SealedBlock<BscBlock>,
@@ -585,8 +577,7 @@ where
             block: sealed.clone_block(),
             td: U128::from(new_td.to::<u128>()),
         });
-        let block_msg =
-            NewBlockMessage { hash: block_hash, block: Arc::new(new_block), td: Some(new_td) };
+        let block_msg = NewBlockMessage { hash: block_hash, block: Arc::new(new_block) };
 
         // Cache + register stats like a self-mined block so range responses and vote-delay metrics
         // work for it (mirrors `on_new_mined_block`).
@@ -599,17 +590,18 @@ where
         if let Err(e) = self.transfer_to_evn_peers(block_msg.clone()) {
             tracing::warn!(target: "bsc::block_import", number = block_number, hash = %block_hash, error = %e, "BidBlock: failed to transfer to EVN peers");
         }
-        let _ = self.to_network.send(BlockImportEvent::Announcement(
-            BlockValidation::ValidHeader { block: block_msg.clone() },
-        ));
-        let _ = self.to_network.send(BlockImportEvent::Announcement(
-            BlockValidation::ValidBlock { block: block_msg },
-        ));
+        let _ =
+            self.to_network.send(BlockImportEvent::Announcement(BlockValidation::ValidHeader {
+                block: block_msg.clone(),
+            }));
+        let _ = self
+            .to_network
+            .send(BlockImportEvent::Announcement(BlockValidation::ValidBlock { block: block_msg }));
 
         // 2. Verify after broadcast.
         let engine = self.engine.clone();
         let forkchoice_engine = self.forkchoice_engine.clone();
-        let mut payload = BscPayloadTypes::block_to_payload(sealed);
+        let mut payload = BscPayloadTypes::block_to_payload(sealed, None);
         let local_fault = Arc::new(AtomicBool::new(false));
         payload.local_fault = Some(local_fault.clone());
         tokio::spawn(async move {
@@ -1037,10 +1029,11 @@ where
         }
         let header_ref = &block.block.0.block.header;
         let coinbase = header_ref.beneficiary;
-        // If from proxied validators or validator address, target EVN peers with ETH NewBlockHashes.
-        if cfg.proxyed_validators.contains(&coinbase)
-            || (mining_config.enabled
-                && mining_config.validator_address.unwrap_or_default() == coinbase)
+        // If from proxied validators or validator address, target EVN peers with ETH
+        // NewBlockHashes.
+        if cfg.proxyed_validators.contains(&coinbase) ||
+            (mining_config.enabled &&
+                mining_config.validator_address.unwrap_or_default() == coinbase)
         {
             if let Some(net) = crate::shared::get_network_handle() {
                 let peers = crate::node::network::evn_peers::snapshot();
@@ -1220,11 +1213,11 @@ where
                     }
                 }
 
-                // TODO: add queued blocks removal later, to avoid milicious block import, and trigger next download.
-                // now, it must wait backfilling to download the correct block.
-                // the verified header can drop the peer later, it cannot transfer a bad header now.
-                // if let Some(block_hash) = outcome.block.hash {
-                //     this.queued_blocks.remove(&block_hash);
+                // TODO: add queued blocks removal later, to avoid milicious block import, and
+                // trigger next download. now, it must wait backfilling to download
+                // the correct block. the verified header can drop the peer later,
+                // it cannot transfer a bad header now. if let Some(block_hash) =
+                // outcome.block.hash {     this.queued_blocks.remove(&block_hash);
                 // }
 
                 if let Err(e) = this.to_network.send(BlockImportEvent::Outcome(outcome)) {
@@ -1294,15 +1287,21 @@ mod tests {
         let (_, from_hashes) = mpsc::unbounded_channel();
         let (to_network, mut events) = mpsc::unbounded_channel();
         let mut service = ImportService::new(
-            MockProvider::new(), spec, ConsensusEngineHandle::new(to_engine),
-            from_network, from_builder, from_bid, from_hashes, to_network,
+            MockProvider::new(),
+            spec,
+            ConsensusEngineHandle::new(to_engine),
+            from_network,
+            from_builder,
+            from_bid,
+            from_hashes,
+            to_network,
         );
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         let block = blob_block(now);
         let hash = block.header.hash_slow();
         let good = NewBlockMessage {
             hash,
-            td: Some(U256::ZERO),
             block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO })),
         };
         let mut missing = good.clone();
@@ -1432,7 +1431,11 @@ mod tests {
         let block = BscBlock {
             header: Header { number, ..Default::default() },
             body: BscBlockBody {
-                inner: BlockBody { transactions: Vec::new(), ommers: Vec::new(), withdrawals: None },
+                inner: BlockBody {
+                    transactions: Vec::new(),
+                    ommers: Vec::new(),
+                    withdrawals: None,
+                },
                 sidecars: None,
             },
         };
@@ -1661,7 +1664,10 @@ mod tests {
             let _ = fixture.handle.poll_outcome(&mut cx);
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         }
-        assert!(pm.is_allowed(builder), "builder must not be revoked for a sufficient average gas price");
+        assert!(
+            pm.is_allowed(builder),
+            "builder must not be revoked for a sufficient average gas price"
+        );
     }
 
     #[derive(Clone)]
@@ -2020,7 +2026,7 @@ mod tests {
         };
         let new_block = BscNewBlock(NewBlock { block, td: U128::from(1) });
         let hash = new_block.0.block.header.hash_slow();
-        NewBlockMessage { hash, block: Arc::new(new_block), td: Some(U256::from(1)) }
+        NewBlockMessage { hash, block: Arc::new(new_block) }
     }
 
     /// Helper function to handle engine messages with specified payload statuses
@@ -2057,9 +2063,6 @@ mod tests {
                         ))))
                         .unwrap();
                     }
-                    BeaconEngineMessage::QueryTd { hash, tx, .. } => {
-                        tx.send(Ok(provider.td_by_hash.get(&hash).copied())).unwrap();
-                    }
                     _ => {}
                 }
             }
@@ -2077,6 +2080,9 @@ mod tests {
         let mut provider = MockProvider::new();
         let header = Header { number: local_tip, ..Default::default() };
         provider.insert(header, U256::from(1));
+        // "TD unknown" is produced by the provider, not the engine: since v2.5 fork choice resolves
+        // TD through `header_td`, and this mock holds only `local_tip`, both the incoming fork
+        // block's hash and its parent's answer `Ok(None)` — the case that used to wedge the head.
         let chain_spec =
             Arc::new(crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet()));
 
@@ -2134,6 +2140,114 @@ mod tests {
         timeout: tokio::time::Duration,
     ) -> Option<ForkchoiceState> {
         tokio::time::timeout(timeout, fcu_rx.recv()).await.ok().flatten()
+    }
+
+    /// Like [`spawn_service_with_tip`], but the provider cannot resolve the incoming block's TD.
+    /// Since v2.5 fork choice reads TD via `header_td` rather than asking the engine, "TD unknown"
+    /// is what a real node sees for a fork whose divergence point lies below the persisted tip.
+    async fn spawn_service_with_td_unknown(
+        local_tip: u64,
+    ) -> (ImportHandle, mpsc::UnboundedReceiver<ForkchoiceState>, mpsc::UnboundedReceiver<()>) {
+        let mut provider = MockProvider::new();
+        let header = Header { number: local_tip, ..Default::default() };
+        provider.insert(header, U256::from(1));
+        let chain_spec =
+            Arc::new(crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet()));
+
+        let (to_engine, mut from_engine) = mpsc::unbounded_channel();
+        let engine_handle = ConsensusEngineHandle::new(to_engine);
+
+        let (fcu_tx, fcu_rx) = mpsc::unbounded_channel();
+        let (np_tx, np_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(message) = from_engine.recv().await {
+                match message {
+                    BeaconEngineMessage::NewPayload { payload: _, tx } => {
+                        let _ = np_tx.send(());
+                        let _ = tx.send(Ok(PayloadStatus::new(PayloadStatusEnum::Valid, None)));
+                    }
+                    BeaconEngineMessage::ForkchoiceUpdated { state, payload_attrs: _, tx } => {
+                        let _ = fcu_tx.send(state);
+                        let _ = tx.send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::new(
+                            PayloadStatusEnum::Valid,
+                            None,
+                        ))));
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let (to_import, from_network) = mpsc::unbounded_channel();
+        let (_to_import_mined, from_builder) = mpsc::unbounded_channel();
+        let (_to_import_bid, from_bid_block) = mpsc::unbounded_channel();
+        let (to_hashes, from_hashes) = mpsc::unbounded_channel();
+        let (to_network, import_outcome) = mpsc::unbounded_channel();
+        let handle = ImportHandle::new(to_import, to_hashes, import_outcome);
+
+        let service = ImportService::new(
+            provider,
+            chain_spec,
+            engine_handle,
+            from_network,
+            from_builder,
+            from_bid_block,
+            from_hashes,
+            to_network,
+        );
+        tokio::spawn(Box::pin(async move {
+            service.await.unwrap();
+        }));
+
+        (handle, fcu_rx, np_rx)
+    }
+
+    /// Builds a test block message at `number`.
+    fn create_test_block_at(number: u64) -> NewBlockMessage<BscNewBlock> {
+        let block = BscBlock {
+            header: Header { number, ..Default::default() },
+            body: BscBlockBody {
+                inner: BlockBody {
+                    transactions: Vec::new(),
+                    ommers: Vec::new(),
+                    withdrawals: None,
+                },
+                sidecars: None,
+            },
+        };
+        let new_block = BscNewBlock(NewBlock { block, td: U128::from(1) });
+        let hash = new_block.0.block.header.hash_slow();
+        NewBlockMessage { hash, block: Arc::new(new_block) }
+    }
+
+    /// Regression test for the unrecoverable-fork wedge (QA net, 2026-07-28).
+    ///
+    /// A node whose persisted tip sits on a branch below the fork point cannot resolve the TD of
+    /// any incoming majority-chain block. Before the fix, `head_choice_with_td` turned that into
+    /// `UnknownTotalDifficulty`, `update_forkchoice` returned `Err`, and **no forkchoice update
+    /// was ever sent** — freezing the canonical head, which kept the DB on the losing branch,
+    /// which kept the TD unresolvable. Four validators stayed dead for an entire run while
+    /// reporting themselves healthy.
+    ///
+    /// This asserts the loop-level property the unit tests cannot: an FCU is actually emitted,
+    /// and it targets the incoming block rather than the stale local tip.
+    #[tokio::test]
+    async fn unresolvable_td_still_emits_forkchoice_update() {
+        // Local tip 63 and incoming 653 mirror the production incident.
+        let (handle, mut fcu_rx, _np_rx) = spawn_service_with_td_unknown(63).await;
+
+        let block = create_test_block_at(653);
+        let expected_head = block.hash;
+        handle.send_block(block, PeerId::random()).unwrap();
+
+        let state = recv_fcu_within(&mut fcu_rx, tokio::time::Duration::from_secs(5)).await.expect(
+            "a forkchoice update must be emitted even when the incoming TD is unresolvable; \
+                 without one the canonical head can never advance and the node is wedged",
+        );
+        assert_eq!(
+            state.head_block_hash, expected_head,
+            "the forkchoice update must target the incoming block, not the stale local tip"
+        );
     }
 
     #[tokio::test]
@@ -2236,7 +2350,8 @@ mod tests {
 
     #[test]
     fn planner_announces_when_peer_best_number_unknown() {
-        // best_number is None before any head info has been observed; announce is the right default.
+        // best_number is None before any head info has been observed; announce is the right
+        // default.
         let peers = vec![peer(1, None)];
         let result = plan_head_announcements(100, &peers);
         assert_eq!(result.len(), 1);

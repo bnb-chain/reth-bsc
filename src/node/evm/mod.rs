@@ -24,7 +24,8 @@ use reth::{
 use reth_evm::{precompiles::PrecompilesMap, Database, Evm, EvmEnv};
 use revm::{
     context::{
-        result::{EVMError, HaltReason, ResultAndState}, CfgEnv,
+        result::{EVMError, HaltReason, ResultAndState},
+        CfgEnv,
     },
     Context, ExecuteEvm, InspectEvm, Inspector, SystemCallEvm,
 };

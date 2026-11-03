@@ -1,8 +1,11 @@
 //! Record reorganizations only after the engine changes the canonical chain.
 
 use crate::{metrics::BscBlockchainMetrics, BscPrimitives};
-use alloy_consensus::BlockHeader;
-use reth_provider::{CanonStateNotification, CanonStateNotifications};
+use alloy_consensus::{BlockHeader, Header};
+use alloy_primitives::U256;
+use reth_provider::{
+    BlockIdReader, CanonStateNotification, CanonStateNotifications, HeaderProvider,
+};
 use tokio::sync::broadcast::error::RecvError;
 
 pub(super) async fn run(
@@ -13,6 +16,8 @@ pub(super) async fn run(
         match notifications.recv().await {
             Ok(notification) => record(&metrics, &notification),
             Err(RecvError::Lagged(skipped)) => {
+                metrics::counter!("bsc.chain_diagnostics.missed_notifications_total")
+                    .increment(skipped);
                 // Do not silently discard gaps via canonical_state_stream(). The engine
                 // counters remain authoritative if this lightweight observer falls behind.
                 tracing::warn!(
@@ -27,6 +32,21 @@ pub(super) async fn run(
 }
 
 fn record(metrics: &BscBlockchainMetrics, notification: &CanonStateNotification<BscPrimitives>) {
+    match notification {
+        CanonStateNotification::Commit { new } => {
+            for block in new.blocks().values() {
+                record_header(block.header(), "canonical_added");
+            }
+        }
+        CanonStateNotification::Reorg { old, new } => {
+            for block in old.blocks().values() {
+                record_header(block.header(), "canonical_removed");
+            }
+            for block in new.blocks().values() {
+                record_header(block.header(), "canonical_added");
+            }
+        }
+    }
     let CanonStateNotification::Reorg { old, new } = notification else { return };
     if old.is_empty() {
         return;
@@ -54,6 +74,92 @@ fn record(metrics: &BscBlockchainMetrics, notification: &CanonStateNotification<
         added_blocks = new.len(),
         "Reorg detected and metrics recorded"
     );
+}
+
+/// Difficulty is assigned and verified by Parlia (2 in-turn, 1 out-of-turn).
+/// Keep unknown values visible rather than silently treating every other value as out-of-turn.
+fn turn(header: &Header) -> &'static str {
+    if header.difficulty == U256::from(2) {
+        "inturn"
+    } else if header.difficulty == U256::from(1) {
+        "outofturn"
+    } else {
+        "unknown"
+    }
+}
+
+fn record_header(header: &Header, stage: &'static str) {
+    metrics::counter!("bsc.chain_diagnostics.blocks_total", "stage" => stage, "turn" => turn(header)).increment(1);
+    metrics::histogram!("bsc.chain_diagnostics.gas_used", "stage" => stage, "turn" => turn(header))
+        .record(header.gas_used as f64);
+}
+
+/// Counts newly finalized headers after an explicit startup baseline. Reads are chunked and
+/// performed off the async executor. Errors leave the cursor at the last successfully read block.
+pub(super) async fn run_finalized<P>(provider: P)
+where
+    P: HeaderProvider<Header = Header> + BlockIdReader + Clone + Send + Sync + 'static,
+{
+    let mut cursor = None;
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    loop {
+        interval.tick().await;
+        let provider = provider.clone();
+        match tokio::task::spawn_blocking(move || scan_finalized(&provider, cursor)).await {
+            Ok(next) => cursor = next,
+            Err(_) => {
+                metrics::counter!("bsc.chain_diagnostics.finalized_scan_errors_total").increment(1);
+            }
+        }
+    }
+}
+
+fn scan_finalized<P>(provider: &P, cursor: Option<u64>) -> Option<u64>
+where
+    P: HeaderProvider<Header = Header> + BlockIdReader,
+{
+    let tip = match provider.finalized_block_number() {
+        Ok(Some(tip)) => tip,
+        Ok(None) => return cursor,
+        Err(_) => {
+            metrics::counter!("bsc.chain_diagnostics.finalized_scan_errors_total").increment(1);
+            return cursor;
+        }
+    };
+    advance_finalized(tip, cursor, |number| provider.header_by_number(number).ok().flatten())
+}
+
+fn advance_finalized(
+    tip: u64,
+    mut cursor: Option<u64>,
+    mut header: impl FnMut(u64) -> Option<Header>,
+) -> Option<u64> {
+    let Some(last) = cursor else {
+        metrics::gauge!("bsc.chain_diagnostics.finalized_baseline_height").set(tip as f64);
+        metrics::gauge!("bsc.chain_diagnostics.finalized_scanned_height").set(tip as f64);
+        return Some(tip);
+    };
+    if tip < last {
+        metrics::counter!("bsc.chain_diagnostics.finality_regressions_total").increment(1);
+        return cursor;
+    }
+    for number in last.saturating_add(1)..=tip.min(last.saturating_add(256)) {
+        match header(number) {
+            Some(header) if header.number == number => {
+                record_header(&header, "finalized");
+                cursor = Some(number);
+            }
+            _ => {
+                metrics::counter!("bsc.chain_diagnostics.finalized_scan_errors_total").increment(1);
+                break;
+            }
+        }
+    }
+    metrics::gauge!("bsc.chain_diagnostics.finalized_scanned_height")
+        .set(cursor.unwrap_or(last) as f64);
+    metrics::gauge!("bsc.chain_diagnostics.finalized_backlog_blocks")
+        .set(tip.saturating_sub(cursor.unwrap_or(last)) as f64);
+    cursor
 }
 
 #[cfg(test)]
@@ -191,5 +297,75 @@ mod tests {
         // Both the lag error and the retained reorg must be handled before Closed.
         run(receiver, metrics).await;
         assert_metrics(&handle, 1, 3, 2, 2);
+    }
+    #[test]
+    fn finalized_cursor_baselines_retries_gaps_and_does_not_double_count() {
+        let baseline = advance_finalized(100, None, |_| panic!("must not scan history"));
+        assert_eq!(baseline, Some(100));
+        let mut reads = Vec::new();
+        let cursor = advance_finalized(104, baseline, |number| {
+            reads.push(number);
+            (number != 103).then_some(Header {
+                number,
+                difficulty: U256::from(1),
+                ..Default::default()
+            })
+        });
+        assert_eq!(cursor, Some(102));
+        assert_eq!(reads, [101, 102, 103]);
+        reads.clear();
+        let cursor = advance_finalized(104, cursor, |number| {
+            reads.push(number);
+            Some(Header { number, difficulty: U256::from(2), ..Default::default() })
+        });
+        assert_eq!(reads, [103, 104]);
+        assert_eq!(cursor, Some(104));
+        assert_eq!(advance_finalized(104, cursor, |_| panic!("already counted")), cursor);
+        assert_eq!(advance_finalized(103, cursor, |_| panic!("regressed")), cursor);
+        assert_eq!(
+            advance_finalized(1000, cursor, |number| Some(Header { number, ..Default::default() })),
+            Some(360)
+        );
+    }
+
+    #[test]
+    fn turn_is_independent_of_gas_limit_and_unknown_is_not_outofturn() {
+        for gas_limit in [100_000_000, 120_000_000, 500_000_000] {
+            for (difficulty, expected) in
+                [(1, "outofturn"), (2, "inturn"), (0, "unknown"), (3, "unknown")]
+            {
+                assert_eq!(
+                    turn(&Header {
+                        difficulty: U256::from(difficulty),
+                        gas_limit,
+                        ..Default::default()
+                    }),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_additions_and_removals_are_separate_from_finalized_counts() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let metrics = BscBlockchainMetrics::new_with_labels(Vec::<metrics::Label>::new());
+            record(&metrics, &CanonStateNotification::Commit { new: chain(101, 2, 0) });
+            record(
+                &metrics,
+                &CanonStateNotification::Reorg { old: chain(101, 2, 0), new: chain(101, 3, 1) },
+            );
+        });
+        let rendered = handle.render();
+        for (stage, expected) in [("canonical_added", 5), ("canonical_removed", 2)] {
+            let line = rendered
+                .lines()
+                .find(|l| l.starts_with("bsc_chain_diagnostics_blocks_total{") && l.contains(stage))
+                .unwrap();
+            assert_eq!(line.split_whitespace().last().unwrap().parse::<u64>().unwrap(), expected);
+        }
+        assert!(!rendered.contains("stage=\"finalized\""));
     }
 }

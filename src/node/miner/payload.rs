@@ -1,54 +1,68 @@
-use crate::chainspec::BscChainSpec;
-use crate::consensus::eip4844::{calc_blob_fee, is_blob_eligible_block, BLOB_TX_BLOB_GAS_PER_BLOB};
-use crate::consensus::parlia::util::calculate_millisecond_timestamp;
-use crate::consensus::parlia::{Parlia, Snapshot};
-use crate::evm::blacklist::{self, BlacklistedAddressError};
-use crate::hardforks::BscHardforks;
-use crate::metrics::{BscConsensusMetrics, BscMinerMetrics};
-use crate::node::engine::{BscBuiltPayload, BuildKind};
-use crate::node::evm::config::{
-    BscEvmConfig, BscExecutionMode, BscNextBlockEnvAttributes, ValidatorCacheSink,
+use super::build_diagnostics::{AttemptKind, AttemptObservation};
+use crate::{
+    chainspec::BscChainSpec,
+    consensus::{
+        eip4844::{calc_blob_fee, is_blob_eligible_block, BLOB_TX_BLOB_GAS_PER_BLOB},
+        parlia::{util::calculate_millisecond_timestamp, Parlia, Snapshot},
+    },
+    evm::blacklist::{self, BlacklistedAddressError},
+    hardforks::BscHardforks,
+    metrics::{BscConsensusMetrics, BscMinerMetrics},
+    node::{
+        engine::{BscBuiltPayload, BuildKind},
+        evm::{
+            config::{
+                BscEvmConfig, BscExecutionMode, BscNextBlockEnvAttributes, ValidatorCacheSink,
+            },
+            pre_execution::{EpochValidators, TURN_LENGTH_CACHE, VALIDATOR_CACHE},
+        },
+        miner::{
+            bid_block::{validate_bid_block_blob_kzg, BidBlockTask},
+            bid_simulator::BidSimulator,
+            block_mev_info::{set_block_mev_info, BlockMevInfoVersion},
+            bsc_miner::{MiningContext, SubmitContext},
+            util::{epoch_validators_for_next_block, finalize_new_header},
+        },
+        primitives::{BscBlobTransactionSidecar, BscBlock},
+    },
 };
-use crate::node::evm::pre_execution::{EpochValidators, TURN_LENGTH_CACHE, VALIDATOR_CACHE};
-use crate::node::miner::bid_block::{validate_bid_block_blob_kzg, BidBlockTask};
-use crate::node::miner::bid_simulator::BidSimulator;
-use crate::node::miner::block_mev_info::{set_block_mev_info, BlockMevInfoVersion};
-use crate::node::miner::bsc_miner::{MiningContext, SubmitContext};
-use crate::node::miner::util::{epoch_validators_for_next_block, finalize_new_header};
-use crate::node::primitives::{BscBlobTransactionSidecar, BscBlock};
 use alloy_consensus::{BlockHeader, Transaction};
 use alloy_eips::eip4895::Withdrawals;
-use alloy_evm::block::BlockExecutor;
 use alloy_evm::Evm;
 use alloy_primitives::U256;
-use reth_node_ethereum::engine::EthPayloadAttributes;
-use reth::transaction_pool::error::Eip4844PoolTransactionError;
-use reth::transaction_pool::error::InvalidPoolTransactionError;
-use reth::transaction_pool::BestTransactionsAttributes;
-use reth::transaction_pool::{PoolTransaction, TransactionPool};
+use once_cell::sync::Lazy;
+use reth::transaction_pool::{
+    error::{Eip4844PoolTransactionError, InvalidPoolTransactionError},
+    BestTransactionsAttributes, PoolTransaction, TransactionPool,
+};
 use reth_basic_payload_builder::PayloadConfig;
 use reth_chainspec::EthChainSpec;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_ethereum_primitives::TransactionSigned;
-use reth_evm::block::{BlockExecutionError, BlockValidationError};
-use reth_evm::execute::BlockBuilder;
-use reth_evm::execute::BlockBuilderOutcome;
-use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
+use reth_evm::{
+    block::{BlockExecutionError, BlockValidationError},
+    execute::{BlockBuilder, BlockBuilderOutcome},
+    ConfigureEvm, NextBlockEnvAttributes,
+};
 use reth_execution_types::BlockExecutionOutput;
+use reth_node_ethereum::engine::EthPayloadAttributes;
 use reth_payload_primitives::{BuiltPayload, BuiltPayloadExecutedBlock, PayloadBuilderError};
-use either::Either;
-use once_cell::sync::Lazy;
-use revm::context_interface::Block as EvmBlock;
-use reth_primitives_traits::{HeaderTy, SealedHeader};
-use reth_primitives_traits::transaction::error::InvalidTransactionError;
-use reth_primitives_traits::{Block, BlockBody, RecoveredBlock, SealedBlock, SignerRecoverable};
+use reth_primitives_traits::{
+    transaction::error::InvalidTransactionError, Block, BlockBody, HeaderTy, RecoveredBlock,
+    SealedBlock, SealedHeader, SignerRecoverable,
+};
 use reth_provider::StateProviderFactory;
-use reth_revm::cached::CachedReads;
-use reth_revm::cancelled::ManualCancel;
-use reth_revm::{database::StateProviderDatabase, db::State};
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use reth_revm::{
+    cached::CachedReads, cancelled::ManualCancel, database::StateProviderDatabase, db::State,
+};
+use revm::context_interface::Block as EvmBlock;
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, trace, warn};
 
@@ -75,12 +89,20 @@ pub const DELAY_LEFT_OVER: u64 = 120;
 /// - `BSC_MINING_ROOT_RESERVE_DEPTH_LOW`  (default 15) — at/below this, default reserve.
 /// - `BSC_MINING_ROOT_RESERVE_DEPTH_HIGH` (default 40) — at/above this, max reserve.
 /// - `BSC_MINING_ROOT_RESERVE_MAX_MS`     (default 280) — reserve used at/above DEPTH_HIGH.
+/// - `BSC_MINING_ROOT_RESERVE_MIN_MS`     (default [`DELAY_LEFT_OVER`]) — reserve at/below
+///   DEPTH_LOW, i.e. the floor for normal-depth blocks. Lower it to hand the extra milliseconds
+///   back to transaction filling: measured `trie_root_duration_ms` on the 3-validator benchmark
+///   cluster was p50 8ms / p99 28ms / max 46ms, so the 120ms default is ~2.6x the worst observed
+///   case there and 80% of blocks under load ended pinned at the build deadline. Clamped to `[10,
+///   reserve_max_ms]`. Raising throughput this way trades against empty-block rate — A/B it and
+///   watch `bsc_miner_effective_reserve_ms` alongside the empty/diff-1 rates.
 #[derive(Debug, Clone, Copy)]
 struct AdaptiveReserveConfig {
     enabled: bool,
     depth_low: u64,
     depth_high: u64,
     reserve_max_ms: u64,
+    reserve_min_ms: u64,
 }
 
 /// Default knob values (also the fallback when the corresponding env var is unset/unparseable).
@@ -97,11 +119,16 @@ fn adaptive_reserve_config() -> &'static AdaptiveReserveConfig {
         let enabled = std::env::var("BSC_MINING_ADAPTIVE_RESERVE")
             .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
             .unwrap_or(true);
+        let reserve_max_ms = env_u64("BSC_MINING_ROOT_RESERVE_MAX_MS", ROOT_RESERVE_MAX_MS);
         let cfg = AdaptiveReserveConfig {
             enabled,
             depth_low: env_u64("BSC_MINING_ROOT_RESERVE_DEPTH_LOW", ROOT_RESERVE_DEPTH_LOW),
             depth_high: env_u64("BSC_MINING_ROOT_RESERVE_DEPTH_HIGH", ROOT_RESERVE_DEPTH_HIGH),
-            reserve_max_ms: env_u64("BSC_MINING_ROOT_RESERVE_MAX_MS", ROOT_RESERVE_MAX_MS),
+            reserve_max_ms,
+            // Clamped so a typo cannot leave no room for the state root, nor invert the
+            // interpolation range.
+            reserve_min_ms: env_u64("BSC_MINING_ROOT_RESERVE_MIN_MS", DELAY_LEFT_OVER)
+                .clamp(10, reserve_max_ms),
         };
         tracing::info!(target: "bsc::miner", ?cfg, "Adaptive root-reserve config");
         cfg
@@ -115,15 +142,21 @@ fn adaptive_reserve_config() -> &'static AdaptiveReserveConfig {
 /// unaffected. The branch ordering also makes a misconfigured `depth_high <= depth_low` behave as a
 /// step at `depth_low` (no divide-by-zero).
 pub fn effective_delay_left_over(overlay_depth: u64) -> u64 {
-    let cfg = adaptive_reserve_config();
+    reserve_for_depth(adaptive_reserve_config(), overlay_depth)
+}
+
+/// Pure interpolation, split out from [`effective_delay_left_over`] so it is testable without
+/// the process-wide env cache.
+fn reserve_for_depth(cfg: &AdaptiveReserveConfig, overlay_depth: u64) -> u64 {
     if !cfg.enabled || overlay_depth <= cfg.depth_low {
-        DELAY_LEFT_OVER
+        cfg.reserve_min_ms
     } else if overlay_depth >= cfg.depth_high {
         cfg.reserve_max_ms
     } else {
         let span = (cfg.depth_high - cfg.depth_low) as f64;
         let t = (overlay_depth - cfg.depth_low) as f64 / span;
-        DELAY_LEFT_OVER + (t * cfg.reserve_max_ms.saturating_sub(DELAY_LEFT_OVER) as f64) as u64
+        cfg.reserve_min_ms +
+            (t * cfg.reserve_max_ms.saturating_sub(cfg.reserve_min_ms) as f64) as u64
     }
 }
 
@@ -231,8 +264,8 @@ fn estimated_uplift_meets_threshold(
     comparison_base: U256,
     threshold_bps: u64,
 ) -> bool {
-    estimated_new_fees.saturating_mul(U256::from(10_000_u64))
-        >= comparison_base.saturating_mul(U256::from(threshold_bps))
+    estimated_new_fees.saturating_mul(U256::from(10_000_u64)) >=
+        comparison_base.saturating_mul(U256::from(threshold_bps))
 }
 
 fn estimated_uplift_bps(current_payload_fees: U256, estimated_new_fees: U256) -> u64 {
@@ -265,10 +298,10 @@ fn local_rebuild_action(input: LocalRebuildPolicyInput) -> LocalRebuildAction {
     let final_shot_max_remaining =
         duration_mul_ratio(input.last_build_duration, FINAL_SHOT_WINDOW_NUM, FINAL_SHOT_WINDOW_DEN);
 
-    if !input.final_shot_used
-        && input.remaining_duration >= final_shot_min_remaining
-        && input.remaining_duration <= final_shot_max_remaining
-        && estimated_uplift_meets_threshold(
+    if !input.final_shot_used &&
+        input.remaining_duration >= final_shot_min_remaining &&
+        input.remaining_duration <= final_shot_max_remaining &&
+        estimated_uplift_meets_threshold(
             input.estimated_new_fees,
             comparison_base,
             FINAL_SHOT_UPLIFT_BPS,
@@ -381,7 +414,7 @@ pub struct BscBuildArguments<Attributes> {
     /// single-consumer channels) and `BscBuildArguments` derives `Clone`. First retry
     /// takes the handle; subsequent retries see `None` and fall back to the legacy
     /// synchronous state-root path (still correct, just slower for that retry).
-    pub trie_handle: Arc<Mutex<Option<reth_engine_tree::tree::multiproof::StateRootHandle>>>,
+    pub trie_handle: Arc<Mutex<Option<reth_engine_tree::tree::StateRootHandle>>>,
     /// Absolute wall-clock deadline (epoch ms) for bounding the sparse-trie
     /// `state_root()` wait in `finish`; threaded into the build ctx. Set from
     /// `MiningContext::end_mining_timestamp_ms` minus [`STATE_ROOT_WAIT_MARGIN_MS`].
@@ -473,7 +506,8 @@ where
             state_root_deadline_ms,
             milli_remainder,
         } = args;
-        let PayloadConfig { parent_header, attributes, payload_id: _ } = config;
+        let PayloadConfig { parent_header, attributes, payload_id: _, parent_block_info: _ } =
+            config;
 
         let parent_hash = parent_header.hash_slow();
 
@@ -483,11 +517,11 @@ where
         // so ~half of in-turn blocks paid the full sync root cost. A fresh handle per attempt
         // is cheap now that R1 shares the engine's proof pools. `None` keeps the sync path
         // (sparse-trie disabled or no spawner registered).
-        let trie_handle: Arc<Mutex<Option<reth_engine_tree::tree::multiproof::StateRootHandle>>> = {
+        let trie_handle: Arc<Mutex<Option<reth_engine_tree::tree::StateRootHandle>>> = {
             let use_sparse_trie = crate::node::miner::config::get_global_mining_config()
                 .is_some_and(|c| c.use_sparse_trie_state_root);
             Arc::new(Mutex::new(if use_sparse_trie {
-                crate::shared::spawn_sparse_trie_state_root(parent_hash, parent_header.state_root())
+                crate::shared::spawn_sparse_trie_state_root(parent_header.as_ref().clone())
             } else {
                 None
             }))
@@ -515,8 +549,8 @@ where
         // the empty build, which has no trie_handle so it jumps straight to the take()) steals the
         // root this attempt deposited, forcing this attempt onto the slow synchronous
         // `state_root_with_updates`. A per-attempt sink makes write→read strictly intra-attempt, so
-        // the full build reads back its OWN precomputed root. When the sparse-trie path is not active
-        // (flag off), this Mutex stays `None` and the builder falls through to
+        // the full build reads back its OWN precomputed root. When the sparse-trie path is not
+        // active (flag off), this Mutex stays `None` and the builder falls through to
         // `state_root_with_updates`.
         let state_root_precomputed_sink: Arc<
             Mutex<Option<(alloy_primitives::B256, reth_trie_common::updates::TrieUpdates)>>,
@@ -553,28 +587,22 @@ where
             .builder_for_next_block(&mut db, &parent_header, next_env_attributes)
             .map_err(PayloadBuilderError::other)?;
 
-        // Wire the sparse-trie state-root task's state hook onto the executor.
+        // Wire the sparse-trie state-root task's update hook onto the building EVM's DB.
         //
-        // The `state_hook` is installed here; it stays installed through `executor.finish()`
-        // (BSC post-execution system txs — slash / reward / validator-set updates) inside
-        // `finish`. When `finish` consumes the executor, the hook is dropped, which sends
-        // `FinishedStateUpdates` to the sparse-trie task. `state_root()` is then called on
-        // the handle from inside `finish` (via `ctx.trie_handle`) — calling it any earlier
-        // would deadlock the task.
-        //
-        // NOTE: This must be set before `apply_pre_execution_changes()` so any state
-        // access/touches performed during pre-execution are also captured by the hook.
-        if let Some(handle_guard) = trie_handle.lock().unwrap().as_ref() {
-            // Install hook from the handle while it's still in the Arc<Mutex<>>.
-            // The handle itself is forwarded via `attrs.trie_handle` (Arc clone) into
-            // `ctx.trie_handle` so `finish` can take it after executor.finish() and
-            // call `state_root()`.
-            builder.executor_mut().set_state_hook(Some(Box::new(handle_guard.state_hook())));
+        // v2.4.1 installs the hook at the DB level (it fires on every state commit) rather than
+        // on the executor. It must be set before `apply_pre_execution_changes()` so pre-execution
+        // state touches are also streamed to the task. The hook is dropped when the executor is
+        // consumed in `finish`, which signals end-of-updates; `finish` then reads the precomputed
+        // root from the same handle (forwarded via `ctx.trie_handle`) with a slot-deadline-bounded
+        // wait. When no spawner is registered, `trie_handle` is empty and this is a no-op
+        // (synchronous fallback).
+        if let Some(handle) = trie_handle.lock().unwrap().as_mut() {
+            builder.evm_mut().db_mut().set_state_hook(Some(Box::new(handle.take_execution_hook())));
             debug!(
                 target: "payload_builder",
                 trace_id,
                 parent_hash = ?parent_hash,
-                "Installed sparse-trie state_hook on executor (handle in ctx for post-exec collection)"
+                "Installed sparse-trie state-root hook on building EVM DB"
             );
         }
 
@@ -647,8 +675,8 @@ where
             }
 
             // filter out blacklisted transactions before executing.
-            if self.chain_spec.is_nano_active_at_block(parent_header.number + 1)
-                && blacklist::check_tx_basic_blacklist(pool_tx.sender(), pool_tx.to())
+            if self.chain_spec.is_nano_active_at_block(parent_header.number + 1) &&
+                blacklist::check_tx_basic_blacklist(pool_tx.sender(), pool_tx.to())
             {
                 debug!(
                     target: "payload_builder",
@@ -658,7 +686,7 @@ where
                 );
                 best_tx_list.mark_invalid(
                     &pool_tx,
-                    &InvalidPoolTransactionError::other(BlacklistedAddressError()),
+                    InvalidPoolTransactionError::other(BlacklistedAddressError()),
                 );
                 continue;
             }
@@ -676,7 +704,7 @@ where
                     min_gas_tip,
                     "Skipping underpriced transaction"
                 );
-                best_tx_list.mark_invalid(&pool_tx, &InvalidPoolTransactionError::Underpriced);
+                best_tx_list.mark_invalid(&pool_tx, InvalidPoolTransactionError::Underpriced);
                 continue;
             }
 
@@ -687,7 +715,7 @@ where
                 // continue
                 best_tx_list.mark_invalid(
                     &pool_tx,
-                    &InvalidPoolTransactionError::ExceedsGasLimit(
+                    InvalidPoolTransactionError::ExceedsGasLimit(
                         pool_tx.gas_limit(),
                         block_gas_limit,
                     ),
@@ -731,7 +759,7 @@ where
                     );
                     best_tx_list.mark_invalid(
                         &pool_tx,
-                        &InvalidPoolTransactionError::Eip4844(
+                        InvalidPoolTransactionError::Eip4844(
                             Eip4844PoolTransactionError::TooManyEip4844Blobs {
                                 have: block_blob_count + tx_blob_count,
                                 permitted: max_blob_count,
@@ -751,7 +779,7 @@ where
                     {
                         best_tx_list.mark_invalid(
                             &pool_tx,
-                            &InvalidPoolTransactionError::Eip4844(
+                            InvalidPoolTransactionError::Eip4844(
                                 Eip4844PoolTransactionError::TooManyEip4844Blobs {
                                     have: block_blob_count + tx_blob_count,
                                     permitted: max_blob_count,
@@ -763,7 +791,9 @@ where
                 }
 
                 let blob_sidecar_result = 'sidecar: {
-                    let Some(sidecar) = self.pool.get_blob(*tx.hash())
+                    let Some(sidecar) = self
+                        .pool
+                        .get_blob(*tx.hash())
                         .inspect_err(|error| {
                             warn!(
                                 target: "payload_builder",
@@ -799,7 +829,7 @@ where
                             "Skipping blob transaction due to invalid sidecar"
                         );
                         best_tx_list
-                            .mark_invalid(&pool_tx, &InvalidPoolTransactionError::Eip4844(error));
+                            .mark_invalid(&pool_tx, InvalidPoolTransactionError::Eip4844(error));
                         continue;
                     }
                 };
@@ -832,7 +862,7 @@ where
                         );
                         // best_tx_list.mark_invalid(
                         //     &pool_tx,
-                        //     &InvalidPoolTransactionError::Consensus(
+                        //     InvalidPoolTransactionError::Consensus(
                         //         InvalidTransactionError::NonceNotConsistent {
                         //             tx: tx.nonce(),
                         //             state: 0_u64, // TODO: get the nonce from the state later.
@@ -855,7 +885,7 @@ where
                         );
                         best_tx_list.mark_invalid(
                             &pool_tx,
-                            &InvalidPoolTransactionError::Consensus(
+                            InvalidPoolTransactionError::Consensus(
                                 InvalidTransactionError::TxTypeNotSupported,
                             ),
                         );
@@ -935,8 +965,13 @@ where
         // per-attempt sink (see `state_root_precomputed_sink` above). Kept bound to avoid an
         // unused-variable warning until the field is removed from BscBuildArguments.
         let _ = &state_root_precomputed;
-        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
-            builder.finish(&state_provider, None)?;
+        let BlockBuilderOutcome {
+            execution_result,
+            hashed_state,
+            trie_updates,
+            block,
+            block_access_list: _,
+        } = builder.finish(&state_provider, None)?;
 
         let mut sealed_block = Arc::new(block.sealed_block().clone());
 
@@ -1019,19 +1054,19 @@ where
         let requests = execution_result.requests.clone();
         let execution_outcome =
             BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
-        let executed: BuiltPayloadExecutedBlock<_> = BuiltPayloadExecutedBlock {
+        let executed_block = BuiltPayloadExecutedBlock {
             recovered_block: Arc::new(block),
             execution_output: Arc::new(execution_outcome),
-            hashed_state: Either::Left(Arc::new(hashed_state)),
-            trie_updates: Either::Left(Arc::new(trie_updates)),
+            hashed_state: Arc::new(hashed_state),
+            trie_updates: Arc::new(trie_updates),
         };
-        let executed_block = executed.into_executed_payload();
 
         // Read validator/turn-length data transported via sinks from the now-consumed builder.
         let pending_validators = validator_cache_sink.lock().unwrap().take();
         let pending_turn_length = turn_length_sink.lock().unwrap().take();
 
         let payload = BscBuiltPayload {
+            diagnostics: None,
             block: sealed_block.clone(),
             fees: total_fees,
             requests: Some(requests),
@@ -1064,7 +1099,8 @@ where
             state_root_deadline_ms: _,
             milli_remainder,
         } = args;
-        let PayloadConfig { parent_header, attributes, payload_id: _ } = config;
+        let PayloadConfig { parent_header, attributes, payload_id: _, parent_block_info: _ } =
+            config;
 
         let parent_hash = parent_header.hash_slow();
         let _ = parent_hash;
@@ -1122,7 +1158,8 @@ where
 
         // Total time spent executing pre-execution changes (no user txs for empty payloads).
         let exec_start = std::time::Instant::now();
-        // Everything before `exec_start` is treated as "prepare" time for this empty payload attempt.
+        // Everything before `exec_start` is treated as "prepare" time for this empty payload
+        // attempt.
         let prepare_duration = exec_start.duration_since(build_start);
         builder.apply_pre_execution_changes().map_err(|err| {
             warn!(
@@ -1148,8 +1185,13 @@ where
         // legacy `state_root_with_updates` cost is acceptable. The handle (if any)
         // stays in `trie_handle` and is dropped when the spawned task ends.
         let _ = (&state_root_precomputed, &trie_handle);
-        let BlockBuilderOutcome { execution_result, hashed_state, trie_updates, block } =
-            builder.finish(&state_provider, None)?;
+        let BlockBuilderOutcome {
+            execution_result,
+            hashed_state,
+            trie_updates,
+            block,
+            block_access_list: _,
+        } = builder.finish(&state_provider, None)?;
         let finalize_elapsed = finalize_start.elapsed();
 
         let sealed_block = Arc::new(block.sealed_block().clone());
@@ -1178,19 +1220,19 @@ where
         let requests = execution_result.requests.clone();
         let execution_outcome =
             BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
-        let executed: BuiltPayloadExecutedBlock<_> = BuiltPayloadExecutedBlock {
+        let executed_block = BuiltPayloadExecutedBlock {
             recovered_block: Arc::new(block),
             execution_output: Arc::new(execution_outcome),
-            hashed_state: Either::Left(Arc::new(hashed_state)),
-            trie_updates: Either::Left(Arc::new(trie_updates)),
+            hashed_state: Arc::new(hashed_state),
+            trie_updates: Arc::new(trie_updates),
         };
-        let executed_block = executed.into_executed_payload();
 
         // Read validator/turn-length data transported via sinks from the now-consumed builder.
         let pending_validators = validator_cache_sink.lock().unwrap().take();
         let pending_turn_length = turn_length_sink.lock().unwrap().take();
 
         let payload = BscBuiltPayload {
+            diagnostics: None,
             block: sealed_block.clone(),
             fees: total_fees,
             requests: Some(requests),
@@ -1416,7 +1458,15 @@ where
             {
                 let builder = self.builder.clone();
                 let build_args = self.build_args.clone();
-                self.join_handle.spawn(async move { builder.build_payload(build_args).await });
+                let cancel = build_args.cancel.clone();
+                let mut observation =
+                    AttemptObservation::new(AttemptKind::Speculative, self.mining_ctx.is_inturn);
+                self.join_handle.spawn(async move {
+                    observation.start();
+                    let mut result = builder.build_payload(build_args).await;
+                    observation.finish(result.as_mut().ok(), cancel.is_cancelled());
+                    result
+                });
             }
 
             tokio::select! {
@@ -1487,8 +1537,14 @@ where
 
                             let builder = self.builder.clone();
                             let build_args = self.build_args.clone();
+                            let cancel = build_args.cancel.clone();
+                            let kind = if self.retries == 1 { AttemptKind::Regular } else { AttemptKind::Rebuild };
+                            let mut observation = AttemptObservation::new(kind, self.mining_ctx.is_inturn);
                             self.join_handle.spawn(async move {
-                                builder.build_payload(build_args).await
+                                observation.start();
+                                let mut result = builder.build_payload(build_args).await;
+                                observation.finish(result.as_mut().ok(), cancel.is_cancelled());
+                                result
                             });
                         }
                         None => {
@@ -1962,7 +2018,15 @@ where
         if self.potential_payloads.is_empty() {
             let builder = self.builder.clone();
             let args = self.build_args.clone();
-            self.join_handle.spawn(async move { builder.build_empty_payload(args).await });
+            let cancel = args.cancel.clone();
+            let mut observation =
+                AttemptObservation::new(AttemptKind::Empty, self.mining_ctx.is_inturn);
+            self.join_handle.spawn(async move {
+                observation.start();
+                let mut result = builder.build_empty_payload(args).await;
+                observation.finish(result.as_mut().ok(), cancel.is_cancelled());
+                result
+            });
 
             // JoinSet::len() counts tasks whose results have not yet been collected via
             // join_next(), regardless of whether the task has already finished executing.
@@ -2126,8 +2190,8 @@ where
                         end_mining_timestamp_ms = self.mining_ctx.end_mining_timestamp_ms,
                         "No background payload candidate finished within wait slice"
                     );
-                    // Keep waiting in further slices until we hit the expected end timestamp (+grace)
-                    // or until all background tasks have completed.
+                    // Keep waiting in further slices until we hit the expected end timestamp
+                    // (+grace) or until all background tasks have completed.
                     continue;
                 }
                 WaitMore::Aborted => {
@@ -2310,12 +2374,13 @@ where
         )
     }
 
-    /// If a collected BidBlock candidate out-bids every local/legacy payload by fee, hand its sealed
-    /// block to the block-import service for broadcast-then-verify and return `true` (the local work
-    /// is then discarded, matching go-bsc's `commitWork` early-return after `enqueueBidBlockTask`).
+    /// If a collected BidBlock candidate out-bids every local/legacy payload by fee, hand its
+    /// sealed block to the block-import service for broadcast-then-verify and return `true`
+    /// (the local work is then discarded, matching go-bsc's `commitWork` early-return after
+    /// `enqueueBidBlockTask`).
     ///
-    /// Returns `false` when there is no candidate, it does not win, or the import sender is missing —
-    /// in which case the caller falls back to submitting the best local payload.
+    /// Returns `false` when there is no candidate, it does not win, or the import sender is missing
+    /// — in which case the caller falls back to submitting the best local payload.
     fn try_submit_winning_bid_block(&mut self) -> bool {
         let Some(bid) = self.bid_block_candidate.take() else { return false };
 
@@ -2395,15 +2460,18 @@ where
         }
 
         // Expensive blob KZG verification on the winning block, BEFORE broadcast (go-bsc
-        // `prepareBidBlockTask` → `validateBidBlockBlobTxs`). Cheap structural sidecar checks already
-        // ran at admission; under zero-simulate full re-execution is deferred to after broadcast, so
-        // this is the last gate that can stop a bad-blob block from being proposed. On failure revoke
-        // the builder and fall back to the local payload (go-bsc `bidBlockFallback`).
+        // `prepareBidBlockTask` → `validateBidBlockBlobTxs`). Cheap structural sidecar checks
+        // already ran at admission; under zero-simulate full re-execution is deferred to
+        // after broadcast, so this is the last gate that can stop a bad-blob block from
+        // being proposed. On failure revoke the builder and fall back to the local payload
+        // (go-bsc `bidBlockFallback`).
         let body = sealed.body();
         let blob_sidecars = body.sidecars.as_deref().unwrap_or(&[]);
-        if let Err(e) =
-            validate_bid_block_blob_kzg(&body.inner.transactions, blob_sidecars, bid.system_tx_start)
-        {
+        if let Err(e) = validate_bid_block_blob_kzg(
+            &body.inner.transactions,
+            blob_sidecars,
+            bid.system_tx_start,
+        ) {
             warn!(
                 target: "bsc::miner::payload",
                 trace_id = self.trace_id,
@@ -2696,8 +2764,13 @@ where
             }
         }
 
+        if let Some(diagnostics) = &best_payload.diagnostics {
+            diagnostics.selected();
+        }
         info!(
             target: "bsc::miner::payload",
+            attempt_id = best_payload.diagnostics.as_ref().map(|d| d.id),
+            attempt_kind = best_payload.diagnostics.as_ref().map(|d| d.kind),
             trace_id = self.trace_id,
             block_number = best_payload.block().header().number(),
             block_hash = %best_payload.block().hash(),
@@ -2885,37 +2958,89 @@ fn finalize_payload(
         }
     }
     payload.block = Arc::new(plain_block.seal_unchecked(final_hash));
-    payload.executed_block.recovered_block = Arc::new(RecoveredBlock::new_sealed(
-        payload.block.as_ref().clone(),
-        senders,
-    ));
+    payload.executed_block.recovered_block =
+        Arc::new(RecoveredBlock::new_sealed(payload.block.as_ref().clone(), senders));
 
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+
+    use super::{reserve_for_depth, AdaptiveReserveConfig, DELAY_LEFT_OVER};
+
+    fn cfg(min_ms: u64, max_ms: u64) -> AdaptiveReserveConfig {
+        AdaptiveReserveConfig {
+            enabled: true,
+            depth_low: 15,
+            depth_high: 40,
+            reserve_max_ms: max_ms,
+            reserve_min_ms: min_ms,
+        }
+    }
+
+    #[test]
+    fn reserve_floor_defaults_to_delay_left_over() {
+        let c = cfg(DELAY_LEFT_OVER, 280);
+        assert_eq!(reserve_for_depth(&c, 0), DELAY_LEFT_OVER);
+        assert_eq!(reserve_for_depth(&c, 15), DELAY_LEFT_OVER);
+        assert_eq!(reserve_for_depth(&c, 40), 280);
+    }
+
+    #[test]
+    fn lowering_the_floor_hands_the_slot_back_to_filling() {
+        // 80% of blocks under load on the benchmark cluster ended pinned at the build deadline
+        // with trie-root p99 at 28ms, so the floor is what caps transaction filling.
+        let c = cfg(60, 280);
+        assert_eq!(reserve_for_depth(&c, 0), 60);
+        assert_eq!(reserve_for_depth(&c, 15), 60);
+        // deep overlay still gets the full reserve — the safety behaviour is unchanged
+        assert_eq!(reserve_for_depth(&c, 40), 280);
+        assert_eq!(reserve_for_depth(&c, 100), 280);
+    }
+
+    #[test]
+    fn interpolation_spans_floor_to_max_and_stays_monotonic() {
+        let c = cfg(60, 280);
+        let mid = reserve_for_depth(&c, 27);
+        assert!(mid > 60 && mid < 280, "midpoint {mid} should sit between floor and max");
+        let mut prev = 0;
+        for d in 0..=45 {
+            let r = reserve_for_depth(&c, d);
+            assert!(r >= prev, "reserve must not decrease as overlay depth grows");
+            prev = r;
+        }
+    }
+
+    #[test]
+    fn disabled_adaptive_reserve_still_honours_the_floor() {
+        let mut c = cfg(60, 280);
+        c.enabled = false;
+        assert_eq!(reserve_for_depth(&c, 0), 60);
+        assert_eq!(reserve_for_depth(&c, 100), 60, "disabled must be a fixed reserve");
+    }
+
     use super::{
         bid_block_broadcast_delay, initial_out_of_turn_build_wait, local_rebuild_action,
         refresh_and_reseal_bid_block, send_bid_block_after_delay, validate_bsc_sidecar,
         LocalRebuildAction, LocalRebuildPolicyInput,
     };
-    use crate::chainspec::BscChainSpec;
-    use crate::consensus::parlia::Parlia;
-    use crate::consensus::parlia::Snapshot;
-    use crate::node::miner::bsc_miner::MiningContext;
-    use crate::node::primitives::BscBlock;
-    use alloy_consensus::BlobTransactionSidecar;
-    use alloy_consensus::Header;
-    use alloy_eips::eip4844::{Blob, Bytes48};
-    use alloy_eips::eip7594::{
-        BlobTransactionSidecarEip7594, BlobTransactionSidecarVariant, CELLS_PER_EXT_BLOB,
+    use crate::{
+        chainspec::BscChainSpec,
+        consensus::parlia::{Parlia, Snapshot},
+        node::{miner::bsc_miner::MiningContext, primitives::BscBlock},
+    };
+    use alloy_consensus::{BlobTransactionSidecar, Header};
+    use alloy_eips::{
+        eip4844::{Blob, Bytes48},
+        eip7594::{
+            BlobTransactionSidecarEip7594, BlobTransactionSidecarVariant, CELLS_PER_EXT_BLOB,
+        },
     };
     use alloy_primitives::{Address, B256, U256};
     use reth::transaction_pool::error::Eip4844PoolTransactionError;
     use reth_primitives_traits::{RecoveredBlock, SealedHeader};
-    use std::sync::Arc;
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
     /// A won BidBlock must not be released before its own header timestamp.
     ///
@@ -2974,8 +3099,8 @@ mod tests {
         assert_eq!(rx.try_recv().expect("BidBlock must be released once due"), 7);
     }
 
-    /// A block already past its timestamp — the common case, sealed at the end of its slot — must go
-    /// out without waiting.
+    /// A block already past its timestamp — the common case, sealed at the end of its slot — must
+    /// go out without waiting.
     #[tokio::test(start_paused = true)]
     async fn bid_block_send_is_immediate_when_already_due() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
@@ -3085,8 +3210,8 @@ mod tests {
                         rebuilds += 1;
                         return rebuilds;
                     }
-                    LocalRebuildAction::ReturnBestPayload
-                    | LocalRebuildAction::WaitForMoreValue => {
+                    LocalRebuildAction::ReturnBestPayload |
+                    LocalRebuildAction::WaitForMoreValue => {
                         break;
                     }
                     LocalRebuildAction::WaitForCooldown(wait_duration) => {
@@ -3336,7 +3461,10 @@ mod tests {
     fn luban_chain_spec() -> Arc<BscChainSpec> {
         Arc::new(BscChainSpec::from(
             reth_chainspec::ChainSpecBuilder::mainnet()
-                .with_fork(crate::hardforks::bsc::BscHardfork::Luban, reth_chainspec::ForkCondition::Block(0))
+                .with_fork(
+                    crate::hardforks::bsc::BscHardfork::Luban,
+                    reth_chainspec::ForkCondition::Block(0),
+                )
                 .build(),
         ))
     }
@@ -3349,7 +3477,12 @@ mod tests {
         let att = VoteAttestation {
             vote_address_set: 0xFF,
             agg_signature: Default::default(),
-            data: VoteData { source_number: 1, source_hash: B256::ZERO, target_number: 0, target_hash: B256::ZERO },
+            data: VoteData {
+                source_number: 1,
+                source_hash: B256::ZERO,
+                target_number: 0,
+                target_hash: B256::ZERO,
+            },
             extra: bytes::Bytes::new(),
         };
         let mut extra = vec![0u8; crate::consensus::parlia::EXTRA_VANITY_LEN];
@@ -3358,7 +3491,10 @@ mod tests {
         Header { number: 1, extra_data: alloy_primitives::Bytes::from(extra), ..Default::default() }
     }
 
-    fn bid_block_with_sidecar(header: Header, sidecar_block_hash: B256) -> RecoveredBlock<BscBlock> {
+    fn bid_block_with_sidecar(
+        header: Header,
+        sidecar_block_hash: B256,
+    ) -> RecoveredBlock<BscBlock> {
         let body = crate::node::primitives::BscBlockBody {
             inner: reth_ethereum_primitives::BlockBody {
                 transactions: Vec::new(),
@@ -3405,7 +3541,8 @@ mod tests {
         let senders = vec![Address::with_last_byte(2)];
 
         for with_sidecars in [true, false] {
-            let header = Header { number: 1, parent_hash: parent_header.hash(), ..Default::default() };
+            let header =
+                Header { number: 1, parent_hash: parent_header.hash(), ..Default::default() };
             let original_hash = header.hash_slow();
             let mut block = bid_block_with_sidecar(header, original_hash).clone_block();
             let transaction = if with_sidecars {
@@ -3423,18 +3560,24 @@ mod tests {
             let mut executed_block = block.clone();
             executed_block.body.sidecars = None;
             let mut payload = super::BscBuiltPayload {
+                diagnostics: None,
                 block: Arc::new(block.into()),
                 fees: U256::ZERO,
                 requests: None,
                 build_kind: super::BuildKind::NormalAttempt,
                 exec_duration: Duration::ZERO,
                 trie_root_duration: Duration::ZERO,
-                executed_block: reth_chain_state::ExecutedBlock {
+                executed_block: reth_payload_primitives::BuiltPayloadExecutedBlock {
                     recovered_block: Arc::new(RecoveredBlock::new_unhashed(
                         executed_block,
                         senders.clone(),
                     )),
-                    ..Default::default()
+                    execution_output: Arc::new(reth_evm::execute::BlockExecutionOutput {
+                        result: Default::default(),
+                        state: Default::default(),
+                    }),
+                    hashed_state: Default::default(),
+                    trie_updates: Default::default(),
                 },
                 pending_validators: None,
                 pending_turn_length: None,
@@ -3475,7 +3618,8 @@ mod tests {
         ensure_bid_block_test_signer();
         let chain_spec = luban_chain_spec();
         let parlia = Arc::new(Parlia::new(chain_spec, 200));
-        let parent_snap = Snapshot::new(vec![Address::with_last_byte(1)], 0, B256::random(), 200, None);
+        let parent_snap =
+            Snapshot::new(vec![Address::with_last_byte(1)], 0, B256::random(), 200, None);
         let parent_header = Header { number: 0, parent_hash: B256::random(), ..Default::default() };
 
         let header = header_with_fake_attestation();
@@ -3513,9 +3657,11 @@ mod tests {
     fn refresh_and_reseal_is_a_noop_pre_luban() {
         ensure_bid_block_test_signer();
         // Mainnet spec without the Luban fork override: inactive at block 1.
-        let chain_spec = Arc::new(BscChainSpec::from(reth_chainspec::ChainSpecBuilder::mainnet().build()));
+        let chain_spec =
+            Arc::new(BscChainSpec::from(reth_chainspec::ChainSpecBuilder::mainnet().build()));
         let parlia = Arc::new(Parlia::new(chain_spec, 200));
-        let parent_snap = Snapshot::new(vec![Address::with_last_byte(1)], 0, B256::random(), 200, None);
+        let parent_snap =
+            Snapshot::new(vec![Address::with_last_byte(1)], 0, B256::random(), 200, None);
         let parent_header = Header { number: 0, parent_hash: B256::random(), ..Default::default() };
 
         let header = header_with_fake_attestation();

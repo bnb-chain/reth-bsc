@@ -412,10 +412,7 @@ mod tests {
     #[test]
     fn snapshot_membership_covers_epoch_transition_lag() {
         // Contract already holds the next set, snapshot still authorizes the sealer.
-        assert_eq!(
-            resolve_sealer_role(ValidatorRole::None, true),
-            Some(ValidatorRole::Candidate)
-        );
+        assert_eq!(resolve_sealer_role(ValidatorRole::None, true), Some(ValidatorRole::Candidate));
         // In neither source: not evidence.
         assert_eq!(resolve_sealer_role(ValidatorRole::None, false), None);
         // Contract classification wins whenever it exists.
