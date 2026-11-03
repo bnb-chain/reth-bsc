@@ -84,6 +84,7 @@ pub(crate) struct BuildWorkObservation {
     completed: bool,
     pub(crate) scanned: u64,
     pub(crate) executed: u64,
+    pub(crate) gas_limit_skip_peak: u64,
     skipped: [u64; 8],
     skipped_time: Duration,
     first_invalid_error: Option<String>,
@@ -126,6 +127,7 @@ impl BuildWorkObservation {
             completed: false,
             scanned: 0,
             executed: 0,
+            gas_limit_skip_peak: 0,
             skipped: [0; 8],
             skipped_time: Duration::ZERO,
             first_invalid_error: None,
@@ -241,6 +243,13 @@ impl Drop for BuildWorkObservation {
         // including EVM reverts. A fatal execution error can leave scanned > executed+skipped.
         metrics::counter!("bsc.build_diagnostics.scanned_transactions_total", "kind" => self.kind, "turn" => self.turn).increment(self.scanned);
         metrics::counter!("bsc.build_diagnostics.executed_transactions_total", "kind" => self.kind, "turn" => self.turn).increment(self.executed);
+        // One sample per attempt, including interrupted attempts. Prometheus summary
+        // quantile=1 exposes the observed maximum in its rolling window; counters
+        // above still provide total scan/execute rates. No per-transaction metric calls.
+        metrics::histogram!("bsc.build_diagnostics.scanned_transactions_per_attempt", "kind" => self.kind, "turn" => self.turn).record(self.scanned as f64);
+        metrics::histogram!("bsc.build_diagnostics.executed_transactions_per_attempt", "kind" => self.kind, "turn" => self.turn).record(self.executed as f64);
+        metrics::histogram!("bsc.build_diagnostics.gas_limit_skip_streak_per_attempt", "kind" => self.kind, "turn" => self.turn).record(self.gas_limit_skip_peak as f64);
+        metrics::counter!("bsc.build_diagnostics.selection_stop_total", "kind" => self.kind, "turn" => self.turn, "reason" => self.reason).increment(1);
         for (reason, count) in SKIP_REASONS.iter().zip(self.skipped) {
             metrics::counter!("bsc.build_diagnostics.skipped_transactions_total", "kind" => self.kind, "turn" => self.turn, "reason" => *reason).increment(count);
         }
@@ -274,6 +283,7 @@ impl Drop for BuildWorkObservation {
                     execution_ms = ?execution.map(|d| d.as_secs_f64() * 1000.0),
                     post_selection_ms = ?finish.map(|d| d.as_secs_f64() * 1000.0),
                     scanned = self.scanned, executed = self.executed,
+                    gas_limit_skip_peak = self.gas_limit_skip_peak,
                     iterator_ms = self.selection_times[SelectionStage::Iterator as usize].as_secs_f64() * 1000.0,
                     precheck_ms = self.selection_times[SelectionStage::Precheck as usize].as_secs_f64() * 1000.0,
                     execute_ms = self.selection_times[SelectionStage::Execute as usize].as_secs_f64() * 1000.0,
@@ -396,6 +406,56 @@ impl Drop for AttemptObservation {
 mod tests {
     use super::*;
     use metrics_exporter_prometheus::PrometheusBuilder;
+
+    #[test]
+    fn scan_distribution_and_stop_reason_keep_attempts_separate() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let mut limited = BuildWorkObservation::new(AttemptKind::Regular, true, 1, 1, None);
+            limited.permit_acquired();
+            limited.execution_started(Instant::now());
+            limited.scanned = 7_500;
+            limited.executed = 2_500;
+            limited.gas_limit_skip_peak = 5_000;
+            limited.selection_stopped("gas_skip_limit");
+            limited.completed();
+            drop(limited);
+            // A cancelled attempt is still counted, but never as a gas-limit stop.
+            let mut cancelled = BuildWorkObservation::new(AttemptKind::Rebuild, true, 2, 1, None);
+            cancelled.scanned = 4;
+            cancelled.gas_limit_skip_peak = 2;
+            cancelled.selection_stopped("cancelled");
+        });
+        let text = handle.render();
+        for (name, kind, value) in [
+            ("scanned_transactions_per_attempt_sum", "regular", "7500"),
+            ("executed_transactions_per_attempt_sum", "regular", "2500"),
+            ("gas_limit_skip_streak_per_attempt_sum", "regular", "5000"),
+            ("scanned_transactions_per_attempt_sum", "rebuild", "4"),
+        ] {
+            assert!(
+                text.lines().any(|line| {
+                    line.starts_with(&format!("bsc_build_diagnostics_{name}{{")) &&
+                        line.contains(&format!("kind=\"{kind}\"")) &&
+                        line.ends_with(&format!(" {value}"))
+                }),
+                "missing {name}/{kind}: {text}"
+            );
+        }
+        for (kind, reason) in [("regular", "gas_skip_limit"), ("rebuild", "cancelled")] {
+            assert!(
+                text.lines().any(|line| {
+                    line.starts_with("bsc_build_diagnostics_selection_stop_total{") &&
+                        line.contains(&format!("kind=\"{kind}\"")) &&
+                        line.contains(&format!("reason=\"{reason}\"")) &&
+                        line.ends_with(" 1")
+                }),
+                "missing {kind}/{reason}: {text}"
+            );
+        }
+        assert!(!text.contains("block_number="));
+    }
 
     #[test]
     fn selection_phases_partition_loop_time_and_keep_interrupted_work() {
