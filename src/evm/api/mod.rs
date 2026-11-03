@@ -241,16 +241,9 @@ where
             frame.interpreter.input.target_address == coinbase
         };
 
-        if hits_coinbase {
-            // Ported from go-bsc (core/vm: "coinbase address cannot be used as contract
-            // address"): refuse to execute any bytecode whose storage/self context is the
-            // block's coinbase, whether reached via CALL/DELEGATECALL to pre-existing code
-            // or freshly deployed via CREATE/CREATE2. Without this, a contract could run
-            // "as" the coinbase and be mistaken for the validator itself by callers that
-            // gate on `caller == coinbase` (e.g. system transaction detection), or otherwise
-            // interfere with fee-distribution invariants that assume the coinbase never
-            // carries code. This mirrors go-ethereum's error-code semantics: burn the
-            // frame's remaining gas and revert its state changes, same as any other halt.
+        if self.cfg.spec >= BscHardfork::Pasteur && hits_coinbase {
+            // Reject bytecode execution in the coinbase's context from Pasteur.
+            // Halt the frame, consuming its remaining gas and reverting its state changes.
             let (ctx, _, _, frame_stack) = self.all_mut();
             let frame = frame_stack.get();
             let mut gas = frame.interpreter.gas;
@@ -745,7 +738,7 @@ mod tests {
         let coinbase = Address::from([0xC0; 20]);
         let caller = Address::from([0x11; 20]);
 
-        let cfg_env = CfgEnv::new_with_spec(BscHardfork::Osaka).with_chain_id(56);
+        let cfg_env = CfgEnv::new_with_spec(BscHardfork::Pasteur).with_chain_id(56);
         let block_env = BlockEnv {
             beneficiary: coinbase,
             prevrandao: Some(U256::from(1).into()),
@@ -795,6 +788,60 @@ mod tests {
         assert_eq!(slot, U256::ZERO, "SSTORE must not have executed");
     }
 
+    #[test]
+    fn coinbase_execution_is_gated_on_pasteur() {
+        for spec in [BscHardfork::Mendel, BscHardfork::Pasteur, BscHardfork::Jenner] {
+            for create in [false, true] {
+                let caller = Address::from([0x11; 20]);
+                let coinbase = caller.create(0);
+                let env = EvmEnv::new(
+                    CfgEnv::new_with_spec(spec).with_chain_id(56),
+                    BlockEnv {
+                        beneficiary: coinbase,
+                        prevrandao: Some(U256::from(1).into()),
+                        ..Default::default()
+                    }
+                    .into(),
+                );
+                let mut db = InMemoryDB::default();
+                db.insert_account_info(
+                    caller,
+                    AccountInfo { balance: U256::from(1_000_000u64), ..Default::default() },
+                );
+                // Return one byte; valid as either runtime or init code.
+                let code = Bytes::from_static(&[0x60, 0x01, 0x60, 0x00, 0xf3]);
+                if !create {
+                    db.insert_account_info(
+                        coinbase,
+                        AccountInfo::default().with_code(Bytecode::new_raw(code.clone())),
+                    );
+                }
+                let mut evm = BscEvm::new(env, db, NoOpInspector, false, false);
+                let tx = TxEnv::builder()
+                    .caller(caller)
+                    .chain_id(Some(56))
+                    .gas_limit(100_000)
+                    .gas_price(1)
+                    .kind(if create { TxKind::Create } else { TxKind::Call(coinbase) })
+                    .data(if create { code } else { Bytes::new() })
+                    .build()
+                    .unwrap();
+                let result = evm.transact_one(BscTxEnv::new(tx)).unwrap();
+                if spec < BscHardfork::Pasteur {
+                    assert!(result.is_success(), "{spec:?}, create={create}: {result:?}");
+                } else {
+                    assert!(
+                        matches!(result, ExecutionResult::Halt {
+                            reason: HaltReason::PrecompileError, ..
+                        }),
+                        "{spec:?}, create={create}: {result:?}"
+                    );
+                    assert_eq!(result.tx_gas_used(), 100_000);
+                }
+            }
+        }
+    }
+
     /// Same guard, but for a `CREATE` whose computed address happens to land on the coinbase.
     #[test]
     fn create_landing_on_coinbase_is_rejected() {
@@ -803,7 +850,7 @@ mod tests {
         // it can be used as the block's coinbase.
         let created_address = caller.create(0);
 
-        let cfg_env = CfgEnv::new_with_spec(BscHardfork::Osaka).with_chain_id(56);
+        let cfg_env = CfgEnv::new_with_spec(BscHardfork::Pasteur).with_chain_id(56);
         let block_env = BlockEnv {
             beneficiary: created_address,
             prevrandao: Some(U256::from(1).into()),
@@ -848,7 +895,7 @@ mod tests {
         let coinbase = Address::from([0xC0; 20]);
         let caller = Address::from([0x11; 20]);
 
-        let cfg_env = CfgEnv::new_with_spec(BscHardfork::Osaka).with_chain_id(56);
+        let cfg_env = CfgEnv::new_with_spec(BscHardfork::Pasteur).with_chain_id(56);
         let block_env = BlockEnv {
             beneficiary: coinbase,
             prevrandao: Some(U256::from(1).into()),
