@@ -224,6 +224,10 @@ impl<ChainSpec: EthChainSpec + BscHardforks + 'static> HeaderValidator<Header>
 impl<ChainSpec: EthChainSpec<Header = Header> + BscHardforks + 'static> Consensus<BscBlock>
     for BscConsensus<ChainSpec>
 {
+    fn is_transient_error(&self, error: &ConsensusError) -> bool {
+        matches!(error, ConsensusError::TimestampIsInFuture { .. })
+    }
+
     /// live-sync validation.
     fn validate_body_against_header(
         &self,
@@ -325,6 +329,17 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, RwLock};
     use tokio::sync::mpsc;
+
+    #[test]
+    fn only_future_timestamp_is_transient() {
+        let consensus =
+            BscConsensus::new(Arc::new(BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet())));
+        assert!(consensus.is_transient_error(&ConsensusError::TimestampIsInFuture {
+            timestamp: 101,
+            present_timestamp: 100,
+        }));
+        assert!(!consensus.is_transient_error(&ConsensusError::BaseFeeMissing));
+    }
 
     #[derive(Clone, Default)]
     struct TestProvider;
@@ -1171,6 +1186,8 @@ pub struct BscForkChoiceEngine<P> {
     pub(crate) provider: P,
     /// The engine handle for communicating with the consensus engine
     pub(crate) engine_handle: ConsensusEngineHandle<BscPayloadTypes>,
+    /// Deferred payload budget shared by this node's import paths.
+    pub(crate) future_payloads: crate::node::network::block_import::future_payload::Pending,
     /// Chain specification
     chain_spec: Arc<BscChainSpec>,
     /// The fork choice rule
@@ -1198,6 +1215,7 @@ where
         Self {
             provider,
             engine_handle,
+            future_payloads: Default::default(),
             chain_spec: chain_spec.clone(),
             forkchoice_rule: Arc::new(BscForkChoiceRule::new(chain_spec)),
             header_td_cache: Arc::new(parking_lot::RwLock::new(schnellru::LruMap::new(
