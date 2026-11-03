@@ -17,9 +17,10 @@ use tokio::time::Instant;
 
 /// Shared health state for the node's ordinary RPC methods on all public transports.
 ///
-/// Matches Go-BSC's completed-request p75 rule, including failures and health probes, but
-/// collects independently of metrics export. Pending calls and subscription lifetimes are
-/// not samples. An empty sample is healthy; this is not a sync or readiness check.
+/// Matches Go-BSC's completed-request p75 rule, including failures and health probes.
+/// Sampling is installed only when metrics are enabled at startup. Pending calls and
+/// subscription lifetimes are not samples. An empty sample is healthy; this is not a sync
+/// or readiness check.
 #[derive(Clone, Debug, Default)]
 pub struct RpcHealth {
     sample: Arc<Mutex<LatencySample>>,
@@ -27,6 +28,7 @@ pub struct RpcHealth {
 
 impl RpcHealth {
     /// Whether the sampled 75th percentile is strictly below five seconds.
+    /// Returns true with an empty sample, including when metrics are disabled.
     pub fn is_healthy(&self) -> bool {
         let mut values: Vec<_> = self.sample.lock().values.iter().map(|v| v.0.elapsed).collect();
         values.sort_unstable();
@@ -51,12 +53,20 @@ impl RpcHealth {
         self.sample.lock().record(Instant::now(), elapsed, uniform);
     }
 
-    /// Instrument each transport separately, preserving its configured methods and callbacks.
+    /// Instrument each transport separately when metrics are enabled at startup.
     /// Call after registering all extensions and before starting the servers.
     ///
+    /// With metrics disabled, the original callbacks are retained without timing wrappers.
     /// Wrapping callbacks also times individual batch entries and IPC requests, which do not
     /// all pass through the same server middleware hook. Subscriptions are left untouched.
-    pub fn instrument(&self, modules: &mut TransportRpcModules) -> Result<(), RegisterMethodError> {
+    pub fn instrument(
+        &self,
+        modules: &mut TransportRpcModules,
+        metrics_enabled: bool,
+    ) -> Result<(), RegisterMethodError> {
+        if !metrics_enabled {
+            return Ok(());
+        }
         if let Some(methods) = modules.http_methods(|_| true) {
             modules.replace_http(self.instrument_methods(&methods)?)?;
         }
@@ -265,7 +275,7 @@ mod tests {
         let mut ws = RpcModule::new(());
         ws.register_method("same_name", |_, _, _| 3u64).unwrap();
         let mut modules = TransportRpcModules::default().with_http(http).with_ipc(ipc).with_ws(ws);
-        health.instrument(&mut modules).unwrap();
+        health.instrument(&mut modules, true).unwrap();
         let http = modules.http_methods(|_| true).unwrap();
         let ipc = modules.ipc_methods(|_| true).unwrap();
         let ws = modules.ws_methods(|_| true).unwrap();
@@ -275,6 +285,47 @@ mod tests {
         assert_eq!(ipc.call::<_, u64>("same_name", rpc_params![]).await.unwrap(), 2);
         assert_eq!(ws.call::<_, u64>("same_name", rpc_params![]).await.unwrap(), 3);
         assert_eq!(health.sample.lock().values.len(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disabled_metrics_retains_callbacks_and_does_not_sample_slow_calls() {
+        let health = RpcHealth::default();
+        let mut module = RpcModule::new(());
+        module.register_method("sync", |_, _, _| 7u64).unwrap();
+        module
+            .register_async_method("slow", |_, _, _| async {
+                tokio::time::sleep(Duration::from_secs(6)).await;
+                Err::<u64, _>(ErrorObjectOwned::owned(-32003, "out of gas", None::<()>))
+            })
+            .unwrap();
+        let mut modules = TransportRpcModules::default()
+            .with_http(module.clone())
+            .with_ws(module.clone())
+            .with_ipc(module.clone());
+        health.instrument(&mut modules, false).unwrap();
+        for methods in [
+            modules.http_methods(|_| true).unwrap(),
+            modules.ws_methods(|_| true).unwrap(),
+            modules.ipc_methods(|_| true).unwrap(),
+        ] {
+            // No wrapper or per-request enablement check should be added in disabled mode.
+            match (module.method("sync").unwrap(), methods.method("sync").unwrap()) {
+                (MethodCallback::Sync(original), MethodCallback::Sync(actual)) => {
+                    assert!(Arc::ptr_eq(original, actual));
+                }
+                _ => panic!("synchronous callback changed kind"),
+            }
+            match (module.method("slow").unwrap(), methods.method("slow").unwrap()) {
+                (MethodCallback::Async(original), MethodCallback::Async(actual)) => {
+                    assert!(Arc::ptr_eq(original, actual));
+                }
+                _ => panic!("asynchronous callback changed kind"),
+            }
+            assert_eq!(methods.call::<_, u64>("sync", rpc_params![]).await.unwrap(), 7);
+            assert!(methods.call::<_, u64>("slow", rpc_params![]).await.is_err());
+        }
+        assert!(health.sample.lock().values.is_empty());
+        assert!(health.is_healthy());
     }
 
     #[tokio::test]
@@ -297,7 +348,7 @@ mod tests {
             .with_http(module.clone())
             .with_ws(module.clone())
             .with_ipc(module);
-        health.instrument(&mut modules).unwrap();
+        health.instrument(&mut modules, true).unwrap();
         let path = std::env::temp_dir().join(format!("rpc-health-{}.ipc", uuid::Uuid::new_v4()));
         let endpoint = path.to_str().unwrap().to_owned();
         let server = RpcServerConfig::http(Default::default())

@@ -23,6 +23,7 @@ pub trait BscEthExtApi {
     async fn coinbase(&self) -> RpcResult<Address>;
 
     /// Returns whether the sampled p75 of completed RPC calls is below five seconds.
+    /// Sampling requires metrics; otherwise returns true.
     #[method(name = "health")]
     async fn health(&self) -> RpcResult<bool>;
 

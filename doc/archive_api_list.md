@@ -9,7 +9,7 @@
 | `eth_blockNumber` | Support |  |
 | `eth_chainID` | Support |  |
 | `eth_syncing` | Support |  |
-| `eth_health` | Support | Healthy when sampled completed RPC latency p75 is below 5 seconds; independent of metrics export. See below. |
+| `eth_health` | Support | With metrics enabled, healthy when sampled completed RPC latency p75 is below 5 seconds. Otherwise returns true. See below. |
 | `eth_gasPrice` | Support |  |
 | `eth_maxPriorityFeePerGas` | Support |  |
 | `eth_feeHistory` | Support |  |
@@ -86,7 +86,11 @@
 `eth_health` returns `false` when the 75th percentile of sampled, completed RPC
 method durations is at least five seconds. Sampling uses Go-BSC's exponentially
 decaying reservoir (1,028 observations, alpha 0.015) and percentile interpolation.
-It runs even when metrics export is disabled. An empty sample returns `true`.
+Sampling is opt-in: enable `--metrics <ADDR:PORT>` (for example,
+`--metrics 127.0.0.1:9001`) or configure `--metrics.prometheus.push.url`.
+With neither configured, no health timing wrappers are installed and `eth_health`
+returns `true` without assessing RPC latency, matching Go-BSC's metrics-disabled
+behavior. An empty sample also returns `true` when metrics are enabled.
 
 HTTP, WebSocket, and IPC share the sample. Each executed batch entry contributes
 separately. Successful and failed method calls are included, including health

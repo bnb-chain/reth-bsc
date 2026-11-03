@@ -500,7 +500,9 @@ fn main() -> eyre::Result<()> {
             let NodeHandle { node, node_exit_future: exit_future } =
                 builder.node(node)
                     .extend_rpc_modules(move |ctx| {
-                        if ctx.config().metrics.prometheus.is_some() || ctx.config().metrics.push_gateway_url.is_some() {
+                        let metrics_enabled = ctx.config().metrics.prometheus.is_some()
+                            || ctx.config().metrics.push_gateway_url.is_some();
+                        if metrics_enabled {
                             reth_bsc::evm::precompiles::cas20::enable_metrics();
                         }
                         // Every BSC namespace below is registered with `merge_if_module_configured`
@@ -645,7 +647,7 @@ fn main() -> eyre::Result<()> {
                         ctx.modules.merge_if_module_configured(RethRpcModule::Eth, eth_config.into_rpc())?;
                         tracing::info!("Succeed to register eth_config (EIP-7910) API");
 
-                        rpc_health.instrument(ctx.modules)?;
+                        rpc_health.instrument(ctx.modules, metrics_enabled)?;
 
                         // Bind only after all RPC module registration succeeded, so a later merge
                         // error cannot leave a detached gRPC listener behind during failed startup.
