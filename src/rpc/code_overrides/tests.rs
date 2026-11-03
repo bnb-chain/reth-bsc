@@ -461,8 +461,8 @@ async fn time_override_across_jenner_follows_the_fork_schedule() {
 async fn time_override_across_osaka_moves_the_tx_gas_limit_cap() {
     // GAS > 2^24, or INVALID.
     const NEEDS_OVER_2_24: &[u8] = &hex!("63010000005a11600b57fe5b00");
-    const OSAKA_AND_LATER: [BscHardfork; 3] =
-        [BscHardfork::Osaka, BscHardfork::Mendel, BscHardfork::Pasteur];
+    const OSAKA_AND_LATER: [BscHardfork; 4] =
+        [BscHardfork::Osaka, BscHardfork::Mendel, BscHardfork::Pasteur, BscHardfork::Jenner];
     let (before, _) = rpc!(chain forks_at(&OSAKA_AND_LATER, NOW + 1));
     let (after, _) = rpc!(chain forks_at(&OSAKA_AND_LATER, NOW));
     let at = |time| Some(Box::new(BlockOverrides { time: Some(time), ..Default::default() }));
