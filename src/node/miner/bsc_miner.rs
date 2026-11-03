@@ -191,7 +191,6 @@ where
             let event = event; // rebind to avoid move issues
                     let committed = event.committed();
                     let tip = committed.tip();
-                    super::pipeline::canonical_head(tip.hash());
                     let mut startup_timing = StartupTiming::new(tip.hash(), super::startup_diagnostics::header_ms(tip.header()), "canonical");
                     let is_reorg = matches!(event, CanonStateNotification::Reorg { .. });
                     debug!(
@@ -432,6 +431,10 @@ where
         &self,
         parent: alloy_primitives::B256,
     ) -> Option<reth_revm::cached::CachedReads> {
+        let _stage = super::startup_diagnostics::HandoffStage::new(
+            "cached_reads_clone",
+            super::startup_diagnostics::handoff_source(parent),
+        );
         self.pre_cached.as_ref().filter(|pc| pc.block == parent).map(|pc| pc.cached.clone())
     }
 
@@ -439,6 +442,10 @@ where
     where
         H: alloy_consensus::BlockHeader + Sealable,
     {
+        if !crate::node::startup_recovery::is_ready() {
+            debug!(target: "bsc::miner", "Skip mining: persisted finalized history is not restored");
+            return;
+        }
         // Check if mining is disabled via miner_stop RPC
         if !crate::shared::is_mining_enabled() {
             debug!("Skip mining: mining is disabled via miner_stop RPC");
@@ -693,6 +700,9 @@ where
             handle.abort();
         }
 
+        let source = super::startup_diagnostics::handoff_source(mining_ctx.parent_header.hash());
+        let attributes_stage =
+            super::startup_diagnostics::HandoffStage::new("job_attributes", source);
         let parent_header = mining_ctx.parent_header.clone();
         let block_number = parent_header.number() + 1;
         let attributes = prepare_new_attributes(
@@ -705,6 +715,9 @@ where
         // Read dynamic config from shared state (updated by miner_* RPC), fall back to init values
         let gas_limit = crate::shared::get_miner_gas_limit().unwrap_or(self.desired_gas_limit);
 
+        drop(attributes_stage);
+        let arguments_stage =
+            super::startup_diagnostics::HandoffStage::new("job_builder_arguments", source);
         let evm_config = BscEvmConfig::new(self.chain_spec.clone());
         let payload_builder = BscPayloadBuilder::new(
             self.provider.clone(),
@@ -716,8 +729,6 @@ where
             mining_ctx.clone(),
         );
         let build_args = BscBuildArguments {
-            pipeline_parent: None,
-            pipeline_context: None,
             cached_reads: mining_ctx.cached_reads.clone().unwrap_or_default(),
             // `% 1000` matches `set_millisecond_part_of_timestamp`, which seals the same
             // remainder into the header's mix_hash at finalize time.
@@ -746,6 +757,8 @@ where
         };
 
         let parent_hash = mining_ctx.parent_header.hash();
+        drop(arguments_stage);
+        let job_stage = super::startup_diagnostics::HandoffStage::new("job_create", source);
         let (mut payload_job, job_handle) = BscPayloadJob::new(
             self.parlia.clone(),
             mining_ctx,
@@ -755,6 +768,7 @@ where
             self.payload_tx.clone(),
         );
 
+        drop(job_stage);
         let start_time = std::time::Instant::now();
         self.running_job_handle = Some(job_handle);
         payload_job.mark_scheduled();

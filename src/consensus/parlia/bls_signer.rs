@@ -76,6 +76,11 @@ impl BlsVoteSigner {
     }
 
     pub fn sign_vote(&self, data: VoteData) -> Result<VoteEnvelope, BlsSignerError> {
+        if !crate::node::startup_recovery::is_ready() {
+            return Err(BlsSignerError::SigningFailed(
+                "Persisted finalized history is not restored".to_string(),
+            ));
+        }
         let vote_address = self.public_key()?;
         let signature = self.sign_hash(data.hash())?;
         Ok(VoteEnvelope { vote_address, signature, data })

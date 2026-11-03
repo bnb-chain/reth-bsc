@@ -679,7 +679,12 @@ fn main() -> eyre::Result<()> {
                         }
                         Ok(())
                     })
-                    .launch().await?;
+                    .launch_with_fn(|builder| {
+                        let launcher = builder.engine_api_launcher().with_backfill(
+                            reth_bsc::node::startup_recovery::BscRecoveryBackfill,
+                        );
+                        builder.launch_with(launcher)
+                    }).await?;
 
             // Send the engine handle to the network
             engine_handle_tx.send(node.beacon_engine_handle.clone()).unwrap();
@@ -696,6 +701,17 @@ fn main() -> eyre::Result<()> {
             // Set the IPC client. IPC is required (see the `--ipc.disable` check above), so a
             // failure here is a startup error rather than something to panic on.
             reth_bsc::shared::set_ipc_client(ipc_path).await?;
+
+            let recovery_provider = node.provider.clone();
+            let recovery_engine = node.beacon_engine_handle.clone();
+            node.task_executor.spawn_critical_task("bsc-startup-recovery", async move {
+                if let Err(error) = reth_bsc::node::startup_recovery::run(
+                    recovery_provider, recovery_engine,
+                ).await {
+                    tracing::error!(target: "bsc::startup_recovery", %error, "Startup finality recovery failed");
+                    panic!("Startup finality recovery failed: {error}");
+                }
+            });
 
             let grpc_handle = mev_grpc_handle.lock().unwrap().take();
             let exit_result = exit_future.await;

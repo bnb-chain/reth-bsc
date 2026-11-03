@@ -15,7 +15,6 @@ use std::{
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum AttemptKind {
     Speculative,
-    Pipeline,
     Regular,
     Rebuild,
     Empty,
@@ -24,7 +23,6 @@ impl AttemptKind {
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Speculative => "speculative",
-            Self::Pipeline => "pipeline",
             Self::Regular => "regular",
             Self::Rebuild => "rebuild",
             Self::Empty => "empty",
@@ -295,7 +293,6 @@ impl Drop for BuildWorkObservation {
 /// Metadata follows a candidate through cloning and finalization; it retains no task resources.
 #[derive(Debug)]
 pub(crate) struct CandidateDiagnostics {
-    pub(crate) ready_at: Instant,
     pub(crate) id: u64,
     pub(crate) kind: &'static str,
     turn: &'static str,
@@ -363,22 +360,12 @@ impl AttemptObservation {
         };
         metrics::counter!("bsc.build_diagnostics.finished_total", "kind" => self.kind, "turn" => self.turn, "outcome" => outcome).increment(1);
         if let Some(payload) = payload {
-            if self.kind != "pipeline" &&
-                payload.diagnostics.as_ref().is_some_and(|d| d.kind == "pipeline")
-            {
-                // Adoption waits for an existing physical computation. Final selection
-                // must credit that computation, not count its execution again.
-                metrics::counter!("bsc_miner_pipeline_total", "outcome" => "reuse_observed")
-                    .increment(1);
-                return;
-            }
             static NEXT_ID: AtomicU64 = AtomicU64::new(1);
             metrics::histogram!("bsc.build_diagnostics.execution_seconds", "kind" => self.kind, "turn" => self.turn).record(payload.exec_duration.as_secs_f64());
             metrics::histogram!("bsc.build_diagnostics.root_seconds", "kind" => self.kind, "turn" => self.turn).record(payload.trie_root_duration.as_secs_f64());
             metrics::histogram!("bsc.build_diagnostics.transactions", "kind" => self.kind, "turn" => self.turn).record(payload.block.body().transaction_count() as f64);
             metrics::histogram!("bsc.build_diagnostics.gas", "kind" => self.kind, "turn" => self.turn).record(payload.block.header().gas_used() as f64);
             payload.diagnostics = Some(Arc::new(CandidateDiagnostics {
-                ready_at: Instant::now(),
                 id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
                 kind: self.kind,
                 turn: self.turn,
@@ -550,16 +537,16 @@ mod tests {
             expired.executing = Some(Instant::now());
         });
         let rendered = handle.render();
-        assert!(rendered
-            .lines()
-            .any(|l| l.starts_with("bsc_build_diagnostics_execution_window_seconds_sum") &&
+        assert!(rendered.lines().any(|l| {
+            l.starts_with("bsc_build_diagnostics_execution_window_seconds_sum") &&
                 l.contains("regular") &&
-                l.ends_with(" 0.08")));
-        assert!(rendered
-            .lines()
-            .any(|l| l.starts_with("bsc_build_diagnostics_execution_window_seconds_sum") &&
+                l.ends_with(" 0.08")
+        }));
+        assert!(rendered.lines().any(|l| {
+            l.starts_with("bsc_build_diagnostics_execution_window_seconds_sum") &&
                 l.contains("rebuild") &&
-                l.ends_with(" 0")));
+                l.ends_with(" 0")
+        }));
     }
 
     #[test]
@@ -631,7 +618,6 @@ mod tests {
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, || {
             let candidate = Arc::new(CandidateDiagnostics {
-                ready_at: Instant::now(),
                 id: 1,
                 kind: "speculative",
                 turn: "outofturn",
@@ -646,7 +632,6 @@ mod tests {
             drop(candidate);
             drop(clone);
             let candidate = Arc::new(CandidateDiagnostics {
-                ready_at: Instant::now(),
                 id: 2,
                 kind: "speculative",
                 turn: "outofturn",

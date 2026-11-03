@@ -19,8 +19,7 @@ FLAGS = {'--chain', '--datadir', '--engine.cross-block-cache-size',
          '--engine.reserved-cpu-cores', '--db.sync-mode', '--db.read-transaction-timeout',
          '--max-pending-imports', '--builder.gaslimit', '--mining.gas-limit'}
 SWITCHES = {'--engine.txpool-prewarming', '--mining.use-sparse-trie-state-root', '--mining.enabled'}
-ENV_KEYS = {'BSC_MINING_PIPELINED_BUILD', 'BSC_MINING_PIPELINE_DEPTH',
-            'BSC_MINING_ALLOW_LATE_FINISH', 'BSC_MINER_SPARSE_REUSE_CANONICAL',
+ENV_KEYS = {'BSC_MINING_ALLOW_LATE_FINISH', 'BSC_MINER_SPARSE_REUSE_CANONICAL',
             'BSC_MINING_ADAPTIVE_RESERVE', 'BSC_MINING_ROOT_RESERVE_MIN_MS',
             'BSC_MINING_ROOT_RESERVE_MAX_MS', 'BSC_MINING_LAST_BLOCK_PERIOD_DIVISOR'}
 
@@ -56,7 +55,6 @@ def stat(text):
 
 def role(name):
     for prefix, group in [('miner-prewarm', 'miner_prewarm'),
-                          ('miner-pipeline', 'miner_pipeline'),
                           ('miner-proof-st', 'miner_storage_proof'),
                           ('miner-proof-ac', 'miner_account_proof'),
                           ('miner-state-ov', 'miner_overlay'),
