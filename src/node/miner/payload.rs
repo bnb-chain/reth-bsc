@@ -46,7 +46,7 @@ use reth_provider::StateProviderFactory;
 use reth_revm::cached::CachedReads;
 use reth_revm::cancelled::ManualCancel;
 use reth_revm::{database::StateProviderDatabase, db::State};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
@@ -1245,6 +1245,12 @@ where
     result_tx: mpsc::UnboundedSender<SubmitContext>,
     /// Potential payloads vector for selecting the best one
     potential_payloads: Vec<BscBuiltPayload>,
+    /// Block hashes of the BEP-322 bid payloads already pushed into `potential_payloads`. The bid
+    /// store is sampled twice per job (see `try_return_best_payload`). Keyed by the built block,
+    /// not the bid: between the samples the simulator's recommit probe can re-simulate the same
+    /// bid over the current mempool and store a higher-reward block for it
+    /// (`BidSimulator::bid_simulate`). That block is a new candidate; the same block twice is one.
+    taken_bid_blocks: HashSet<alloy_primitives::B256>,
     /// Best (sealed, unexecuted) BEP-675 BidBlock for this parent, collected from the simulator.
     /// Competes against `potential_payloads` by fee; if it wins it is broadcast first and verified
     /// on import (zero-simulate), so it is intentionally kept out of `potential_payloads`.
@@ -1354,6 +1360,7 @@ where
             is_aborted: false,
             result_tx,
             potential_payloads: Vec::new(),
+            taken_bid_blocks: HashSet::new(),
             bid_block_candidate: None,
             build_args,
             retries: 0,
@@ -1879,8 +1886,8 @@ where
         }
     }
 
-    /// Fetch the best bid for the current parent block, push it into `potential_payloads`,
-    /// and return its block hash (or `None` if no valid bid exists).
+    /// Fetch the best bid for the current parent block and push its payload into
+    /// `potential_payloads`, unless an earlier sample of this job already pushed that block.
     fn collect_best_bid(&mut self) {
         let Some(best_bid) = self.simulator.get_best_bid(self.mining_ctx.parent_header.hash())
         else {
@@ -1888,6 +1895,10 @@ where
         };
         let bid_info = best_bid.bid;
         if let Some(bsc_payload) = best_bid.bsc_payload {
+            if !take_bid_candidate(&mut self.taken_bid_blocks, &bsc_payload) {
+                // Already a candidate: this job's earlier sample took this very block.
+                return;
+            }
             info!(
                 target: "bsc::miner::payload",
                 trace_id = self.trace_id,
@@ -1896,6 +1907,7 @@ where
                 builder = ?bid_info.builder,
                 bid_gas_fee = %bid_info.gas_fee,
                 bid_hash = %bid_info.bid_hash,
+                block_hash = %bsc_payload.block().hash(),
                 payload_fees = %bsc_payload.fees(),
                 "Found best bid"
             );
@@ -2248,17 +2260,6 @@ where
     fn try_return_best_payload(&mut self) -> Result<(), Box<BscPayloadJobError>> {
         self.collect_best_bid();
 
-        // Sample "is a replacement simulation still in flight" here, right after the last moment a
-        // finished bid could still have been collected — not down at the metric site. A simulation
-        // that completes after this point is already too late to be used, yet its `simulating_bid`
-        // entry is removed the instant it completes, so a later check would report it as on-time.
-        // On the common path the gap is a few ms and either point would do; the reason to sample
-        // early is `collect_payload_candidates`, which blocks on `join_next` when no candidate has
-        // landed yet — precisely the fat-block-under-load case this metric exists to detect, where
-        // a late check would be biased toward reporting "on time".
-        let replacement_in_flight =
-            self.simulator.is_simulating(self.mining_ctx.parent_header.hash());
-
         self.collect_payload_candidates()?;
 
         // Hold the slot open before deciding, then sample the BidBlock store. Both must happen
@@ -2266,6 +2267,22 @@ where
         // local build finished and no background tasks remain (the empty-mempool case), so without
         // the wait this decision is made at t≈0 and no bid can ever be seen.
         self.wait_for_submission_deadline()?;
+        // Sample the BEP-322 store again too, as go-bsc does after its wait (`GetBestBid` right
+        // before `GetBestBidBlock` in `commitWork`). The sample at the top of this function runs at
+        // t≈0 of the job, before any builder can answer: a builder bids on a block it built after
+        // this slot started, so its `mev_sendBid` arrives hundreds of milliseconds in. Sampled only
+        // then, every bid is admitted and simulated but never becomes a candidate.
+        self.collect_best_bid();
+
+        // Sample "is a replacement simulation still in flight" here, right after the last moment a
+        // finished bid could still have been collected (the read above) — not down at the metric
+        // site. A simulation that completes after this point is already too late to be used, yet
+        // its `simulating_bid` entry is removed the instant it completes, so a later check would
+        // report it as on-time. A replacement that finished during the wait was collected above
+        // and is not late; one that started during the wait and is still running is.
+        let replacement_in_flight =
+            self.simulator.is_simulating(self.mining_ctx.parent_header.hash());
+
         self.collect_best_bid_block();
 
         // BEP-675 zero-simulate selection (go-bsc `selectBidBlock`): if the unexecuted BidBlock's
@@ -2893,12 +2910,23 @@ fn finalize_payload(
     Ok(())
 }
 
+/// Records a BEP-322 bid payload as a candidate of the payload job. False if an earlier sample of
+/// the job already took this block: the bid store is sampled twice per job, and the best bid may
+/// not have changed in between. Keyed by the built block, not the bid hash, because the simulator
+/// can store a better block for the same bid between the samples.
+fn take_bid_candidate(
+    taken: &mut HashSet<alloy_primitives::B256>,
+    payload: &BscBuiltPayload,
+) -> bool {
+    taken.insert(payload.block().hash())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         bid_block_broadcast_delay, initial_out_of_turn_build_wait, local_rebuild_action,
-        refresh_and_reseal_bid_block, send_bid_block_after_delay, validate_bsc_sidecar,
-        LocalRebuildAction, LocalRebuildPolicyInput,
+        refresh_and_reseal_bid_block, send_bid_block_after_delay, take_bid_candidate,
+        validate_bsc_sidecar, LocalRebuildAction, LocalRebuildPolicyInput,
     };
     use crate::chainspec::BscChainSpec;
     use crate::consensus::parlia::Parlia;
@@ -2914,8 +2942,39 @@ mod tests {
     use alloy_primitives::{Address, B256, U256};
     use reth::transaction_pool::error::Eip4844PoolTransactionError;
     use reth_primitives_traits::{RecoveredBlock, SealedHeader};
+    use std::collections::HashSet;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn a_resampled_bid_block_is_taken_once() {
+        // The payload the simulator stores for a bid; `gas_used` stands in for the block it built.
+        let bid_payload = |gas_used: u64| {
+            let header = Header { number: 1, gas_used, ..Default::default() };
+            let block = BscBlock { header, body: crate::node::primitives::BscBlockBody::default() };
+            super::BscBuiltPayload {
+                block: Arc::new(reth_primitives_traits::SealedBlock::seal_slow(block)),
+                fees: U256::from(gas_used),
+                requests: None,
+                build_kind: super::BuildKind::NormalAttempt,
+                exec_duration: Duration::ZERO,
+                trie_root_duration: Duration::ZERO,
+                executed_block: Default::default(),
+                pending_validators: None,
+                pending_turn_length: None,
+                bid_builder: Some(Address::with_last_byte(1)),
+            }
+        };
+
+        let mut taken = HashSet::new();
+        // First sample (t≈0): the best bid's block so far.
+        assert!(take_bid_candidate(&mut taken, &bid_payload(21_000)));
+        // After the deadline wait the store still holds that block: not a second candidate.
+        assert!(!take_bid_candidate(&mut taken, &bid_payload(21_000)));
+        // The recommit probe re-simulated the same bid over the mempool and stored a better
+        // block for it, or a better bid arrived: either way a new candidate.
+        assert!(take_bid_candidate(&mut taken, &bid_payload(42_000)));
+    }
 
     /// A won BidBlock must not be released before its own header timestamp.
     ///
