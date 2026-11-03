@@ -2,6 +2,7 @@ use crate::{BscBlock, BscBlockBody, BscPrimitives};
 use crate::node::primitives::BscBlobTransactionSidecar;
 use alloy_consensus::BlockHeader;
 use alloy_eips::eip2718::{EIP4844_TX_TYPE_ID, Typed2718};
+use alloy_eips::eip4895::Withdrawals;
 use alloy_eips::eip7594::BlobTransactionSidecarVariant;
 use alloy_primitives::B256;
 use reth_chainspec::EthereumHardforks;
@@ -108,12 +109,13 @@ where
     ) -> ProviderResult<Vec<BscBlockBody>> {
         // Pre-extract block metadata and per-tx (hash, type) before `inputs` is consumed.
         #[allow(clippy::type_complexity)]
-        let block_info: Vec<(u64, B256, Vec<(B256, u8)>)> = inputs
+        let block_info: Vec<(u64, B256, bool, Vec<(B256, u8)>)> = inputs
             .iter()
             .map(|(header, txs)| {
                 (
                     header.number(),
                     header.hash_slow(),
+                    header.withdrawals_root().is_some(),
                     txs.iter().map(|tx| (*tx.hash(), tx.ty())).collect(),
                 )
             })
@@ -125,7 +127,8 @@ where
         let bodies = eth_bodies
             .into_iter()
             .zip(block_info)
-            .map(|(inner, (block_number, block_hash, tx_info))| {
+            .map(|(mut inner, (block_number, block_hash, has_withdrawals_root, tx_info))| {
+                inner.withdrawals = committed_withdrawals(inner.withdrawals, has_withdrawals_root);
                 // Collect blob tx hashes and their position in the full block tx list.
                 let blob_txs: Vec<(B256, u64)> = tx_info.iter()
                     .enumerate()
@@ -157,6 +160,23 @@ where
             .collect();
         Ok(bodies)
     }
+}
+
+/// The withdrawals a stored body carries: only those its header commits to.
+///
+/// `EthStorage` reads withdrawals for every block from the Shanghai timestamp on, the Ethereum
+/// rule. A BSC header commits to withdrawals only from Cancun (go-bsc `verifyCascadingFields`
+/// wants a nil `WithdrawalsHash` before it, as `validate_withdrawals_root_for_bsc` does here), so
+/// the blocks between Shanghai and Cancun have no `withdrawalsRoot` yet were read with
+/// `withdrawals: []`: mainnet 2024-01-23 to 2024-06-20, testnet blocks 36087828..=39539136, and a
+/// private network's blocks before London. go-bsc's downloader rejects such a body ("retrieved
+/// block body is invalid") and drops the peer, so a go-bsc node cannot sync them from reth-bsc;
+/// reth's own `validate_body_against_header` refuses it too (`WithdrawalsRootUnexpected`).
+fn committed_withdrawals(
+    withdrawals: Option<Withdrawals>,
+    has_withdrawals_root: bool,
+) -> Option<Withdrawals> {
+    withdrawals.filter(|_| has_withdrawals_root)
 }
 
 /// Look up blob sidecars from the blob store.
@@ -252,5 +272,93 @@ impl ChainStorage<BscPrimitives> for BscStorage {
         Types: NodeTypesForProvider<Primitives = BscPrimitives>,
     {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_eips::eip4895::Withdrawal;
+
+    #[test]
+    fn a_body_keeps_only_the_withdrawals_its_header_commits_to() {
+        let one = Withdrawals::new(vec![Withdrawal { index: 1, ..Default::default() }]);
+        // Shanghai timestamp passed, London (and so BSC's Shanghai) not yet: no withdrawalsRoot.
+        assert_eq!(committed_withdrawals(Some(Withdrawals::default()), false), None);
+        assert_eq!(committed_withdrawals(Some(one.clone()), false), None);
+        // Shanghai active: the stored withdrawals, empty or not.
+        assert_eq!(
+            committed_withdrawals(Some(Withdrawals::default()), true),
+            Some(Withdrawals::default())
+        );
+        assert_eq!(committed_withdrawals(Some(one.clone()), true), Some(one));
+        assert_eq!(committed_withdrawals(None, false), None);
+    }
+
+    /// The read path a peer's `GetBlockBodies` and `eth_getBlockByNumber` share, on BSC testnet
+    /// headers around Shanghai and Cancun. Before the fix the middle one came back as `Some([])`,
+    /// which reth's own body check refused as well.
+    #[test]
+    fn bodies_between_shanghai_and_cancun_read_without_withdrawals() {
+        use alloy_consensus::{Header, constants::EMPTY_WITHDRAWALS};
+        use reth::{beacon_consensus::EthBeaconConsensus, consensus::Consensus};
+        use reth_primitives_traits::SealedHeader;
+        use reth_provider::{
+            DatabaseProviderFactory, test_utils::create_test_provider_factory_with_chain_spec,
+        };
+
+        let spec = Arc::new(crate::chainspec::bsc_chapel::bsc_testnet());
+        let factory = create_test_provider_factory_with_chain_spec(spec.clone());
+        let provider = factory.database_provider_ro().unwrap();
+        // Last block before Shanghai, a block between Shanghai and Cancun, first Cancun block.
+        let pre_shanghai =
+            Header { number: 36_087_827, timestamp: 0x6581_4d7d, ..Default::default() };
+        let pre_cancun =
+            Header { number: 37_087_828, timestamp: 0x65af_1668, ..Default::default() };
+        let cancun = Header {
+            number: 39_539_137,
+            timestamp: 0x661f_590c,
+            withdrawals_root: Some(EMPTY_WITHDRAWALS),
+            ..Default::default()
+        };
+
+        let bodies = BscStorage::default()
+            .read_block_bodies(
+                &provider,
+                vec![(&pre_shanghai, Vec::new()), (&pre_cancun, Vec::new()), (&cancun, Vec::new())],
+            )
+            .unwrap();
+        let withdrawals: Vec<_> =
+            bodies.iter().map(|body| body.inner.withdrawals.clone()).collect();
+        assert_eq!(withdrawals, vec![None, None, Some(Withdrawals::default())]);
+
+        // The body-against-header check `BscConsensus` runs on blocks fetched from peers.
+        let consensus = EthBeaconConsensus::new(spec);
+        for (header, body) in [pre_shanghai, pre_cancun, cancun].into_iter().zip(&bodies) {
+            Consensus::<BscBlock>::validate_body_against_header(
+                &consensus,
+                body,
+                &SealedHeader::seal_slow(header),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_body_without_withdrawals_root_encodes_without_withdrawals() {
+        use alloy_rlp::Encodable;
+        // What go-bsc's downloader checks: a header without withdrawalsRoot needs a body
+        // without the withdrawals list.
+        let body = BscBlockBody {
+            inner: reth_ethereum_primitives::BlockBody {
+                withdrawals: committed_withdrawals(Some(Withdrawals::default()), false),
+                ..Default::default()
+            },
+            sidecars: None,
+        };
+        let mut out = Vec::new();
+        body.encode(&mut out);
+        // [transactions, ommers]: two empty lists.
+        assert_eq!(out, vec![0xc2, 0xc0, 0xc0]);
     }
 }
