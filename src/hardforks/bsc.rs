@@ -124,6 +124,7 @@ impl BscHardfork {
             (Self::Osaka.boxed(), ForkCondition::Timestamp(1777343400)),
             (Self::Mendel.boxed(), ForkCondition::Timestamp(1777343400)),
             (Self::Pasteur.boxed(), ForkCondition::Timestamp(1787625000)), /* 2026-08-25 02:30:00 AM UTC */
+            (Self::Jenner.boxed(), ForkCondition::Timestamp(1796697000)), /* 2026-12-08 02:30:00 AM UTC */
         ])
     }
 
@@ -422,19 +423,18 @@ mod tests {
     }
 
     #[test]
-    fn test_jenner_not_scheduled_on_other_builtin_chains() {
-        // Mirrors go-bsc `JennerTime: nil` on BSCChainConfig: mainnet activation is not
-        // scheduled in this release. Local stays unscheduled.
-        for (name, forks) in [
-            ("mainnet", BscHardfork::bsc_mainnet()),
-            ("local", BscHardfork::bsc_local()),
-        ] {
-            assert_eq!(
-                forks.fork(BscHardfork::Jenner),
-                ForkCondition::Never,
-                "Jenner must stay unscheduled on {name} until its activation is announced"
-            );
-        }
+    fn test_jenner_scheduled_on_mainnet() {
+        // Mainnet JennerTime matches go-bsc: 2026-12-08 02:30:00 AM UTC (1796697000).
+        assert_eq!(
+            BscHardfork::bsc_mainnet().fork(BscHardfork::Jenner),
+            ForkCondition::Timestamp(1796697000),
+            "Jenner should activate on mainnet at its announced timestamp"
+        );
+    }
+
+    #[test]
+    fn test_jenner_not_scheduled_on_local() {
+        assert_eq!(BscHardfork::bsc_local().fork(BscHardfork::Jenner), ForkCondition::Never);
     }
 
     #[test]
@@ -485,8 +485,8 @@ mod tests {
             revm_spec_by_timestamp_and_block_number(spec.clone(), jenner_time, block),
             BscHardfork::Jenner
         );
-        // Cross-fork regression (mirrors go-bsc TestRulesJennerRegression): with Jenner
-        // unscheduled, resolution at the same instants is unchanged.
+        // The built-in mainnet schedule still resolves to Pasteur at these timestamps,
+        // before its Jenner activation.
         let plain = crate::chainspec::BscChainSpec::from(bsc_mainnet());
         assert_eq!(
             revm_spec_by_timestamp_and_block_number(plain.clone(), jenner_time, block),
