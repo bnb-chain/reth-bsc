@@ -4,9 +4,19 @@
 //! checkpoint awaiting its next persistence batch. The marker survives successful recovery:
 //! otherwise another restart could lose it before the Engine persists restored finality.
 
+use crate::hardforks::BscHardforks;
 use crate::node::engine_api::payload::BscPayloadTypes;
+use crate::{
+    chainspec::BscChainSpec,
+    consensus::parlia::{
+        provider::DbSnapshotProvider, BscForkChoiceRule, HeaderForForkchoice, SnapshotProvider,
+    },
+};
+use alloy_consensus::Header;
 use alloy_eips::BlockNumHash;
+use alloy_primitives::U256;
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
+use reth_chainspec::ChainSpecProvider;
 use reth_engine_primitives::ConsensusEngineHandle;
 use reth_node_builder::sync::{BackfillContext, BackfillSyncBuilder, PipelineBackfill};
 use reth_provider::{
@@ -25,18 +35,46 @@ const METADATA_KEY: &str = "bsc_startup_finalized";
 const RETRY_INTERVAL: Duration = Duration::from_secs(3);
 const ENGINE_TIMEOUT: Duration = Duration::from_secs(10);
 static RECOVERY: OnceLock<StartupRecovery> = OnceLock::new();
+static NETWORK_READY: AtomicBool = AtomicBool::new(false);
 
 /// Delegates ordinary staged sync, capturing finality before consistency checks can unwind it.
 #[derive(Debug, Default)]
 pub struct BscRecoveryBackfill;
 
-impl<N: ProviderNodeTypes, C> BackfillSyncBuilder<N, C> for BscRecoveryBackfill {
+impl<N, C> BackfillSyncBuilder<N, C> for BscRecoveryBackfill
+where
+    N: ProviderNodeTypes<ChainSpec = BscChainSpec, Primitives = crate::BscPrimitives>,
+{
     type Backfill = <PipelineBackfill as BackfillSyncBuilder<N, C>>::Backfill;
 
     fn recover(&mut self, factory: &ProviderFactory<N>) -> eyre::Result<()> {
         let checkpoint = capture_checkpoint(factory)?;
+        // Finish tracks committed executed blocks, unlike the header/static-file tip.
+        let provider = factory.database_provider_ro()?;
+        let head = provider.chain_info()?;
+        let mut recovery = StartupRecovery::new(checkpoint);
+        recovery.head = (head.best_number > 0)
+            .then_some(BlockNumHash { number: head.best_number, hash: head.best_hash });
+        recovery.head_resolved.store(recovery.head.is_none(), Ordering::Release);
+        if let Some(head) = recovery.head {
+            let header = provider
+                .sealed_header(head.number)?
+                .ok_or_else(|| eyre::eyre!("missing persisted executed head"))?;
+            let snapshots = DbSnapshotProvider::new(factory.db_ref().clone(), 2048);
+            recovery.head_score = Some(PersistedHead {
+                header: header.header().clone(),
+                td: provider.header_td(&head.hash)?,
+                justified: capture_justified(
+                    &provider,
+                    header.header().clone(),
+                    &snapshots,
+                    factory.chain_spec(),
+                )?,
+            });
+        }
+        recovery.ready.store(checkpoint.is_none() && recovery.head.is_none(), Ordering::Release);
         RECOVERY
-            .set(StartupRecovery::new(checkpoint))
+            .set(recovery)
             .map_err(|_| eyre::eyre!("BSC startup recovery already initialized"))?;
         Ok(())
     }
@@ -48,12 +86,23 @@ impl<N: ProviderNodeTypes, C> BackfillSyncBuilder<N, C> for BscRecoveryBackfill 
 
 struct StartupRecovery {
     checkpoint: Option<BlockNumHash>,
+    head: Option<BlockNumHash>,
+    head_score: Option<PersistedHead>,
+    head_resolved: AtomicBool,
+    restore_lock: tokio::sync::Mutex<()>,
     ready: AtomicBool,
 }
 
 impl StartupRecovery {
     fn new(checkpoint: Option<BlockNumHash>) -> Self {
-        Self { checkpoint, ready: AtomicBool::new(checkpoint.is_none()) }
+        Self {
+            checkpoint,
+            head: None,
+            head_score: None,
+            head_resolved: AtomicBool::new(true),
+            restore_lock: tokio::sync::Mutex::new(()),
+            ready: AtomicBool::new(checkpoint.is_none()),
+        }
     }
 
     fn is_ready(&self) -> bool {
@@ -66,8 +115,11 @@ impl StartupRecovery {
     where
         P: BlockNumReader + HeaderProvider + BlockIdReader,
     {
-        let Some(checkpoint) = self.checkpoint else { return Ok(None) };
+        if self.checkpoint.is_none() && self.head.is_none() {
+            return Ok(None);
+        }
         let head = provider.chain_info()?;
+        let Some(checkpoint) = self.checkpoint else { return Ok(None) };
         let head_hash = if head.best_number < checkpoint.number {
             checkpoint.hash
         } else {
@@ -122,10 +174,11 @@ impl StartupRecovery {
         P: BlockNumReader + HeaderProvider + BlockIdReader,
     {
         loop {
+            let guard = self.restore_lock.lock().await;
             let Some(target) = self.recovery_target(&provider)? else {
                 self.ready.store(true, Ordering::Release);
                 tracing::info!(target: "bsc::startup_recovery", checkpoint = ?self.checkpoint,
-                    "Persisted finalized history restored; mining and voting enabled");
+                    "Persisted finalized history restored; waiting for startup head assessment");
                 return Ok(());
             };
             tracing::warn!(target: "bsc::startup_recovery", checkpoint = ?self.checkpoint,
@@ -151,14 +204,47 @@ impl StartupRecovery {
                 Err(_) => tracing::warn!(target: "bsc::startup_recovery",
                     "Finalized recovery request timed out; mining and voting remain disabled"),
             }
+            drop(guard);
             tokio::time::sleep(RETRY_INTERVAL).await;
         }
+    }
+    async fn supersede_head(
+        &self,
+        header: &Header,
+        td: Option<U256>,
+        justified: u64,
+        spec: std::sync::Arc<BscChainSpec>,
+    ) -> eyre::Result<()> {
+        let _guard = self.restore_lock.lock().await;
+        if self.head.is_none_or(|head| head.hash == header.hash_slow()) {
+            self.head_resolved.store(true, Ordering::Release);
+            return Ok(());
+        }
+        let Some(saved) = &self.head_score else { return Ok(()) };
+        let saved_justified = saved.justified.or_else(|| {
+            crate::shared::get_snapshot_provider()
+                .and_then(|snapshots| snapshots.snapshot_by_hash(&saved.header.hash_slow()))
+                .map(|snapshot| snapshot.vote_data.target_number)
+        });
+        let Some(saved_justified) = saved_justified else { return Ok(()) };
+        let rule = BscForkChoiceRule::new(spec);
+        if rule.is_need_reorg(
+            &HeaderForForkchoice::new(header, td, justified),
+            &HeaderForForkchoice::new(&saved.header, saved.td, saved_justified),
+        )? {
+            self.head_resolved.store(true, Ordering::Release);
+        }
+        Ok(())
     }
 }
 
 /// Shared signing gate. The launcher installs it before any BSC components can start.
 pub(crate) fn is_ready() -> bool {
-    RECOVERY.get().is_none_or(StartupRecovery::is_ready)
+    RECOVERY.get().is_none_or(|recovery| {
+        recovery.is_ready()
+            && recovery.head_resolved.load(Ordering::Acquire)
+            && NETWORK_READY.load(Ordering::Acquire)
+    })
 }
 
 /// Restore the saved checkpoint through the running Engine before enabling local signing.
@@ -329,6 +415,79 @@ mod tests {
         assert_eq!(target.head_block_hash, checkpoint(21).hash);
         assert_eq!(target.finalized_block_hash, checkpoint(21).hash);
         assert!(!recovery.is_ready());
+    }
+
+    #[tokio::test]
+    async fn verified_lower_head_can_supersede_unfinalized_tip() {
+        let factory = create_test_provider_factory();
+        write_header(&factory, &header(30));
+        let provider = BlockchainProvider::with_latest(factory, header(28)).unwrap();
+        provider.set_finalized(header(21));
+        let mut recovery = StartupRecovery::new(Some(checkpoint(21)));
+        recovery.head = Some(checkpoint(30));
+        recovery.head_score = Some(PersistedHead {
+            header: header(30).header().clone(),
+            td: Some(U256::from(60)),
+            justified: Some(22),
+        });
+        recovery.head_resolved.store(false, Ordering::Release);
+        // Merely receiving a lower peer head cannot discard the durable tip.
+        assert!(!recovery.head_resolved.load(Ordering::Acquire));
+        recovery
+            .supersede_head(
+                header(28).header(),
+                Some(U256::from(56)),
+                27,
+                std::sync::Arc::new(BscChainSpec::from(crate::chainspec::bsc_rialto::bsc_qanet())),
+            )
+            .await
+            .unwrap();
+        assert!(recovery.head_resolved.load(Ordering::Acquire));
+        assert!(recovery.recovery_target(&provider).unwrap().is_none());
+        assert_eq!(provider.finalized_block_num_hash().unwrap(), Some(checkpoint(21)));
+    }
+
+    #[test]
+    fn captures_justified_from_static_headers_without_a_snapshot_at_the_tip() {
+        let factory = create_test_provider_factory();
+        let mut parent = B256::ZERO;
+        let mut headers = Vec::<SealedHeader<Header>>::new();
+        for number in 0..=30 {
+            let mut header = Header { number, parent_hash: parent, ..Default::default() };
+            if number == 23 {
+                let attestation = crate::consensus::parlia::VoteAttestation {
+                    vote_address_set: 0,
+                    agg_signature: Default::default(),
+                    data: crate::consensus::parlia::VoteData {
+                        source_number: 21,
+                        source_hash: headers[21].hash(),
+                        target_number: 22,
+                        target_hash: parent,
+                    },
+                    extra: Default::default(),
+                };
+                let mut extra = vec![0; crate::consensus::parlia::EXTRA_VANITY_LEN];
+                extra.extend(alloy_rlp::encode(attestation));
+                extra.extend([0; crate::consensus::parlia::EXTRA_SEAL_LEN]);
+                header.extra_data = extra.into();
+            }
+            let header = SealedHeader::seal_slow(header);
+            parent = header.hash();
+            headers.push(header);
+        }
+        insert_headers(&factory, &headers);
+        let snapshots = DbSnapshotProvider::new(factory.db_ref().clone(), 2048);
+        let provider = factory.database_provider_ro().unwrap();
+        assert_eq!(
+            capture_justified(
+                &provider,
+                headers[30].header().clone(),
+                &snapshots,
+                std::sync::Arc::new(BscChainSpec::from(crate::chainspec::bsc_rialto::bsc_qanet()))
+            )
+            .unwrap(),
+            Some(22)
+        );
     }
 
     #[test]
@@ -617,4 +776,107 @@ mod tests {
         assert!(recovery.is_ready());
         assert!(requests.try_recv().is_err());
     }
+}
+
+/// Complete one successful network-head assessment before either signer can run.
+pub(crate) fn network_ready(head: alloy_eips::BlockNumHash) {
+    if !NETWORK_READY.swap(true, Ordering::AcqRel) {
+        tracing::info!(target: "bsc::startup_sync", number = head.number, hash = %head.hash,
+            "Network head assessed; startup network signing gate released");
+    }
+}
+
+/// The captured checkpoint remains a safety floor even before Engine restores its marker.
+pub(crate) fn finalized_checkpoint() -> Option<BlockNumHash> {
+    RECOVERY.get().and_then(|recovery| recovery.checkpoint)
+}
+
+/// Snapshot checkpoints are sparse and headers may live only in static files. The latest
+/// applicable attestation determines justified height; use the same parser/target rule as
+/// Snapshot::update_attestation while walking the already executed canonical history.
+fn capture_justified<P>(
+    provider: &P,
+    mut header: Header,
+    snapshots: &dyn SnapshotProvider,
+    spec: std::sync::Arc<BscChainSpec>,
+) -> eyre::Result<Option<u64>>
+where
+    P: HeaderProvider<Header = Header>,
+{
+    let parlia = crate::consensus::parlia::Parlia::new(spec.clone(), 200);
+    for _ in 0..crate::node::network::block_import::fork_recover::MAX_FORK_DEPTH {
+        if let Some(snapshot) = snapshots.snapshot_by_hash(&header.hash_slow()) {
+            return Ok(Some(if snapshot.vote_data.target_hash.is_zero() {
+                0
+            } else {
+                snapshot.vote_data.target_number
+            }));
+        }
+        if !spec.is_luban_active_at_block(header.number) || header.number == 0 {
+            return Ok(Some(0));
+        }
+        if let Some(attestation) =
+            parlia.get_vote_attestation_from_header(&header, parlia.get_epoch_length(&header))?
+        {
+            if spec.is_fermi_active_at_timestamp(header.number, header.timestamp)
+                || (attestation.data.target_number.checked_add(1) == Some(header.number)
+                    && attestation.data.target_hash == header.parent_hash)
+            {
+                return Ok(Some(if attestation.data.target_hash.is_zero() {
+                    0
+                } else {
+                    attestation.data.target_number
+                }));
+            }
+        }
+        let Some(parent) = provider.sealed_header(header.number - 1)? else { return Ok(None) };
+        eyre::ensure!(
+            parent.hash() == header.parent_hash,
+            "persisted executed head ancestry conflict"
+        );
+        header = parent.header().clone();
+    }
+    Ok(None)
+}
+
+struct PersistedHead {
+    header: Header,
+    td: Option<U256>,
+    justified: Option<u64>,
+}
+
+/// Only an executed head selected by the normal Parlia rule may supersede an unfinalized
+/// persisted tip. Coordinate this decision with restoration of the finalized checkpoint.
+pub(crate) async fn supersede_persisted_head(
+    header: &Header,
+    td: Option<U256>,
+    justified: u64,
+    spec: std::sync::Arc<BscChainSpec>,
+) -> eyre::Result<()> {
+    let Some(recovery) = RECOVERY.get() else { return Ok(()) };
+    recovery.supersede_head(header, td, justified, spec).await
+}
+
+/// An unfinalized durable head is a recovery candidate, never an Engine sync target by itself.
+pub(crate) fn unresolved_persisted_head() -> Option<BlockNumHash> {
+    RECOVERY
+        .get()
+        .filter(|recovery| !recovery.head_resolved.load(Ordering::Acquire))
+        .and_then(|recovery| recovery.head)
+}
+
+/// Executed canonical ancestry is sufficient to recover the durable tip without a peer claim.
+pub(crate) fn confirm_persisted_ancestor<P>(provider: &P) -> eyre::Result<()>
+where
+    P: reth_provider::BlockHashReader + BlockNumReader,
+{
+    let Some(recovery) = RECOVERY.get() else { return Ok(()) };
+    if let Some(saved) = recovery.head {
+        if provider.chain_info()?.best_number >= saved.number
+            && provider.block_hash(saved.number)? == Some(saved.hash)
+        {
+            recovery.head_resolved.store(true, Ordering::Release);
+        }
+    }
+    Ok(())
 }

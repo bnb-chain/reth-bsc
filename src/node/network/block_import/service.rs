@@ -256,7 +256,7 @@ where
             failed_heads: crate::node::network::block_import::fork_recover::new_failed_heads_cooler(
                 LRU_PROCESSED_BLOCKS_SIZE,
             ),
-            recovery_gate: crate::node::network::block_import::fork_recover::new_recovery_gate(),
+            recovery_gate: crate::node::network::block_import::fork_recover::shared_recovery_gate(),
             pipeline_targets: super::pipeline_targets::PipelineTargets::new(engine.clone()),
             announce_interval: {
                 // 3s ≈ 6-7 BSC slots (450ms each). Fast enough to break fork
