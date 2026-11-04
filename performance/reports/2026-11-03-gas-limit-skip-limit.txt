@@ -1,0 +1,10 @@
+Gas-limit tail scan bound (validated implementation)
+
+BSC_MINING_GAS_LIMIT_SKIP_LIMIT: startup-cached nonnegative integer, default5000.0 disables the cutoff. Invalid input warns and falls back5000.
+Each build independently counts consecutive iterator candidates rejected for insufficient remaining block gas. Stop at the limit; cancellation/deadlines remain active. A fitting candidate or a rejection for another reason resets the streak. This is neither a total scan cap nor a transaction pool eviction rule. Existing mark_invalid only filters this candidate iterator and descendants; no additional pool removal or transaction validity change.
+
+Purpose: bound scans near a full block. Current4500run observed36937scanned/2559executed/34378gas-skips in a sampled normal build,~35.8ms skip walltime. The cutoff may miss a smaller fitting transaction later in the iterator, so reduced scan work is expected but throughput/total-block-time gains need a separate deployed comparison. Proof runs concurrently, so no equal walltime savings guaranteed.
+
+Existing bsc_miner_build_stop_total gains reason=gas_skip_limit. New bsc.build_diagnostics.selection_stop_total partitions attempts by kind/turn/reason (includes interrupted/incomplete paths); scanned_transactions_per_attempt, executed_transactions_per_attempt, gas_limit_skip_streak_per_attempt are histograms recorded once per attempt, no metric invocation per transaction. Exporter summary quantile1 (when enabled) is a rolling-window observed max, not a lifetime maximum; aggregate counter/scans-per-second is not per-block maximum. Existing abnormal budget log gains gas_limit_skip_peak. No hash/block labels.
+
+4450TPS600s test ran unchanged deployed396e7e9, not this local patch. Do not use it to claim this cutoff improved performance. Validation: 3 perf_tuning and 8 build_diagnostics tests pass; clippy --lib --tests -D warnings, fmt and diff checks pass. User authorized remote compilation; this report does not claim deployment or performance benefit.

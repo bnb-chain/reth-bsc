@@ -824,6 +824,8 @@ where
             cache.execution_started();
         }
         work.execution_started(exec_start);
+        let mut gas_limit_skips = super::perf_tuning::GasLimitSkips::configured();
+        let mut gas_skip_limit_reached = false;
         loop {
             work.selection_stage(SelectionStage::Control);
             let iteration_started = std::time::Instant::now();
@@ -857,6 +859,7 @@ where
                     InvalidPoolTransactionError::other(BlacklistedAddressError()),
                 );
                 work.skip(SkipReason::Blacklisted, iteration_started);
+                gas_limit_skips.reset();
                 continue;
             }
             // filter out tx with min gas tip.
@@ -875,6 +878,7 @@ where
                 );
                 best_tx_list.mark_invalid(&pool_tx, InvalidPoolTransactionError::Underpriced);
                 work.skip(SkipReason::Underpriced, iteration_started);
+                gas_limit_skips.reset();
                 continue;
             }
 
@@ -891,8 +895,15 @@ where
                     ),
                 );
                 work.skip(SkipReason::GasLimit, iteration_started);
+                gas_skip_limit_reached = gas_limit_skips.rejected();
+                work.gas_limit_skip_peak = gas_limit_skips.peak() as u64;
+                if gas_skip_limit_reached {
+                    break;
+                }
                 continue;
             }
+
+            gas_limit_skips.reset();
 
             let tx = pool_tx.to_consensus();
             if tx.is_eip4844() && !blob_eligible {
@@ -1142,6 +1153,8 @@ where
             let now = std::time::Instant::now();
             let reason = if cancel.is_cancelled() {
                 "cancelled"
+            } else if gas_skip_limit_reached {
+                "gas_skip_limit"
             } else if !control.allows_late_finish() && now >= control.finish_until {
                 "completion_deadline"
             } else if now >= control.transactions_until {
@@ -1160,6 +1173,8 @@ where
         } else {
             work.selection_stopped(if cancel.is_cancelled() {
                 "cancelled"
+            } else if gas_skip_limit_reached {
+                "gas_skip_limit"
             } else {
                 "pool_or_gas_limit"
             });
