@@ -2,10 +2,7 @@ use crate::{
     consensus::parlia::SnapshotProvider,
     node::{
         engine_api::payload::BscPayloadTypes,
-        network::{
-            block_import::service::{IncomingBidBlock, IncomingBlock, IncomingMinedBlock},
-            BscNetworkPrimitives,
-        },
+        network::{block_import::service::IncomingLocalBlock, BscNetworkPrimitives},
         primitives::BscBlock,
     },
 };
@@ -34,7 +31,10 @@ use std::{
         Arc, OnceLock, RwLock,
     },
 };
-use tokio::sync::{broadcast, mpsc::UnboundedSender};
+use tokio::sync::{
+    broadcast,
+    mpsc::{Sender, UnboundedSender},
+};
 
 /// Public type alias for the BSC engine API sender (replaces private reth EngineApiTx).
 pub type BscEngineApiTx = UnboundedSender<
@@ -50,9 +50,16 @@ type HeaderByNumberFn = Arc<dyn Fn(u64) -> Option<Header> + Send + Sync>;
 /// Global shared access to the snapshot provider for RPC
 static SNAPSHOT_PROVIDER: OnceLock<Arc<dyn SnapshotProvider + Send + Sync>> = OnceLock::new();
 
+/// Select independent normal/fallback worker sessions while sharing parent overlays.
+#[derive(Debug, Clone, Copy)]
+pub enum MinerRootKind {
+    Normal,
+    EmptyFallback,
+}
+
 /// Function type for spawning a sparse-trie state-root background task.
 ///
-/// Takes the parent block's sealed header, returns an opaque handle that the
+/// Takes the parent block's sealed header and worker kind, returns an opaque handle that the
 /// miner can:
 ///   1. attach as a `state_hook` on the BSC executor (streams per-tx state diffs to the task)
 ///   2. block on after execution to receive the precomputed `(state_root, trie_updates)`
@@ -65,7 +72,9 @@ static SNAPSHOT_PROVIDER: OnceLock<Arc<dyn SnapshotProvider + Send + Sync>> = On
 /// `--mining.use-sparse-trie-state-root` is enabled. Returns `None` if the engine
 /// has not been wired (graceful fallback to legacy `state_root_with_updates`).
 pub type SparseTrieSpawnFn = Arc<
-    dyn Fn(SealedHeader<Header>) -> Option<reth_engine_tree::tree::StateRootHandle> + Send + Sync,
+    dyn Fn(SealedHeader<Header>, MinerRootKind) -> Option<reth_engine_tree::tree::StateRootHandle>
+        + Send
+        + Sync,
 >;
 
 /// Global sparse-trie state-root spawner. See [`SparseTrieSpawnFn`].
@@ -89,15 +98,8 @@ type BestTdFn = Arc<dyn Fn() -> Option<u128> + Send + Sync>;
 /// Global best total difficulty provider
 static BEST_TD_PROVIDER: OnceLock<BestTdFn> = OnceLock::new();
 
-/// Global sender for submitting mined blocks to the import service
-static BLOCK_IMPORT_MINED_SENDER: OnceLock<UnboundedSender<IncomingMinedBlock>> = OnceLock::new();
-
-/// Global sender for submitting built payload to the import service
-static BLOCK_IMPORT_SENDER: OnceLock<UnboundedSender<IncomingBlock>> = OnceLock::new();
-
-/// Global sender for submitting a selected (sealed, unexecuted) BEP-675 BidBlock to the import
-/// service, which broadcasts it then verifies it on import (zero-simulate).
-static BID_BLOCK_IMPORT_SENDER: OnceLock<UnboundedSender<IncomingBidBlock>> = OnceLock::new();
+/// Bounded ingress shared by locally mined, fallback and selected BidBlocks.
+static LOCAL_BLOCK_IMPORT_SENDER: OnceLock<Sender<IncomingLocalBlock>> = OnceLock::new();
 
 /// Global local peer ID for network identification
 static LOCAL_PEER_ID: OnceLock<PeerId> = OnceLock::new();
@@ -336,7 +338,15 @@ pub fn set_sparse_trie_spawn_fn(spawner: SparseTrieSpawnFn) -> Result<(), Sparse
 pub fn spawn_sparse_trie_state_root(
     parent_header: SealedHeader<Header>,
 ) -> Option<reth_engine_tree::tree::StateRootHandle> {
-    SPARSE_TRIE_SPAWN_FN.get().and_then(|f| f(parent_header))
+    SPARSE_TRIE_SPAWN_FN.get().and_then(|f| f(parent_header, MinerRootKind::Normal))
+}
+
+/// Reuse miner parent overlays, with independent workers so a normal task waiting for
+/// more transaction updates cannot block the empty candidate's root.
+pub fn spawn_empty_sparse_trie_state_root(
+    parent_header: SealedHeader<Header>,
+) -> Option<reth_engine_tree::tree::StateRootHandle> {
+    SPARSE_TRIE_SPAWN_FN.get().and_then(|f| f(parent_header, MinerRootKind::EmptyFallback))
 }
 
 /// Whether the sparse-trie state-root fast path is wired up.
@@ -452,40 +462,16 @@ pub fn get_best_canonical_td() -> Option<u128> {
     BEST_TD_PROVIDER.get().and_then(|f| f())
 }
 
-/// Store the block import sender globally. Returns an error if it was set before.
-pub fn set_block_import_mined_sender(
-    sender: UnboundedSender<IncomingMinedBlock>,
-) -> Result<(), UnboundedSender<IncomingMinedBlock>> {
-    BLOCK_IMPORT_MINED_SENDER.set(sender)
+/// Store the local block import sender. Returns an error if already initialised.
+pub(crate) fn set_local_block_import_sender(
+    sender: Sender<IncomingLocalBlock>,
+) -> Result<(), Sender<IncomingLocalBlock>> {
+    LOCAL_BLOCK_IMPORT_SENDER.set(sender)
 }
 
-/// Get a reference to the global block import sender, if initialized.
-pub fn get_block_import_mined_sender() -> Option<&'static UnboundedSender<IncomingMinedBlock>> {
-    BLOCK_IMPORT_MINED_SENDER.get()
-}
-
-/// Store the block import sender globally. Returns an error if it was set before.
-pub fn set_block_import_sender(
-    sender: UnboundedSender<IncomingBlock>,
-) -> Result<(), UnboundedSender<IncomingBlock>> {
-    BLOCK_IMPORT_SENDER.set(sender)
-}
-
-/// Get a reference to the global block import sender, if initialized.
-pub fn get_block_import_sender() -> Option<&'static UnboundedSender<IncomingBlock>> {
-    BLOCK_IMPORT_SENDER.get()
-}
-
-/// Store the BidBlock import sender globally. Returns an error if it was set before.
-pub fn set_bid_block_import_sender(
-    sender: UnboundedSender<IncomingBidBlock>,
-) -> Result<(), UnboundedSender<IncomingBidBlock>> {
-    BID_BLOCK_IMPORT_SENDER.set(sender)
-}
-
-/// Get a reference to the global BidBlock import sender, if initialized.
-pub fn get_bid_block_import_sender() -> Option<&'static UnboundedSender<IncomingBidBlock>> {
-    BID_BLOCK_IMPORT_SENDER.get()
+/// The local producer must await capacity or reserve it before spawning a delayed send.
+pub(crate) fn get_local_block_import_sender() -> Option<&'static Sender<IncomingLocalBlock>> {
+    LOCAL_BLOCK_IMPORT_SENDER.get()
 }
 
 /// Store the local peer ID globally. Returns an error if it was set before.

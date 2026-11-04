@@ -305,7 +305,9 @@ fn trusted_local_build_produces_block() {
                 turn_length_sink: None,
                 state_root_precomputed_sink: None,
                 trie_handle: None,
+                finish_diagnostics: None,
                 state_root_deadline_ms: None,
+                build_control: None,
             },
         )
         .expect("builder for next block");
@@ -386,7 +388,15 @@ fn round_trip_build_finalize_reexecute_agree() {
                     turn_length_sink: None,
                     state_root_precomputed_sink: None,
                     trie_handle: None,
+                    finish_diagnostics: None,
                     state_root_deadline_ms: None,
+                    build_control: Some(reth_bsc::node::miner::build_control::BuildControl::new(
+                        std::time::Instant::now(),
+                        std::time::Duration::from_secs(10),
+                        std::time::Duration::from_secs(1),
+                        std::time::Duration::from_secs(10),
+                        Default::default(),
+                    )),
                 },
             )
             .expect("builder for next block");
@@ -509,7 +519,9 @@ fn execution_gate_round_trip() {
         turn_length_sink: None,
         state_root_precomputed_sink: None,
         trie_handle: None,
+        finish_diagnostics: None,
         state_root_deadline_ms: None,
+        build_control: None,
     };
 
     // --- Build + finalize + insert block 1 (absorbs the one-time system-contract init txs). ---
@@ -822,7 +834,9 @@ fn jenner_payment_lane_chain_round_trips() {
                 turn_length_sink: None,
                 state_root_precomputed_sink: None,
                 trie_handle: None,
+                finish_diagnostics: None,
                 state_root_deadline_ms: None,
+                build_control: None,
             };
             let mut builder = evm_config
                 .builder_for_next_block(&mut db, &parent, attrs)
