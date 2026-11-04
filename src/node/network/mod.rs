@@ -38,7 +38,7 @@ use tracing::{debug, info, warn};
 pub mod block_import;
 pub(crate) mod blocks_by_range;
 pub mod bootnodes;
-mod data_availability;
+pub(crate) mod data_availability;
 pub mod evn;
 pub mod evn_peers;
 pub mod handshake;

@@ -391,6 +391,43 @@ where
         "Phase 1 complete"
     );
 
+    import_discovered(
+        RecoverTarget {
+            fetch_start_hash,
+            fetch_start_num,
+            fcu_target_hash,
+            fcu_target_num,
+            fcu_target_header,
+        },
+        discovery,
+        provider,
+        engine,
+        forkchoice_engine,
+        progress,
+    )
+    .await
+}
+
+/// Import an already hash-linked ancestor walk through the ordinary recovery/fork-choice path.
+/// Startup callers authenticate its common ancestor against executed and finalized history first.
+pub(crate) async fn import_discovered<P>(
+    target: RecoverTarget,
+    discovery: Discovery,
+    provider: P,
+    engine: ConsensusEngineHandle<BscPayloadTypes>,
+    forkchoice_engine: BscForkChoiceEngine<P>,
+    progress: &dyn ProgressSink,
+) -> Result<(), ForkRecoverError>
+where
+    P: BlockHashReader
+        + BlockNumReader
+        + HeaderProvider<Header = alloy_consensus::Header>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+{
+    let RecoverTarget { fcu_target_hash, fcu_target_num, fcu_target_header, .. } = target;
     // ---- Phase 2: import oldest → newest via new_payload ----
     let mut to_import = discovery.fork_blocks;
     to_import.reverse();
@@ -1896,4 +1933,10 @@ mod cooler_tests {
         assert!(cooler.is_cooling(&b));
         assert!(cooler.is_cooling(&c));
     }
+}
+
+/// Share recovery admission between announcement-driven and active startup catch-up.
+pub(crate) fn shared_recovery_gate() -> RecoveryGate {
+    static GATE: std::sync::OnceLock<RecoveryGate> = std::sync::OnceLock::new();
+    GATE.get_or_init(new_recovery_gate).clone()
 }

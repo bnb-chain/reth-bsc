@@ -704,6 +704,8 @@ fn main() -> eyre::Result<()> {
 
             let recovery_provider = node.provider.clone();
             let recovery_engine = node.beacon_engine_handle.clone();
+            let recovery_network = node.network.clone();
+            let recovery_chain_spec = node.chain_spec();
             node.task_executor.spawn_critical_task("bsc-startup-recovery", async move {
                 if let Err(error) = reth_bsc::node::startup_recovery::run(
                     recovery_provider, recovery_engine,
@@ -711,6 +713,13 @@ fn main() -> eyre::Result<()> {
                     tracing::error!(target: "bsc::startup_recovery", %error, "Startup finality recovery failed");
                     panic!("Startup finality recovery failed: {error}");
                 }
+            });
+            let sync_provider = node.provider.clone();
+            let sync_engine = node.beacon_engine_handle.clone();
+            node.task_executor.spawn_critical_task("bsc-startup-sync", async move {
+                reth_bsc::node::startup_sync::run(
+                    sync_provider, sync_engine, recovery_network, recovery_chain_spec,
+                ).await;
             });
 
             let grpc_handle = mev_grpc_handle.lock().unwrap().take();
