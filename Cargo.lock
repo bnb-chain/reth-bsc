@@ -10798,6 +10798,7 @@ dependencies = [
  "futures",
  "gmp-mpfr-sys",
  "hex 0.4.3",
+ "humantime",
  "jsonrpsee",
  "jsonrpsee-core",
  "jsonrpsee-types",

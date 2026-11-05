@@ -139,6 +139,7 @@ tonic-prost = "0.14.6"
 tracing = "0.1"
 bit-set = "0.5.3"
 rand = "0.9"
+humantime = { version = "2", default-features = false }
 zeroize = "1"
 # For EIP-2335 BLS keystore support
 aes = "0.8"

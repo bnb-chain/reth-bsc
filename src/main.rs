@@ -149,6 +149,10 @@ pub struct BscCliArgs {
     /// Disable TX broadcast forbidden for EVN peers.
     #[arg(long = "evn.disable-tx-broadcast-forbidden")]
     pub evn_disable_tx_broadcast_forbidden: bool,
+
+    /// Block download, ancestor recovery, and active startup catch-up tuning.
+    #[command(flatten)]
+    pub block_sync: reth_bsc::node::network::block_import::config::BlockSyncArgs,
 }
 
 /// BSC default for `--gpo.ignoreprice` (wei), matching geth and pre-v2.2 reth-bsc.
@@ -232,6 +236,7 @@ fn main() -> eyre::Result<()> {
             )
         },
         async move |mut builder, args| {
+            let block_sync = args.block_sync.into_config()?;
             // Set genesis hash override if provided
             if let Err(e) = genesis_override::set_genesis_hash_override(args.genesis_hash) {
                 tracing::error!("Failed to set genesis hash override: {}", e);
@@ -520,6 +525,7 @@ fn main() -> eyre::Result<()> {
             let mev_grpc_handle_for_rpc = Arc::clone(&mev_grpc_handle);
 
             let (node, engine_handle_tx) = BscNode::new();
+            let node = node.with_block_sync(block_sync.clone());
             let NodeHandle { node, node_exit_future: exit_future } =
                 builder.node(node)
                     .extend_rpc_modules(move |ctx| {
@@ -717,8 +723,8 @@ fn main() -> eyre::Result<()> {
             let sync_provider = node.provider.clone();
             let sync_engine = node.beacon_engine_handle.clone();
             node.task_executor.spawn_critical_task("bsc-startup-sync", async move {
-                reth_bsc::node::startup_sync::run(
-                    sync_provider, sync_engine, recovery_network, recovery_chain_spec,
+                reth_bsc::node::startup_sync::run_with_config(
+                    sync_provider, sync_engine, recovery_network, recovery_chain_spec, block_sync,
                 ).await;
             });
 
@@ -735,7 +741,7 @@ fn main() -> eyre::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::user_set_gpo_ignore_price;
+    use super::*;
 
     fn args(v: &[&str]) -> std::vec::IntoIter<String> {
         v.iter().map(|s| s.to_string()).collect::<Vec<_>>().into_iter()
@@ -747,5 +753,27 @@ mod tests {
         assert!(user_set_gpo_ignore_price(args(&["reth-bsc", "node", "--gpo.ignoreprice=7"])));
         assert!(!user_set_gpo_ignore_price(args(&["reth-bsc", "node", "--chain", "bsc"])));
         assert!(!user_set_gpo_ignore_price(args(&["reth-bsc", "node", "--gpo.blocks", "20"])));
+    }
+
+    #[test]
+    fn real_node_cli_exposes_and_parses_block_sync_tuning() {
+        let help =
+            Cli::<BscChainSpecParser, BscCliArgs>::try_parse_from(["reth-bsc", "node", "--help"])
+                .unwrap_err();
+        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert!(help.to_string().contains("--bsc.block-sync.quick-timeout"));
+        let cli = Cli::<BscChainSpecParser, BscCliArgs>::try_parse_from([
+            "reth-bsc",
+            "node",
+            "--bsc.block-sync.max-head-fetches",
+            "48",
+            "--bsc.block-sync.quick-timeout",
+            "80ms",
+        ])
+        .unwrap();
+        let reth::cli::Commands::Node(node) = cli.command else { panic!("node command expected") };
+        assert_eq!(node.ext.block_sync.max_head_fetches, 48);
+        assert_eq!(node.ext.block_sync.quick_timeout, std::time::Duration::from_millis(80));
+        node.ext.block_sync.into_config().unwrap();
     }
 }

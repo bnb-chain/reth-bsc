@@ -1366,7 +1366,7 @@ where
     }
 
     /// Gets the finalized number and hash from the header's snapshot.
-    fn get_finalized_number_and_hash(&self, header: &Header) -> Option<(u64, B256)> {
+    pub(crate) fn get_finalized_number_and_hash(&self, header: &Header) -> Option<(u64, B256)> {
         if !self.chain_spec.is_plato_active_at_block(header.number) {
             return None;
         }
@@ -1455,23 +1455,41 @@ where
 
     /// Gets the total difficulty for a specific header, keyed by hash.
     ///
-    /// Reads the TD from the provider's `header_td` hook, which serves the persisted per-block TD
-    /// from the `HeaderTerminalDifficulties` table (written in `save_blocks`) and extends it over
-    /// any not-yet-persisted in-memory tail. Results are cached here for the sequential queries
-    /// fork choice makes.
+    /// Recovered fork TDs come from the hash-keyed cache. Provider fallback is allowed only
+    /// after confirming the hash identifies its canonical block number, since the provider's
+    /// TD lookup may otherwise return the canonical chain's TD for a side-branch hash.
     async fn header_td(
         &self,
         _engine: &ConsensusEngineHandle<BscPayloadTypes>,
         _number: u64,
         hash: B256,
     ) -> Result<Option<alloy_primitives::U256>, ParliaConsensusErr> {
+        self.header_td_by_hash(hash)
+    }
+
+    /// Resolve exact-hash TD from the fork cache or a confirmed canonical provider block.
+    /// Provider TD APIs may resolve a noncanonical hash through its canonical block number.
+    pub(crate) fn header_td_by_hash(
+        &self,
+        hash: B256,
+    ) -> Result<Option<alloy_primitives::U256>, ParliaConsensusErr> {
         if let Some(td) = self.header_td_cache.write().get(&hash) {
             return Ok(*td);
         }
+        let canonical =
+            match self.provider.block_number(hash).map_err(ParliaConsensusErr::internal)? {
+                Some(number) => self
+                    .provider
+                    .header_by_number(number)
+                    .map_err(ParliaConsensusErr::internal)?
+                    .is_some_and(|header| header.hash_slow() == hash),
+                None => false,
+            };
+        if !canonical {
+            return Ok(None);
+        }
         let td = self.provider.header_td(&hash).map_err(ParliaConsensusErr::internal)?;
-        // Only memoize resolved values. Caching a `None` makes a transient failure permanent for
-        // that hash: TD becomes resolvable once the block is persisted or a common ancestor
-        // appears, but a cached `None` means we would never ask again.
+        // Only memoize resolved values; a missing hash may become available later.
         if td.is_some() {
             self.header_td_cache.write().insert(hash, td);
         }
@@ -1498,9 +1516,7 @@ where
     {
         let mut iter = headers.into_iter().peekable();
         let Some(first) = iter.peek() else { return Ok(()) };
-        let Some(mut running) =
-            self.provider.header_td(&first.parent_hash).map_err(ParliaConsensusErr::internal)?
-        else {
+        let Some(mut running) = self.header_td_by_hash(first.parent_hash)? else {
             // Fork point TD unknown; leave resolution to the header_td fallback.
             return Ok(());
         };
