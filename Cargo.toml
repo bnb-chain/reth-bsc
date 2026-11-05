@@ -18,7 +18,19 @@ path = "src/main.rs"
 
 [dependencies]
 reth-bsc-evm = { path = "crates/evm" }
-reth = { git = "https://github.com/bnb-chain/reth.git", rev = "5a4d1791caca286fd348ac713a55014d225cf7e9" }
+# Keep Reth's non-allocator defaults explicit so `--no-default-features` can
+# disable jemalloc throughout the dependency graph for static musl builds.
+# The local `jemalloc` feature below enables Reth's allocator for normal builds.
+reth = { git = "https://github.com/bnb-chain/reth.git", rev = "5a4d1791caca286fd348ac713a55014d225cf7e9", default-features = false, features = [
+    "otlp",
+    "otlp-logs",
+    "js-tracer",
+    "keccak-cache-global",
+    "asm-keccak",
+    "gmp",
+    "min-trace-logs",
+    "portable",
+] }
 reth-cli = { git = "https://github.com/bnb-chain/reth.git", rev = "5a4d1791caca286fd348ac713a55014d225cf7e9" }
 reth-cli-commands = { git = "https://github.com/bnb-chain/reth.git", rev = "5a4d1791caca286fd348ac713a55014d225cf7e9" }
 reth-basic-payload-builder = { git = "https://github.com/bnb-chain/reth.git", rev = "5a4d1791caca286fd348ac713a55014d225cf7e9" }
