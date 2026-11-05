@@ -29,8 +29,8 @@ pub const FORK_RECOVER_HOP_COUNT: u64 = 4;
 /// Default per-peer ancestor request timeout, overridden by recovery-timeout.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Default sequential BSC peer attempts per hop. Runtime uses recovery-peer-attempts.
-/// The default stalled-hop window is 3 * 5s = 15s; a full walk's network budget
+/// Default bounded BSC peer attempts per hop. Runtime uses recovery-peer-attempts.
+/// The default stalled-hop window is 5s + 2 * 200ms; a full walk's network budget
 /// scales with ceil(max-depth / recovery-hop-count), excluding Engine execution.
 pub const MAX_PEER_ATTEMPTS: usize = 3;
 
@@ -50,8 +50,8 @@ pub const FAILED_HEAD_COOLDOWN: Duration = Duration::from_secs(30);
 /// concurrency this gate exists to prevent.
 ///
 /// Derived rather than guessed: the longest legitimate silence is one stalled
-/// hop, `MAX_PEER_ATTEMPTS * FETCH_TIMEOUT` = 15s, plus the execution of a
-/// single heavy block. 60s leaves ~4x margin over that.
+/// hop, `FETCH_TIMEOUT + (MAX_PEER_ATTEMPTS - 1) * 200ms` = 5.4s, plus
+/// execution of a single heavy block. 60s leaves ample margin over that.
 pub const RECOVERY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How many ancestor recoveries may run at once.
@@ -162,11 +162,54 @@ impl RangeFetcher for BscRangeFetcher {
                 count,
                 self.1.args.recovery_timeout,
                 usize::from(self.1.args.recovery_peer_attempts),
+                self.1.args.recovery_fallback_delay,
                 &self.0,
             )
             .await?;
             Ok(resp.blocks)
         })
+    }
+}
+
+/// Near-head missing parents use the same single-block downloader as hash
+/// announcements; older cursors retain the configured range batch strategy.
+pub(crate) struct ParentRangeFetcher {
+    pub range: BscRangeFetcher,
+    pub eth_peer: PeerId,
+    pub single_block_floor: Option<u64>,
+}
+
+impl RangeFetcher for ParentRangeFetcher {
+    fn max_depth(&self) -> u64 {
+        self.range.max_depth()
+    }
+    fn hop_count(&self) -> u64 {
+        self.range.hop_count()
+    }
+    fn fetch<'a>(
+        &'a self,
+        peer: PeerId,
+        start_num: u64,
+        start_hash: B256,
+        count: u64,
+    ) -> BoxFuture<'a, Result<Vec<BscBlock>, String>> {
+        if self.single_block_floor.is_some_and(|floor| start_num >= floor) {
+            let download = self.range.1.downloader.download(
+                reth_eth_wire::BlockHashNumber { hash: start_hash, number: start_num },
+                self.eth_peer,
+                false,
+                self.range.0.clone(),
+                self.range.1.args,
+            );
+            return Box::pin(async move {
+                let (block, _) = download.await.map_err(|error| format!("{error:#}"))?;
+                if block.header.number != start_num || block.header.hash_slow() != start_hash {
+                    return Err("shared parent download target mismatch".into());
+                }
+                Ok(vec![block])
+            });
+        }
+        self.range.fetch(peer, start_num, start_hash, count)
     }
 }
 
@@ -214,17 +257,10 @@ pub async fn discover_fork_blocks<
     let mut walked: u64 = 0;
 
     loop {
-        // Pre-hop local checks: if this cursor is already local, we've
-        // reached the common ancestor (or short-circuited because the
-        // starting cursor was itself locally known).
-        //
-        // The side-chain hit (`provider.header(cursor_hash).is_some()`) is
-        // safe to treat as "ancestor reached" because engine-tree only stores
-        // a header when its parent was already Valid via a prior new_payload.
-        // Transitively, any side-block in our provider is rooted at the
-        // canonical chain, so no further walking is required.
-        let cursor_is_local = provider.block_hash(cursor_num)? == Some(cursor_hash) ||
-            provider.header(cursor_hash)?.is_some();
+        // Only canonical history is execution evidence. A side-chain header may
+        // have arrived through header sync without its body/state; fetch and
+        // validate those blocks through Engine before considering fork choice.
+        let cursor_is_local = provider.block_hash(cursor_num)? == Some(cursor_hash);
         if cursor_is_local {
             let outcome = if fork_blocks.is_empty() {
                 DiscoveryOutcome::Shortcircuit
@@ -242,10 +278,25 @@ pub async fn discover_fork_blocks<
         let remaining = max_depth - walked;
         let count = fetcher.hop_count().min(remaining);
 
-        let resp = fetcher
-            .fetch(peer, cursor_num, cursor_hash, count)
-            .await
-            .map_err(ForkRecoverError::FetchFailed)?;
+        let request = fetcher.fetch(peer, cursor_num, cursor_hash, count);
+        tokio::pin!(request);
+        let result = loop {
+            tokio::select! {
+                result = &mut request => break result,
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                    if provider.block_hash(cursor_num)? == Some(cursor_hash) {
+                        tracing::info!(target: "bsc::fork_recover", cursor_num, %cursor_hash,
+                            "Local canonical progress canceled pending ancestor request");
+                        return Ok(Discovery { fork_blocks, outcome: DiscoveryOutcome::Shortcircuit });
+                    }
+                }
+            }
+        };
+        // Another importer may have completed at the same instant as a timeout/error.
+        if provider.block_hash(cursor_num)? == Some(cursor_hash) {
+            return Ok(Discovery { fork_blocks, outcome: DiscoveryOutcome::Shortcircuit });
+        }
+        let resp = result.map_err(ForkRecoverError::FetchFailed)?;
         if resp.is_empty() {
             return Err(ForkRecoverError::EmptyResponse { num: cursor_num, hash: cursor_hash });
         }
@@ -258,10 +309,6 @@ pub async fn discover_fork_blocks<
             if provider.block_hash(b.header.number)? == Some(b.header.hash_slow()) {
                 found_ancestor = true;
                 break;
-            }
-            // Side-chain already present: skip adding to fork_blocks, but keep walking.
-            if provider.header(b.header.hash_slow())?.is_some() {
-                continue;
             }
             fork_blocks.push(b.clone());
         }
@@ -1134,9 +1181,9 @@ mod tests {
         assert_eq!(fetcher.calls().len(), hops);
     }
 
-    // ---- Spec test #7: head already present as side-chain (short-circuit, empty fork_blocks) ----
+    // A side-chain header alone cannot establish executed ancestry.
     #[tokio::test]
-    async fn discover_head_side_chain_shortcircuit() {
+    async fn discover_head_side_chain_requires_payload_validation() {
         let mut provider = FakeProvider::default();
         let (shared, shared_hashes) = linear_chain(0, 96, B256::ZERO, 0xC);
         for h in &shared {
@@ -1145,21 +1192,21 @@ mod tests {
         // Insert a side-chain block at 96 (not canonical).
         let side_96 = make_header(96, shared_hashes[95], 0xB);
         let side_hash = side_96.hash_slow();
-        provider.insert_side(side_96);
+        provider.insert_side(side_96.clone());
 
-        let fetcher = ScriptedFetcher::new(vec![]);
+        let fetcher = ScriptedFetcher::new(vec![Ok(vec![make_block(side_96)])]);
         let out =
             discover_fork_blocks(fake_peer(), side_hash, 96, &provider, fetcher.as_ref(), &())
                 .await
                 .unwrap();
-        assert!(matches!(out.outcome, DiscoveryOutcome::Shortcircuit));
-        assert!(out.fork_blocks.is_empty());
-        assert_eq!(fetcher.calls().len(), 0);
+        assert!(matches!(out.outcome, DiscoveryOutcome::AncestorFound));
+        assert_eq!(out.fork_blocks.len(), 1);
+        assert_eq!(fetcher.calls().len(), 1);
     }
 
     // ---- Spec test #8: mid-chain side block already present, skipped ----
     #[tokio::test]
-    async fn discover_mid_chain_side_block_skipped() {
+    async fn discover_mid_chain_side_header_is_revalidated() {
         let mut provider = FakeProvider::default();
         let (shared, shared_hashes) = linear_chain(0, 96, B256::ZERO, 0xC);
         for h in &shared {
@@ -1189,11 +1236,7 @@ mod tests {
 
         assert!(matches!(out.outcome, DiscoveryOutcome::AncestorFound));
         let nums: Vec<u64> = out.fork_blocks.iter().map(|b| b.header.number).collect();
-        // Non-contiguous fork_blocks: 97Y is omitted because it's already a
-        // known side-block. Task 4's import loop must therefore tolerate gaps
-        // — it imports [96, 98, 99] oldest-first and relies on engine-tree
-        // already holding 97Y as Valid (which is why the side-block exists).
-        assert_eq!(nums, vec![99, 98, 96], "97Y skipped because already on side-chain");
+        assert_eq!(nums, vec![99, 98, 97, 96], "side headers still require Engine validation");
         assert_eq!(fetcher.calls().len(), 1);
     }
 

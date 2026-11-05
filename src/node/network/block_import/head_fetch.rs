@@ -37,6 +37,197 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 type HeadFetch = BoxFuture<'static, (B256, Option<eyre::Result<(BscBlock, PeerId)>>)>;
 
+type Download = BoxFuture<'static, Result<(BscBlock, PeerId), String>>;
+
+#[derive(Debug)]
+struct DownloadEntry {
+    future: futures::future::WeakShared<Download>,
+    eth_hints: Arc<parking_lot::Mutex<Vec<PeerId>>>,
+    supplied: Option<oneshot::Sender<(BscBlock, PeerId)>>,
+    started: Instant,
+}
+
+/// Per-node hash single-flight shared by announcement and parent downloads.
+/// Only weak references live here: dropping the last subscriber cancels all requests.
+#[derive(Debug, Default)]
+pub(crate) struct BlockDownloader {
+    active: parking_lot::Mutex<B256Map<DownloadEntry>>,
+}
+
+impl BlockDownloader {
+    pub(crate) fn has_active(&self, hash: B256) -> bool {
+        self.active.lock().get(&hash).and_then(|entry| entry.future.upgrade()).is_some()
+    }
+
+    /// Download completion is separate from execution validity. Callers still
+    /// submit the supplied payload to Engine before considering fork choice.
+    pub(crate) fn supply(
+        &self,
+        hash: B256,
+        block: &BscBlock,
+        peer: PeerId,
+        spec: &BscChainSpec,
+    ) -> bool {
+        if !self.has_active(hash) {
+            return false;
+        }
+        let mut block = block.clone();
+        let target = BlockHashNumber { hash, number: block.header.number };
+        if let Err(error) = validate_block(&mut block, &target, spec) {
+            tracing::debug!(target: "bsc::head_fetch", %hash, %peer, %error,
+                "Full block cannot satisfy pending download");
+            return false;
+        }
+        let mut active = self.active.lock();
+        let Some(entry) = active.get_mut(&hash) else {
+            return false;
+        };
+        let Some(sender) = entry.supplied.take() else {
+            return false;
+        };
+        if sender.send((block, peer)).is_ok() {
+            if entry.started.elapsed() >= Duration::from_millis(500) {
+                tracing::info!(target: "bsc::head_fetch", %hash, %peer,
+                    elapsed_ms = entry.started.elapsed().as_millis() as u64,
+                    "Complete block delivery satisfied pending download");
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    fn join(
+        &self,
+        hash: B256,
+        peer: PeerId,
+        capacity: usize,
+        create: impl FnOnce(
+            Arc<parking_lot::Mutex<Vec<PeerId>>>,
+            oneshot::Receiver<(BscBlock, PeerId)>,
+        ) -> Download,
+    ) -> Result<futures::future::Shared<Download>, String> {
+        let mut active = self.active.lock();
+        active.retain(|_, entry| entry.future.upgrade().is_some());
+        if let Some(entry) = active.get(&hash) {
+            if let Some(future) = entry.future.upgrade() {
+                let mut hints = entry.eth_hints.lock();
+                if hints.len() < 16 && !hints.contains(&peer) {
+                    hints.push(peer);
+                }
+                return Ok(future);
+            }
+        }
+        if active.len() >= capacity {
+            return Err("shared block download capacity exhausted".into());
+        }
+        let eth_hints = Arc::new(parking_lot::Mutex::new(vec![peer]));
+        let (supplied, supplied_rx) = oneshot::channel();
+        let future = create(eth_hints.clone(), supplied_rx).shared();
+        active.insert(
+            hash,
+            DownloadEntry {
+                future: future.downgrade().expect("new download"),
+                eth_hints,
+                supplied: Some(supplied),
+                started: Instant::now(),
+            },
+        );
+        Ok(future)
+    }
+
+    pub(crate) fn download(
+        &self,
+        target: BlockHashNumber,
+        preferred: PeerId,
+        announced_target: bool,
+        spec: Arc<BscChainSpec>,
+        config: BlockSyncArgs,
+    ) -> BoxFuture<'static, eyre::Result<(BscBlock, PeerId)>> {
+        let network = crate::shared::get_network_handle();
+        self.download_with(
+            target,
+            preferred,
+            announced_target,
+            spec,
+            config,
+            move |peer, request| {
+                if let Some(network) = &network {
+                    network.send_request(peer, request);
+                }
+            },
+        )
+    }
+
+    fn download_with(
+        &self,
+        target: BlockHashNumber,
+        preferred: PeerId,
+        announced_target: bool,
+        spec: Arc<BscChainSpec>,
+        config: BlockSyncArgs,
+        send: impl Fn(PeerId, PeerRequest<BscNetworkPrimitives>) + Send + Sync + 'static,
+    ) -> BoxFuture<'static, eyre::Result<(BscBlock, PeerId)>> {
+        let received_at = Instant::now();
+        let hash = target.hash;
+        let shared =
+            self.join(hash, preferred, usize::from(config.max_head_fetches), move |hints, supplied| {
+                async move {
+                    let quick = async {
+                        // Receiving a child is only an ETH hint. BSC range queries
+                        // require an announcement of this exact hash to avoid geth disconnects.
+                        let candidates = registry::list_live_v2_announcers_for(hash);
+                        let peer = if announced_target && registry::is_v2_peer(preferred) {
+                            Some(preferred)
+                        } else {
+                            candidates
+                                .iter()
+                                .find(|peer| **peer == preferred)
+                                .copied()
+                                .or_else(|| candidates.first().copied())
+                        }
+                        .ok_or_else(|| eyre::eyre!("no qualified bsc/2 announcer for target"))?;
+                        Ok((fetch_quick(&target, peer, config.quick_timeout).await?, peer))
+                    };
+                    let network = async {
+                    fetch_head(
+                        &target,
+                        preferred,
+                        quick,
+                        send,
+                        move || {
+                            let mut peers = registry::list_eth_announcers_for(hash);
+                            for peer in hints.lock().iter() {
+                                if !peers.contains(peer) {
+                                    peers.push(*peer);
+                                }
+                            }
+                            peers
+                        },
+                        &spec,
+                        config,
+                        received_at,
+                    )
+                    .await
+                    .map_err(|error| format!("{error:#}"))
+
+                    };
+                    tokio::pin!(network);
+                    tokio::select! {
+                        result = &mut network => result,
+                        delivered = supplied => {
+                            let (mut block, peer) = delivered.map_err(|_| "block delivery canceled".to_string())?;
+                            validate_block(&mut block, &target, &spec).map_err(|error| format!("{error:#}"))?;
+                            Ok((block, peer))
+                        }
+                    }
+                }
+                .boxed()
+            });
+        async move { shared.map_err(eyre::Error::msg)?.await.map_err(eyre::Error::msg) }.boxed()
+    }
+}
+
 /// Dropping the service drops all requests; full-block arrival aborts a hash's fetch.
 #[derive(Default)]
 pub(crate) struct HeadFetches {
@@ -57,21 +248,9 @@ impl HeadFetches {
         {
             return;
         }
-        let Some(network) = crate::shared::get_network_handle() else { return };
-        let hash = target.hash;
-        let config = self.config.args;
-        self.insert(hash, async move {
-            fetch_head(
-                &target,
-                peer,
-                fetch_quick(&target, peer, config.quick_timeout),
-                move |peer, request| network.send_request(peer, request),
-                move || registry::list_eth_announcers_for(hash),
-                &spec,
-                config,
-            )
-            .await
-        });
+        let future =
+            self.config.downloader.download(target.clone(), peer, true, spec, self.config.args);
+        self.insert(target.hash, future);
     }
 
     /// Retain a request under the same hash deduplication and capacity bounds.
@@ -131,11 +310,12 @@ impl HeadFetches {
 async fn fetch_head(
     target: &BlockHashNumber,
     preferred: PeerId,
-    quick: impl Future<Output = eyre::Result<BscBlock>>,
+    quick: impl Future<Output = eyre::Result<(BscBlock, PeerId)>>,
     send: impl Fn(PeerId, PeerRequest<BscNetworkPrimitives>),
     announcers: impl Fn() -> Vec<PeerId>,
     spec: &BscChainSpec,
     config: BlockSyncArgs,
+    received_at: Instant,
 ) -> eyre::Result<(BscBlock, PeerId)> {
     let started = Instant::now();
     let quick = tokio::time::timeout(config.quick_timeout, quick).fuse();
@@ -149,6 +329,7 @@ async fn fetch_head(
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut attempted = Vec::with_capacity(usize::from(config.eth_peer_attempts));
     let mut requests = FuturesUnordered::new();
+    let mut fallback_started = None;
     let mut quick_finished = false;
     let mut last_error = eyre::eyre!("head fetch timed out");
     loop {
@@ -156,8 +337,11 @@ async fn fetch_head(
             result = &mut quick, if !quick_finished => {
                 quick_finished = true;
                 match result {
-                    Ok(Ok(mut block)) => match validate_block(&mut block, target, spec) {
-                        Ok(()) => return Ok((block, preferred)),
+                    Ok(Ok((mut block, quick_peer))) => match validate_block(&mut block, target, spec) {
+                        Ok(()) => {
+                            log_slow_head(target, preferred, quick_peer, "quick", received_at, started, fallback_started);
+                            return Ok((block, quick_peer));
+                        },
                         Err(error) => last_error = error,
                     },
                     Ok(Err(error)) => last_error = error,
@@ -173,18 +357,48 @@ async fn fetch_head(
                     peers.swap(0, position);
                 }
                 if let Some(peer) = peers.first().copied() {
+                    fallback_started.get_or_insert_with(|| started.elapsed());
                     attempted.push(peer);
                     requests.push(fetch_eth(target, peer, &send, spec));
                 }
             }
             Some(result) = requests.next(), if !requests.is_empty() => {
                 match result {
-                    Ok(block) => return Ok(block),
+                    Ok(block) => {
+                        log_slow_head(target, preferred, block.1, "ETH", received_at, started, fallback_started);
+                        return Ok(block);
+                    },
                     Err(error) => last_error = error,
                 }
             }
-            _ = &mut deadline => return Err(last_error.wrap_err("unable to fetch announced head")),
+            _ = &mut deadline => {
+                tracing::warn!(target: "bsc::head_fetch", number = target.number, hash = %target.hash,
+                    first_announcer = %preferred, total_ms = received_at.elapsed().as_millis() as u64,
+                    fetch_ms = started.elapsed().as_millis() as u64,
+                    fallback_started_ms = ?fallback_started.map(|delay| delay.as_millis() as u64),
+                    eth_attempts = attempted.len(), error = %last_error, "Block download failed");
+                return Err(last_error.wrap_err("unable to fetch announced head"));
+            },
         }
+    }
+}
+
+fn log_slow_head(
+    target: &BlockHashNumber,
+    preferred: PeerId,
+    winner: PeerId,
+    route: &str,
+    received_at: Instant,
+    started: Instant,
+    fallback_started: Option<Duration>,
+) {
+    if received_at.elapsed() >= Duration::from_millis(500) {
+        tracing::info!(target: "bsc::head_fetch", number = target.number, hash = %target.hash,
+            first_announcer = %preferred, winner = %winner, route,
+            total_ms = received_at.elapsed().as_millis() as u64,
+            fetch_ms = started.elapsed().as_millis() as u64,
+            fallback_started_ms = ?fallback_started.map(|delay| delay.as_millis() as u64),
+            "Slow block download completed");
     }
 }
 
@@ -194,6 +408,7 @@ async fn fetch_eth(
     send: &impl Fn(PeerId, PeerRequest<BscNetworkPrimitives>),
     spec: &BscChainSpec,
 ) -> eyre::Result<(BscBlock, PeerId)> {
+    let started = Instant::now();
     let (response, receiver) = oneshot::channel();
     send(
         peer,
@@ -215,6 +430,7 @@ async fn fetch_eth(
         header.number == target.number && header.hash_slow() == target.hash,
         "announced header mismatch"
     );
+    let header_elapsed = started.elapsed();
     let (response, receiver) = oneshot::channel();
     send(
         peer,
@@ -225,10 +441,16 @@ async fn fetch_eth(
     ensure!(bodies.0.len() == 1, "body fetch must return exactly one body");
     let mut block = BscBlock { header, body: bodies.0.remove(0) };
     validate_block(&mut block, target, spec)?;
+    if started.elapsed() >= Duration::from_millis(500) {
+        tracing::info!(target: "bsc::head_fetch", number = target.number, hash = %target.hash,
+            %peer, header_ms = header_elapsed.as_millis() as u64,
+            body_ms = started.elapsed().saturating_sub(header_elapsed).as_millis() as u64,
+            "Slow ETH head response validated");
+    }
     Ok((block, peer))
 }
 
-fn validate_block(
+pub(crate) fn validate_block(
     block: &mut BscBlock,
     target: &BlockHashNumber,
     spec: &BscChainSpec,
@@ -282,8 +504,164 @@ mod tests {
         BlockHashNumber { hash: block.header.hash_slow(), number: block.header.number }
     }
 
-    fn assert_pending(future: Pin<&mut impl Future>) {
+    fn assert_pending(future: Pin<&mut (impl Future + ?Sized)>) {
         assert!(future.poll(&mut Context::from_waker(noop_waker_ref())).is_pending());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn complete_block_delivery_satisfies_shared_download_only_after_byte_validation() {
+        let config = BlockSyncArgs::default().into_config().unwrap();
+        let spec = Arc::new(BscChainSpec::from(bsc_mainnet()));
+        let mut block = block();
+        block.header.extra_data = B256::random().to_vec().into();
+        let target = target(&block);
+        let peer = PeerId::random();
+        let (tx, mut requests) = mpsc::unbounded_channel();
+        let mut download = config.downloader.download_with(
+            target.clone(),
+            peer,
+            false,
+            spec.clone(),
+            config.args,
+            move |peer, request| tx.send((peer, request)).unwrap(),
+        );
+        let mut second =
+            config.downloader.download(target.clone(), peer, false, spec.clone(), config.args);
+        assert_pending(download.as_mut());
+        assert_pending(second.as_mut());
+        tokio::time::advance(ARRIVE_TIMEOUT).await;
+        assert_pending(download.as_mut());
+        let (_, PeerRequest::GetBlockHeaders { response: stalled, .. }) =
+            requests.try_recv().unwrap()
+        else {
+            panic!("pending ETH header")
+        };
+        let mut wrong_hash = block.clone();
+        wrong_hash.header.number += 1;
+        assert!(!config.downloader.supply(target.hash, &wrong_hash, peer, &spec));
+        let mut bad_body = block.clone();
+        bad_body.body.inner.ommers.push(Header::default());
+        assert!(!config.downloader.supply(target.hash, &bad_body, peer, &spec));
+        assert!(!stalled.is_closed());
+        assert!(config.downloader.supply(target.hash, &block, peer, &spec));
+        assert_eq!(download.await.unwrap(), (block.clone(), peer));
+        assert_eq!(second.await.unwrap(), (block, peer));
+        assert!(stalled.is_closed());
+        assert!(!config.downloader.has_active(target.hash));
+        assert!(
+            requests.try_recv().is_err(),
+            "delivery cancels network; execution is a later step"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hash_and_parent_entrances_share_eth_download_and_cancel_independently() {
+        use crate::node::network::block_import::fork_recover::{
+            BscRangeFetcher, ParentRangeFetcher, RangeFetcher,
+        };
+        for version in [1, 2] {
+            let config =
+                BlockSyncArgs { max_head_fetches: 1, ..Default::default() }.into_config().unwrap();
+            let spec = Arc::new(BscChainSpec::from(bsc_mainnet()));
+            let mut block = block();
+            block.header.extra_data = B256::random().to_vec().into();
+            let target = target(&block);
+            let peer = PeerId::random();
+            let (bsc, mut bsc_rx) = mpsc::unbounded_channel();
+            registry::register_peer(peer, bsc, version);
+            // A complete child's sender is an ETH hint, not evidence that a BSC
+            // range start is committed. No announcement of this parent exists.
+            let (tx, mut requests) = mpsc::unbounded_channel();
+            let seed = config.downloader.download_with(
+                target.clone(),
+                peer,
+                false,
+                spec.clone(),
+                config.args,
+                move |peer, request| tx.send((peer, request)).unwrap(),
+            );
+            let fetcher = ParentRangeFetcher {
+                range: BscRangeFetcher(spec.clone(), config.clone()),
+                eth_peer: peer,
+                single_block_floor: Some(0),
+            };
+            let mut parent = fetcher.fetch(peer, target.number, target.hash, 4);
+            let mut hashes = HeadFetches::new(config.clone());
+            hashes.start(target.clone(), peer, spec.clone());
+            let mut cx = Context::from_waker(noop_waker_ref());
+            assert!(parent.as_mut().poll(&mut cx).is_pending());
+            assert!(hashes.poll(&mut cx).is_pending());
+            assert!(
+                bsc_rx.try_recv().is_err(),
+                "child receipt must never cause unknown-start BSC requests"
+            );
+            let blocked = config.downloader.download_with(
+                BlockHashNumber { hash: B256::random(), number: target.number },
+                peer,
+                false,
+                spec,
+                config.args,
+                |_, _| panic!("capacity rejection must not launch a request"),
+            );
+            assert!(blocked.await.unwrap_err().to_string().contains("capacity exhausted"));
+            drop(seed);
+            hashes.cancel(&target.hash);
+            let _ = hashes.poll(&mut cx);
+            tokio::time::advance(ARRIVE_TIMEOUT).await;
+            assert!(parent.as_mut().poll(&mut cx).is_pending());
+            let (selected, PeerRequest::GetBlockHeaders { response, .. }) =
+                requests.try_recv().unwrap()
+            else {
+                panic!("shared ETH header request")
+            };
+            assert_eq!(selected, peer);
+            assert!(requests.try_recv().is_err(), "one shared request, despite two entrances");
+            response.send(Ok(BlockHeaders(vec![block.header.clone()]))).unwrap();
+            assert!(parent.as_mut().poll(&mut cx).is_pending());
+            let (_, PeerRequest::GetBlockBodies { response, .. }) = requests.try_recv().unwrap()
+            else {
+                panic!("shared ETH body request")
+            };
+            response.send(Ok(BlockBodies(vec![block.body.clone()]))).unwrap();
+            assert_eq!(parent.await.unwrap(), vec![block]);
+            assert!(!config.downloader.has_active(target.hash));
+            assert!(requests.try_recv().is_err());
+            assert!(bsc_rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn last_shared_parent_subscriber_cancels_network_and_frees_capacity() {
+        let config =
+            BlockSyncArgs { max_head_fetches: 1, ..Default::default() }.into_config().unwrap();
+        let spec = Arc::new(BscChainSpec::from(bsc_mainnet()));
+        let mut block = block();
+        block.header.extra_data = B256::random().to_vec().into();
+        let target = target(&block);
+        let peer = PeerId::random();
+        let (tx, mut requests) = mpsc::unbounded_channel();
+        let mut download = config.downloader.download_with(
+            target.clone(),
+            peer,
+            false,
+            spec.clone(),
+            config.args,
+            move |peer, request| tx.send((peer, request)).unwrap(),
+        );
+        assert_pending(download.as_mut());
+        tokio::time::advance(ARRIVE_TIMEOUT).await;
+        assert_pending(download.as_mut());
+        let (_, PeerRequest::GetBlockHeaders { response, .. }) = requests.try_recv().unwrap()
+        else {
+            panic!("header waiter")
+        };
+        drop(download);
+        assert!(response.is_closed());
+        assert!(!config.downloader.has_active(target.hash));
+        let mut retry =
+            config.downloader.download_with(target, peer, false, spec, config.args, |_, _| {});
+        assert_pending(retry.as_mut());
+        assert!(config.downloader.active.lock().len() <= 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -297,11 +675,17 @@ mod tests {
         let fetch = fetch_head(
             &target,
             peer,
-            fetch_quick(&target, peer, BlockSyncArgs::default().quick_timeout),
+            async {
+                Ok((
+                    fetch_quick(&target, peer, BlockSyncArgs::default().quick_timeout).await?,
+                    peer,
+                ))
+            },
             |_, _| panic!("quick success must not request ETH"),
             || vec![peer],
             &spec,
             BlockSyncArgs::default(),
+            Instant::now(),
         );
         tokio::pin!(fetch);
         assert_pending(fetch.as_mut());
@@ -336,11 +720,12 @@ mod tests {
         let fetch = fetch_head(
             &target,
             preferred,
-            async { Ok(quick_rx.await?) },
+            async { Ok((quick_rx.await?, preferred)) },
             |peer, request| tx.send((peer, request)).unwrap(),
             || vec![preferred, other],
             &spec,
             BlockSyncArgs::default(),
+            Instant::now(),
         );
         tokio::pin!(fetch);
         assert_pending(fetch.as_mut());
@@ -383,11 +768,12 @@ mod tests {
         let fetch = fetch_head(
             &target,
             preferred,
-            async { Ok(quick_rx.await?) },
+            async { Ok((quick_rx.await?, preferred)) },
             |peer, request| tx.send((peer, request)).unwrap(),
             || peers.lock().clone(),
             &spec,
             BlockSyncArgs::default(),
+            Instant::now(),
         );
         tokio::pin!(fetch);
         assert_pending(fetch.as_mut());
@@ -431,6 +817,7 @@ mod tests {
             || vec![peer],
             &spec,
             BlockSyncArgs::default(),
+            Instant::now(),
         );
         tokio::pin!(fetch);
         assert_pending(fetch.as_mut());
@@ -598,6 +985,7 @@ mod tests {
             || peers.clone(),
             &spec,
             BlockSyncArgs::default(),
+            Instant::now(),
         );
         tokio::pin!(fetch);
         assert_pending(fetch.as_mut());
@@ -637,11 +1025,12 @@ mod tests {
         let fetch = fetch_head(
             &target,
             peer,
-            async { Ok(quick_rx.await?) },
+            async { Ok((quick_rx.await?, peer)) },
             |peer, request| tx.send((peer, request)).unwrap(),
             || vec![peer, other],
             &spec,
             config,
+            Instant::now(),
         );
         tokio::pin!(fetch);
         assert_pending(fetch.as_mut());

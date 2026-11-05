@@ -536,14 +536,10 @@ pub(crate) fn plan_v2_failover_peers(
     out
 }
 
-/// Like [`request_blocks_by_range`], but rotates through the other announcers
-/// of `start_hash` on `Err` or empty response. Returns the first non-empty
-/// success, otherwise the last seen result (preserving the original error for
-/// diagnostics).
-///
-/// Candidates are restricted to bsc/2 peers with a reason to have the block
-/// (the walked peer and the hash's announcers); see
-/// [`plan_v2_failover_peers`].
+/// Fetch from the walked peer and live hash announcers with bounded hedged requests.
+/// Re-read candidates while waiting: a newly received announcement may provide a faster peer.
+/// Each request has its own timeout; the hop ends by `timeout + delay * (attempts - 1)`.
+/// Dropping the winning hop cancels all remaining waiters (late packets are ignored).
 pub async fn request_blocks_by_range_with_failover(
     preferred: PeerId,
     start_height: u64,
@@ -551,67 +547,104 @@ pub async fn request_blocks_by_range_with_failover(
     count: u64,
     timeout_dur: Duration,
     max_attempts: usize,
+    fallback_delay: Duration,
     chain_spec: &crate::chainspec::BscChainSpec,
 ) -> Result<BlocksByRangePacket, String> {
-    let announcers = list_announcers_for(start_hash);
-    let peers = plan_v2_failover_peers(preferred, announcers, list_v2_peers(), max_attempts);
-    if peers.is_empty() {
-        return Err("no bsc/2 peers available for range request".to_string());
-    }
-
-    let mut last: Result<BlocksByRangePacket, String> = Err("uninitialised failover".to_string());
-    for (idx, peer) in peers.iter().enumerate() {
-        let response = request_blocks_by_range(*peer, start_height, start_hash, count, timeout_dur)
-            .await
-            .and_then(|mut response| {
-                for block in &mut response.blocks {
-                    if let Err(error) = super::super::data_availability::validate_data_availability(
-                        block, chain_spec,
-                    ) {
-                        tracing::warn!(
-                            target: "bsc_protocol",
-                            %peer,
-                            request_id = response.request_id,
-                            block_number = block.header.number,
-                            block_hash = %block.header.hash_slow(),
-                            error = %format_args!("{error:#}"),
-                            "Rejecting BlocksByRange with unavailable blob data"
-                        );
-                        return Err(format!("{error:#}"));
-                    }
+    use futures::{stream::FuturesUnordered, StreamExt};
+    let mut attempted = HashSet::new();
+    let mut pending = FuturesUnordered::new();
+    let started = tokio::time::Instant::now();
+    let deadline = started + timeout_dur + fallback_delay * max_attempts.saturating_sub(1) as u32;
+    let mut next_launch = started;
+    let mut last = Err("no bsc/2 peers available for range request".to_string());
+    loop {
+        let now = tokio::time::Instant::now();
+        if attempted.len() < max_attempts && now >= next_launch {
+            let live = REGISTRY
+                .read()
+                .map(|registry| {
+                    registry
+                        .iter()
+                        .filter_map(|(peer, entry)| {
+                            (entry.version >= 2 && !entry.tx.is_closed()).then_some(*peer)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let peers = plan_v2_failover_peers(
+                preferred,
+                list_live_v2_announcers_for(start_hash),
+                live,
+                max_attempts,
+            );
+            if let Some(peer) = peers.into_iter().find(|peer| !attempted.contains(peer)) {
+                attempted.insert(peer);
+                if attempted.len() > 1 {
+                    tracing::debug!(target: "bsc::fork_recover", start_height, %start_hash, %peer,
+                        attempt = attempted.len(), elapsed_ms = started.elapsed().as_millis() as u64,
+                        "Starting ancestor hedge");
                 }
-                Ok(response)
-            });
-        match response {
-            Ok(resp) if !resp.blocks.is_empty() => return Ok(resp),
-            Ok(empty_resp) => {
-                tracing::debug!(
-                    target: "bsc_protocol",
-                    %peer,
-                    attempt = idx + 1,
-                    total = peers.len(),
-                    start_height,
-                    %start_hash,
-                    "Empty BlocksByRange response, trying next peer"
-                );
-                last = Ok(empty_resp);
-            }
-            Err(err) => {
-                tracing::debug!(
-                    target: "bsc_protocol",
-                    %peer,
-                    attempt = idx + 1,
-                    total = peers.len(),
-                    start_height,
-                    %start_hash,
-                    %err,
-                    "BlocksByRange request failed, trying next peer"
-                );
-                last = Err(err);
+                pending.push(async move {
+                    let mut response =
+                        request_blocks_by_range(peer, start_height, start_hash, count, timeout_dur)
+                            .await?;
+                    // Validate the full backward hash walk before letting a peer win the race.
+                    if response.blocks.len() as u64 > count {
+                        return Err("range response exceeds requested count".to_string());
+                    }
+                    let (mut hash, mut height) = (start_hash, start_height);
+                    for block in &mut response.blocks {
+                        if block.header.number != height || block.header.hash_slow() != hash {
+                            return Err(
+                                "range response does not match requested ancestry".to_string()
+                            );
+                        }
+                        super::super::block_import::head_fetch::validate_block(
+                            block,
+                            &reth_eth_wire::BlockHashNumber { hash, number: height },
+                            chain_spec,
+                        )
+                        .map_err(|error| format!("{error:#}"))?;
+                        hash = block.header.parent_hash;
+                        height = height.saturating_sub(1);
+                    }
+                    Ok((response, peer))
+                });
+                next_launch = now + fallback_delay;
             }
         }
+        if attempted.len() >= max_attempts && pending.is_empty() {
+            return last;
+        }
+        tokio::select! {
+            biased;
+            response = pending.next(), if !pending.is_empty() => {
+                match response.expect("nonempty requests") {
+                    Ok((response, peer)) if !response.blocks.is_empty() => {
+                        if started.elapsed() >= Duration::from_millis(500) || attempted.len() > 1 {
+                            tracing::info!(target: "bsc::fork_recover", start_height, %start_hash,
+                                preferred = %preferred, winner = %peer, attempts = attempted.len(),
+                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                "Ancestor range completed");
+                        }
+                        return Ok(response);
+                    }
+                    Ok((response, _)) => last = Ok(response),
+                    Err(error) => last = Err(error),
+                }
+                // Errors/empty results permit immediate failover, retaining pending hedges.
+                next_launch = tokio::time::Instant::now();
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                tracing::warn!(target: "bsc::fork_recover", start_height, %start_hash,
+                    %preferred, attempts = attempted.len(), elapsed_ms = started.elapsed().as_millis() as u64,
+                    error = ?last.as_ref().err(), "Ancestor range exhausted its hop deadline");
+                return last;
+            },
+            // Poll only local registry state; network probes remain asynchronous.
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+        }
     }
-    last
 }
 
 #[cfg(test)]
@@ -638,6 +671,86 @@ mod version_tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn hedged_range_discovers_new_announcers_rejects_bad_walk_and_cancels_losers() {
+        use std::future::Future;
+        let spec = crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet());
+        let block = crate::BscBlock {
+            header: alloy_consensus::Header {
+                number: 100,
+                extra_data: B256::random().to_vec().into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let hash = block.header.hash_slow();
+        let _hash_guard = TestHashGuard(hash);
+        let peers = [
+            PeerId::random(),
+            PeerId::random(),
+            PeerId::random(),
+            PeerId::random(),
+            PeerId::random(),
+        ];
+        let _guards = peers.map(TestPeerGuard);
+        let mut receivers = Vec::new();
+        for (index, peer) in peers.iter().enumerate() {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            register_peer(*peer, tx, if index == 4 { 1 } else { 2 });
+            receivers.push(rx);
+        }
+        record_announcer(hash, peers[4]); // v1 is ineligible even though it announced.
+        let request = request_blocks_by_range_with_failover(
+            peers[0],
+            100,
+            hash,
+            4,
+            Duration::from_secs(5),
+            3,
+            Duration::from_millis(200),
+            &spec,
+        );
+        tokio::pin!(request);
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        assert!(request.as_mut().poll(&mut cx).is_pending());
+        let BscCommand::GetBlocksByRange(_, stalled) = receivers[0].try_recv().unwrap() else {
+            panic!("first request")
+        };
+        tokio::time::advance(Duration::from_millis(200)).await;
+        assert!(request.as_mut().poll(&mut cx).is_pending());
+        assert!(
+            receivers.iter_mut().skip(1).all(|rx| rx.try_recv().is_err()),
+            "unannounced v2 and announced v1 peers must not be queried"
+        );
+        record_announcer(hash, peers[1]); // Arrived after the request began.
+        tokio::time::advance(Duration::from_millis(25)).await;
+        assert!(request.as_mut().poll(&mut cx).is_pending());
+        let BscCommand::GetBlocksByRange(req, reply) = receivers[1].try_recv().unwrap() else {
+            panic!("dynamic hedge")
+        };
+        let mut wrong = block.clone();
+        wrong.header.number -= 1;
+        reply
+            .send(Ok(BlocksByRangePacket { request_id: req.request_id, blocks: vec![wrong] }))
+            .unwrap();
+        record_announcer(hash, peers[2]);
+        assert!(request.as_mut().poll(&mut cx).is_pending());
+        let BscCommand::GetBlocksByRange(req, reply) = receivers[2].try_recv().unwrap() else {
+            panic!("bad reply must permit immediate next candidate")
+        };
+        reply
+            .send(Ok(BlocksByRangePacket {
+                request_id: req.request_id,
+                blocks: vec![block.clone()],
+            }))
+            .unwrap();
+        assert_eq!(request.await.unwrap().blocks, vec![block]);
+        assert!(stalled.is_closed(), "winning hedge drops the original slow waiter");
+        assert!(stalled.send(Err("late response".into())).is_err());
+        assert!(receivers[3].try_recv().is_err());
+        assert!(receivers[4].try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn range_failover_retries_missing_sidecars_from_another_announcer() {
         use crate::node::network::data_availability::tests::blob_block;
@@ -646,8 +759,13 @@ mod version_tests {
         );
         let now =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        let block = blob_block(now);
+        use reth_primitives_traits::BlockBody;
+        let mut block = blob_block(now);
+        block.header.transactions_root = block.body.calculate_tx_root();
         let hash = block.header.hash_slow();
+        for sidecar in block.body.sidecars.as_mut().unwrap() {
+            sidecar.block_hash = hash;
+        }
         let _hash_guard = TestHashGuard(hash);
         let peers = [PeerId::random(), PeerId::random()];
         let _guards = peers.map(TestPeerGuard);
@@ -684,6 +802,7 @@ mod version_tests {
                 1,
                 Duration::from_secs(1),
                 2,
+                Duration::from_millis(200),
                 &spec,
             ),
         )
