@@ -26,7 +26,7 @@ maxperf-musl: ## Static musl build via glibc->musl cross (runs on old glibc, e.g
 		messense/rust-musl-cross:x86_64-musl bash -euxc '\
 			apt-get update && apt-get install -y --no-install-recommends clang libclang-dev m4 cmake perl golang pkg-config && \
 			export PERL_USE_UNSAFE_INC=1 && \
-			RUSTFLAGS="-C target-cpu=native" cargo build --bin reth-bsc --profile maxperf --features jemalloc,asm-keccak --target x86_64-unknown-linux-musl'
+			RUSTFLAGS="-C target-cpu=native" cargo build --bin reth-bsc --profile maxperf --no-default-features --features asm-keccak --target x86_64-unknown-linux-musl'
 
 .PHONY: bench-test
 bench-test: ## Builds `reth-bsc` with the bench-test feature.

@@ -299,3 +299,57 @@ pub(crate) fn address_occupied(ctx: &mut Ctx<'_, '_>, addr: Address) -> bool {
         Some(hash) => !had_no_code(hash),
     }
 }
+
+pub(super) fn native_id(address: Address) -> Option<String> {
+    resolve(address).map(|kind| kind.name().to_owned())
+}
+
+pub(super) fn run_native(
+    address: Address,
+    evm: &mut evm2::Evm<'_, reth_bsc_evm::types::BscEvmTypes>,
+    message: &evm2::interpreter::Message<reth_bsc_evm::types::BscEvmTypes>,
+    gas: &mut evm2::interpreter::GasTracker,
+) -> Result<evm2::evm::precompile::PrecompileOutput, evm2::precompiles::PrecompileError> {
+    let kind = resolve(address).expect("CAS20 route was resolved");
+    let observer = NodeObserver;
+    let started = observer.enabled().then(Instant::now);
+    let mut frame = Frame::new(evm, gas.remaining());
+    let ctx = Ctx {
+        frame: &mut frame,
+        self_addr: address,
+        caller: message.caller,
+        read_only: message.is_static(),
+        direct_call: message.destination == message.call_target,
+        value: message.value,
+        admin_renounced: false,
+    };
+    let result = execute(kind, ctx, &message.input);
+    let (outcome, used, refund) = complete(&mut frame, result);
+    if let Some(started) = started {
+        observer.record_call(&CallRecord {
+            kind,
+            selector: sigs::selector_index(&message.input),
+            status: outcome.status(),
+            gas_used: used,
+            elapsed: started.elapsed(),
+            stats: frame.stats,
+        });
+    }
+    use evm2::{
+        evm::precompile::PrecompileOutput as Output,
+        precompiles::{PrecompileError as Error, PrecompileHalt as Halt},
+    };
+    match outcome {
+        Outcome::Return(bytes) => {
+            gas.spend(used).map_err(|_| Halt::OutOfGas)?;
+            gas.record_refund(refund);
+            Ok(Output::new(bytes.into()))
+        }
+        Outcome::Revert(bytes) => {
+            gas.spend(used).map_err(|_| Halt::OutOfGas)?;
+            Err(Error::Revert(bytes.into()))
+        }
+        Outcome::OutOfGas => Err(Halt::OutOfGas.into()),
+        Outcome::Fatal(message) => Err(Error::Fatal(message.into())),
+    }
+}

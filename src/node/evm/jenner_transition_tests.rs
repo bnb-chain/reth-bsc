@@ -10,18 +10,14 @@
 use crate::{
     chainspec::parser::parse_genesis_json,
     consensus::parlia::util::{calculate_millisecond_timestamp, set_millisecond_part_of_timestamp},
-    evm::{api::BscEvm, transaction::BscTxEnv},
     node::evm::config::evm_env_for_header,
 };
 use alloy_consensus::Header;
 use alloy_primitives::{Address, Bytes, U256};
 use revm::{
-    context::{result::ExecutionResult, TxEnv},
     database::InMemoryDB,
-    inspector::NoOpInspector,
     primitives::TxKind,
     state::{AccountInfo, Bytecode},
-    ExecuteEvm,
 };
 
 /// Jenner activates mid-chain at this timestamp.
@@ -85,22 +81,23 @@ fn call_bep706_contract_at(spec: &crate::chainspec::BscChainSpec, header: &Heade
         AccountInfo::default().with_code(Bytecode::new_raw(Bytes::from(bep706_caller_code()))),
     );
 
-    let mut evm = BscEvm::new(env, db, NoOpInspector, false, false);
-    let tx = BscTxEnv::new(
-        TxEnv::builder()
-            .caller(caller)
-            .chain_id(Some(714))
-            .gas_limit(200_000)
-            .gas_price(1)
-            .kind(TxKind::Call(contract))
-            .build()
-            .expect("tx env should build"),
+    use reth_evm::Evm;
+    let mut evm = super::factory::BscEvmFactory
+        .create_evm(evm2::evm::Db::new(super::test_utils::LegacyDb(db)), env);
+    let tx = alloy_consensus::transaction::Recovered::new_unchecked(
+        evm2::ethereum::TxEnvelope::Legacy(alloy_consensus::TxLegacy {
+            chain_id: Some(714),
+            nonce: 0,
+            gas_limit: 200_000,
+            gas_price: 1,
+            to: TxKind::Call(contract),
+            value: U256::ZERO,
+            input: Bytes::new(),
+        }),
+        caller,
     );
-
-    match evm.transact_one(tx).expect("execution should not error") {
-        ExecutionResult::Success { output, .. } => (true, U256::from_be_slice(&output.into_data())),
-        _ => (false, U256::ZERO),
-    }
+    let result = evm.transact_result(&tx).expect("execution should not error");
+    (result.status, U256::from_be_slice(&result.output))
 }
 
 /// go-bsc `TestJennerForkTransition`: five consecutive blocks crossing the

@@ -1,12 +1,7 @@
 use alloy_primitives::{address, b256, Address, B256, U256};
-use reth_evm::block::BlockExecutionError;
+use reth_evm::BlockExecutionError;
 use reth_primitives_traits::SignedTransaction;
-use revm::{
-    state::{Account, EvmState, EvmStorageSlot, TransactionId},
-    Database, DatabaseCommit,
-};
 use std::{collections::HashMap, str::FromStr, sync::LazyLock};
-use tracing::trace;
 
 struct StoragePatch {
     address: Address,
@@ -676,104 +671,6 @@ static CHAPEL_PATCHES_AFTER_TX: LazyLock<HashMap<B256, StoragePatch>> = LazyLock
     ])
 });
 
-pub(crate) fn patch_mainnet_before_tx<DB, T>(
-    transaction: &T,
-    db: &mut DB,
-) -> Result<(), BlockExecutionError>
-where
-    T: SignedTransaction,
-    DB: Database + DatabaseCommit,
-    <DB as Database>::Error: std::error::Error + Send + Sync + 'static,
-{
-    let tx_hash = transaction.tx_hash();
-    if let Some(patch) = MAINNET_PATCHES_BEFORE_TX.get(tx_hash) {
-        trace!("patch evm state for mainnet before tx {:?}", tx_hash);
-        apply_patch(db, patch.address, &patch.storage)?;
-    }
-    Ok(())
-}
-
-pub(crate) fn patch_mainnet_after_tx<DB, T>(
-    transaction: &T,
-    db: &mut DB,
-) -> Result<(), BlockExecutionError>
-where
-    DB: Database + DatabaseCommit,
-    <DB as Database>::Error: std::error::Error + Send + Sync + 'static,
-    T: SignedTransaction,
-{
-    let tx_hash = transaction.tx_hash();
-    if let Some(patch) = MAINNET_PATCHES_AFTER_TX.get(tx_hash) {
-        trace!("patch evm state for mainnet after tx {:?}", tx_hash);
-        apply_patch(db, patch.address, &patch.storage)?;
-    }
-    Ok(())
-}
-
-pub(crate) fn patch_chapel_before_tx<DB, T>(
-    transaction: &T,
-    db: &mut DB,
-) -> Result<(), BlockExecutionError>
-where
-    T: SignedTransaction,
-    DB: Database + DatabaseCommit,
-    <DB as Database>::Error: std::error::Error + Send + Sync + 'static,
-{
-    let tx_hash = transaction.tx_hash();
-    if let Some(patch) = CHAPEL_PATCHES_BEFORE_TX.get(tx_hash) {
-        trace!("patch evm state for chapel testnet before tx {:?}", tx_hash);
-        apply_patch(db, patch.address, &patch.storage)?;
-    }
-    Ok(())
-}
-
-pub(crate) fn patch_chapel_after_tx<DB, T>(
-    transaction: &T,
-    db: &mut DB,
-) -> Result<(), BlockExecutionError>
-where
-    DB: Database + DatabaseCommit,
-    <DB as Database>::Error: std::error::Error + Send + Sync + 'static,
-    T: SignedTransaction,
-{
-    let tx_hash = transaction.tx_hash();
-    if let Some(patch) = CHAPEL_PATCHES_AFTER_TX.get(tx_hash) {
-        trace!("patch evm state for chapel testnet after tx {:?}", tx_hash);
-        apply_patch(db, patch.address, &patch.storage)?;
-    }
-    Ok(())
-}
-
-fn apply_patch<DB>(
-    db: &mut DB,
-    address: Address,
-    storage: &HashMap<U256, U256>,
-) -> Result<(), BlockExecutionError>
-where
-    DB: Database + DatabaseCommit,
-    <DB as Database>::Error: std::error::Error + Send + Sync + 'static,
-{
-    let info = db.basic(address).map_err(BlockExecutionError::other)?.unwrap_or_default();
-    let mut account = Account::from(info);
-    account.mark_touch();
-    for (&key, &value) in storage.iter() {
-        let original = if value == U256::ZERO { U256::from(1) } else { U256::ZERO };
-        account.storage.insert(
-            key,
-            EvmStorageSlot {
-                original_value: original,
-                present_value: value,
-                transaction_id: TransactionId::ZERO,
-                is_cold: false,
-            },
-        );
-    }
-    let mut changes: EvmState = Default::default();
-    changes.insert(address, account);
-    db.commit(changes);
-    Ok(())
-}
-
 /// Hertz patch manager for compatibility.
 /// <https://>forum.bnbchain.org/t/about-the-hertzfix/2400>
 pub struct HertzPatchManager {
@@ -784,41 +681,42 @@ impl HertzPatchManager {
     pub fn new(is_mainnet: bool) -> Self {
         Self { is_mainnet }
     }
+}
 
-    pub fn patch_before_tx<T, DB>(
+impl HertzPatchManager {
+    /// Converts historical storage corrections using actual pre-state for both root paths.
+    pub fn native_patch<T: SignedTransaction>(
         &self,
         transaction: &T,
-        db: &mut DB,
-    ) -> Result<(), BlockExecutionError>
-    where
-        T: SignedTransaction,
-        DB: Database + DatabaseCommit,
-        <DB as Database>::Error: std::error::Error + Send + Sync + 'static,
-    {
-        if self.is_mainnet {
-            patch_mainnet_before_tx(transaction, db)?;
-        } else {
-            patch_chapel_before_tx(transaction, db)?;
+        before: bool,
+        evm: &mut evm2::Evm<'_, reth_bsc_evm::types::BscEvmTypes>,
+    ) -> Result<evm2::evm::PendingState, BlockExecutionError> {
+        use evm2::evm::DynDatabase;
+        let patches = match (self.is_mainnet, before) {
+            (true, true) => &*MAINNET_PATCHES_BEFORE_TX,
+            (true, false) => &*MAINNET_PATCHES_AFTER_TX,
+            (false, true) => &*CHAPEL_PATCHES_BEFORE_TX,
+            (false, false) => &*CHAPEL_PATCHES_AFTER_TX,
+        };
+        let mut pending = evm2::evm::PendingState::default();
+        if let Some(patch) = patches.get(transaction.tx_hash()) {
+            let original = evm
+                .overlay_db_mut()
+                .get_account(&patch.address)
+                .map_err(BlockExecutionError::other)?;
+            pending.insert_account(
+                patch.address,
+                original.clone(),
+                Some(original.unwrap_or_default()),
+            );
+            for (slot, value) in &patch.storage {
+                let original = evm
+                    .overlay_db_mut()
+                    .get_storage(&patch.address, slot)
+                    .map_err(BlockExecutionError::other)?;
+                pending.insert_storage(patch.address, *slot, original, *value);
+            }
         }
-        Ok(())
-    }
-
-    /// Apply patches after transaction execution
-    pub fn patch_after_tx<T, DB>(
-        &self,
-        transaction: &T,
-        db: &mut DB,
-    ) -> Result<(), BlockExecutionError>
-    where
-        T: SignedTransaction,
-        DB: Database + DatabaseCommit,
-        <DB as Database>::Error: std::error::Error + Send + Sync + 'static,
-    {
-        if self.is_mainnet {
-            patch_mainnet_after_tx(transaction, db)?;
-        } else {
-            patch_chapel_after_tx(transaction, db)?;
-        }
-        Ok(())
+        Ok(pending)
     }
 }

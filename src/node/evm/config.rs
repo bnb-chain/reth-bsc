@@ -1,7 +1,5 @@
 use super::{
-    assembler::BscBlockAssembler,
-    builder::BscBlockBuilder,
-    executor::{BscBlockExecutor, BscTxResult},
+    assembler::BscBlockAssembler, builder::BscBlockBuilder, executor::BscBlockExecutor,
     factory::BscEvmFactory,
 };
 use crate::{
@@ -10,7 +8,6 @@ use crate::{
         eip4844::next_block_excess_blob_gas_with_mendel,
         parlia::{util::millisecond_remainder, VoteAddress},
     },
-    evm::{block_env::BscBlockEnv, transaction::BscTxEnv},
     hardforks::{bsc::BscHardfork, BscHardforks},
     node::engine_api::validator::BscExecutionData,
     system_contracts::{feynman_fork::ValidatorElectionInfo, SystemContract},
@@ -19,29 +16,18 @@ use crate::{
 use alloy_consensus::{transaction::SignerRecoverable, BlockHeader, Header, TxReceipt};
 use alloy_eips::eip7840::BlobParams;
 use alloy_primitives::{Address, BlockHash, Log, U256};
+use evm2::{env::BlockEnv, SpecId, Version};
+use reth_bsc_evm::{env::BscEvmEnv, evm::BscEvm, types::BscEvmTypes};
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
-use reth_ethereum_forks::EthereumHardfork;
 use reth_ethereum_primitives::TransactionSigned;
 use reth_evm::{
-    block::{BlockExecutorFactory, BlockExecutorFor},
-    eth::{receipt_builder::ReceiptBuilder, EthBlockExecutionCtx},
-    execute::BlockBuilder,
-    ConfigureEngineEvm, ConfigureEvm, Database, EvmEnv, EvmEnvFor, EvmFactory, EvmFor,
-    ExecutableTxIterator, ExecutionCtxFor, FromRecoveredTx, FromTxWithEncoded, InspectorFor,
-    IntoTxEnv, NextBlockEnvAttributes,
+    execute::BlockBuilder, BlockExecutorFactory, ConfigureEngineEvm, ConfigureEvm, Database,
+    DynDatabase, EvmEnvFor, EvmFor, ExecutableTxIterator, ExecutionCtxFor, NextBlockEnvAttributes,
+    ReceiptBuilder,
 };
-use reth_evm_ethereum::RethReceiptBuilder;
-use reth_primitives_traits::{
-    constants::MAX_TX_GAS_LIMIT_OSAKA, BlockTy, HeaderTy, SealedBlock, SealedHeader,
-};
-use reth_revm::State;
+use reth_evm_ethereum::{EthBlockExecutionCtx, RethReceiptBuilder};
+use reth_primitives_traits::{BlockTy, HeaderTy, SealedBlock, SealedHeader};
 use reth_rpc_eth_api::helpers::pending_block::BuildPendingEnv;
-use revm::{
-    context::{BlockEnv, CfgEnv},
-    context_interface::block::BlobExcessGasAndPrice,
-    primitives::hardfork::SpecId,
-    Inspector,
-};
 use std::{
     borrow::Cow,
     cell::RefCell,
@@ -282,60 +268,49 @@ impl BscEvmConfig {
         self.executor_factory.spec()
     }
 
-    /// Reconciles the rules and revm's fork-dependent environment after RPC overrides.
-    /// Explicit opcode-0x44 overrides are captured by `BlockOverridesExt` before
-    /// their presence is lost. Here we translate the remaining header-derived fields,
-    /// without rebuilding the environment or resetting the caller's RPC configuration.
-    pub(crate) fn with_block_rules(
-        &self,
-        mut evm_env: EvmEnv<BscHardfork, BscBlockEnv>,
-    ) -> EvmEnv<BscHardfork, BscBlockEnv> {
-        let number = evm_env.block_env.number.saturating_to();
-        let timestamp = evm_env.block_env.timestamp.saturating_to();
+    /// Reconciles inherited opcode and gas rules after a block-number or time override.
+    pub(crate) fn with_block_rules(&self, mut env: BscEvmEnv) -> BscEvmEnv {
+        let number = env.block.number.saturating_to();
+        let timestamp = env.block.timestamp.saturating_to();
         let spec =
             revm_spec_by_timestamp_and_block_number(self.chain_spec().clone(), timestamp, number);
-        if spec == evm_env.cfg_env.spec {
-            return evm_env;
+        if spec == env.spec {
+            return env;
         }
-
-        let old_spec = SpecId::from(evm_env.cfg_env.spec);
-        let new_spec = SpecId::from(spec);
-        // BSC still exposes DIFFICULTY after Kepler, using revm's PREVRANDAO
-        // field. Only translate header-derived values: an explicit RPC value is
-        // already exposed by both Block accessors without changing header fields.
-        if evm_env.block_env.opcode_44_override.is_none() {
-            let block = &mut evm_env.block_env.inner;
-            if old_spec < SpecId::MERGE && new_spec >= SpecId::MERGE {
-                block.prevrandao.get_or_insert(block.difficulty.into());
-            } else if old_spec >= SpecId::MERGE && new_spec < SpecId::MERGE {
-                if let Some(random) = block.prevrandao {
-                    block.difficulty = U256::from_be_bytes(random.0);
-                }
+        let old_defaults = Version::new(env.spec.into());
+        let removed = old_defaults.features & !env.version.features;
+        let added = env.version.features & !old_defaults.features;
+        let mut version = Version::new(spec.into());
+        version.chain_id = env.version.chain_id;
+        version.features = (version.features & !removed) | added;
+        if env.version.max_code_size != old_defaults.max_code_size {
+            version.max_code_size = env.version.max_code_size;
+        }
+        if env.version.max_initcode_size != old_defaults.max_initcode_size {
+            version.max_initcode_size = env.version.max_initcode_size;
+        }
+        version.initial_call_depth = env.version.initial_call_depth;
+        version.memory_limit = env.version.memory_limit;
+        if env.version.tx_gas_limit_cap != old_defaults.tx_gas_limit_cap ||
+            !env.version.feature(evm2::EvmFeatures::BLOCK_GAS_LIMIT_CHECK)
+        {
+            version.tx_gas_limit_cap = env.version.tx_gas_limit_cap;
+        }
+        if let Some(params) = self.chain_spec().blob_params_at_timestamp(timestamp) {
+            version.max_blobs_per_tx = params.max_blobs_per_tx as usize;
+            if SpecId::from(env.spec) < SpecId::CANCUN &&
+                SpecId::from(spec) >= SpecId::CANCUN &&
+                !env.blob_base_fee_overridden
+            {
+                env.block.blob_basefee = U256::from(params.calc_blob_fee(0));
             }
         }
-
-        if old_spec < SpecId::CANCUN && new_spec >= SpecId::CANCUN {
-            let params = self
-                .chain_spec()
-                .blob_params_at_timestamp(timestamp)
-                .unwrap_or_else(BlobParams::cancun);
-            // Same initial excess as next_evm_env on entry into Cancun. Preserve
-            // any explicit blobBaseFee (including zero) already installed by
-            // BlockOverridesExt, as well as an existing header-derived price.
-            evm_env.block_env.inner.blob_excess_gas_and_price.get_or_insert_with(|| {
-                BlobExcessGasAndPrice { excess_blob_gas: 0, blob_gasprice: params.calc_blob_fee(0) }
-            });
-            if evm_env.cfg_env.max_blobs_per_tx.is_none() {
-                evm_env.cfg_env.set_max_blobs_per_tx(params.max_blobs_per_tx);
-            }
+        if env.version.max_blobs_per_tx != old_defaults.max_blobs_per_tx {
+            version.max_blobs_per_tx = env.version.max_blobs_per_tx;
         }
-        evm_env.cfg_env.set_spec_and_mainnet_gas_params(spec);
-        if matches!(evm_env.cfg_env.tx_gas_limit_cap, None | Some(MAX_TX_GAS_LIMIT_OSAKA)) {
-            evm_env.cfg_env.tx_gas_limit_cap =
-                BscHardforks::is_osaka_active_at_timestamp(self.chain_spec(), number, timestamp)
-                    .then_some(MAX_TX_GAS_LIMIT_OSAKA);
-        }
-        evm_env
+        env.spec = spec;
+        env.version = version;
+        env
     }
 }
 
@@ -372,41 +347,36 @@ impl<R, Spec, EvmFactory> BscBlockExecutorFactory<R, Spec, EvmFactory> {
     }
 }
 
-impl<R, Spec, EvmF> BlockExecutorFactory for BscBlockExecutorFactory<R, Spec, EvmF>
+impl<R, Spec> BlockExecutorFactory for BscBlockExecutorFactory<R, Spec, BscEvmFactory>
 where
-    R: ReceiptBuilder<Transaction = TransactionSigned, Receipt: TxReceipt<Log = Log>> + Clone,
-    Spec: EthereumHardforks + BscHardforks + EthChainSpec + Hardforks + Clone,
-    EvmF: EvmFactory<
-        Tx: FromRecoveredTx<TransactionSigned> + FromTxWithEncoded<TransactionSigned>,
-        BlockEnv = BscBlockEnv,
-    >,
-    R::Transaction: From<TransactionSigned> + Clone,
-    Self: 'static,
-    BscTxEnv: IntoTxEnv<<EvmF as EvmFactory>::Tx>,
+    R: ReceiptBuilder<Transaction = TransactionSigned, Receipt: TxReceipt<Log = Log>>
+        + Clone
+        + 'static,
+    Spec: EthereumHardforks + BscHardforks + EthChainSpec + Hardforks + Clone + 'static,
 {
-    type EvmFactory = EvmF;
-    type TxExecutionResult = BscTxResult<<EvmF as EvmFactory>::HaltReason>;
+    type EvmFactory = BscEvmFactory;
+    type EvmTypes = BscEvmTypes;
+    type Evm<'a> = BscEvm<'a>;
+    type EvmEnv = BscEvmEnv;
     type ExecutionCtx<'a> = BscBlockExecutionCtx<'a>;
     type Transaction = TransactionSigned;
     type Receipt = R::Receipt;
-    type Executor<
-        'a,
-        DB: alloy_evm::block::StateDB,
-        I: Inspector<<Self::EvmFactory as EvmFactory>::Context<DB>>,
-    > = BscBlockExecutor<'a, <EvmF as EvmFactory>::Evm<DB, I>, Spec, R>;
+    type Executor<'a> = BscBlockExecutor<'a, Spec, R>;
 
     fn evm_factory(&self) -> &Self::EvmFactory {
         &self.evm_factory
     }
 
-    fn create_executor<'a, DB, I>(
+    fn evm_with_env<'a, DB: DynDatabase + 'a>(&self, db: DB, env: BscEvmEnv) -> BscEvm<'a> {
+        self.evm_factory.create_evm(db, env)
+    }
+    fn create_executor<'a>(
         &'a self,
-        evm: <Self::EvmFactory as EvmFactory>::Evm<DB, I>,
+        evm: BscEvm<'a>,
         ctx: Self::ExecutionCtx<'a>,
-    ) -> Self::Executor<'a, DB, I>
+    ) -> Self::Executor<'a>
     where
-        DB: alloy_evm::block::StateDB,
-        I: Inspector<<Self::EvmFactory as EvmFactory>::Context<DB>>,
+        Self: 'a,
     {
         BscBlockExecutor::new(
             evm,
@@ -421,97 +391,62 @@ where
 
 pub(crate) const EIP1559_INITIAL_BASE_FEE: u64 = 0;
 
-/// The [`EvmEnv`] that `header` itself presents to the EVM — go-bsc's
-/// `core.NewEVMBlockContext(header, ..)`.
-pub(crate) fn evm_env_for_header<Spec>(
-    spec: &Spec,
-    header: &Header,
-) -> EvmEnv<BscHardfork, BscBlockEnv>
+/// Resolves opcode-visible fields from the header without losing BSC's fork identity.
+pub(crate) fn evm_env_for_header<Spec>(spec: &Spec, header: &Header) -> BscEvmEnv
 where
     Spec: BscHardforks + EthChainSpec + Clone,
 {
-    // `BscHardforks::` disambiguates from the same-named `EthereumHardforks` supertrait methods.
+    let hardfork =
+        revm_spec_by_timestamp_and_block_number(spec.clone(), header.timestamp, header.number);
     let blob_params =
         BscHardforks::is_cancun_active_at_timestamp(spec, header.number, header.timestamp)
             .then(|| spec.blob_params_at_timestamp(header.timestamp))
             .flatten();
-    let hardfork =
-        revm_spec_by_timestamp_and_block_number(spec.clone(), header.timestamp(), header.number());
-    let spec_id = SpecId::from(hardfork);
-
-    let mut cfg_env = CfgEnv::new_with_spec(hardfork).with_chain_id(spec.chain().id());
-
-    if let Some(blob_params) = &blob_params {
-        cfg_env.set_max_blobs_per_tx(blob_params.max_blobs_per_tx);
-    }
-    if BscHardforks::is_osaka_active_at_timestamp(spec, header.number, header.timestamp) {
-        cfg_env.tx_gas_limit_cap = Some(MAX_TX_GAS_LIMIT_OSAKA);
-    }
-
-    // derive the EIP-4844 blob fees from the header's `excess_blob_gas` and the current blobparams
-    let blob_excess_gas_and_price =
-        header.excess_blob_gas.zip(blob_params).map(|(excess_blob_gas, params)| {
-            let blob_gasprice = params.calc_blob_fee(excess_blob_gas);
-            BlobExcessGasAndPrice { excess_blob_gas, blob_gasprice }
-        });
-
-    let block_env = BlockEnv {
-        number: U256::from(header.number()),
-        beneficiary: header.beneficiary(),
-        timestamp: U256::from(header.timestamp()),
-        difficulty: if spec_id >= SpecId::MERGE { U256::ZERO } else { header.difficulty() },
-        // BSC does not replace the DIFFICULTY output with prevrandao so here we are setting
-        // this to the difficulty values to ensure correct opcode outputs
-        prevrandao: if spec_id >= SpecId::MERGE { Some(header.difficulty().into()) } else { None },
-        gas_limit: header.gas_limit(),
-        basefee: header.base_fee_per_gas().unwrap_or_default(),
-        blob_excess_gas_and_price,
-        slot_num: 0,
+    let blob_basefee = header
+        .excess_blob_gas
+        .zip(blob_params)
+        .map(|(excess, params)| U256::from(params.calc_blob_fee(excess)))
+        .unwrap_or_default();
+    let block = BlockEnv::<BscEvmTypes> {
+        number: U256::from(header.number),
+        beneficiary: header.beneficiary,
+        timestamp: U256::from(header.timestamp),
+        difficulty: header.difficulty,
+        prevrandao: header.difficulty,
+        gas_limit: U256::from(header.gas_limit),
+        basefee: U256::from(header.base_fee_per_gas.unwrap_or_default()),
+        blob_basefee,
+        ..Default::default()
     };
-    // The millisecond remainder lives in the header's `mix_hash` tail (BEP-520) — the
-    // BscBlockEnv counterpart of go-bsc filling `BlockContext.MilliTimestamp` from
-    // `header.MilliTimestamp()` in `NewEVMBlockContext`.
-    let block_env = BscBlockEnv::new(block_env, millisecond_remainder(header));
-
-    EvmEnv { cfg_env, block_env }
+    let mut env = BscEvmEnv::new(hardfork, block, spec.chain().id(), millisecond_remainder(header));
+    env.header_mix_hash = header.mix_hash;
+    if let Some(params) = blob_params {
+        env.version.max_blobs_per_tx = params.max_blobs_per_tx as usize;
+    }
+    env
 }
 
-impl ConfigureEvm for BscEvmConfig
-where
-    Self: Send + Sync + Unpin + Clone + 'static,
-{
+impl ConfigureEvm for BscEvmConfig {
     type Primitives = BscPrimitives;
     type Error = Infallible;
     type NextBlockEnvCtx = BscNextBlockEnvAttributes;
     type BlockExecutorFactory = BscBlockExecutorFactory;
     type BlockAssembler = BscBlockAssembler<BscChainSpec>;
-
     fn block_executor_factory(&self) -> &Self::BlockExecutorFactory {
         &self.executor_factory
     }
-
     fn block_assembler(&self) -> &Self::BlockAssembler {
         &self.block_assembler
     }
-
-    fn evm_with_env<DB: Database>(&self, db: DB, evm_env: EvmEnvFor<Self>) -> EvmFor<Self, DB> {
-        self.evm_factory().create_evm(db, self.with_block_rules(evm_env))
-    }
-
-    fn evm_with_env_and_inspector<DB, I>(
+    fn evm_with_env<'a, DB: Database + 'a>(
         &self,
         db: DB,
-        evm_env: EvmEnvFor<Self>,
-        inspector: I,
-    ) -> EvmFor<Self, DB, I>
-    where
-        DB: Database,
-        I: InspectorFor<Self, DB>,
-    {
-        self.evm_factory().create_evm_with_inspector(db, self.with_block_rules(evm_env), inspector)
+        env: EvmEnvFor<Self>,
+    ) -> EvmFor<'a, Self> {
+        self.executor_factory.evm_with_database(db, self.with_block_rules(env))
     }
 
-    fn evm_env(&self, header: &Header) -> Result<EvmEnv<BscHardfork, BscBlockEnv>, Self::Error> {
+    fn evm_env(&self, header: &Header) -> Result<BscEvmEnv, Self::Error> {
         Ok(evm_env_for_header(self.chain_spec(), header))
     }
 
@@ -519,95 +454,49 @@ where
         &self,
         parent: &Header,
         attributes: &Self::NextBlockEnvCtx,
-    ) -> Result<EvmEnv<BscHardfork, BscBlockEnv>, Self::Error> {
-        let milli_remainder = attributes.milli_remainder;
-        let attributes = &attributes.inner;
-        // ensure we're not missing any timestamp based hardforks
-        let spec_id = revm_spec_by_timestamp_and_block_number(
+    ) -> Result<BscEvmEnv, Self::Error> {
+        let spec = revm_spec_by_timestamp_and_block_number(
             self.chain_spec().clone(),
-            attributes.timestamp,
-            parent.number() + 1,
+            attributes.inner.timestamp,
+            parent.number + 1,
         );
-
-        // configure evm env based on parent block
-        let mut cfg_env =
-            CfgEnv::new_with_spec(spec_id).with_chain_id(self.chain_spec().chain().id());
-
-        let blob_params = self.chain_spec().blob_params_at_timestamp(attributes.timestamp);
-
-        // if the parent block did not have excess blob gas (i.e. it was pre-cancun), but it is
-        // cancun now, we need to set the excess blob gas to the default value(0)
-        let blob_excess_gas_and_price = next_block_excess_blob_gas_with_mendel(
+        let params = self.chain_spec().blob_params_at_timestamp(attributes.inner.timestamp);
+        let blob_basefee = next_block_excess_blob_gas_with_mendel(
             self.chain_spec(),
             parent.number + 1,
-            attributes.timestamp,
+            attributes.inner.timestamp,
             parent,
-            blob_params,
+            params,
         )
-        .map(|excess_blob_gas| {
-            let blob_gasprice =
-                blob_params.unwrap_or_else(BlobParams::cancun).calc_blob_fee(excess_blob_gas);
-            BlobExcessGasAndPrice { excess_blob_gas, blob_gasprice }
-        });
-
-        if BscHardforks::is_osaka_active_at_timestamp(
-            self.chain_spec(),
-            parent.number + 1,
-            attributes.timestamp,
-        ) {
-            cfg_env.tx_gas_limit_cap = Some(MAX_TX_GAS_LIMIT_OSAKA);
-        }
-
-        // Refer to geth-bsc: https://github.com/bnb-chain/bsc/blob/master/consensus/misc/eip1559/eip1559.go#L61
-        let mut basefee = Some(EIP1559_INITIAL_BASE_FEE);
-
-        let mut gas_limit = U256::from(parent.gas_limit);
-
-        // If we are on the London fork boundary, we need to multiply the parent's gas limit by the
-        // elasticity multiplier to get the new gas limit.
-        if self
-            .chain_spec()
-            .inner
-            .fork(EthereumHardfork::London)
-            .transitions_at_block(parent.number + 1)
-        {
-            let elasticity_multiplier = self
-                .chain_spec()
-                .base_fee_params_at_timestamp(attributes.timestamp)
-                .elasticity_multiplier;
-
-            // multiply the gas limit by the elasticity multiplier
-            gas_limit *= U256::from(elasticity_multiplier);
-
-            // set the base fee to the initial base fee from the EIP-1559 spec
-            basefee = Some(EIP1559_INITIAL_BASE_FEE);
-        }
-
-        let block_env = BlockEnv {
-            number: U256::from(parent.number() + 1),
-            beneficiary: attributes.suggested_fee_recipient,
-            timestamp: U256::from(attributes.timestamp),
-            difficulty: U256::ZERO,
-            prevrandao: Some(attributes.prev_randao),
-            gas_limit: attributes.gas_limit,
-            // calculate basefee based on parent block's gas usage
-            basefee: basefee.unwrap_or_default(),
-            // calculate excess gas based on parent block's blob gas usage
-            blob_excess_gas_and_price,
-            slot_num: 0,
+        .map(|excess| U256::from(params.unwrap_or_else(BlobParams::cancun).calc_blob_fee(excess)))
+        .unwrap_or_default();
+        let block = BlockEnv::<BscEvmTypes> {
+            number: U256::from(parent.number + 1),
+            beneficiary: attributes.inner.suggested_fee_recipient,
+            timestamp: U256::from(attributes.inner.timestamp),
+            prevrandao: U256::from_be_bytes(attributes.inner.prev_randao.0),
+            difficulty: U256::from_be_bytes(attributes.inner.prev_randao.0),
+            gas_limit: U256::from(attributes.inner.gas_limit),
+            basefee: U256::from(EIP1559_INITIAL_BASE_FEE),
+            blob_basefee,
+            ..Default::default()
         };
-        // Millisecond remainder for the next block, threaded through the attributes:
-        // the miner/bid-simulator's planned `block_timestamp_ms % 1000`, or `0` on the
-        // RPC pending/simulate paths (go-bsc synthetic-header semantics).
-        let block_env = BscBlockEnv::new(block_env, milli_remainder);
-
-        Ok(EvmEnv { cfg_env, block_env })
+        let mut env =
+            BscEvmEnv::new(spec, block, self.chain_spec().chain().id(), attributes.milli_remainder);
+        env.header_difficulty = U256::ZERO;
+        if let Some(params) = params {
+            env.version.max_blobs_per_tx = params.max_blobs_per_tx as usize;
+        }
+        Ok(env)
     }
 
     fn context_for_block<'a>(
         &self,
         block: &'a SealedBlock<BlockTy<Self::Primitives>>,
-    ) -> Result<ExecutionCtxFor<'a, Self>, Self::Error> {
+    ) -> Result<ExecutionCtxFor<'a, Self>, Self::Error>
+    where
+        Self: 'a,
+    {
         Ok(BscBlockExecutionCtx {
             base: EthBlockExecutionCtx {
                 tx_count_hint: Some(block.transaction_count()),
@@ -668,18 +557,15 @@ where
     }
 
     // payload builder use this method to create BscBlockBuilder.
-    fn create_block_builder<'a, DB, I>(
+    fn create_block_builder<'a>(
         &'a self,
-        evm: EvmFor<Self, &'a mut State<DB>, I>,
+        evm: EvmFor<'a, Self>,
+        evm_env: BscEvmEnv,
         parent: &'a SealedHeader<HeaderTy<Self::Primitives>>,
-        ctx: <Self::BlockExecutorFactory as BlockExecutorFactory>::ExecutionCtx<'a>,
-    ) -> impl BlockBuilder<
-        Primitives = Self::Primitives,
-        Executor = BlockExecutorFor<'a, Self::BlockExecutorFactory, &'a mut State<DB>, I>,
-    >
+        ctx: ExecutionCtxFor<'a, Self>,
+    ) -> impl BlockBuilder<Primitives = Self::Primitives, Executor = reth_evm::BlockExecutorFor<'a, Self>>
     where
-        DB: Database,
-        I: InspectorFor<Self, &'a mut State<DB>> + 'a,
+        Self: 'a,
     {
         // just init a default custom ctx for mining block.
         let shared_ctx = BscExecutionSharedCtx::default();
@@ -692,7 +578,7 @@ where
             SystemContract::new(self.executor_factory.spec().clone()),
         );
 
-        BscBlockBuilder::new(bsc_executor, ctx, shared_ctx, &self.block_assembler, parent)
+        BscBlockBuilder::new(bsc_executor, evm_env, ctx, shared_ctx, &self.block_assembler, parent)
     }
 }
 
@@ -700,10 +586,7 @@ impl ConfigureEngineEvm<BscExecutionData> for BscEvmConfig
 where
     Self: Send + Sync + Unpin + Clone + 'static,
 {
-    fn evm_env_for_payload(
-        &self,
-        payload: &BscExecutionData,
-    ) -> Result<EvmEnv<BscHardfork, BscBlockEnv>, Self::Error> {
+    fn evm_env_for_payload(&self, payload: &BscExecutionData) -> Result<BscEvmEnv, Self::Error> {
         self.evm_env(&payload.block.header)
     }
 
@@ -863,10 +746,10 @@ mod tests {
             &mut header,
         );
         let env = evm_config.evm_env(&header).unwrap();
-        assert_eq!(env.block_env.milli_remainder, 750);
-        assert_eq!(env.block_env.milli_timestamp(), 1_780_000_000_750);
+        assert_eq!(env.milli_remainder, 750);
+        assert_eq!(env.milli_timestamp(), 1_780_000_000_750);
         assert_eq!(
-            env.block_env.milli_timestamp(),
+            env.milli_timestamp(),
             crate::consensus::parlia::util::calculate_millisecond_timestamp(&header),
             "env and header millisecond sources must agree"
         );
@@ -874,8 +757,8 @@ mod tests {
         // Pre-Lorentz-shaped header (zero mix_hash): remainder 0, value Time*1000.
         header.mix_hash = B256::ZERO;
         let env = evm_config.evm_env(&header).unwrap();
-        assert_eq!(env.block_env.milli_remainder, 0);
-        assert_eq!(env.block_env.milli_timestamp(), 1_780_000_000_000);
+        assert_eq!(env.milli_remainder, 0);
+        assert_eq!(env.milli_timestamp(), 1_780_000_000_000);
 
         // Stale-immunity across the generic `inner_mut()` mutation path (block
         // overrides, traceCallMany's bump, callBundle): the live value follows the
@@ -885,9 +768,9 @@ mod tests {
             &mut header,
         );
         let mut env = evm_config.evm_env(&header).unwrap();
-        use alloy_evm::env::BlockEnvironment;
-        env.block_env.inner_mut().timestamp = U256::from(1_790_000_000u64);
-        assert_eq!(env.block_env.milli_timestamp(), 1_790_000_000_750);
+
+        env.block.timestamp = U256::from(1_790_000_000u64);
+        assert_eq!(env.milli_timestamp(), 1_790_000_000_750);
     }
 
     /// `next_evm_env` (miner / pending / simulate paths) carries a zero remainder until
@@ -907,11 +790,8 @@ mod tests {
             &parent, None,
         );
         let env = evm_config.next_evm_env(&parent, &attrs).unwrap();
-        assert_eq!(env.block_env.milli_remainder, 0);
-        assert_eq!(
-            env.block_env.milli_timestamp(),
-            env.block_env.timestamp.saturating_to::<u64>() * 1000
-        );
+        assert_eq!(env.milli_remainder, 0);
+        assert_eq!(env.milli_timestamp(), env.block.timestamp.saturating_to::<u64>() * 1000);
     }
 
     /// The miner threads `block_timestamp_ms % 1000` through the attributes; the env's
@@ -938,8 +818,8 @@ mod tests {
         attrs.milli_remainder = block_timestamp_ms % 1000;
 
         let env = evm_config.next_evm_env(&parent, &attrs).unwrap();
-        assert_eq!(env.block_env.milli_remainder, 750);
-        assert_eq!(env.block_env.milli_timestamp(), block_timestamp_ms);
+        assert_eq!(env.milli_remainder, 750);
+        assert_eq!(env.milli_timestamp(), block_timestamp_ms);
 
         // Sealing the same value into a header (what finalize does via
         // `set_millisecond_part_of_timestamp`) reports the identical milliseconds.
@@ -949,7 +829,7 @@ mod tests {
             &mut sealed,
         );
         assert_eq!(
-            env.block_env.milli_timestamp(),
+            env.milli_timestamp(),
             crate::consensus::parlia::util::calculate_millisecond_timestamp(&sealed),
         );
     }

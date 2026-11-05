@@ -33,7 +33,6 @@ use crate::{
 };
 use alloy_consensus::{BlockHeader, Transaction};
 use alloy_eips::eip4895::Withdrawals;
-use alloy_evm::Evm;
 use alloy_primitives::U256;
 use once_cell::sync::Lazy;
 use reth::transaction_pool::{
@@ -45,9 +44,10 @@ use reth_chainspec::EthChainSpec;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_ethereum_primitives::TransactionSigned;
 use reth_evm::{
-    block::{BlockExecutionError, BlockValidationError},
+    cached::CachedReads,
+    database::StateProviderDatabase,
     execute::{BlockBuilder, BlockBuilderOutcome},
-    ConfigureEvm, NextBlockEnvAttributes,
+    BlockExecutionError, BlockValidationError, ConfigureEvm, EvmEnv, NextBlockEnvAttributes,
 };
 use reth_execution_types::BlockExecutionOutput;
 use reth_node_ethereum::engine::EthPayloadAttributes;
@@ -57,9 +57,7 @@ use reth_primitives_traits::{
     SealedBlock, SealedHeader, SignerRecoverable,
 };
 use reth_provider::{EvmStateProviderAdapter, StateProviderFactory};
-use reth_revm::{cached::CachedReads, database::StateProviderDatabase, db::State};
 use reth_tasks::ManualCancel;
-use revm::context_interface::Block as EvmBlock;
 use std::{
     collections::HashMap,
     sync::{
@@ -644,7 +642,7 @@ where
         let (state, read_phase) =
             ObservedStateDb::new(&mut cached_reads, state, kind, self.ctx.is_inturn);
         let state = state.with_shared_prewarm(parent_hash, prewarm_cache.clone());
-        let mut db = State::builder().with_database(state).with_bundle_update().build();
+        let mut db = state;
 
         // Sinks transport current_validators / turn_length from the builder (which is consumed by
         // `finish`) back to this layer so they can be written to cache after
@@ -703,6 +701,10 @@ where
 
         let evm_setup =
             super::perf_tuning::Phase::new(kind.label(), self.ctx.is_inturn, "evm_context");
+        let prewarm_env = self
+            .evm_config
+            .next_evm_env(&parent_header, &next_env_attributes)
+            .map_err(PayloadBuilderError::other)?;
         let mut builder = self
             .evm_config
             .builder_for_next_block(&mut db, &parent_header, next_env_attributes)
@@ -720,7 +722,10 @@ where
         // wait. When no spawner is registered, `trie_handle` is empty and this is a no-op
         // (synchronous fallback).
         if let Some(handle) = trie_handle.lock().unwrap().as_mut() {
-            builder.evm_mut().db_mut().set_state_hook(Some(Box::new(handle.take_execution_hook())));
+            let mut hook = handle.take_execution_hook();
+            builder.set_state_hook(move |state| {
+                reth_execution_types::OnStateHook::on_state(&mut hook, state)
+            });
             debug!(
                 target: "payload_builder",
                 trace_id,
@@ -755,10 +760,14 @@ where
             parent_header.number + 1,
             attributes.timestamp,
         );
-        let block_gas_limit: u64 =
-            builder.evm_mut().block().gas_limit().saturating_sub(system_txs_gas);
+        let block_gas_limit: u64 = builder
+            .evm_env()
+            .block_env()
+            .gas_limit
+            .saturating_to::<u64>()
+            .saturating_sub(system_txs_gas);
 
-        let base_fee = builder.evm_mut().block().basefee();
+        let base_fee = builder.evm_env().block_env().basefee.saturating_to::<u64>();
         trace!("build_payload: base_fee={}", base_fee);
 
         let mut sidecars_map = HashMap::new();
@@ -800,10 +809,6 @@ where
         }
 
         // Total time spent selecting + executing user transactions.
-        let prewarm_env = reth_evm::EvmEnv {
-            cfg_env: builder.evm_mut().cfg_env().clone(),
-            block_env: builder.evm_mut().block().clone(),
-        };
         selection_setup.complete();
         let execution_phase =
             super::perf_tuning::Phase::new(kind.label(), self.ctx.is_inturn, "execution");
@@ -1254,6 +1259,7 @@ where
         let _ = &state_root_precomputed;
         let BlockBuilderOutcome {
             execution_result,
+            execution_state,
             hashed_state,
             trie_updates,
             block,
@@ -1352,7 +1358,7 @@ where
 
         let requests = execution_result.requests.clone();
         let execution_outcome =
-            BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
+            BlockExecutionOutput { state: execution_state, result: execution_result };
         let executed_block = BuiltPayloadExecutedBlock {
             shared_trie_data: None,
             recovered_block: Arc::new(block),
@@ -1423,7 +1429,7 @@ where
         let state = StateProviderDatabase::new(EvmStateProviderAdapter(&state_provider));
         let (state, read_phase) =
             ObservedStateDb::new(&mut cached_reads, state, AttemptKind::Empty, self.ctx.is_inturn);
-        let mut db = State::builder().with_database(state).with_bundle_update().build();
+        let mut db = state;
 
         // Sinks for empty-payload builds (same delayed-seal mechanism as normal builds).
         let validator_cache_sink: ValidatorCacheSink = Arc::new(Mutex::new(None));
@@ -1471,7 +1477,10 @@ where
         // Install before pre-execution; finish() also streams all system transactions,
         // closes this candidate's hook, and consumes only its own root result.
         if let Some(handle) = trie_handle.lock().unwrap().as_mut() {
-            builder.evm_mut().db_mut().set_state_hook(Some(Box::new(handle.take_execution_hook())));
+            let mut hook = handle.take_execution_hook();
+            builder.set_state_hook(move |state| {
+                reth_execution_types::OnStateHook::on_state(&mut hook, state)
+            });
         }
 
         // Total time spent executing pre-execution changes (no user txs for empty payloads).
@@ -1500,6 +1509,7 @@ where
         // Without the sparse-trie flag/spawner, finish keeps the legacy synchronous path.
         let BlockBuilderOutcome {
             execution_result,
+            execution_state,
             hashed_state,
             trie_updates,
             block,
@@ -1532,7 +1542,7 @@ where
 
         let requests = execution_result.requests.clone();
         let execution_outcome =
-            BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
+            BlockExecutionOutput { state: execution_state, result: execution_result };
         let executed_block = BuiltPayloadExecutedBlock {
             shared_trie_data: None,
             recovered_block: Arc::new(block),

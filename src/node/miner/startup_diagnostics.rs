@@ -247,6 +247,35 @@ fn allow_log(now: Instant) -> bool {
     true
 }
 
+/// Scope wall time, including lock waits and early returns. Never labels by hash.
+pub(crate) struct HandoffStage {
+    phase: &'static str,
+    source: &'static str,
+    started: Instant,
+}
+
+impl HandoffStage {
+    pub(crate) fn new(phase: &'static str, source: &'static str) -> Self {
+        Self { phase, source, started: Instant::now() }
+    }
+}
+
+impl Drop for HandoffStage {
+    fn drop(&mut self) {
+        metrics::histogram!("bsc.block_handoff.stage_seconds", "phase" => self.phase, "source" => self.source)
+            .record(self.started.elapsed().as_secs_f64());
+    }
+}
+
+/// Classifies only recent ingress observations; startup/retry heads can be unknown.
+pub(crate) fn handoff_source(hash: B256) -> &'static str {
+    PARENTS
+        .lock()
+        .peek(&hash)
+        .filter(|p| p.arrived.elapsed() <= MAX_AGE)
+        .map_or("unknown", |p| p.source)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,33 +393,4 @@ mod tests {
         assert_eq!(budget_limiter(d(2000), d(450), false, d(420), d(420)), "period_cap");
         assert_eq!(budget_limiter(d(0), d(50), false, d(0), d(50)), "recovery_floor");
     }
-}
-
-/// Scope wall time, including lock waits and early returns. Never labels by hash.
-pub(crate) struct HandoffStage {
-    phase: &'static str,
-    source: &'static str,
-    started: Instant,
-}
-
-impl HandoffStage {
-    pub(crate) fn new(phase: &'static str, source: &'static str) -> Self {
-        Self { phase, source, started: Instant::now() }
-    }
-}
-
-impl Drop for HandoffStage {
-    fn drop(&mut self) {
-        metrics::histogram!("bsc.block_handoff.stage_seconds", "phase" => self.phase, "source" => self.source)
-            .record(self.started.elapsed().as_secs_f64());
-    }
-}
-
-/// Classifies only recent ingress observations; startup/retry heads can be unknown.
-pub(crate) fn handoff_source(hash: B256) -> &'static str {
-    PARENTS
-        .lock()
-        .peek(&hash)
-        .filter(|p| p.arrived.elapsed() <= MAX_AGE)
-        .map_or("unknown", |p| p.source)
 }

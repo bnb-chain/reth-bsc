@@ -51,7 +51,7 @@ pub struct MiningContext {
     pub parent_header: reth_primitives_traits::SealedHeader,
     pub parent_snapshot: Arc<crate::consensus::parlia::snapshot::Snapshot>,
     pub is_inturn: bool,
-    pub cached_reads: Option<reth_revm::cached::CachedReads>,
+    pub cached_reads: Option<reth_evm::cached::CachedReads>,
     /// Block timestamp in milliseconds, computed via `block_time_for_ramanujan_fork`.
     pub block_timestamp_ms: u64,
     /// End timestamp of the mining job (UNIX epoch ms), computed via `delay_for_ramanujan_fork`.
@@ -430,7 +430,7 @@ where
     fn maybe_pre_cached(
         &self,
         parent: alloy_primitives::B256,
-    ) -> Option<reth_revm::cached::CachedReads> {
+    ) -> Option<reth_evm::cached::CachedReads> {
         let _stage = super::startup_diagnostics::HandoffStage::new(
             "cached_reads_clone",
             super::startup_diagnostics::handoff_source(parent),

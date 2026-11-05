@@ -8,16 +8,21 @@ use alloy_primitives::{
     map::{AddressMap, B256Map, HashMap},
     Address, B256, U256,
 };
+use evm2::{
+    bytecode::Bytecode,
+    evm::{AccountInfo, Database},
+};
 use parking_lot::{Mutex, RwLock};
 use reth_ethereum_primitives::TransactionSigned;
-use reth_evm::{ConfigureEvm, Evm, EvmEnvFor};
+use reth_evm::{
+    database::StateProviderDatabase, ConfigureEvm, Evm, EvmEnv, EvmEnvFor, FromRecoveredTx,
+};
 use reth_provider::{EvmStateProviderAdapter, StateProviderFactory};
-use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_tasks::ManualCancel;
 use reth_transaction_pool::{
     BestTransactions, BestTransactionsAttributes, PoolTransaction, TransactionPool,
 };
-use revm::{bytecode::Bytecode, state::AccountInfo, Database, DatabaseCommit, DatabaseRef};
+
 use std::{
     cell::Cell,
     collections::hash_map::Entry,
@@ -332,34 +337,37 @@ pub(crate) struct SharedStateDb<DB> {
     pub(crate) cache: Arc<SharedStateCache>,
 }
 
-impl<DB: DatabaseRef> DatabaseRef for SharedStateDb<DB> {
+impl<DB: Database> Database for SharedStateDb<DB> {
     type Error = DB::Error;
-    fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        if let Some(value) = self.cache.account(address) {
+    fn is_fatal(error: &Self::Error) -> bool {
+        DB::is_fatal(error)
+    }
+    fn get_account(&mut self, address: &Address) -> Result<Option<AccountInfo>, Self::Error> {
+        if let Some(value) = self.cache.account(*address) {
             return Ok(value)
         }
-        let value = self.inner.basic_ref(address)?;
-        self.cache.insert_account_from(address, value.clone(), 0);
+        let value = self.inner.get_account(address)?;
+        self.cache.insert_account_from(*address, value.clone(), 0);
         Ok(value)
     }
-    fn storage_ref(&self, address: Address, slot: U256) -> Result<U256, Self::Error> {
-        if let Some(value) = self.cache.storage(address, slot) {
+    fn get_storage(&mut self, address: &Address, slot: &U256) -> Result<U256, Self::Error> {
+        if let Some(value) = self.cache.storage(*address, *slot) {
             return Ok(value)
         }
-        let value = self.inner.storage_ref(address, slot)?;
-        self.cache.insert_storage_from(address, slot, value, 0);
+        let value = self.inner.get_storage(address, slot)?;
+        self.cache.insert_storage_from(*address, *slot, value, 0);
         Ok(value)
     }
-    fn code_by_hash_ref(&self, hash: B256) -> Result<Bytecode, Self::Error> {
-        if let Some(value) = self.cache.code(hash) {
+    fn get_code_by_hash(&mut self, hash: &B256) -> Result<Bytecode, Self::Error> {
+        if let Some(value) = self.cache.code(*hash) {
             return Ok(value)
         }
-        let value = self.inner.code_by_hash_ref(hash)?;
-        self.cache.insert_code_from(hash, value.clone(), 0);
+        let value = self.inner.get_code_by_hash(hash)?;
+        self.cache.insert_code_from(*hash, value.clone(), 0);
         Ok(value)
     }
-    fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
-        self.inner.block_hash_ref(number)
+    fn get_block_hash(&mut self, number: &U256) -> Result<B256, Self::Error> {
+        self.inner.get_block_hash(number)
     }
 }
 
@@ -633,7 +641,7 @@ where
         let candidates = Arc::new(Mutex::new((std::iter::once(first).chain(best), 0usize)));
         // Transfer capacity from setup to execution jobs in the same independent pool.
         drop(setup_permit);
-        env.cfg_env.disable_nonce_check = true;
+        env = env.with_nonce_check_disabled();
         for _ in 0..workers.pool.current_num_threads() {
             if !reserve(&workers.active, 1, workers.pool.current_num_threads()) {
                 metrics::counter!("bsc.miner_prewarm.workers_total", "result" => "busy").increment(1);
@@ -743,21 +751,21 @@ fn warm_transactions<DB, Config>(
     should_stop: impl Fn() -> bool,
 ) -> (u64, u64)
 where
-    DB: DatabaseRef<Error: std::error::Error + Send + Sync + 'static> + std::fmt::Debug,
+    DB: Database<Error: std::error::Error + Send + Sync + 'static> + std::fmt::Debug,
     Config: ConfigureEvm,
     Config::Primitives: reth_primitives_traits::NodePrimitives<SignedTx = TransactionSigned>,
 {
     let mut observation = TransactionObservation { cache: db.cache.clone(), outcomes: [[0; 2]; 3] };
-    let mut state = State::builder().with_database_ref(db).build();
+    let mut state = db;
     let mut evm = config.evm_with_env(&mut state, env);
     let (mut completed, mut failed) = (0, 0);
     while !should_stop() {
         let Some(tx) = next() else { break };
         // Read explicit touches even when nonce/fee validation prevents execution.
-        let _ = evm.db_mut().basic(tx.signer());
+        let _ = evm.account_info(&tx.signer());
         if let Some(to) = tx.to() {
-            if let Ok(Some(account)) = evm.db_mut().basic(to) {
-                let _ = evm.db_mut().code_by_hash(account.code_hash);
+            if let Ok(Some(account)) = evm.account_info(&to) {
+                let _ = evm.state_db_mut().get_code_by_hash(&account.code_hash);
             }
         }
         if let Some(list) = tx.access_list() {
@@ -765,27 +773,28 @@ where
                 if should_stop() {
                     return (completed, failed)
                 }
-                let _ = evm.db_mut().basic(item.address);
+                let _ = evm.account_info(&item.address);
                 for slot in &item.storage_keys {
                     if should_stop() {
                         return (completed, failed)
                     }
-                    let _ = evm.db_mut().storage(item.address, U256::from_be_bytes(slot.0));
+                    let _ =
+                        evm.state_db_mut().get_storage(&item.address, &U256::from_be_bytes(slot.0));
                 }
             }
         }
         if should_stop() {
             break
         }
-        let result = evm.transact(tx);
+        let tx = reth_evm::TxEnvFor::<Config>::from_recovered_tx(tx);
+        let result = evm.transact_commit(&tx);
         let phase = observation.cache.phase.load(Ordering::Relaxed);
         observation.outcomes[phase][usize::from(result.is_err())] += 1;
         match result {
-            Ok(result) => {
+            Ok(_) => {
                 // Like go-bsc's worker-local StateDB, preserve speculative transitions only in
                 // this worker's private State. Its backing read cache still contains parent
                 // values; no write reaches that cache, the provider or the actual miner.
-                evm.db_mut().commit(result.state);
                 completed += 1;
             }
             Err(_) => failed += 1,
@@ -886,34 +895,34 @@ mod tests {
             // cached as the parent's slot value or alter the subsequent real execution.
             Self {
                 reads: Default::default(),
-                code: Bytecode::new_raw(Bytes::from_static(&[
+                code: Bytecode::new_legacy(Bytes::from_static(&[
                     0x60, 0x07, 0x60, 0x00, 0x55, 0x60, 0x00, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20,
                     0x60, 0x00, 0xf3,
                 ])),
             }
         }
     }
-    impl DatabaseRef for ParentDb {
+    impl Database for ParentDb {
         type Error = Infallible;
-        fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Infallible> {
+        fn get_account(&mut self, address: &Address) -> Result<Option<AccountInfo>, Infallible> {
             self.reads.fetch_add(1, Ordering::Relaxed);
-            Ok(if address == SENDER {
+            Ok(if *address == SENDER {
                 Some(AccountInfo { balance: U256::from(1_000_000_000u64), ..Default::default() })
-            } else if address == CONTRACT {
+            } else if *address == CONTRACT {
                 Some(AccountInfo::default().with_code(self.code.clone()))
             } else {
                 None
             })
         }
-        fn storage_ref(&self, _: Address, _: U256) -> Result<U256, Infallible> {
+        fn get_storage(&mut self, _: &Address, _: &U256) -> Result<U256, Infallible> {
             self.reads.fetch_add(1, Ordering::Relaxed);
             Ok(U256::from(3))
         }
-        fn code_by_hash_ref(&self, _: B256) -> Result<Bytecode, Infallible> {
+        fn get_code_by_hash(&mut self, _: &B256) -> Result<Bytecode, Infallible> {
             self.reads.fetch_add(1, Ordering::Relaxed);
             Ok(self.code.clone())
         }
-        fn block_hash_ref(&self, _: u64) -> Result<B256, Infallible> {
+        fn get_block_hash(&mut self, _: &U256) -> Result<B256, Infallible> {
             Ok(B256::ZERO)
         }
     }
@@ -956,9 +965,9 @@ mod tests {
     }
 
     fn execute_block_transaction(
-        db: impl DatabaseRef<Error = Infallible> + std::fmt::Debug,
+        db: impl Database<Error = Infallible> + std::fmt::Debug,
     ) -> (u64, String, Vec<reth_ethereum_primitives::Receipt>, Option<AccountInfo>, U256) {
-        use reth_evm::block::BlockExecutor;
+        use reth_evm::BlockExecutor;
         use reth_primitives_traits::SealedBlock;
         let (cfg, _) = config_and_env();
         let block = SealedBlock::seal_slow(crate::BscBlock {
@@ -972,33 +981,33 @@ mod tests {
             },
             body: Default::default(),
         });
-        let mut state = State::builder().with_database_ref(db).build();
+        let mut state = db;
         let mut executor = cfg.executor_for_block(&mut state, &block).unwrap();
         let output = executor.execute_transaction_without_commit(transaction(0)).unwrap();
-        let gas = executor.commit_transaction(output).tx_gas_used();
+        let gas = executor.commit_transaction(output).unwrap().tx_gas_used();
         let error = executor
             .execute_transaction_without_commit(transaction(9))
             .err()
             .expect("nonce mismatch must fail")
             .to_string();
         let receipts = executor.receipts().to_vec();
-        drop(executor);
+        let state = executor.evm_mut().state_db_mut();
         (
             gas,
             error,
             receipts,
-            state.basic(SENDER).unwrap(),
-            state.storage(CONTRACT, U256::ZERO).unwrap(),
+            state.get_account(&SENDER).unwrap(),
+            state.get_storage(&CONTRACT, &U256::ZERO).unwrap(),
         )
     }
 
     #[test]
     fn speculative_sstore_does_not_change_parent_or_real_execution_result() {
-        let parent = ParentDb::default();
+        let mut parent = ParentDb::default();
         let cache = SharedStateCache::new(B256::repeat_byte(1));
         let (cfg, env) = config_and_env();
         let mut speculative_env = env.clone();
-        speculative_env.cfg_env.disable_nonce_check = true;
+        speculative_env = speculative_env.with_nonce_check_disabled();
         let mut txs = vec![transaction(7)].into_iter();
         assert_eq!(
             warm_transactions(
@@ -1013,10 +1022,14 @@ mod tests {
         assert_eq!(cache.storage(CONTRACT, U256::ZERO), Some(U256::from(3)));
         assert_eq!(cache.account(SENDER).unwrap().unwrap().nonce, 0);
 
-        let mut cold = State::builder().with_database_ref(parent.clone()).build();
-        let cold_result =
-            cfg.evm_with_env(&mut cold, env.clone()).transact(transaction(0)).unwrap();
-        let mut local = reth_revm::cached::CachedReads::default();
+        let mut cold = parent.clone();
+        let cold_result = cfg
+            .evm_with_env(&mut cold, env.clone())
+            .transact(&reth_evm::TxEnvFor::<crate::node::evm::BscEvmConfig>::from_recovered_tx(
+                transaction(0),
+            ))
+            .unwrap();
+        let mut local = reth_evm::cached::CachedReads::default();
         let (observed, _) = super::super::state_read_diagnostics::ObservedStateDb::new(
             &mut local,
             parent.clone(),
@@ -1024,17 +1037,30 @@ mod tests {
             true,
         );
         let observed = observed.with_shared_prewarm(cache.parent(), Some(cache.clone()));
-        let mut warm = State::builder().with_database(observed).build();
-        let warm_result =
-            cfg.evm_with_env(&mut warm, env.clone()).transact(transaction(0)).unwrap();
+        let mut warm = observed;
+        let warm_result = cfg
+            .evm_with_env(&mut warm, env.clone())
+            .transact(&reth_evm::TxEnvFor::<crate::node::evm::BscEvmConfig>::from_recovered_tx(
+                transaction(0),
+            ))
+            .unwrap();
         assert_eq!(cold_result.result, warm_result.result, "status, gas, output and logs");
-        assert_eq!(cold_result.state, warm_result.state, "account/storage writes");
-        let cold_error =
-            cfg.evm_with_env(&mut cold, env.clone()).transact(transaction(9)).unwrap_err();
-        let warm_error = cfg.evm_with_env(&mut warm, env).transact(transaction(9)).unwrap_err();
+        assert_eq!(cold_result.pending_state, warm_result.pending_state, "account/storage writes");
+        let cold_error = cfg
+            .evm_with_env(&mut cold, env.clone())
+            .transact(&reth_evm::TxEnvFor::<crate::node::evm::BscEvmConfig>::from_recovered_tx(
+                transaction(9),
+            ))
+            .unwrap_err();
+        let warm_error = cfg
+            .evm_with_env(&mut warm, env)
+            .transact(&reth_evm::TxEnvFor::<crate::node::evm::BscEvmConfig>::from_recovered_tx(
+                transaction(9),
+            ))
+            .unwrap_err();
         assert_eq!(cold_error.to_string(), warm_error.to_string());
         assert_eq!(cache.storage(CONTRACT, U256::ZERO), Some(U256::from(3)));
-        assert_eq!(parent.storage_ref(CONTRACT, U256::ZERO).unwrap(), U256::from(3));
+        assert_eq!(parent.get_storage(&CONTRACT, &U256::ZERO).unwrap(), U256::from(3));
         let baseline = execute_block_transaction(parent.clone());
         let prewarmed = execute_block_transaction(SharedStateDb { inner: parent, cache });
         assert_eq!(
@@ -1051,14 +1077,14 @@ mod tests {
         let next_parent = SharedStateCache::new(B256::repeat_byte(2));
         let parent = ParentDb::default();
         let (cfg, mut env) = config_and_env();
-        env.cfg_env.disable_nonce_check = true;
+        env = env.with_nonce_check_disabled();
         let barrier = std::sync::Barrier::new(3);
         std::thread::scope(|scope| {
             for i in 0..3 {
                 let (cache, parent) = (cache.clone(), parent.clone());
                 let (cfg, env, barrier) = (cfg.clone(), env.clone(), &barrier);
                 scope.spawn(move || {
-                    let db = SharedStateDb { inner: parent, cache };
+                    let mut db = SharedStateDb { inner: parent, cache };
                     barrier.wait();
                     let mut transactions = vec![transaction(i as u64)].into_iter();
                     assert_eq!(
@@ -1073,8 +1099,11 @@ mod tests {
                     );
                     for j in 0..100 {
                         let address = Address::repeat_byte((j + i) as u8);
-                        assert_eq!(db.basic_ref(address).unwrap(), db.basic_ref(address).unwrap());
-                        assert_eq!(db.storage_ref(address, U256::ZERO).unwrap(), U256::from(3));
+                        assert_eq!(
+                            db.get_account(&address).unwrap(),
+                            db.get_account(&address).unwrap()
+                        );
+                        assert_eq!(db.get_storage(&address, &U256::ZERO).unwrap(), U256::from(3));
                     }
                 });
             }
@@ -1088,7 +1117,7 @@ mod tests {
     #[test]
     fn speculative_revert_and_halt_preserve_formal_receipts_and_errors() {
         for code in [Bytes::from_static(&[0x60, 0, 0x60, 0, 0xfd]), Bytes::from_static(&[0xfe])] {
-            let parent = ParentDb { code: Bytecode::new_raw(code), ..Default::default() };
+            let parent = ParentDb { code: Bytecode::new_legacy(code), ..Default::default() };
             let cache = SharedStateCache::new(B256::ZERO);
             let (cfg, env) = config_and_env();
             let mut transactions = vec![transaction(0)].into_iter();
@@ -1112,14 +1141,14 @@ mod tests {
     fn admission_caps_fall_back_to_reads_without_fabricating_values() {
         let cache = SharedStateCache::new(B256::ZERO);
         cache.entries.store(MAX_ENTRIES, Ordering::Relaxed);
-        let db = SharedStateDb { inner: ParentDb::default(), cache: cache.clone() };
-        assert!(db.basic_ref(SENDER).unwrap().is_some());
-        assert_eq!(db.storage_ref(CONTRACT, U256::ZERO).unwrap(), U256::from(3));
+        let mut db = SharedStateDb { inner: ParentDb::default(), cache: cache.clone() };
+        assert!(db.get_account(&SENDER).unwrap().is_some());
+        assert_eq!(db.get_storage(&CONTRACT, &U256::ZERO).unwrap(), U256::from(3));
         assert_eq!(cache.account(SENDER), None);
         assert_eq!(cache.storage(CONTRACT, U256::ZERO), None);
         cache.entries.store(0, Ordering::Relaxed);
         cache.code_bytes.store(MAX_CODE_BYTES, Ordering::Relaxed);
-        assert!(db.code_by_hash_ref(B256::ZERO).is_ok());
+        assert!(db.get_code_by_hash(&B256::ZERO).is_ok());
         assert_eq!(cache.code(B256::ZERO), None);
         assert_eq!(cache.entries.load(Ordering::Relaxed), 0);
     }

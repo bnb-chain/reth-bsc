@@ -63,15 +63,14 @@ mod tests {
     use reth_engine_tree::tree::{
         state_root_strategy::spawn_payload_builder_state_root_with_cache_wait, TreeConfig,
     };
-    use reth_execution_types::BlockExecutionOutput;
+    use reth_evm::BundleState;
+    use reth_execution_types::{BlockExecutionOutput, OnStateHook};
     use reth_primitives_traits::RecoveredBlock;
     use reth_provider::{DatabaseProviderROFactory, HashedPostStateProvider, StateRootProvider};
     use reth_storage_overlay::{OverlayManager, OverlayStateProviderFactory};
     use reth_trie_common::SortedTrieData;
-    use revm::{
-        database::BundleState,
-        state::{Account, AccountInfo, AccountStatus, EvmState, EvmStorageSlot, TransactionId},
-        OnStateHook,
+    use revm::state::{
+        Account, AccountInfo, AccountStatus, EvmState, EvmStorageSlot, TransactionId,
     };
     use std::{sync::Arc, time::Duration};
 
@@ -124,7 +123,10 @@ mod tests {
             let next = if number == 3 { U256::ZERO } else { U256::from(number * 11) };
             let info = AccountInfo { nonce: number, balance: U256::from(1), ..Default::default() };
             let bundle = BundleState::builder(number..=number)
-                .state_present_account_info(address, info.clone())
+                .state_present_account_info(
+                    address,
+                    crate::node::evm::test_utils::account(info.clone()),
+                )
                 .state_storage(address, [(U256::ZERO, (previous, next))].into_iter().collect())
                 .build();
             let factory_for_parent = OverlayStateProviderFactory::new(
@@ -163,7 +165,7 @@ mod tests {
             let mut update = EvmState::default();
             update.insert(address, account);
             let mut hook = handle.take_execution_hook();
-            hook.on_state(update);
+            hook.on_state(crate::node::evm::test_utils::update(update));
             drop(hook);
             let outcome = handle.state_root().unwrap();
             assert_eq!(outcome.state_root, serial);

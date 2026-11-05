@@ -265,8 +265,7 @@ mod tests {
                 Duration::from_secs(1),
                 cancel,
             );
-            let mut cancelled =
-                FinishObservation::new(Some(("empty", "outofturn")), Some(control));
+            let mut cancelled = FinishObservation::new(Some(("empty", "outofturn")), Some(control));
             cancelled.enter("hash_state");
             drop(cancelled);
             let mut rpc = FinishObservation::new(None, None);

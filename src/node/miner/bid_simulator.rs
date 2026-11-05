@@ -24,7 +24,7 @@ use crate::{
 };
 use alloy_consensus::{BlobTransactionSidecar, BlockHeader as _, Transaction};
 use alloy_eips::eip4895::Withdrawals;
-use alloy_evm::Evm;
+
 use alloy_primitives::{Address, Bytes, B256, U256};
 use parking_lot::RwLock;
 use reth::transaction_pool::BestTransactionsAttributes;
@@ -32,8 +32,9 @@ use reth_chainspec::EthChainSpec;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_ethereum_primitives::TransactionSigned;
 use reth_evm::{
+    database::StateProviderDatabase,
     execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutionError, BlockValidationError},
-    ConfigureEvm, NextBlockEnvAttributes,
+    ConfigureEvm, Evm, EvmEnv, NextBlockEnvAttributes,
 };
 use reth_execution_types::BlockExecutionOutput;
 use reth_node_ethereum::engine::EthPayloadAttributes;
@@ -42,8 +43,6 @@ use reth_primitives_traits::{SealedHeader, SignerRecoverable};
 use reth_provider::{
     BlockHashReader, EvmStateProviderAdapter, HeaderProvider, StateProviderFactory,
 };
-use reth_revm::{database::StateProviderDatabase, db::State};
-use revm::{context_interface::Block as EvmBlock, Database};
 use std::{
     collections::HashMap,
     sync::{
@@ -633,7 +632,7 @@ where
             }
         };
         let sp_db = StateProviderDatabase::new(EvmStateProviderAdapter(&state_provider));
-        let mut db = State::builder().with_database(sp_db).with_bundle_update().build();
+        let mut db = sp_db;
 
         // Clone necessary fields to avoid borrow conflicts
         let evm_config = bid_runtime.evm_config.clone();
@@ -700,8 +699,12 @@ where
                 return Err(());
             }
         };
-        let mut block_gas_limit: u64 =
-            builder.evm_mut().block().gas_limit().saturating_sub(system_txs_gas);
+        let mut block_gas_limit: u64 = builder
+            .evm_env()
+            .block_env()
+            .gas_limit
+            .saturating_to::<u64>()
+            .saturating_sub(system_txs_gas);
         block_gas_limit = block_gas_limit.saturating_sub(PAY_BID_TX_GAS_LIMIT);
 
         // todo: prefetch transactions
@@ -826,6 +829,7 @@ where
         };
         let BlockBuilderOutcome {
             execution_result,
+            execution_state,
             hashed_state,
             trie_updates,
             block,
@@ -866,7 +870,7 @@ where
 
         let requests = execution_result.requests.clone();
         let execution_outcome =
-            BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
+            BlockExecutionOutput { state: execution_state, result: execution_result };
         let executed_block = BuiltPayloadExecutedBlock {
             shared_trie_data: None,
             recovered_block: Arc::new(block.clone()),
@@ -1163,7 +1167,7 @@ where
         B::Executor: LaneAdmission,
         B::Primitives: reth_primitives_traits::NodePrimitives<SignedTx = TransactionSigned>,
     {
-        let base_fee: u64 = builder.evm().block().basefee();
+        let base_fee: u64 = builder.evm_env().block_env().basefee.saturating_to::<u64>();
         let min_gas_tip = crate::node::pool::tip::current_tip_floor();
         let blob_params = self.chain_spec.blob_params_at_timestamp(self.attributes.timestamp);
         let header = self.mining_ctx.header.as_ref().ok_or("no header in the mining context")?;
@@ -1204,7 +1208,7 @@ where
             }
             if from_pool {
                 // Skip consumed nonces before capacity checks can suppress their descendants.
-                let nonce = builder.evm_mut().db_mut().basic(signer)?.map_or(0, |info| info.nonce);
+                let nonce = builder.evm_mut().account_info(&signer)?.map_or(0, |info| info.nonce);
                 if recovered_tx.nonce() < nonce {
                     continue;
                 }
@@ -1358,7 +1362,7 @@ where
         B::Executor: LaneAdmission,
         B::Primitives: reth_primitives_traits::NodePrimitives<SignedTx = TransactionSigned>,
     {
-        let base_fee = builder.evm_mut().block().basefee();
+        let base_fee = builder.evm_env().block_env().basefee.saturating_to::<u64>();
         let mut blob_fee = None;
 
         if BscHardforks::is_cancun_active_at_timestamp(
@@ -1472,10 +1476,9 @@ mod tests {
 
     fn greedy_merge_case(minimum_tip: u64) {
         use alloy_consensus::{Header, TxLegacy};
-        use alloy_evm::block::{BlockExecutor, CommitChanges, GasOutput};
         use alloy_primitives::{Signature, TxKind};
         use reth::transaction_pool::noop::NoopTransactionPool;
-        use reth_evm::execute::ExecutorTx;
+        use reth_evm::{execute::ExecutorTx, BlockExecutor, CommitChanges, GasOutput};
         use reth_primitives_traits::Recovered;
         use reth_provider::StateProvider;
         use reth_rpc_eth_api::helpers::pending_block::BuildPendingEnv;
@@ -1490,6 +1493,30 @@ mod tests {
         impl<B: BlockBuilder> BlockBuilder for CountingBuilder<B> {
             type Primitives = B::Primitives;
             type Executor = B::Executor;
+            type EvmEnv = B::EvmEnv;
+            fn evm_env(&self) -> &Self::EvmEnv {
+                self.inner.evm_env()
+            }
+            fn execute_transaction_with_result_closure(
+                &mut self,
+                tx: impl ExecutorTx<Self::Executor>,
+                f: impl FnOnce(&<Self::Executor as BlockExecutor>::TransactionResultWithState),
+            ) -> Result<GasOutput, BlockExecutionError> {
+                self.attempts += 1;
+                self.inner.execute_transaction_with_result_closure(tx, f)
+            }
+            fn finish_with_state_root(
+                self,
+                provider: impl StateProvider,
+                root: impl FnOnce(
+                    &reth_execution_types::BlockExecutionOutput<
+                        reth_primitives_traits::ReceiptTy<Self::Primitives>,
+                    >,
+                )
+                    -> Result<Option<(B256, TrieUpdates)>, BlockExecutionError>,
+            ) -> Result<BlockBuilderOutcome<Self::Primitives>, BlockExecutionError> {
+                self.inner.finish_with_state_root(provider, root)
+            }
 
             fn apply_pre_execution_changes(&mut self) -> Result<(), BlockExecutionError> {
                 self.inner.apply_pre_execution_changes()
@@ -1498,7 +1525,11 @@ mod tests {
             fn execute_transaction_with_commit_condition(
                 &mut self,
                 tx: impl ExecutorTx<Self::Executor>,
-                f: impl FnOnce(&<Self::Executor as BlockExecutor>::Result) -> CommitChanges,
+                f: impl FnOnce(
+                    &evm2::TxResult<
+                        <<Self::Executor as BlockExecutor>::Evm as reth_evm::Evm>::EvmTypes,
+                    >,
+                ) -> CommitChanges,
             ) -> Result<Option<GasOutput>, BlockExecutionError> {
                 self.attempts += 1;
                 self.inner.execute_transaction_with_commit_condition(tx, f)
@@ -1608,9 +1639,15 @@ mod tests {
                     },
                 );
             }
-            let mut state = State::builder().with_database(db).with_bundle_update().build();
+            let mut state = db;
             let mut builder = CountingBuilder {
-                inner: config.builder_for_next_block(&mut state, &parent, attrs).unwrap(),
+                inner: config
+                    .builder_for_next_block(
+                        crate::node::evm::test_utils::LegacyDb(&mut state),
+                        &parent,
+                        attrs,
+                    )
+                    .unwrap(),
                 attempts: 0,
             };
 
@@ -1618,7 +1655,7 @@ mod tests {
             runtime
                 .commit_transaction_recovered(vec![prefix.clone()], &mut builder, 121_000, false, 0)
                 .unwrap();
-            assert_eq!(builder.evm_mut().db_mut().basic(sender).unwrap().unwrap().nonce, 1);
+            assert_eq!(builder.evm_mut().account_info(&sender).unwrap().unwrap().nonce, 1);
 
             // A private bid replacement consumes nonce 0 without matching the pool's hash.
             let stale = tx(sender, 0, stale_gas_limit, 2u64);
@@ -1635,10 +1672,10 @@ mod tests {
                 .unwrap();
 
             assert_eq!(
-                builder.evm_mut().db_mut().basic(sender).unwrap().unwrap().nonce,
+                builder.evm_mut().account_info(&sender).unwrap().unwrap().nonce,
                 if minimum_tip == 0 { 2 } else { 1 }
             );
-            assert_eq!(builder.evm_mut().db_mut().basic(other).unwrap().unwrap().nonce, 1);
+            assert_eq!(builder.evm_mut().account_info(&other).unwrap().unwrap().nonce, 1);
             let expected_attempts = if minimum_tip == 0 { 3 } else { 2 };
             assert_eq!(runtime.gas_used, expected_attempts * TX_GAS);
             assert_eq!(
