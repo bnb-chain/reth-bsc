@@ -34,9 +34,13 @@ pub struct BlockSyncArgs {
     #[arg(long = "bsc.block-sync.recovery-hop-count", default_value_t = Self::default().recovery_hop_count, value_parser = clap::value_parser!(u64).range(1..=64))]
     pub recovery_hop_count: u64,
 
-    /// Per-request ancestor timeout; BSC peer attempts are sequential.
+    /// Per-request ancestor timeout; hedged peers have independent deadlines.
     #[arg(long = "bsc.block-sync.recovery-timeout", default_value = humantime::format_duration(Self::default().recovery_timeout).to_string(), value_parser = parse_duration)]
     pub recovery_timeout: Duration,
+
+    /// Delay before requesting another eligible BSC peer during ancestor recovery.
+    #[arg(long = "bsc.block-sync.recovery-fallback-delay", default_value = humantime::format_duration(Self::default().recovery_fallback_delay).to_string(), value_parser = parse_duration)]
+    pub recovery_fallback_delay: Duration,
 
     /// Maximum BSC announcer attempts per ancestor hop (1..=16).
     #[arg(long = "bsc.block-sync.recovery-peer-attempts", default_value_t = Self::default().recovery_peer_attempts, value_parser = clap::value_parser!(u16).range(1..=16))]
@@ -73,6 +77,7 @@ impl Default for BlockSyncArgs {
             eth_peer_attempts: 3,
             recovery_hop_count: FORK_RECOVER_HOP_COUNT,
             recovery_timeout: FETCH_TIMEOUT,
+            recovery_fallback_delay: Duration::from_millis(200),
             recovery_peer_attempts: MAX_PEER_ATTEMPTS as u16,
             max_recoveries: MAX_CONCURRENT_RECOVERIES as u16,
             max_depth: MAX_FORK_DEPTH,
@@ -89,6 +94,7 @@ pub struct BlockSyncConfig {
     /// Validated retrieval limits and deadlines.
     pub args: BlockSyncArgs,
     pub(crate) recovery_gate: RecoveryGate,
+    pub(crate) downloader: super::head_fetch::BlockDownloader,
 }
 
 impl Default for BlockSyncConfig {
@@ -100,6 +106,7 @@ impl Default for BlockSyncConfig {
                 args.recovery_idle_timeout,
             ),
             args,
+            downloader: Default::default(),
         }
     }
 }
@@ -112,6 +119,7 @@ impl BlockSyncArgs {
             self.eth_fallback_delay,
             self.head_timeout,
             self.recovery_timeout,
+            self.recovery_fallback_delay,
             self.recovery_idle_timeout,
         ] {
             validate_duration(duration)?;
@@ -145,6 +153,7 @@ impl BlockSyncArgs {
                 self.recovery_idle_timeout,
             ),
             args: self,
+            downloader: Default::default(),
         }))
     }
 }
@@ -294,6 +303,8 @@ mod tests {
             "2",
             "--bsc.block-sync.recovery-timeout",
             "300ms",
+            "--bsc.block-sync.recovery-fallback-delay",
+            "75ms",
             "--bsc.block-sync.recovery-peer-attempts",
             "2",
             "--bsc.block-sync.max-recoveries",
@@ -317,6 +328,7 @@ mod tests {
             eth_peer_attempts: 2,
             recovery_hop_count: 2,
             recovery_timeout: Duration::from_millis(300),
+            recovery_fallback_delay: Duration::from_millis(75),
             recovery_peer_attempts: 2,
             max_recoveries: 1,
             max_depth: 64,
@@ -337,6 +349,7 @@ mod tests {
             BlockSyncArgs { eth_fallback_delay: Duration::ZERO, ..defaults },
             BlockSyncArgs { head_timeout: Duration::ZERO, ..defaults },
             BlockSyncArgs { recovery_timeout: Duration::ZERO, ..defaults },
+            BlockSyncArgs { recovery_fallback_delay: Duration::ZERO, ..defaults },
             BlockSyncArgs { recovery_idle_timeout: Duration::ZERO, ..defaults },
         ] {
             assert!(matches!(args.into_config(), Err(BlockSyncConfigError::DurationRange)));
