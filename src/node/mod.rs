@@ -15,7 +15,7 @@ use crate::{
 use consensus::BscConsensusBuilder;
 use engine::BscPayloadServiceBuilder;
 use evm::BscExecutorBuilder;
-use network::BscNetworkBuilder;
+use network::{block_import::config::BlockSyncConfig, BscNetworkBuilder};
 use reth::{
     api::{FullNodeComponents, FullNodeTypes, NodeTypes, PrimitivesTy},
     builder::{
@@ -111,13 +111,20 @@ where
 /// Type configuration for a regular BSC node.
 #[derive(Debug, Clone)]
 pub struct BscNode {
+    block_sync: Arc<BlockSyncConfig>,
     engine_handle_rx: Arc<Mutex<Option<oneshot::Receiver<ConsensusEngineHandle<BscPayloadTypes>>>>>,
 }
 
 impl BscNode {
     pub fn new() -> (Self, oneshot::Sender<ConsensusEngineHandle<BscPayloadTypes>>) {
         let (tx, rx) = oneshot::channel();
-        (Self { engine_handle_rx: Arc::new(Mutex::new(Some(rx))) }, tx)
+        (
+            Self {
+                block_sync: Arc::new(BlockSyncConfig::default()),
+                engine_handle_rx: Arc::new(Mutex::new(Some(rx))),
+            },
+            tx,
+        )
     }
 }
 
@@ -129,6 +136,12 @@ impl Default for BscNode {
 }
 
 impl BscNode {
+    /// Configure block retrieval and share its recovery gate with startup catch-up.
+    pub fn with_block_sync(mut self, config: Arc<BlockSyncConfig>) -> Self {
+        self.block_sync = config;
+        self
+    }
+
     /// Returns a [`ComponentsBuilder`] configured for a regular BSC node.
     pub fn components<Node>(
         &self,
@@ -148,7 +161,10 @@ impl BscNode {
             .pool(BscPoolBuilder::default())
             .executor(BscExecutorBuilder::default())
             .payload(BscPayloadServiceBuilder::default())
-            .network(BscNetworkBuilder::new(self.engine_handle_rx.clone()))
+            .network(
+                BscNetworkBuilder::new(self.engine_handle_rx.clone())
+                    .with_sync_config(self.block_sync.clone()),
+            )
             .consensus(BscConsensusBuilder::default())
     }
 }

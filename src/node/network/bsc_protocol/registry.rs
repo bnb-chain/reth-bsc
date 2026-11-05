@@ -146,13 +146,7 @@ pub fn record_announcer(hash: B256, peer: PeerId) {
 
 /// Snapshot of peers that announced `hash` and currently negotiate bsc/2.
 pub fn list_announcers_for(hash: B256) -> Vec<PeerId> {
-    let raw: Vec<PeerId> = {
-        let mut g = ANNOUNCERS.lock();
-        match g.get(&hash) {
-            Some(list) => list.clone(),
-            None => return Vec::new(),
-        }
-    };
+    let raw = list_eth_announcers_for(hash);
     let v2: Vec<PeerId> = raw.into_iter().filter(|p| is_v2_peer(*p)).collect();
     if v2.is_empty() {
         tracing::trace!(
@@ -162,6 +156,25 @@ pub fn list_announcers_for(hash: B256) -> Vec<PeerId> {
         );
     }
     v2
+}
+
+/// Snapshot of all announcers, including peers without the bsc/2 capability.
+/// Standard ETH header/body requests do not require bsc/2.
+pub(crate) fn list_eth_announcers_for(hash: B256) -> Vec<PeerId> {
+    ANNOUNCERS.lock().get(&hash).cloned().unwrap_or_default()
+}
+
+/// Live bsc/2 announcers eligible for fetching an announced head's parents.
+/// A closed subprotocol sender cannot service a range even if its registry entry remains.
+pub(crate) fn list_live_v2_announcers_for(hash: B256) -> Vec<PeerId> {
+    let mut peers = list_announcers_for(hash);
+    match REGISTRY.read() {
+        Ok(registry) => {
+            peers.retain(|peer| registry.get(peer).is_some_and(|entry| !entry.tx.is_closed()))
+        }
+        Err(_) => peers.clear(),
+    }
+    peers
 }
 
 /// Initialize the proxyed peer IDs map from a list of peer IDs.
@@ -844,6 +857,7 @@ mod version_tests {
 
         // Only the v2-and-still-registered peer survives the filter.
         assert_eq!(list_announcers_for(h), vec![v2_peer]);
+        assert_eq!(list_eth_announcers_for(h), vec![v2_peer, v1_peer, ghost_peer]);
     }
 
     #[test]

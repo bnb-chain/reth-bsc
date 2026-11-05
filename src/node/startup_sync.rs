@@ -9,9 +9,12 @@ use crate::{
         consensus::BscForkChoiceEngine,
         engine_api::payload::BscPayloadTypes,
         network::{
-            block_import::fork_recover::{
-                import_discovered, Discovery, DiscoveryOutcome, ForkRecoverError, RangeFetcher,
-                RecoverTarget, FETCH_TIMEOUT, MAX_FORK_DEPTH,
+            block_import::{
+                config::BlockSyncConfig,
+                fork_recover::{
+                    import_discovered, Discovery, DiscoveryOutcome, ForkRecoverError, RangeFetcher,
+                    RecoverTarget, RecoveryGate,
+                },
             },
             BscNetworkPrimitives,
         },
@@ -42,6 +45,8 @@ const HEADER_BATCH: u64 = 128;
 const ENGINE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Maintain active catch-up independently of unsolicited `NewBlock` announcements.
+/// This standalone entrypoint uses its own default recovery gate. Library callers sharing
+/// admission with live imports must pass the same config to `run_with_config` and the node.
 /// Startup requires a responsive, assessed peer. Unauthenticated hints receive a bounded grace
 /// period; once a valid preferred chain is discovered, signing waits for its execution.
 /// The startup gate is monotonic. Active discovery continues after it opens, while ordinary
@@ -61,8 +66,29 @@ pub async fn run<P>(
         + Sync
         + 'static,
 {
+    run_with_config(provider, engine, network, chain_spec, Arc::new(BlockSyncConfig::default()))
+        .await;
+}
+
+/// Run catch-up with the same per-node limits and recovery gate as live imports.
+pub async fn run_with_config<P>(
+    provider: P,
+    engine: ConsensusEngineHandle<BscPayloadTypes>,
+    network: NetworkHandle<BscNetworkPrimitives>,
+    chain_spec: Arc<BscChainSpec>,
+    config: Arc<BlockSyncConfig>,
+) where
+    P: BlockHashReader
+        + BlockIdReader
+        + BlockNumReader
+        + HeaderProvider<Header = Header>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+{
     let forkchoice = BscForkChoiceEngine::new(provider.clone(), engine.clone(), chain_spec.clone());
-    let fetcher = EthRangeFetcher { network: network.clone(), chain_spec };
+    let fetcher = EthRangeFetcher { network: network.clone(), chain_spec, config };
     let mut unavailable = HashMap::new();
     let mut pending_target: Option<Header> = None;
     let mut round = 0usize;
@@ -229,7 +255,17 @@ where
             fetcher.headers(peer, BlockHashOrNumber::Number(start), limit, HeadersDirection::Rising)
         })
         .await?;
-    match assess_target(peer, target, provider, engine, forkchoice, fetcher).await? {
+    match assess_target(
+        peer,
+        target,
+        provider,
+        engine,
+        forkchoice,
+        fetcher,
+        &fetcher.config.recovery_gate,
+    )
+    .await?
+    {
         Assessment::Complete if !tip_confirmed => Ok(Assessment::Retry),
         assessment => Ok(assessment),
     }
@@ -311,6 +347,7 @@ async fn assess_target<P>(
     engine: &ConsensusEngineHandle<BscPayloadTypes>,
     forkchoice: &BscForkChoiceEngine<P>,
     fetcher: &dyn RangeFetcher,
+    gate: &RecoveryGate,
 ) -> eyre::Result<Assessment>
 where
     P: BlockHashReader
@@ -322,7 +359,6 @@ where
         + Sync
         + 'static,
 {
-    let gate = crate::node::network::block_import::fork_recover::shared_recovery_gate();
     let permit = match gate.try_acquire(target.number) {
         Ok(permit) => permit,
         Err(_) => return Ok(Assessment::Retry),
@@ -431,10 +467,11 @@ where
             "peer chain conflicts with finalized history"
         );
         eyre::ensure!(
-            blocks.len() < MAX_FORK_DEPTH as usize,
-            "peer chain exceeds bounded startup ancestor walk"
+            blocks.len() < fetcher.max_depth() as usize,
+            "peer chain exceeds startup ancestor max_depth={}",
+            fetcher.max_depth()
         );
-        let count = (MAX_FORK_DEPTH as usize - blocks.len()).min(4) as u64;
+        let count = (fetcher.max_depth() - blocks.len() as u64).min(fetcher.hop_count());
         let response = fetcher.fetch(peer, number, hash, count).await.map_err(eyre::Error::msg)?;
         progress.record_progress();
         eyre::ensure!(
@@ -463,6 +500,7 @@ where
 struct EthRangeFetcher {
     network: NetworkHandle<BscNetworkPrimitives>,
     chain_spec: Arc<BscChainSpec>,
+    config: Arc<BlockSyncConfig>,
 }
 
 impl EthRangeFetcher {
@@ -481,13 +519,20 @@ impl EthRangeFetcher {
                 response,
             },
         );
-        let headers = tokio::time::timeout(FETCH_TIMEOUT, rx).await???;
+        let headers = tokio::time::timeout(self.config.args.recovery_timeout, rx).await???;
         eyre::ensure!(headers.0.len() <= limit as usize, "oversized peer header response");
         Ok(headers.0)
     }
 }
 
 impl RangeFetcher for EthRangeFetcher {
+    fn max_depth(&self) -> u64 {
+        self.config.args.max_depth
+    }
+    fn hop_count(&self) -> u64 {
+        self.config.args.recovery_hop_count
+    }
+
     fn fetch<'a>(
         &'a self,
         peer: PeerId,
@@ -513,7 +558,8 @@ impl RangeFetcher for EthRangeFetcher {
                         response,
                     },
                 );
-                let bodies = tokio::time::timeout(FETCH_TIMEOUT, rx).await???;
+                let bodies =
+                    tokio::time::timeout(self.config.args.recovery_timeout, rx).await???;
                 eyre::ensure!(bodies.0.len() == headers.len(), "peer omitted requested bodies");
                 headers
                     .into_iter()
@@ -537,6 +583,7 @@ impl RangeFetcher for EthRangeFetcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node::network::block_import::fork_recover::MAX_FORK_DEPTH;
     use alloy_primitives::B256;
     use alloy_rpc_types_engine::{PayloadStatus, PayloadStatusEnum};
     use reth_engine_primitives::{BeaconEngineMessage, OnForkChoiceUpdated};
@@ -677,6 +724,7 @@ mod tests {
             engine.clone(),
             Arc::new(BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet())),
         );
+        let gate = BlockSyncConfig::default().recovery_gate;
         let work = assess_target(
             PeerId::random(),
             blocks[5].header.clone(),
@@ -684,6 +732,7 @@ mod tests {
             &engine,
             &choice,
             &fetcher,
+            &gate,
         );
         let responder = async {
             let mut payloads = 0;

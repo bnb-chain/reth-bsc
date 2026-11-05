@@ -166,6 +166,7 @@ pub type BscNetworkPrimitives =
 /// A basic bsc network builder.
 #[derive(Debug)]
 pub struct BscNetworkBuilder {
+    sync_config: Arc<block_import::config::BlockSyncConfig>,
     engine_handle_rx: Arc<Mutex<Option<oneshot::Receiver<ConsensusEngineHandle<BscPayloadTypes>>>>>,
 }
 
@@ -236,7 +237,10 @@ impl BscNetworkBuilder {
             Mutex<Option<oneshot::Receiver<ConsensusEngineHandle<BscPayloadTypes>>>>,
         >,
     ) -> Self {
-        Self { engine_handle_rx }
+        Self {
+            engine_handle_rx,
+            sync_config: Arc::new(block_import::config::BlockSyncConfig::default()),
+        }
     }
 }
 
@@ -248,6 +252,12 @@ impl Default for BscNetworkBuilder {
 }
 
 impl BscNetworkBuilder {
+    /// Use per-node retrieval limits and the startup catch-up admission gate.
+    pub fn with_sync_config(mut self, config: Arc<block_import::config::BlockSyncConfig>) -> Self {
+        self.sync_config = config;
+        self
+    }
+
     /// Returns the [`NetworkConfig`] that contains the settings to launch the p2p network.
     ///
     /// This applies the configured [`BscNetworkBuilder`] settings.
@@ -258,7 +268,7 @@ impl BscNetworkBuilder {
     where
         Node: FullNodeTypes<Types = BscNode>,
     {
-        let Self { engine_handle_rx } = self;
+        let Self { engine_handle_rx, sync_config } = self;
 
         // Check if CLI bootnodes are provided and set bootnode override
         if let Some(cli_bootnodes) = ctx.config().network.resolved_bootnodes() {
@@ -354,6 +364,7 @@ impl BscNetworkBuilder {
                 from_hashes,
                 to_network,
             )
+            .with_sync_config(sync_config)
             .await
             {
                 tracing::error!(target: "bsc::network", ?err, "Block import service exited");
