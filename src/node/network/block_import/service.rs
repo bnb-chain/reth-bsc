@@ -479,9 +479,15 @@ where
         startup_diagnostics::import_started(block_msg.hash);
         let block = &block_msg.block.0.block;
         // insert header to cache
-        insert_header_to_cache_with_hash(block.header.clone(), Some(block_msg.hash));
+        {
+            let _stage = startup_diagnostics::HandoffStage::new("header_cache", "local");
+            insert_header_to_cache_with_hash(block.header.clone(), Some(block_msg.hash));
+        }
         // Cache the full block body for later range responses.
-        crate::shared::cache_full_block(block.clone());
+        {
+            let _stage = startup_diagnostics::HandoffStage::new("body_clone_cache", "local");
+            crate::shared::cache_full_block(block.clone());
+        }
         let block_hash = block_msg.hash;
         // Clone header for FCU update
         let header_for_fcu = block.header.clone();
@@ -492,14 +498,27 @@ where
         // delay; for a block we just produced locally the sample would actually reflect local
         // mining/finalize latency and would pollute cross-region diagnosis. Mirrors geth-bsc,
         // which only sets `RecvNewBlockTime` inside `handleBlockBroadcast` (the network path).
-        crate::consensus::parlia::block_stats::register_self_mined_block(block_hash, &block.header);
+        {
+            let _stage = startup_diagnostics::HandoffStage::new("stats_register", "local");
+            crate::consensus::parlia::block_stats::register_self_mined_block(
+                block_hash,
+                &block.header,
+            );
+        }
 
-        // send to EVN peers first
-        if let Err(e) = self.transfer_to_evn_peers(block_msg.clone()) {
-            tracing::warn!(target: "bsc::block_import", "Failed to transfer block to EVN peers: number = {:?}, hash = {:?}, error = {}", block.header.number, block_hash, e);
+        // This scope measures enqueue work, not delivery to the remote peer.
+        {
+            let _stage = startup_diagnostics::HandoffStage::new("evn_enqueue", "local");
+            // send to EVN peers first
+            if let Err(e) = self.transfer_to_evn_peers(block_msg.clone()) {
+                tracing::warn!(target: "bsc::block_import", "Failed to transfer block to EVN peers: number = {:?}, hash = {:?}, error = {}", block.header.number, block_hash, e);
+            }
         }
         // One reserved slot owns both full-block and hash propagation notifications.
-        propagation.send(block_msg);
+        {
+            let _stage = startup_diagnostics::HandoffStage::new("propagation_enqueue", "local");
+            propagation.send(block_msg);
+        }
 
         // Insert the executed block into the engine tree, then update fork choice.
         //
@@ -516,7 +535,9 @@ where
             let engine_tx_opt = crate::shared::get_engine_api_tx();
             let executed_block = payload.executed_block.clone();
             let forkchoice_engine = self.forkchoice_engine.clone();
+            let submitted = std::time::Instant::now();
             tokio::spawn(async move {
+                metrics::histogram!("bsc.block_handoff.stage_seconds", "phase" => "submit_task_schedule", "source" => "local").record(submitted.elapsed().as_secs_f64());
                 if let Some(engine_tx) = engine_tx_opt {
                     tracing::debug!(
                         target: "bsc::block_import",

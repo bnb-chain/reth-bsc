@@ -1,4 +1,4 @@
-//! Parent post-state reads shared by canonical and unpublished-child construction.
+//! Parent post-state reads for canonical construction.
 use reth_evm::{cached::CachedReads, BundleState};
 
 /// Seed only the parent's final changed values. Untouched slots and absent/deleted accounts

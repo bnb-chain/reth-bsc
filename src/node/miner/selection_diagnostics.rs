@@ -42,7 +42,6 @@ pub(crate) struct SelectionDiagnostics {
     pub(crate) end: PoolSnapshot,
     pub(crate) exit: SelectionExit,
     pub(crate) yielded: u64,
-    pub(crate) ancestor_excluded: u64,
     pub(crate) executed: u64,
     pub(crate) skipped: [u64; 8],
     pub(crate) gas_used: u64,
@@ -115,11 +114,7 @@ impl SelectionDiagnostics {
         if matches!(self.exit, SelectionExit::IteratorExhausted) {
             metrics::counter!("bsc.miner_selection_exhausted_total", "stage" => stage, "kind" => kind, "turn" => turn, "supply" => self.supply(), "fill" => fill).increment(1);
         }
-        for (reason, count) in [
-            ("iterator_yielded", self.yielded),
-            ("ancestor_excluded", self.ancestor_excluded),
-            ("executed", self.executed),
-        ] {
+        for (reason, count) in [("iterator_yielded", self.yielded), ("executed", self.executed)] {
             metrics::counter!("bsc.miner_selection_transactions_total", "stage" => stage, "kind" => kind, "turn" => turn, "reason" => reason).increment(count);
         }
         for (reason, count) in SKIP_REASONS.iter().zip(self.skipped) {
@@ -144,7 +139,7 @@ impl SelectionDiagnostics {
             tracing::info!(target: "bsc::miner::diagnostics", block_number = self.block_number,
                 kind, turn, reason, fill, gas_used = gas, gas_limit = limit,
                 pool_start = ?self.start, pool_end = ?self.end,
-                iterator_yielded = self.yielded, ancestor_excluded = self.ancestor_excluded,
+                iterator_yielded = self.yielded,
                 executed = self.executed, skips = ?self.skipped,
                 remaining_ms = self.remaining_seconds * 1000.0,
                 "Selected underfilled candidate selection evidence");
@@ -162,7 +157,6 @@ pub(crate) mod tests {
             end: PoolSnapshot { pending: 6000, ..Default::default() },
             exit: SelectionExit::IteratorExhausted,
             yielded: 6000,
-            ancestor_excluded: 5000,
             executed: 1000,
             skipped: [0; 8],
             gas_used: 100,
@@ -176,7 +170,7 @@ pub(crate) mod tests {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, || {
-            sample().record("selection", "pipeline", "inturn", 100, 200);
+            sample().record("selection", "local", "inturn", 100, 200);
         });
         let text = handle.render();
         assert!(text.lines().any(|l| l.starts_with("bsc_miner_selection_exhausted_total{") &&
@@ -184,7 +178,6 @@ pub(crate) mod tests {
             l.ends_with(" 1")));
         assert!(!text.contains("gas_skip_limit"));
         assert!(!text.contains("pool_empty"));
-        assert!(text.lines().any(|l| l.contains("ancestor_excluded") && l.ends_with(" 5000")));
         let mut summary = sample();
         summary.end = PoolSnapshot { queued: 12, ..Default::default() };
         assert_eq!(summary.supply(), "parked_only");

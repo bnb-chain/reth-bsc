@@ -277,15 +277,12 @@ where
         )?;
         self.inner_ctx.parent_header = Some(parent_header.clone());
 
-        let snap = if let Some(private) = self.ctx.private_snapshot(&header.parent_hash) {
-            private
-        } else {
-            self.snapshot_provider
-                .as_ref()
-                .ok_or_else(|| BlockExecutionError::msg("Snapshot provider is not available"))?
-                .snapshot_by_hash(&header.parent_hash)
-                .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?
-        };
+        let snap = self
+            .snapshot_provider
+            .as_ref()
+            .ok_or_else(|| BlockExecutionError::msg("Snapshot provider is not available"))?
+            .snapshot_by_hash(&header.parent_hash)
+            .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
         self.inner_ctx.snap = Some(snap.clone());
         self.inner_ctx.expected_turn_length = None;
 
@@ -673,17 +670,14 @@ where
                 .into());
             }
 
-            let pre_snap = if let Some(private) = self.ctx.private_snapshot(&ancestor.parent_hash) {
-                private
-            } else {
-                self.snapshot_provider
-                    .as_ref()
-                    .ok_or_else(|| BlockExecutionError::msg("Snapshot provider is not available"))?
-                    .snapshot_by_hash(&ancestor.parent_hash)
-                    .ok_or(BlockExecutionError::msg(
-                        "Failed to get pre snapshot from snapshot provider",
-                    ))?
-            };
+            let pre_snap = self
+                .snapshot_provider
+                .as_ref()
+                .ok_or_else(|| BlockExecutionError::msg("Snapshot provider is not available"))?
+                .snapshot_by_hash(&ancestor.parent_hash)
+                .ok_or(BlockExecutionError::msg(
+                    "Failed to get pre snapshot from snapshot provider",
+                ))?;
 
             // query bls keys from snapshot.
             let validators_count = pre_snap.validators.len();
@@ -871,20 +865,9 @@ where
         &mut self,
         block: &BlockEnv,
     ) -> Result<(), BlockExecutionError> {
-        let parent_header = if let Some(private) = &self.ctx.private_parent {
-            if self.ctx.mode != BscExecutionMode::Mining ||
-                private.header.hash() != self.ctx.base.parent_hash ||
-                private.snapshot.block_hash != self.ctx.base.parent_hash ||
-                private.snapshot.block_number != private.header.number
-            {
-                return Err(BlockExecutionError::msg("Private mining parent context mismatch"));
-            }
-            private.header.header().clone()
-        } else {
-            self.ctx.header_by_hash(&self.ctx.base.parent_hash).ok_or(BlockExecutionError::msg(
-                "Failed to get parent header from global header reader",
-            ))?
-        };
+        let parent_header = self.ctx.header_by_hash(&self.ctx.base.parent_hash).ok_or(
+            BlockExecutionError::msg("Failed to get parent header from global header reader"),
+        )?;
         self.inner_ctx.parent_header = Some(parent_header.clone());
 
         // Only the Parlia finalization in `finish` reads the snapshot, and simulation skips
@@ -892,17 +875,12 @@ where
         // the `unwrap` below — whenever the snapshot provider is unavailable, e.g. during
         // early startup before consensus has published it.
         if self.ctx.mode != BscExecutionMode::Simulation {
-            let snap = if let Some(private) = &self.ctx.private_parent {
-                private.snapshot.as_ref().clone()
-            } else {
-                self.snapshot_provider
-                    .as_ref()
-                    .ok_or(BlockExecutionError::msg("Snapshot provider is not available"))?
-                    .snapshot_by_hash(&self.ctx.base.parent_hash)
-                    .ok_or(BlockExecutionError::msg(
-                        "Failed to get snapshot from snapshot provider",
-                    ))?
-            };
+            let snap = self
+                .snapshot_provider
+                .as_ref()
+                .ok_or(BlockExecutionError::msg("Snapshot provider is not available"))?
+                .snapshot_by_hash(&self.ctx.base.parent_hash)
+                .ok_or(BlockExecutionError::msg("Failed to get snapshot from snapshot provider"))?;
             self.inner_ctx.snap = Some(snap.clone());
         }
 

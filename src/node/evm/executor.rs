@@ -179,7 +179,7 @@ where
         let _spec_clone = spec.clone();
         let execution_diagnostics =
             crate::node::miner::state_read_diagnostics::ExecutionObservation::new(
-                ctx.finish_diagnostics.map(|(kind, turn, _)| (kind, turn)),
+                ctx.finish_diagnostics,
             );
         Self {
             execution_diagnostics,

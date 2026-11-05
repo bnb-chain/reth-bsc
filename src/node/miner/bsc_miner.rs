@@ -191,7 +191,6 @@ where
             let event = event; // rebind to avoid move issues
                     let committed = event.committed();
                     let tip = committed.tip();
-                    super::pipeline::canonical_head(tip.hash());
                     let mut startup_timing = StartupTiming::new(tip.hash(), super::startup_diagnostics::header_ms(tip.header()), "canonical");
                     let is_reorg = matches!(event, CanonStateNotification::Reorg { .. });
                     debug!(
@@ -432,6 +431,10 @@ where
         &self,
         parent: alloy_primitives::B256,
     ) -> Option<reth_evm::cached::CachedReads> {
+        let _stage = super::startup_diagnostics::HandoffStage::new(
+            "cached_reads_clone",
+            super::startup_diagnostics::handoff_source(parent),
+        );
         self.pre_cached.as_ref().filter(|pc| pc.block == parent).map(|pc| pc.cached.clone())
     }
 
@@ -697,45 +700,25 @@ where
             handle.abort();
         }
 
+        let source = super::startup_diagnostics::handoff_source(mining_ctx.parent_header.hash());
+        let attributes_stage =
+            super::startup_diagnostics::HandoffStage::new("job_attributes", source);
         let parent_header = mining_ctx.parent_header.clone();
         let block_number = parent_header.number() + 1;
-        // Resolve dynamic parameters before claiming any existing computation. A wall-clock
-        // timestamp refresh must not invalidate a still-valid private successor.
         let gas_limit = crate::shared::get_miner_gas_limit().unwrap_or(self.desired_gas_limit);
         let min_gas_tip = crate::shared::get_miner_gas_tip()
             .map(|v| v as u128)
             .unwrap_or(self.desired_min_gas_tip);
-        let effective_gas_limit = EthereumBuilderConfig::new()
-            .with_gas_limit(gas_limit)
-            .gas_limit(parent_header.gas_limit);
-        let claimed = if mining_ctx.is_inturn {
-            super::pipeline::claim(parent_header.hash(), |key, plan| {
-                key.beneficiary == self.validator_address &&
-                    key.gas_limit == effective_gas_limit &&
-                    key.min_gas_tip == min_gas_tip &&
-                    plan.valid_for(key, &mining_ctx, &self.parlia)
-            })
-        } else {
-            None
-        };
-        let (attributes, adoption) = if let Some((plan, adoption)) = claimed {
-            mining_ctx.header = plan.context.header;
-            mining_ctx.block_timestamp_ms = plan.context.block_timestamp_ms;
-            mining_ctx.end_mining_timestamp_ms = plan.context.end_mining_timestamp_ms;
-            super::pipeline::event("planned_context_adopted");
-            (plan.attributes, Some(adoption))
-        } else {
-            (
-                prepare_new_attributes(
-                    &mut mining_ctx,
-                    self.parlia.clone(),
-                    &parent_header,
-                    self.validator_address,
-                ),
-                None,
-            )
-        };
+        let attributes = prepare_new_attributes(
+            &mut mining_ctx,
+            self.parlia.clone(),
+            &parent_header,
+            self.validator_address,
+        );
 
+        drop(attributes_stage);
+        let arguments_stage =
+            super::startup_diagnostics::HandoffStage::new("job_builder_arguments", source);
         let evm_config = BscEvmConfig::new(self.chain_spec.clone());
         let payload_builder = BscPayloadBuilder::new(
             self.provider.clone(),
@@ -747,8 +730,6 @@ where
             mining_ctx.clone(),
         );
         let build_args = BscBuildArguments {
-            pipeline_parent: None,
-            pipeline_context: None,
             cached_reads: mining_ctx.cached_reads.clone().unwrap_or_default(),
             // `% 1000` matches `set_millisecond_part_of_timestamp`, which seals the same
             // remainder into the header's mix_hash at finalize time.
@@ -775,6 +756,8 @@ where
         };
 
         let parent_hash = mining_ctx.parent_header.hash();
+        drop(arguments_stage);
+        let job_stage = super::startup_diagnostics::HandoffStage::new("job_create", source);
         let (mut payload_job, job_handle) = BscPayloadJob::new(
             self.parlia.clone(),
             mining_ctx,
@@ -784,9 +767,7 @@ where
             self.payload_tx.clone(),
         );
 
-        if let Some(adoption) = adoption {
-            payload_job.adopt_pipeline(adoption);
-        }
+        drop(job_stage);
         let start_time = std::time::Instant::now();
         self.running_job_handle = Some(job_handle);
         payload_job.mark_scheduled();

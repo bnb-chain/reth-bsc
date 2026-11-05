@@ -293,7 +293,6 @@ fn skip_redundant_empty_fallback<T: 'static>(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LocalRebuildPolicyInput {
-    parent_frozen: bool,
     current_payload_fees: U256,
     estimated_new_fees: U256,
     last_build_duration: std::time::Duration,
@@ -354,9 +353,6 @@ fn miner_metrics() -> &'static crate::metrics::BscMinerMetrics {
 }
 
 fn local_rebuild_action(input: LocalRebuildPolicyInput) -> LocalRebuildAction {
-    if input.parent_frozen {
-        return LocalRebuildAction::ReturnBestPayload;
-    }
     let finalize_margin = std::time::Duration::from_millis(FINALIZE_MARGIN_MS);
     if input.remaining_duration < input.last_build_duration.saturating_add(finalize_margin) {
         return LocalRebuildAction::ReturnBestPayload;
@@ -500,9 +496,6 @@ pub struct BscBuildArguments<Attributes> {
     /// BEP-706 precompile) sees the same millisecond timestamp that is later sealed
     /// into the header's `mix_hash`.
     pub milli_remainder: u64,
-    /// Unpublished parent ancestry, held privately; never install it in canonical state.
-    pub(crate) pipeline_parent: Option<crate::shared::PrivateMinerChain>,
-    pub(crate) pipeline_context: Option<Arc<crate::node::evm::config::PrivateMiningParent>>,
 }
 
 /// BSC payload builder, used to build payload for bsc miner.
@@ -591,13 +584,10 @@ where
             state_root_deadline_ms,
             build_control,
             milli_remainder,
-            pipeline_parent,
-            pipeline_context,
         } = args;
         let PayloadConfig { parent_header, attributes, payload_id: _, parent_block_info: _ } =
             config;
 
-        let private_depth = pipeline_parent.as_ref().map_or(0, |chain| chain.blocks().len());
         let parent_hash = parent_header.hash_slow();
         let mut work = BuildWorkObservation::new(
             kind,
@@ -606,9 +596,7 @@ where
             parent_header.number() + 1,
             build_control.as_ref(),
         );
-        // Private work already holds this same lease from its opportunistic reservation.
-        // Exact-parent adoption above keeps that running task; do not reacquire its lease.
-        let _build_permit = if build_control.is_some() && pipeline_parent.is_none() {
+        let _build_permit = if build_control.is_some() {
             Some(
                 super::build_control::LOCAL_BUILD_PERMIT
                     .acquire()
@@ -625,24 +613,13 @@ where
 
         // Each candidate owns its root task; all candidates reuse the miner's dedicated
         // executor. `None` keeps the synchronous path when sparse-trie building is disabled.
-        let root_setup = super::perf_tuning::Phase::new(
-            kind.label(),
-            self.ctx.is_inturn,
-            private_depth,
-            "root_setup",
-        );
+        let root_setup =
+            super::perf_tuning::Phase::new(kind.label(), self.ctx.is_inturn, "root_setup");
         let trie_handle: Arc<Mutex<Option<reth_engine_tree::tree::StateRootHandle>>> = {
             let use_sparse_trie = crate::node::miner::config::get_global_mining_config()
                 .is_some_and(|c| c.use_sparse_trie_state_root);
             Arc::new(Mutex::new(if use_sparse_trie {
-                if let Some(parent) = &pipeline_parent {
-                    crate::shared::spawn_private_sparse_trie_state_root(
-                        parent_header.as_ref().clone(),
-                        parent.clone(),
-                    )
-                } else {
-                    crate::shared::spawn_sparse_trie_state_root(parent_header.as_ref().clone())
-                }
+                crate::shared::spawn_sparse_trie_state_root(parent_header.as_ref().clone())
             } else {
                 None
             }))
@@ -652,21 +629,12 @@ where
         let parent_setup = super::perf_tuning::Phase::new(
             kind.label(),
             self.ctx.is_inturn,
-            private_depth,
             "parent_state_factory",
         );
-        let parent_state = if let Some(parent) = &pipeline_parent {
-            super::prewarm::ParentState::private(parent.clone())?
-        } else {
-            super::prewarm::ParentState::canonical(self.client.clone(), parent_hash)
-        };
+        let parent_state = super::prewarm::ParentState::canonical(self.client.clone(), parent_hash);
         parent_setup.complete();
-        let provider_setup = super::perf_tuning::Phase::new(
-            kind.label(),
-            self.ctx.is_inturn,
-            private_depth,
-            "state_provider_open",
-        );
+        let provider_setup =
+            super::perf_tuning::Phase::new(kind.label(), self.ctx.is_inturn, "state_provider_open");
         let state_provider = parent_state.open()?;
         provider_setup.complete();
         let state = StateProviderDatabase::new(EvmStateProviderAdapter(&state_provider));
@@ -712,7 +680,6 @@ where
                 slot_number: None,
             },
             mode: BscExecutionMode::Mining,
-            private_parent: pipeline_context,
             milli_remainder,
             validator_cache_sink: Some(validator_cache_sink.clone()),
             turn_length_sink: Some(turn_length_sink.clone()),
@@ -729,16 +696,11 @@ where
             finish_diagnostics: Some((
                 kind.label(),
                 if self.ctx.is_inturn { "inturn" } else { "outofturn" },
-                private_depth,
             )),
         };
 
-        let evm_setup = super::perf_tuning::Phase::new(
-            kind.label(),
-            self.ctx.is_inturn,
-            private_depth,
-            "evm_context",
-        );
+        let evm_setup =
+            super::perf_tuning::Phase::new(kind.label(), self.ctx.is_inturn, "evm_context");
         let prewarm_env = self
             .evm_config
             .next_evm_env(&parent_header, &next_env_attributes)
@@ -775,7 +737,6 @@ where
         let pre_execution = super::perf_tuning::Phase::new(
             kind.label(),
             self.ctx.is_inturn,
-            private_depth,
             "system_pre_execution",
         );
         builder.apply_pre_execution_changes().map_err(|err| {
@@ -789,12 +750,8 @@ where
         })?;
 
         pre_execution.complete();
-        let selection_setup = super::perf_tuning::Phase::new(
-            kind.label(),
-            self.ctx.is_inturn,
-            private_depth,
-            "selection_setup",
-        );
+        let selection_setup =
+            super::perf_tuning::Phase::new(kind.label(), self.ctx.is_inturn, "selection_setup");
         let mut total_fees = U256::ZERO;
         let mut cumulative_gas_used = 0;
         // reserve the systemtx gas
@@ -843,7 +800,6 @@ where
         }
         let selection_pool_start = self.pool.pool_size().into();
         let mut iterator_yielded = 0u64;
-        let mut ancestor_excluded = 0u64;
         let selection_exit;
         let mut best_tx_list = self.pool.best_transactions_with_attributes(
             BestTransactionsAttributes::new(base_fee, blob_fee.map(|fee| fee as u64)),
@@ -854,12 +810,8 @@ where
 
         // Total time spent selecting + executing user transactions.
         selection_setup.complete();
-        let execution_phase = super::perf_tuning::Phase::new(
-            kind.label(),
-            self.ctx.is_inturn,
-            private_depth,
-            "execution",
-        );
+        let execution_phase =
+            super::perf_tuning::Phase::new(kind.label(), self.ctx.is_inturn, "execution");
         let exec_start = std::time::Instant::now();
         // Arm the shared floor once at actual execution entry, after preparation.
         if let Some(control) = &build_control {
@@ -915,11 +867,6 @@ where
             iterator_yielded += 1;
             if let Some(prewarm) = &prewarm {
                 prewarm.selected(pool_tx.sender(), pool_tx.nonce());
-            }
-            if parent_state.consumed(pool_tx.sender(), pool_tx.nonce()) {
-                ancestor_excluded += 1;
-                gas_limit_skips.reset();
-                continue;
             }
             work.selection_stage(SelectionStage::Precheck);
             work.scanned += 1;
@@ -1227,7 +1174,6 @@ where
             end: self.pool.pool_size().into(),
             exit: selection_exit,
             yielded: iterator_yielded,
-            ancestor_excluded,
             executed: work.executed,
             skipped: work.skipped,
             gas_used: cumulative_gas_used,
@@ -1320,9 +1266,7 @@ where
             block_access_list: _,
         } = builder.finish(&state_provider, None)?;
 
-        if let Some(control) = build_control
-            .as_ref()
-            .filter(|control| control.allows_late_finish() && pipeline_parent.is_none())
+        if let Some(control) = build_control.as_ref().filter(|control| control.allows_late_finish())
         {
             let overrun =
                 std::time::Instant::now().saturating_duration_since(control.finish_until());
@@ -1422,11 +1366,6 @@ where
             hashed_state: Arc::new(hashed_state),
             trie_updates: Arc::new(trie_updates),
         };
-        let executed_block = if super::pipeline::enabled() {
-            executed_block.with_shared_trie_data()
-        } else {
-            executed_block
-        };
 
         // Read validator/turn-length data transported via sinks from the now-consumed builder.
         let pending_validators = validator_cache_sink.lock().unwrap().take();
@@ -1434,7 +1373,6 @@ where
 
         let payload = BscBuiltPayload {
             selection_diagnostics: Some(selection_diagnostics),
-            pipeline_seal: None,
             diagnostics: None,
             block: sealed_block.clone(),
             fees: total_fees,
@@ -1462,8 +1400,6 @@ where
             mut cached_reads,
             config,
             cancel: _,
-            pipeline_parent: _,
-            pipeline_context: _,
             trace_id,
             min_gas_tip: _,
             state_root_precomputed: _,
@@ -1530,11 +1466,9 @@ where
                     // it does not inherit that attempt's cancellation or expired root deadline.
                     state_root_deadline_ms: None,
                     build_control: None,
-                    private_parent: None,
                     finish_diagnostics: Some((
                         "empty",
                         if self.ctx.is_inturn { "inturn" } else { "outofturn" },
-                        0,
                     )),
                 },
             )
@@ -1623,7 +1557,6 @@ where
 
         let payload = BscBuiltPayload {
             selection_diagnostics: None,
-            pipeline_seal: None,
             diagnostics: None,
             block: sealed_block.clone(),
             fees: total_fees,
@@ -1663,7 +1596,6 @@ where
     mining_ctx: MiningContext,
     /// The payload builder instance
     builder: Arc<BscPayloadBuilder<Pool, Client, EvmConfig>>,
-    pipeline_adoption: Option<super::pipeline::Adoption>,
     /// Timeout for payload building
     timeout: std::time::Duration,
     /// Time reserved for system transactions and state-root completion.
@@ -1783,7 +1715,6 @@ where
             parlia,
             mining_ctx,
             builder: Arc::new(builder),
-            pipeline_adoption: None,
             timeout: std::time::Duration::from_millis(mining_delay),
             root_reserve: std::time::Duration::from_millis(effective_reserve),
             try_build_rx,
@@ -1821,10 +1752,6 @@ where
         (job, handle)
     }
 
-    pub(crate) fn adopt_pipeline(&mut self, adoption: super::pipeline::Adoption) {
-        self.pipeline_adoption = Some(adoption);
-    }
-
     pub(crate) fn mark_scheduled(&mut self) {
         if let Some(timing) = &mut self.mining_ctx.startup_timing {
             timing.scheduled();
@@ -1833,57 +1760,6 @@ where
 
     /// Runs the payload job asynchronously with timeout support
     pub async fn start(mut self) -> Result<(), Box<BscPayloadJobError>> {
-        if let Some(mut adoption) = self.pipeline_adoption.take() {
-            let started = std::time::Instant::now();
-            let phase =
-                super::perf_tuning::Phase::new("pipeline", true, adoption.depth, "adoption_wait");
-            let result = match adoption.wait(&mut self.abort_rx).await {
-                Ok(result) => result,
-                Err(()) => {
-                    self.build_args.cancel.clone().cancel();
-                    return Err(Box::new(BscPayloadJobError::JobAborted));
-                }
-            };
-            phase.complete();
-            metrics::histogram!("bsc_miner_pipeline_adoption_wait_seconds")
-                .record(started.elapsed().as_secs_f64());
-            if !adoption.is_cancelled() {
-                if let Ok(payload) = result {
-                    adoption.accept();
-                    super::pipeline::event("reused");
-                    super::pipeline::event("reuse_observed");
-                    self.potential_payloads.push(payload);
-                    return self.try_return_best_payload();
-                }
-            }
-            drop(adoption);
-            // An invalidated generation cannot publish or rebuild against a stale parent.
-            if !super::pipeline::is_head(self.mining_ctx.parent_header.hash()) {
-                return Err(Box::new(BscPayloadJobError::JobAborted));
-            }
-            super::pipeline::event("fallback");
-            // Only an actual failed adoption creates a fresh ordinary job budget and timestamp.
-            let parent = self.mining_ctx.parent_header.clone();
-            self.build_args.config.attributes = super::util::prepare_new_attributes(
-                &mut self.mining_ctx,
-                self.parlia.clone(),
-                &parent,
-                self.build_args.config.attributes.suggested_fee_recipient,
-            );
-            self.build_args.milli_remainder = self.mining_ctx.block_timestamp_ms % 1000;
-            self.build_args.state_root_deadline_ms = Some(
-                self.mining_ctx
-                    .end_mining_timestamp_ms
-                    .saturating_sub(STATE_ROOT_WAIT_MARGIN_MS as u128) as u64,
-            );
-            Arc::make_mut(&mut self.builder).ctx = self.mining_ctx.clone();
-            self.timeout = std::time::Duration::from_millis(self.parlia.delay_for_mining(
-                &self.mining_ctx.parent_snapshot,
-                self.mining_ctx.header.as_ref().expect("refreshed mining header"),
-                self.root_reserve.as_millis() as u64,
-            ));
-        }
-
         // Sparse-trie state-root (`--mining.use-sparse-trie-state-root`):
         // R3 spawns a fresh background task PER build attempt inside `build_payload`
         // (not once here), so every attempt — including value-gated rebuilds — gets the
@@ -2033,13 +1909,6 @@ where
                 args = self.try_build_rx.recv() => {
                     match args {
                         Some(_) => {
-                            if self.has_frozen_pipeline_parent() {
-                                super::pipeline::event("rebuild_suppressed_frozen_parent");
-                                return self.try_return_best_payload()
-                            }
-                            if self.retries > 0 {
-                                super::pipeline::selected_parent(None);
-                            }
                             self.retries += 1;
                             start_time = std::time::Instant::now();
                             debug!(
@@ -2099,7 +1968,6 @@ where
                             );
                             self.record_local_build(&payload, elapsed);
                             self.potential_payloads.push(payload);
-                            self.try_start_next_pipeline();
                             let mut wait_for_more_txs = None;
                             // loop wait new transactions or timeout.
                             loop {
@@ -2408,22 +2276,14 @@ where
             .saturating_mul(U256::from(pool_tx.gas_limit().min(ESTIMATED_FEE_GAS_CAP)))
     }
 
-    fn has_frozen_pipeline_parent(&self) -> bool {
-        self.potential_payloads.iter().any(|payload| payload.pipeline_seal.is_some())
-    }
-
     fn evaluate_local_rebuild_action(
         &self,
         remaining_duration: std::time::Duration,
     ) -> Option<LocalRebuildAction> {
-        if self.has_frozen_pipeline_parent() {
-            super::pipeline::event("rebuild_suppressed_frozen_parent");
-        }
         let last_build_duration = self.last_local_build_duration?;
         let last_build_finished_at = self.last_local_build_finished_at?;
 
         Some(local_rebuild_action(LocalRebuildPolicyInput {
-            parent_frozen: self.has_frozen_pipeline_parent(),
             current_payload_fees: self.current_local_payload_fees,
             estimated_new_fees: self.estimated_new_local_fees,
             last_build_duration,
@@ -2821,302 +2681,6 @@ where
         Ok(())
     }
 
-    /// Start at most one unpublished child while this job is waiting to publish its parent.
-    /// The ordinary canonical builder later adopts it only for the exact finalized parent/env.
-    fn try_start_next_pipeline(&mut self) {
-        use super::pipeline;
-        if self.has_frozen_pipeline_parent() {
-            return;
-        }
-        if !pipeline::enabled() || !self.mining_ctx.is_inturn || !crate::shared::is_mining_enabled()
-        {
-            return;
-        }
-        if !pipeline::can_start(self.mining_ctx.parent_header.hash()) {
-            return;
-        }
-        let now_ms = super::startup_diagnostics::wall_ms();
-        if self.mining_ctx.end_mining_timestamp_ms.saturating_sub(now_ms) < 25 {
-            pipeline::depth_event(1, "start_check_no_lead");
-            return;
-        }
-        let Some(best_index) = self
-            .potential_payloads
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, p)| p.fees())
-            .map(|(i, _)| i)
-        else {
-            return;
-        };
-        let best = &self.potential_payloads[best_index];
-        if best.build_kind == BuildKind::EmptyFallback || best.bid_builder.is_some() {
-            return;
-        }
-        let mut parent_ready_at = best.diagnostics.as_ref().map(|d| d.ready_at);
-        let parent_preparation =
-            super::perf_tuning::Phase::new("pipeline", true, 1, "successor_context");
-        let Some((parent, context, attributes)) = prepare_pipeline_successor(
-            best,
-            &self.mining_ctx,
-            self.parlia.clone(),
-            self.builder.chain_spec.as_ref(),
-        ) else {
-            return;
-        };
-        parent_preparation.complete();
-        let parent_header = parent.block().clone_sealed_header();
-        let signer = parent.block().beneficiary();
-        let gas_limit = self.builder.builder_config.gas_limit(parent_header.gas_limit);
-        let min_gas_tip = self.build_args.min_gas_tip;
-        let key = pipeline::Key {
-            parent: parent_header.hash(),
-            timestamp_ms: context.block_timestamp_ms,
-            beneficiary: signer,
-            gas_limit,
-            min_gas_tip,
-        };
-        let Some((id, cancel, result, permit)) = pipeline::reserve(
-            key,
-            parent_header.parent_hash,
-            pipeline::Plan { context: context.clone(), attributes: attributes.clone() },
-        ) else {
-            return;
-        };
-        let client = self.builder.client.clone();
-        let pool = self.builder.pool.clone();
-        let evm_config = self.builder.evm_config.clone();
-        let builder_config = self.builder.builder_config.clone();
-        let chain_spec = self.builder.chain_spec.clone();
-        let parlia = self.parlia.clone();
-        let parent_publish_at = self.mining_ctx.end_mining_timestamp_ms;
-        let launch_queue = super::perf_tuning::Phase::new("pipeline", true, 1, "launch_queue");
-        let frozen_parent = parent.clone();
-        let launched = pipeline::launch(async move {
-            launch_queue.complete();
-            let _permit = permit;
-            let _completion = pipeline::WorkerCompletion(id);
-            let depth = pipeline::depth();
-            metrics::histogram!("bsc_miner_pipeline_target_depth").record(depth as f64);
-            let initial_state =
-                super::perf_tuning::Phase::new("pipeline", true, 1, "executed_parent");
-            let mut ancestry =
-                crate::shared::PrivateMinerChain::new(executed_pipeline_parent(&parent));
-            initial_state.complete();
-            let (mut context, mut attributes, mut result, mut parent_publish_at) =
-                (context, attributes, result, parent_publish_at);
-            let mut private_context = None;
-            loop {
-                let parent_hash = ancestry.parent().recovered_block().hash();
-                let Some(level) = pipeline::wait_for_slot(
-                    id,
-                    parent_hash,
-                    context.block_timestamp_ms.saturating_add(2000),
-                )
-                .await
-                else {
-                    pipeline::failed(id, "window_unavailable");
-                    break;
-                };
-                if let Some(accepted) = pipeline::accepted_parent(id) {
-                    ancestry = ancestry.rebased_at(accepted);
-                }
-                if cancel.is_cancelled() {
-                    break;
-                }
-                pipeline::depth_event(level, "compute_started");
-                if let Some(ready) = parent_ready_at {
-                    metrics::histogram!("bsc.miner_pipeline_parent_ready_to_start_seconds", "depth" => super::perf_tuning::depth_label(level)).record(ready.elapsed().as_secs_f64());
-                }
-                let compute_phase =
-                    super::perf_tuning::Phase::new("pipeline", true, level, "compute_total");
-                let args_phase = super::perf_tuning::Phase::new(
-                    "pipeline",
-                    true,
-                    level,
-                    "arguments_and_parent_cache",
-                );
-                let started = std::time::Instant::now();
-                metrics::histogram!("bsc_miner_pipeline_start_lead_seconds").record(
-                    parent_publish_at.saturating_sub(super::startup_diagnostics::wall_ms()) as f64 /
-                        1000.0,
-                );
-                let parent_header = context.parent_header.clone();
-                let reserve = std::time::Duration::from_millis(effective_delay_left_over(0));
-                let control = super::build_control::BuildControl::new(
-                    started,
-                    std::time::Duration::from_millis(context.parent_snapshot.block_interval),
-                    reserve,
-                    std::time::Duration::from_millis(
-                        context
-                            .end_mining_timestamp_ms
-                            .saturating_sub(super::startup_diagnostics::wall_ms())
-                            .min(u64::MAX as u128) as u64,
-                    )
-                    .saturating_sub(std::time::Duration::from_millis(STATE_ROOT_WAIT_MARGIN_MS)),
-                    cancel.clone(),
-                )
-                .with_late_finish(late_finish_experiment(true), started, reserve);
-                private_context = Some(Arc::new(crate::node::evm::config::PrivateMiningParent {
-                    header: context.parent_header.clone(),
-                    snapshot: context.parent_snapshot.clone(),
-                    ancestor: private_context.and_then(
-                        |parent: Arc<crate::node::evm::config::PrivateMiningParent>| {
-                            parent.retained_from(ancestry.blocks()[0].recovered_block().number)
-                        },
-                    ),
-                }));
-                let args = BscBuildArguments {
-                    pipeline_context: private_context.clone(),
-                    pipeline_parent: Some(ancestry.clone()),
-                    cached_reads: super::parent_state::cached_reads(
-                        &ancestry.parent().execution_output.state,
-                    ),
-                    milli_remainder: context.block_timestamp_ms % 1000,
-                    config: PayloadConfig::new(
-                        Arc::new(parent_header),
-                        attributes,
-                        alloy_rpc_types_engine::PayloadId::new([0; 8]),
-                    ),
-                    cancel: cancel.clone(),
-                    trace_id: generate_trace_id(),
-                    min_gas_tip,
-                    state_root_precomputed: Arc::new(Mutex::new(None)),
-                    trie_handle: Arc::new(Mutex::new(None)),
-                    state_root_deadline_ms: Some(
-                        context
-                            .end_mining_timestamp_ms
-                            .saturating_sub(STATE_ROOT_WAIT_MARGIN_MS as u128)
-                            .min(u64::MAX as u128) as u64,
-                    ),
-                    build_control: Some(control),
-                };
-                let child_publish_at = context.end_mining_timestamp_ms;
-                let builder = BscPayloadBuilder::new(
-                    client.clone(),
-                    pool.clone(),
-                    evm_config.clone(),
-                    builder_config.clone(),
-                    chain_spec.clone(),
-                    parlia.clone(),
-                    context,
-                );
-                args_phase.complete();
-                let mut observation = AttemptObservation::new(AttemptKind::Pipeline, true);
-                observation.start();
-                let mut built = builder.build_payload_observed(args, AttemptKind::Pipeline).await;
-                observation.finish(built.as_mut().ok(), cancel.is_cancelled());
-                metrics::histogram!("bsc_miner_pipeline_compute_seconds")
-                    .record(started.elapsed().as_secs_f64());
-                if let Ok(payload) = &built {
-                    pipeline::track_candidate(id, payload);
-                }
-                let mut payload = match built {
-                    Ok(payload) if !cancel.is_cancelled() => payload,
-                    rejected => {
-                        pipeline::failed(
-                            id,
-                            if cancel.is_cancelled() {
-                                "compute_cancelled"
-                            } else {
-                                "compute_error"
-                            },
-                        );
-                        drop(rejected);
-                        pipeline::event("compute_failed");
-                        pipeline::depth_event(
-                            level,
-                            if cancel.is_cancelled() {
-                                "compute_cancelled"
-                            } else {
-                                "compute_error"
-                            },
-                        );
-                        let _ = result.send(Err("private build failed or cancelled".to_owned()));
-                        return;
-                    }
-                };
-                compute_phase.complete();
-                pipeline::ready(id, parent_hash);
-                pipeline::depth_event(level, "ready");
-                let now = super::startup_diagnostics::wall_ms();
-                metrics::histogram!("bsc.miner_pipeline_deadline_seconds", "depth" => super::perf_tuning::depth_label(level), "side" => if now > child_publish_at { "late" } else { "early" }).record(now.abs_diff(child_publish_at) as f64 / 1000.0);
-                metrics::histogram!("bsc_miner_pipeline_ready_lead_seconds")
-                    .record(child_publish_at.saturating_sub(now) as f64 / 1000.0);
-                metrics::histogram!("bsc_miner_pipeline_ready_late_seconds")
-                    .record(now.saturating_sub(child_publish_at) as f64 / 1000.0);
-                // Register the exact next parent before delivering this candidate: a fast
-                // canonical notification must recognize it while the descendant is running.
-                let successor_phase =
-                    super::perf_tuning::Phase::new("pipeline", true, level, "successor_context");
-                let next = if !cancel.is_cancelled() {
-                    prepare_pipeline_successor(
-                        &payload,
-                        &builder.ctx,
-                        parlia.clone(),
-                        chain_spec.as_ref(),
-                    )
-                    .and_then(|(parent, context, attrs)| {
-                        let chain = ancestry
-                            .rebased_at(pipeline::accepted_parent(id)?)
-                            .appended(executed_pipeline_parent(&parent))?;
-                        let key = pipeline::Key {
-                            parent: parent.block().hash(),
-                            timestamp_ms: context.block_timestamp_ms,
-                            beneficiary: parent.block().beneficiary(),
-                            gas_limit: builder_config.gas_limit(parent.block().gas_limit()),
-                            min_gas_tip,
-                        };
-                        let sender = pipeline::extend(
-                            id,
-                            key,
-                            pipeline::Plan { context: context.clone(), attributes: attrs.clone() },
-                        )?;
-                        // Deliver the same sealed parent used by the successor, not its
-                        // unsealed pre-finalization input.
-                        payload = parent;
-                        Some((chain, context, attrs, sender))
-                    })
-                } else {
-                    None
-                };
-                successor_phase.complete();
-                if next.is_none() {
-                    pipeline::depth_event(
-                        level,
-                        if cancel.is_cancelled() {
-                            "stop_cancelled"
-                        } else {
-                            "stop_successor_unavailable"
-                        },
-                    );
-                }
-                parent_ready_at = payload.diagnostics.as_ref().map(|d| d.ready_at);
-                if let Err(undelivered) = result.send(Ok(payload)) {
-                    pipeline::depth_event(level, "result_receiver_dropped");
-                    pipeline::failed(id, "result_receiver_dropped");
-                    drop(undelivered);
-                    return;
-                }
-                let Some((chain, next_context, attrs, sender)) = next else { break };
-                pipeline::event("extended");
-                ancestry = chain;
-                context = next_context;
-                attributes = attrs;
-                result = sender;
-                parent_publish_at = child_publish_at;
-            }
-        });
-        if !launched {
-            pipeline::failed(id, "launch_failed");
-            pipeline::event("launch_failed");
-            return;
-        }
-        self.potential_payloads[best_index] = frozen_parent;
-        pipeline::event("parent_frozen");
-        pipeline::event("started");
-    }
-
     /// Sleep until this slot's submission deadline so that BidBlocks arriving later in the slot
     /// are still visible when selection runs — go-bsc defers `selectBidBlock` to the end of the
     /// build window for exactly this reason.
@@ -3188,7 +2752,6 @@ where
         // after candidate collection: `collect_payload_candidates` returns immediately when the
         // local build finished and no background tasks remain (the empty-mempool case), so without
         // the wait this decision is made at t≈0 and no bid can ever be seen.
-        self.try_start_next_pipeline();
         self.wait_for_submission_deadline()?;
         self.collect_best_bid_block();
 
@@ -3197,13 +2760,11 @@ where
         // is broadcast immediately and only then executed + state-root-verified on import — the
         // validator never re-executes before proposing. A losing BidBlock is simply dropped here.
         if self.try_submit_winning_bid_block() {
-            super::pipeline::selected_parent(None);
             return Ok(());
         }
 
         let best_payload = self.pick_best_payload_and_finalize(replacement_in_flight)?;
 
-        super::pipeline::selected_parent(Some(best_payload.block().hash()));
         self.submit_payload(best_payload)?;
 
         Ok(())
@@ -3720,101 +3281,6 @@ async fn send_bid_block_after_delay<T>(
     permit.send(block);
 }
 
-/// Preview one exact private parent and derive its successor using unchanged consensus timing.
-fn prepare_pipeline_successor(
-    best: &BscBuiltPayload,
-    ctx: &MiningContext,
-    parlia: Arc<Parlia<BscChainSpec>>,
-    chain_spec: &BscChainSpec,
-) -> Option<(BscBuiltPayload, MiningContext, EthPayloadAttributes)> {
-    if best.build_kind == BuildKind::EmptyFallback || best.bid_builder.is_some() {
-        return None;
-    }
-    // Epoch/validator-set transitions need an imported snapshot; do not guess it privately.
-    let snap = &ctx.parent_snapshot;
-    let number = best.block().number();
-    if snap.epoch_num == 0 ||
-        [number, number + 1].iter().any(|n| {
-            let remainder = n % snap.epoch_num;
-            remainder == 0 || remainder == snap.miner_history_check_len()
-        }) ||
-        best.pending_validators.is_some() ||
-        best.pending_turn_length.is_some()
-    {
-        return None;
-    }
-    let snapshots = crate::shared::get_snapshot_provider()?;
-    let mut parent = best.clone();
-    // This preview is private. At the publish deadline the normal selection/seal still runs;
-    // changed bids or attestations change the hash and invalidate this child.
-    let preview_start = std::time::Instant::now();
-    if finalize_payload_inner(
-        &mut parent,
-        parlia.clone(),
-        snap,
-        &ctx.parent_header,
-        snapshots,
-        ctx.block_timestamp_ms,
-        None,
-        false,
-    )
-    .is_err()
-    {
-        super::pipeline::event("preview_failed");
-        return None;
-    }
-    metrics::histogram!("bsc_miner_pipeline_preview_seconds")
-        .record(preview_start.elapsed().as_secs_f64());
-    parent.pipeline_seal = Some(parent.block().hash());
-    let Ok(attestation) =
-        parlia.get_vote_attestation_from_header(parent.block().header(), snap.epoch_num)
-    else {
-        return None;
-    };
-    let next_snapshot = snap.apply(
-        parent.block().beneficiary(),
-        parent.block().header(),
-        Vec::new(),
-        None,
-        attestation,
-        None,
-        chain_spec,
-    )?;
-    let signer = parent.block().beneficiary();
-    if !next_snapshot.is_inturn(signer) ||
-        next_snapshot.sign_recently(signer) ||
-        next_snapshot.last_block_in_one_turn(number + 1)
-    {
-        // The turn's final block has a separate, shorter packing cap. Keep it
-        // on the unchanged ordinary path rather than borrowing its full slot.
-        return None;
-    }
-    let parent_header = parent.block().clone_sealed_header();
-    let mut context = MiningContext {
-        header: None,
-        parent_header: parent_header.clone(),
-        parent_snapshot: Arc::new(next_snapshot),
-        is_inturn: true,
-        cached_reads: None,
-        block_timestamp_ms: 0,
-        end_mining_timestamp_ms: 0,
-        startup_timing: None,
-    };
-    let attributes =
-        super::util::prepare_new_attributes(&mut context, parlia.clone(), &parent_header, signer);
-    Some((parent, context, attributes))
-}
-
-fn executed_pipeline_parent(
-    parent: &BscBuiltPayload,
-) -> reth_chain_state::ExecutedBlock<crate::BscPrimitives> {
-    reth_chain_state::ExecutedBlock::new(
-        parent.executed_block.recovered_block.clone(),
-        parent.executed_block.execution_output.clone(),
-        parent.executed_block.sorted_trie_data(),
-    )
-}
-
 fn refresh_and_reseal_bid_block(
     parlia: Arc<Parlia<BscChainSpec>>,
     parent_snapshot: &Snapshot,
@@ -3862,41 +3328,6 @@ fn finalize_payload(
     block_timestamp_ms: u64,
     epoch_validators: Option<EpochValidators>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    finalize_payload_inner(
-        payload,
-        parlia,
-        parent_snapshot,
-        parent_header,
-        snapshot_provider,
-        block_timestamp_ms,
-        epoch_validators,
-        true,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn finalize_payload_inner(
-    payload: &mut BscBuiltPayload,
-    parlia: Arc<Parlia<BscChainSpec>>,
-    parent_snapshot: &Snapshot,
-    parent_header: &SealedHeader<alloy_consensus::Header>,
-    snapshot_provider: &Arc<dyn crate::consensus::parlia::SnapshotProvider + Send + Sync>,
-    block_timestamp_ms: u64,
-    epoch_validators: Option<EpochValidators>,
-    publish_cache: bool,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if let Some(sealed) = payload.pipeline_seal {
-        if sealed != payload.block().hash() ||
-            sealed != payload.executed_block.recovered_block.hash()
-        {
-            return Err(std::io::Error::other("frozen pipeline payload identity changed").into());
-        }
-        if publish_cache {
-            publish_payload_caches(payload, parent_header.hash(), sealed);
-            super::pipeline::event("frozen_parent_published");
-        }
-        return Ok(());
-    }
     let senders = payload.executed_block.recovered_block.senders().to_vec();
     let mut plain_block = payload.executed_block.recovered_block.sealed_block().clone_block();
 
@@ -3934,9 +3365,7 @@ fn finalize_payload_inner(
     })?;
 
     let final_hash = plain_block.header.hash_slow();
-    if publish_cache {
-        publish_payload_caches(payload, parent_header.hash(), final_hash);
-    }
+    publish_payload_caches(payload, parent_header.hash(), final_hash);
     // Both payload blocks must carry sidecars with the final sealed hash.
     plain_block.body.sidecars = payload.block.body().sidecars.clone();
     if let Some(sidecars) = &mut plain_block.body.sidecars {
@@ -3993,32 +3422,6 @@ mod tests {
             depth_high: 40,
             reserve_max_ms: max_ms,
             reserve_min_ms: min_ms,
-        }
-    }
-
-    #[test]
-    fn frozen_parent_ignores_new_transaction_value_until_publication() {
-        for remaining in [180, 500] {
-            let input = super::LocalRebuildPolicyInput {
-                parent_frozen: false,
-                current_payload_fees: U256::from(1_000_000),
-                estimated_new_fees: U256::from(10_000_000),
-                last_build_duration: Duration::from_millis(100),
-                since_last_build: Duration::from_millis(100),
-                remaining_duration: Duration::from_millis(remaining),
-                final_shot_used: false,
-            };
-            assert!(matches!(
-                super::local_rebuild_action(input),
-                super::LocalRebuildAction::RebuildNow { .. }
-            ));
-            assert_eq!(
-                super::local_rebuild_action(super::LocalRebuildPolicyInput {
-                    parent_frozen: true,
-                    ..input
-                }),
-                super::LocalRebuildAction::ReturnBestPayload
-            );
         }
     }
 
@@ -4307,7 +3710,6 @@ mod tests {
                 }
 
                 match local_rebuild_action(LocalRebuildPolicyInput {
-                    parent_frozen: false,
                     current_payload_fees,
                     estimated_new_fees,
                     last_build_duration: build_duration,
@@ -4331,7 +3733,6 @@ mod tests {
 
             estimated_new_fees = estimated_new_fees.saturating_add(estimated_fees);
             match local_rebuild_action(LocalRebuildPolicyInput {
-                parent_frozen: false,
                 current_payload_fees,
                 estimated_new_fees,
                 last_build_duration: build_duration,
@@ -4354,7 +3755,6 @@ mod tests {
 
         while let Some(deadline_ms) = wait_deadline_ms {
             match local_rebuild_action(LocalRebuildPolicyInput {
-                parent_frozen: false,
                 current_payload_fees,
                 estimated_new_fees,
                 last_build_duration: build_duration,
@@ -4414,7 +3814,6 @@ mod tests {
     #[test]
     fn local_rebuild_policy_skips_when_uplift_is_below_threshold() {
         let action = local_rebuild_action(LocalRebuildPolicyInput {
-            parent_frozen: false,
             current_payload_fees: U256::from(1_000_000_u64),
             estimated_new_fees: U256::from(100_000_u64),
             last_build_duration: Duration::from_millis(100),
@@ -4429,7 +3828,6 @@ mod tests {
     #[test]
     fn local_rebuild_policy_rebuilds_after_cooldown_when_uplift_is_high_enough() {
         let action = local_rebuild_action(LocalRebuildPolicyInput {
-            parent_frozen: false,
             current_payload_fees: U256::from(1_000_000_u64),
             estimated_new_fees: U256::from(200_000_u64),
             last_build_duration: Duration::from_millis(100),
@@ -4444,7 +3842,6 @@ mod tests {
     #[test]
     fn local_rebuild_policy_returns_best_when_remaining_time_cannot_cover_rebuild() {
         let action = local_rebuild_action(LocalRebuildPolicyInput {
-            parent_frozen: false,
             current_payload_fees: U256::from(1_000_000_u64),
             estimated_new_fees: U256::from(500_000_u64),
             last_build_duration: Duration::from_millis(100),
@@ -4459,7 +3856,6 @@ mod tests {
     #[test]
     fn local_rebuild_policy_allows_one_final_shot_in_near_deadline_window() {
         let action = local_rebuild_action(LocalRebuildPolicyInput {
-            parent_frozen: false,
             current_payload_fees: U256::from(1_000_000_u64),
             estimated_new_fees: U256::from(350_000_u64),
             last_build_duration: Duration::from_millis(100),
@@ -4474,7 +3870,6 @@ mod tests {
     #[test]
     fn local_rebuild_policy_does_not_allow_second_final_shot() {
         let action = local_rebuild_action(LocalRebuildPolicyInput {
-            parent_frozen: false,
             current_payload_fees: U256::from(1_000_000_u64),
             estimated_new_fees: U256::from(350_000_u64),
             last_build_duration: Duration::from_millis(100),
@@ -4489,7 +3884,6 @@ mod tests {
     #[test]
     fn local_rebuild_policy_uses_synthetic_baseline_for_empty_payloads() {
         let action = local_rebuild_action(LocalRebuildPolicyInput {
-            parent_frozen: false,
             current_payload_fees: U256::ZERO,
             estimated_new_fees: U256::from(1_000_000_000_000_u64),
             last_build_duration: Duration::from_millis(100),
@@ -4682,7 +4076,6 @@ mod tests {
             executed_block.body.sidecars = None;
             let mut payload = super::BscBuiltPayload {
                 selection_diagnostics: None,
-                pipeline_seal: None,
                 diagnostics: None,
                 block: Arc::new(block.into()),
                 fees: U256::ZERO,
@@ -4703,81 +4096,10 @@ mod tests {
                     hashed_state: Default::default(),
                     trie_updates: Default::default(),
                 },
-                pending_validators: None,
-                pending_turn_length: None,
+                pending_validators: Some((vec![Address::with_last_byte(8)], Vec::new())),
+                pending_turn_length: Some(7),
                 bid_builder: None,
             };
-
-            let mut preview = payload.clone();
-            preview.pending_validators = Some((vec![Address::with_last_byte(8)], Vec::new()));
-            preview.pending_turn_length = Some(7);
-            super::finalize_payload_inner(
-                &mut preview,
-                parlia.clone(),
-                &parent_snap,
-                &parent_header,
-                &snapshot_provider,
-                0,
-                None,
-                false,
-            )
-            .unwrap();
-            assert!(cache_get(preview.block.hash()).is_none());
-            assert!(!crate::node::evm::pre_execution::VALIDATOR_CACHE
-                .lock()
-                .unwrap()
-                .get(&preview.block.hash())
-                .is_some());
-            assert!(!crate::node::evm::pre_execution::TURN_LENGTH_CACHE
-                .lock()
-                .unwrap()
-                .get(&preview.block.hash())
-                .is_some());
-            assert!(preview.pending_validators.is_some());
-            assert_eq!(preview.pending_turn_length, Some(7));
-            assert_eq!(preview.executed_block.recovered_block.hash(), preview.block.hash());
-
-            preview.pipeline_seal = Some(preview.block.hash());
-            let sealed_header = preview.block.clone();
-            super::finalize_payload(
-                &mut preview,
-                parlia.clone(),
-                &parent_snap,
-                &parent_header,
-                &snapshot_provider,
-                0,
-                None,
-            )
-            .unwrap();
-            assert!(
-                Arc::ptr_eq(&sealed_header, &preview.block),
-                "publication must not reseal the parent's header"
-            );
-            assert_eq!(preview.executed_block.recovered_block.hash(), sealed_header.hash());
-            assert!(preview.pending_validators.is_none());
-            assert!(preview.pending_turn_length.is_none());
-            assert_eq!(
-                crate::node::evm::pre_execution::TURN_LENGTH_CACHE
-                    .lock()
-                    .unwrap()
-                    .get(&sealed_header.hash())
-                    .copied(),
-                Some(7)
-            );
-            assert!(cache_get(sealed_header.hash()).is_some());
-            let mut changed = preview.clone();
-            changed.pipeline_seal = Some(B256::repeat_byte(99));
-            let err = super::finalize_payload(
-                &mut changed,
-                parlia.clone(),
-                &parent_snap,
-                &parent_header,
-                &snapshot_provider,
-                0,
-                None,
-            )
-            .unwrap_err();
-            assert_eq!(err.to_string(), "frozen pipeline payload identity changed");
 
             super::finalize_payload(
                 &mut payload,
@@ -4789,6 +4111,22 @@ mod tests {
                 None,
             )
             .unwrap();
+
+            assert!(payload.pending_validators.is_none());
+            assert!(payload.pending_turn_length.is_none());
+            assert_eq!(
+                crate::node::evm::pre_execution::TURN_LENGTH_CACHE
+                    .lock()
+                    .unwrap()
+                    .get(&payload.block.hash())
+                    .copied(),
+                Some(7),
+            );
+            assert!(crate::node::evm::pre_execution::VALIDATOR_CACHE
+                .lock()
+                .unwrap()
+                .get(&payload.block.hash())
+                .is_some());
 
             let recovered = &payload.executed_block.recovered_block;
             assert_eq!(recovered.body(), payload.block.body());

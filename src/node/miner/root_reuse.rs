@@ -75,7 +75,7 @@ mod tests {
     use std::{sync::Arc, time::Duration};
 
     #[test]
-    fn private_and_import_share_sorted_outputs_but_replaced_sources_do_not() {
+    fn completed_and_imported_blocks_share_sorted_outputs_but_replaced_sources_do_not() {
         let mut block = reth_payload_primitives::BuiltPayloadExecutedBlock::<BscPrimitives> {
             recovered_block: Arc::new(RecoveredBlock::new_unhashed(
                 BscBlock::default(),
@@ -89,24 +89,24 @@ mod tests {
         .with_shared_trie_data();
         assert!(block.ready_trie_data().is_none());
         let import = block.clone();
-        let private = block.sorted_trie_data();
+        let sorted = block.sorted_trie_data();
         let ready = import.ready_trie_data().unwrap();
-        assert!(Arc::ptr_eq(&private.hashed_state, &ready.hashed_state));
-        assert!(Arc::ptr_eq(&private.trie_updates, &ready.trie_updates));
+        assert!(Arc::ptr_eq(&sorted.hashed_state, &ready.hashed_state));
+        assert!(Arc::ptr_eq(&sorted.trie_updates, &ready.trie_updates));
         block.hashed_state =
             Arc::new(reth_trie_common::HashedPostState::default().with_accounts([(
                 alloy_primitives::B256::ZERO,
                 Some(reth_primitives_traits::Account { nonce: 17, ..Default::default() }),
             )]));
         assert!(block.ready_trie_data().is_none());
-        assert_ne!(block.sorted_trie_data().hashed_state, private.hashed_state);
+        assert_ne!(block.sorted_trie_data().hashed_state, sorted.hashed_state);
         let mut replaced = import;
         replaced.trie_updates = Arc::new(Default::default());
         assert!(replaced.ready_trie_data().is_none());
     }
 
     #[test]
-    fn private_chain_tree_handoff_matches_serial_roots_across_slot_updates() {
+    fn completed_parent_tree_handoff_matches_serial_roots_across_slot_updates() {
         let factory = reth_provider::test_utils::create_test_provider_factory_with_chain_spec(
             Arc::new(reth_chainspec::ChainSpec::default()),
         );
