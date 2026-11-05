@@ -1,4 +1,4 @@
-use super::handle::ImportHandle;
+use super::{fork_recover::MAX_STALE_BLOCK_DISTANCE, handle::ImportHandle};
 use crate::{
     chainspec::BscChainSpec,
     consensus::{parlia::vote_pool, ParliaConsensusErr},
@@ -160,6 +160,16 @@ fn log_recovery_error(
                 committed,
                 source,
                 "Fork recovery committed partial progress"
+            );
+        }
+        ForkRecoverError::StaleHead { head, tip } => {
+            tracing::debug!(
+                target: "bsc::block_import",
+                %head_hash,
+                head,
+                tip,
+                source,
+                "Fork recovery skipped: stale head"
             );
         }
         _ => {
@@ -729,7 +739,6 @@ where
         // resources on stale blocks from misbehaving or out-of-sync peers. Without this
         // guard, proof workers open read transactions against cold historical trie pages,
         // blocking until db.read-transaction-timeout (5 min default) is hit.
-        const MAX_STALE_BLOCK_DISTANCE: u64 = 64;
         if let Ok(info) = self.forkchoice_engine.provider.chain_info() {
             let block_number = block.block.0.block.header.number;
             if block_number + MAX_STALE_BLOCK_DISTANCE < info.best_number {
@@ -856,6 +865,17 @@ where
                 continue;
             }
             if self.queued_blocks.contains(&hash_number.hash) {
+                continue;
+            }
+            // `recover_ancestors` would refuse it; skip before taking a slot.
+            if hash_number.number.saturating_add(MAX_STALE_BLOCK_DISTANCE) < local_tip {
+                tracing::trace!(
+                    target: "bsc::block_import",
+                    block_hash = %hash_number.hash,
+                    block_number = hash_number.number,
+                    local_tip,
+                    "Skipping fork recovery: stale head"
+                );
                 continue;
             }
             if self.failed_heads.is_cooling(&hash_number.hash) {
@@ -1157,7 +1177,6 @@ where
 /// there's no evidence it is ahead, and the worst case is the peer ignores the
 /// hint.
 fn plan_head_announcements(local_head: u64, peers: &[(PeerId, Option<u64>)]) -> Vec<PeerId> {
-    const MAX_STALE_BLOCK_DISTANCE: u64 = 64;
     peers
         .iter()
         .filter_map(|(peer_id, peer_best)| match peer_best {

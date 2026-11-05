@@ -73,6 +73,10 @@ pub const RECOVERY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// while preserving a spare walk that can make progress meanwhile.
 pub const MAX_CONCURRENT_RECOVERIES: usize = 3;
 
+/// Blocks more than this far below the local tip are stale: past finality,
+/// and importing one makes the engine rebuild old state from the database.
+pub const MAX_STALE_BLOCK_DISTANCE: u64 = 64;
+
 /// Error kinds produced by `recover_ancestors` / `discover_fork_blocks`.
 #[derive(Debug, thiserror::Error)]
 pub enum ForkRecoverError {
@@ -112,6 +116,9 @@ pub enum ForkRecoverError {
 
     #[error("fcu_target_header.hash {got} ≠ fcu_target_hash {expected}")]
     FcuTargetHeaderMismatch { expected: alloy_primitives::B256, got: alloy_primitives::B256 },
+
+    #[error("head {head} is more than {MAX_STALE_BLOCK_DISTANCE} below the tip {tip}")]
+    StaleHead { head: u64, tip: u64 },
 }
 
 /// Abstraction over `GetBlocksByRange`. Tests substitute a fake; production
@@ -366,6 +373,9 @@ where
         fcu_target_header,
     } = target;
 
+    // Checked again before Phase 2: the tip moves during the walk.
+    ensure_head_not_stale(&provider, fcu_target_num)?;
+
     tracing::info!(
         target: "bsc::fork_recover",
         %peer,
@@ -393,6 +403,7 @@ where
     );
 
     // ---- Phase 2: import oldest → newest via new_payload ----
+    ensure_head_not_stale(&provider, fcu_target_num)?;
     let mut to_import = discovery.fork_blocks;
     to_import.reverse();
     // Highest block the engine accepted this attempt. On a halt it becomes the
@@ -516,6 +527,18 @@ where
         );
     }
 
+    Ok(())
+}
+
+/// Errors if `head` is more than [`MAX_STALE_BLOCK_DISTANCE`] below the best block.
+fn ensure_head_not_stale<P: BlockNumReader>(
+    provider: &P,
+    head: u64,
+) -> Result<(), ForkRecoverError> {
+    let tip = provider.best_block_number()?;
+    if head.saturating_add(MAX_STALE_BLOCK_DISTANCE) < tip {
+        return Err(ForkRecoverError::StaleHead { head, tip });
+    }
     Ok(())
 }
 
@@ -1749,6 +1772,72 @@ mod tests {
                 after_second,
                 vec![101, 102, 103, 104, 105, 105],
                 "the retry resumes at 105 instead of replaying 101-104",
+            );
+        }
+
+        /// A sibling of canonical block `height`; local tip is 200.
+        fn stale_sibling(height: u64) -> (FakeProvider, ChainFetcher, B256) {
+            let (provider, _fetcher, _heads) = scenario(200, 0);
+            let parent = provider.canonical_by_num[&(height - 1)];
+            let side = make_header(height, parent, 0xD);
+            let side_hash = side.hash_slow();
+            let fetcher = ChainFetcher {
+                blocks: HashMap::from([(side_hash, make_block(side))]),
+                ..Default::default()
+            };
+            (provider, fetcher, side_hash)
+        }
+
+        /// A head far below the tip is neither fetched nor imported.
+        #[tokio::test]
+        async fn stale_head_is_neither_fetched_nor_imported() {
+            let (provider, fetcher, side_hash) = stale_sibling(100);
+            let (engine, submissions, fcus) = recording_engine(vec![]);
+            let fce = BscForkChoiceEngine::new(provider.clone(), engine.clone(), chain_spec());
+            let err = recover_ancestors(
+                fake_peer(),
+                RecoverTarget::single_pair(side_hash, 100),
+                provider.clone(),
+                engine.clone(),
+                fce,
+                &fetcher,
+                &(),
+            )
+            .await
+            .unwrap_err();
+
+            assert!(
+                matches!(err, ForkRecoverError::StaleHead { head: 100, tip: 200 }),
+                "expected a stale head, got {err:?}",
+            );
+            assert_eq!(fetcher.hops(), 0, "nothing is fetched");
+            assert!(submissions.lock().unwrap().is_empty(), "nothing reaches the engine");
+            assert!(fcus.lock().unwrap().is_empty(), "no forkchoice update");
+        }
+
+        /// A head exactly `MAX_STALE_BLOCK_DISTANCE` below the tip is still recovered.
+        #[tokio::test]
+        async fn head_at_the_stale_distance_is_still_recovered() {
+            let height = 200 - MAX_STALE_BLOCK_DISTANCE;
+            let (provider, fetcher, side_hash) = stale_sibling(height);
+            let (engine, submissions, _fcus) = recording_engine(vec![]);
+            let fce = BscForkChoiceEngine::new(provider.clone(), engine.clone(), chain_spec());
+            recover_ancestors(
+                fake_peer(),
+                RecoverTarget::single_pair(side_hash, height),
+                provider.clone(),
+                engine.clone(),
+                fce,
+                &fetcher,
+                &(),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                submissions.lock().unwrap().as_slice(),
+                &[(height, side_hash)],
+                "the sibling is imported",
             );
         }
     }
