@@ -264,10 +264,19 @@ where
                         runtime.spawn_drop(retired);
                     }
 
-                    // Anchor directly at the parent hash; the overlay manager resolves the
-                    // in-memory parent trie (mirrors the engine's own payload-builder path in
-                    // `payload_state_root_handle_for`).
-                    let overlay_builder = overlay_manager.overlay_builder(parent_hash);
+                    // A DB snapshot can still reference a different Finish branch after a reorg.
+                    // Share only the Engine's block index, retaining miner-owned caches/workers.
+                    let overlay_manager =
+                        if let Some(source) = crate::shared::get_engine_overlay_block_source() {
+                            overlay_manager.with_block_source(&source)
+                        } else {
+                            overlay_manager
+                        };
+                    let overlay_builder = if let Some(state) = state {
+                        overlay_manager.overlay_builder_for_state(state)
+                    } else {
+                        overlay_manager.overlay_builder(parent_hash)
+                    };
                     let overlay_factory = MinerProofProviderFactory::new(
                         provider.clone(),
                         overlay_builder,

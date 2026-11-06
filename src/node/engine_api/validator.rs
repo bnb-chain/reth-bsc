@@ -90,6 +90,9 @@ where
             InvalidBlockHooks(vec![Box::new(evidence_reporter.clone()), configured_hook]);
 
         let txpool_prewarming = tree_config.txpool_prewarming();
+        if crate::shared::set_engine_overlay_block_source(overlay_manager.clone()).is_err() {
+            tracing::warn!(target: "bsc::miner", "Engine overlay block source already registered");
+        }
         let mut inner = BasicEngineValidator::new(
             ctx.node.provider().clone(),
             Arc::new(ctx.node.consensus().clone()),

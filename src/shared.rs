@@ -23,6 +23,7 @@ use reth_network_api::PeerId;
 use reth_payload_builder_primitives::Events;
 use reth_primitives_traits::SealedHeader;
 use reth_provider::{BlockNumReader, HeaderProvider};
+use reth_storage_overlay::OverlayManager;
 use schnellru::{ByLength, LruMap};
 use std::{
     collections::VecDeque,
@@ -1047,6 +1048,22 @@ pub fn set_canonical_in_memory_state(
 pub fn get_canonical_in_memory_state(
 ) -> Option<reth_chain_state::CanonicalInMemoryState<crate::BscPrimitives>> {
     CANONICAL_IN_MEMORY_STATE.get().cloned()
+}
+
+/// Engine block index used to resolve the database Finish branch during miner proof construction.
+static ENGINE_OVERLAY_BLOCK_SOURCE: OnceLock<OverlayManager<crate::BscPrimitives>> =
+    OnceLock::new();
+
+/// Publishes the block source before the engine starts validating payloads.
+pub(crate) fn set_engine_overlay_block_source(
+    source: OverlayManager<crate::BscPrimitives>,
+) -> Result<(), OverlayManager<crate::BscPrimitives>> {
+    ENGINE_OVERLAY_BLOCK_SOURCE.set(source)
+}
+
+/// Returns the live executed-block source; mining keeps its own computation caches and workers.
+pub(crate) fn get_engine_overlay_block_source() -> Option<OverlayManager<crate::BscPrimitives>> {
+    ENGINE_OVERLAY_BLOCK_SOURCE.get().cloned()
 }
 
 /// Global engine api tx (custom request sender)
