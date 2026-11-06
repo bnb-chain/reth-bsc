@@ -1175,6 +1175,19 @@ where
         &self.chain_spec
     }
 
+    /// Returns Parlia finality for a locally known canonical head, not a remote sync target.
+    /// `None` means fast finality or the head snapshot is not available.
+    pub(crate) fn finalized_number_at_head(
+        &self,
+        head_number: u64,
+    ) -> Result<Option<u64>, reth_provider::ProviderError> {
+        Ok(self
+            .provider
+            .header_by_number(head_number)?
+            .and_then(|head| self.get_finalized_number_and_hash(&head))
+            .map(|(number, _)| number))
+    }
+
     /// Updates the fork choice based on the incoming header.
     ///
     /// This function evaluates whether the incoming header should become the new canonical head

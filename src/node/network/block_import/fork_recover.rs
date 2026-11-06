@@ -80,6 +80,14 @@ pub enum ForkRecoverError {
     #[error("range fetch failed: {0}")]
     FetchFailed(String),
 
+    #[error(
+        "recovery block ({got_number}, {got}) does not match requested ({number}, {expected})"
+    )]
+    RecoveryAncestryMismatch { number: u64, expected: B256, got_number: u64, got: B256 },
+
+    #[error("fork base {base} is below the finalized block {finalized}")]
+    BelowFinalized { base: u64, finalized: u64 },
+
     #[error("local provider error: {0}")]
     Provider(#[from] reth_provider::ProviderError),
 
@@ -303,28 +311,52 @@ pub async fn discover_fork_blocks<
         // A hop came back: this walk is alive, however deep it still has to go.
         progress.record_progress();
 
-        // Iterate newest -> oldest (the order we got them in).
+        // Check the discovery boundary as well as the production fetcher: every response must
+        // follow the requested cursor before any locally known ancestor can end the walk.
+        if resp.len() as u64 > count {
+            return Err(ForkRecoverError::FetchFailed("oversized recovery range".into()));
+        }
         let mut found_ancestor = false;
-        for b in &resp {
-            if provider.block_hash(b.header.number)? == Some(b.header.hash_slow()) {
+        for block in &resp {
+            let got = block.header.hash_slow();
+            if block.header.number != cursor_num || got != cursor_hash {
+                return Err(ForkRecoverError::RecoveryAncestryMismatch {
+                    number: cursor_num,
+                    expected: cursor_hash,
+                    got_number: block.header.number,
+                    got,
+                });
+            }
+            cursor_hash = block.header.parent_hash;
+            cursor_num = cursor_num.saturating_sub(1);
+            if provider.block_hash(block.header.number)? == Some(got) {
                 found_ancestor = true;
                 break;
             }
-            fork_blocks.push(b.clone());
+            fork_blocks.push(block.clone());
         }
         if found_ancestor {
             return Ok(Discovery { fork_blocks, outcome: DiscoveryOutcome::AncestorFound });
         }
 
-        // Advance cursor to the block just below the oldest in this response.
-        // saturating_sub: if we're already at block 0 with no match, the next
-        // pre-hop check fails and `walked >= MAX_FORK_DEPTH` eventually trips
-        // ForkTooDeep rather than panicking on underflow.
-        let oldest = resp.last().unwrap();
         walked += resp.len() as u64;
-        cursor_num = oldest.header.number.saturating_sub(1);
-        cursor_hash = oldest.header.parent_hash;
     }
+}
+
+/// Checks the validated recovery range before opening any historical execution state.
+/// A fork may build on the finalized block, but cannot replace it or an older block.
+fn ensure_fork_above_finalized(
+    fork_blocks: &[BscBlock],
+    finalized: Option<u64>,
+) -> Result<(), ForkRecoverError> {
+    let (Some(oldest), Some(finalized)) = (fork_blocks.last(), finalized) else {
+        return Ok(());
+    };
+    let base = oldest.header.number.saturating_sub(1);
+    if base < finalized {
+        return Err(ForkRecoverError::BelowFinalized { base, finalized });
+    }
+    Ok(())
 }
 
 /// Inputs to [`recover_ancestors`]. The discovery start and FCU target are
@@ -488,6 +520,13 @@ where
         + 'static,
 {
     let RecoverTarget { fcu_target_hash, fcu_target_num, fcu_target_header, .. } = target;
+    // Finality may advance while discovery waits for peers. Recheck at the shared import
+    // boundary so neither network recovery nor startup callers bypass the floor.
+    let local_tip = provider.best_block_number()?;
+    ensure_fork_above_finalized(
+        &discovery.fork_blocks,
+        forkchoice_engine.finalized_number_at_head(local_tip)?,
+    )?;
     // ---- Phase 2: import oldest → newest via new_payload ----
     let mut to_import = discovery.fork_blocks;
     to_import.reverse();
@@ -1031,6 +1070,91 @@ mod tests {
 
     fn fake_peer() -> PeerId {
         PeerId::from([0u8; 64])
+    }
+
+    #[tokio::test]
+    async fn discover_rejects_spliced_first_walk_and_wrong_start() {
+        let mut provider = FakeProvider::default();
+        let (canonical, hashes) = linear_chain(0, 201, B256::ZERO, 0xC);
+        for header in &canonical {
+            provider.insert_canonical(header.clone());
+        }
+        let crafted = make_header(10_001, hashes[128], 0xD);
+        let crafted_hash = crafted.hash_slow();
+        for (response, number, expected, got_number, got) in [
+            (
+                vec![make_block(crafted.clone()), make_block(canonical[128].clone())],
+                10_000,
+                hashes[128],
+                128,
+                hashes[128],
+            ),
+            (vec![make_block(canonical[200].clone())], 10_001, crafted_hash, 200, hashes[200]),
+        ] {
+            let fetcher = ScriptedFetcher::new(vec![Ok(response)]);
+            let error = discover_fork_blocks(
+                fake_peer(),
+                crafted_hash,
+                10_001,
+                &provider,
+                fetcher.as_ref(),
+                &(),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                ForkRecoverError::RecoveryAncestryMismatch {
+                    number: actual_number, expected: actual_expected,
+                    got_number: actual_got_number, got: actual_got,
+                } if (actual_number, actual_expected, actual_got_number, actual_got)
+                    == (number, expected, got_number, got)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn discover_rejects_broken_continuation_and_oversized_range() {
+        let provider = FakeProvider::default();
+        let (chain, hashes) = linear_chain(1, 8, B256::ZERO, 0xD);
+        let first: Vec<_> = chain[4..].iter().rev().cloned().map(make_block).collect();
+        let wrong = make_header(4, B256::ZERO, 0xE);
+        let wrong_hash = wrong.hash_slow();
+        let fetcher = ScriptedFetcher::new(vec![Ok(first), Ok(vec![make_block(wrong)])]);
+        let error =
+            discover_fork_blocks(fake_peer(), hashes[7], 8, &provider, fetcher.as_ref(), &())
+                .await
+                .unwrap_err();
+        assert!(matches!(
+            error,
+            ForkRecoverError::RecoveryAncestryMismatch {
+                number: 4, expected, got_number: 4, got,
+            } if expected == hashes[3] && got == wrong_hash
+        ));
+        assert_eq!(fetcher.calls().len(), 2);
+
+        let oversized = chain[3..].iter().rev().cloned().map(make_block).collect();
+        let fetcher = ScriptedFetcher::new(vec![Ok(oversized)]);
+        let error =
+            discover_fork_blocks(fake_peer(), hashes[7], 8, &provider, fetcher.as_ref(), &())
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(error, ForkRecoverError::FetchFailed(reason) if reason == "oversized recovery range")
+        );
+    }
+
+    #[test]
+    fn fork_base_finality_floor_allows_only_eligible_recovery() {
+        let (chain, _) = linear_chain(129, 2, B256::ZERO, 0xD);
+        let fork: Vec<_> = chain.into_iter().rev().map(make_block).collect();
+        assert!(matches!(
+            ensure_fork_above_finalized(&fork, Some(9_900)),
+            Err(ForkRecoverError::BelowFinalized { base: 128, finalized: 9_900 })
+        ));
+        ensure_fork_above_finalized(&fork, Some(128)).unwrap();
+        ensure_fork_above_finalized(&fork, None).unwrap();
+        ensure_fork_above_finalized(&[], Some(9_900)).unwrap();
     }
 
     // ---- Spec test #1: head already on canonical (pre-hop short-circuit) ----
