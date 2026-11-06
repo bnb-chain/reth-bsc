@@ -1,18 +1,17 @@
 use alloy_eips::eip7910::{EthForkConfig, SystemContract};
-use jsonrpsee::core::RpcResult;
-use jsonrpsee::proc_macros::rpc;
+use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use reth_chainspec::{ChainSpecProvider, EthereumHardforks, Hardforks};
 use reth_evm::ConfigureEvm;
-use reth_primitives_traits::NodePrimitives;
-use reth_primitives_traits::header::HeaderMut;
+use reth_primitives_traits::{header::HeaderMut, NodePrimitives};
 use reth_provider::BlockReaderIdExt;
 use reth_rpc_eth_api::helpers::config::{EthConfigApiServer, EthConfigHandler};
 
 use std::sync::Arc;
 
-use crate::hardforks::BscHardforks;
-use crate::hardforks::bsc::BscHardfork;
-use crate::node::evm::config::revm_spec_by_timestamp_and_block_number;
+use crate::{
+    hardforks::{bsc::BscHardfork, BscHardforks},
+    node::evm::config::revm_spec_by_timestamp_and_block_number,
+};
 
 /// BSC-specific `eth_config` (EIP-7910) RPC.
 ///
@@ -33,7 +32,8 @@ pub trait BscEthConfigApi {
 /// - `systemContracts`: BSC only exposes `HISTORY_STORAGE_ADDRESS` (from Prague); Ethereum-specific
 ///   contracts (BeaconRoots, Deposit, Consolidation, Withdrawal) are dropped.
 /// - `blobSchedule`: mirrors go-bsc's `ChainConfig.BlobConfig(LatestFork(t))` — only the forks that
-///   go-bsc reports a blob config for keep a value; all others (incl. Mendel/Pasteur) become `null`.
+///   go-bsc reports a blob config for keep a value; all others (incl. Mendel/Pasteur) become
+///   `null`.
 #[derive(Debug, Clone)]
 pub struct BscEthConfigHandler<Provider, Evm> {
     inner: EthConfigHandler<Provider, Evm>,
@@ -112,7 +112,8 @@ where
 }
 
 /// Mirrors go-bsc `params.ChainConfig.BlobConfig`: only these forks return a blob config; every
-/// other fork (including Mendel and Pasteur) yields `nil`, which serializes as `blobSchedule: null`.
+/// other fork (including Mendel and Pasteur) yields `nil`, which serializes as `blobSchedule:
+/// null`.
 ///
 /// go-bsc keeps: `Cancun`, `Prague`, `Fermi`, `Maxwell`, `Lorentz`, `Osaka`. The reth-bsc spec
 /// resolver never emits a standalone `Prague` (it is always superseded by a later BSC fork), so the
@@ -120,11 +121,11 @@ where
 const fn go_bsc_reports_blob_schedule(fork: BscHardfork) -> bool {
     matches!(
         fork,
-        BscHardfork::Cancun
-            | BscHardfork::Fermi
-            | BscHardfork::Maxwell
-            | BscHardfork::Lorentz
-            | BscHardfork::Osaka
+        BscHardfork::Cancun |
+            BscHardfork::Fermi |
+            BscHardfork::Maxwell |
+            BscHardfork::Lorentz |
+            BscHardfork::Osaka
     )
 }
 

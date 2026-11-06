@@ -6,13 +6,18 @@
 //! the trailing region must have for the given header.
 //!
 //! Most of these functions are pure (no consensus state): they classify and verify transactions and
-//! so are parameterized on `(txs, header, parent)` rather than the not-yet-ported `DecodedBidBlock`.
-//! The exception is [`Parlia::block_time_upper_check`] — a stateful timestamp bound used by BidBlock
-//! pre-seal verification. The remaining stateful methods (`prepare_for_bid_block`, assembly, the
-//! `sign_system_tx` wrapper) land with the miner build path.
+//! so are parameterized on `(txs, header, parent)` rather than the not-yet-ported
+//! `DecodedBidBlock`. The exception is [`Parlia::block_time_upper_check`] — a stateful timestamp
+//! bound used by BidBlock pre-seal verification. The remaining stateful methods
+//! (`prepare_for_bid_block`, assembly, the `sign_system_tx` wrapper) land with the miner build
+//! path.
 
 use crate::{
-    consensus::parlia::{consensus::Parlia, util::is_breathe_block, util::calculate_millisecond_timestamp, Snapshot},
+    consensus::parlia::{
+        consensus::Parlia,
+        util::{calculate_millisecond_timestamp, is_breathe_block},
+        Snapshot,
+    },
     hardforks::BscHardforks,
     node::evm::error::{BscBlockExecutionError, BscBlockValidationError},
     system_contracts::{is_invoke_system_contract, VALIDATOR_CONTRACT},
@@ -106,9 +111,9 @@ pub fn is_unsigned_system_tx_candidate(tx: &TransactionSigned) -> bool {
 /// Reports whether `tx` may be blind-signed for a BidBlock: an unsigned candidate targeting the
 /// Validator contract with a signable selector.
 pub fn is_signable_system_tx(tx: &TransactionSigned) -> bool {
-    is_unsigned_system_tx_candidate(tx)
-        && tx.to() == Some(VALIDATOR_CONTRACT)
-        && has_signable_selector(tx.input())
+    is_unsigned_system_tx_candidate(tx) &&
+        tx.to() == Some(VALIDATOR_CONTRACT) &&
+        has_signable_selector(tx.input())
 }
 
 /// The expected trailing system-tx order for an accepted BidBlock:
@@ -168,9 +173,9 @@ pub fn extract_bid_block_deposit_value(txs: &[TransactionSigned]) -> (usize, U25
         system_tx_start = i;
     }
 
-    if system_tx_start > 0
-        && system_tx_start < txs.len()
-        && txs[system_tx_start].input().starts_with(&DEPOSIT_SELECTOR)
+    if system_tx_start > 0 &&
+        system_tx_start < txs.len() &&
+        txs[system_tx_start].input().starts_with(&DEPOSIT_SELECTOR)
     {
         return (system_tx_start, txs[system_tx_start].value());
     }
@@ -337,7 +342,8 @@ mod tests {
             },
         ];
 
-        let ok = [system_tx(DEPOSIT_SELECTOR, 0), system_tx(DISTRIBUTE_FINALITY_REWARD_SELECTOR, 0)];
+        let ok =
+            [system_tx(DEPOSIT_SELECTOR, 0), system_tx(DISTRIBUTE_FINALITY_REWARD_SELECTOR, 0)];
         assert_eq!(verify_system_tx_shape(&ok, &shape), Ok(()));
 
         // Missing the trailing tx.
@@ -399,7 +405,8 @@ mod tests {
         assert_eq!(verify_bid_block_system_txs(&good, &header, &parent, 1), Ok(()));
 
         // A trailing tx with a non-signable selector is rejected.
-        let bad = vec![user_tx, system_tx(DEPOSIT_SELECTOR, 1), system_tx([0xaa, 0xbb, 0xcc, 0xdd], 0)];
+        let bad =
+            vec![user_tx, system_tx(DEPOSIT_SELECTOR, 1), system_tx([0xaa, 0xbb, 0xcc, 0xdd], 0)];
         assert_eq!(
             verify_bid_block_system_txs(&bad, &header, &parent, 1),
             Err(BidBlockSystemTxError::NotSignable { index: 2 })

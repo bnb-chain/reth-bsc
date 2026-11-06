@@ -26,8 +26,8 @@ use std::sync::Arc;
 /// `44 600052 6020 6020 6000 6000 6070 5a fa 50 6040 6000 f3`
 const PROBE_CODE: &[u8] = &hex!("44600052602060206000600060705afa5060406000f3");
 const PROBE_ADDR: Address = Address::new([
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x0b, 0xee, 0xf0,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x0b, 0xee, 0xf0,
 ]);
 
 /// Jenner activation used by the post-activation spec.
@@ -70,8 +70,7 @@ fn head_header() -> alloy_consensus::Header {
 macro_rules! bsc_eth_api {
     ($spec:expr) => {{
         let spec = $spec;
-        let provider = MockEthProvider::<BscPrimitives, _>::new()
-            .with_chain_spec((*spec).clone());
+        let provider = MockEthProvider::<BscPrimitives, _>::new().with_chain_spec((*spec).clone());
         let header = head_header();
         let hash = header.hash_slow();
         provider.add_header(hash, header.clone());
@@ -139,11 +138,8 @@ async fn eth_call_serves_the_head_millisecond_timestamp() {
 async fn eth_call_time_override_resets_the_remainder() {
     let api = bsc_eth_api!(spec(Some(JENNER_AT)));
     let t2 = HEAD_SECS + 10_000;
-    let out = call_probe!(
-        api,
-        Some(BlockOverrides { time: Some(t2), ..Default::default() })
-    )
-    .expect("call should succeed");
+    let out = call_probe!(api, Some(BlockOverrides { time: Some(t2), ..Default::default() }))
+        .expect("call should succeed");
     let (prevrandao, milli) = words(&out);
     assert_eq!(milli, t2 * 1000, "time override resets the remainder to .000");
     assert_eq!(prevrandao, 2, "an untouched 0x44 view must not move");
@@ -152,11 +148,8 @@ async fn eth_call_time_override_resets_the_remainder() {
 #[tokio::test]
 async fn eth_call_time_override_preserves_wrapping_arithmetic() {
     let api = bsc_eth_api!(spec(Some(JENNER_AT)));
-    let out = call_probe!(
-        api,
-        Some(BlockOverrides { time: Some(u64::MAX), ..Default::default() })
-    )
-    .expect("call should succeed");
+    let out = call_probe!(api, Some(BlockOverrides { time: Some(u64::MAX), ..Default::default() }))
+        .expect("call should succeed");
     let (_, milli) = words(&out);
     assert_eq!(milli, u64::MAX.wrapping_mul(1000));
     assert_eq!(milli, 18_446_744_073_709_550_616);
@@ -165,11 +158,9 @@ async fn eth_call_time_override_preserves_wrapping_arithmetic() {
 #[tokio::test]
 async fn eth_call_prev_randao_override_is_the_remainder() {
     let api = bsc_eth_api!(spec(Some(JENNER_AT)));
-    let out = call_probe!(
-        api,
-        Some(BlockOverrides { random: Some(randao(55)), ..Default::default() })
-    )
-    .expect("call should succeed");
+    let out =
+        call_probe!(api, Some(BlockOverrides { random: Some(randao(55)), ..Default::default() }))
+            .expect("call should succeed");
     let (prevrandao, milli) = words(&out);
     assert_eq!(milli, HEAD_SECS * 1000 + 55, "remainder replaced on the original seconds");
     assert_eq!(prevrandao, 55, "0x44 serves the override (go: Random is still replaced)");
@@ -192,11 +183,9 @@ async fn eth_call_combined_override_assembles_both() {
 #[tokio::test]
 async fn eth_call_rejects_out_of_range_prev_randao() {
     let api = bsc_eth_api!(spec(Some(JENNER_AT)));
-    let err = call_probe!(
-        api,
-        Some(BlockOverrides { random: Some(randao(1000)), ..Default::default() })
-    )
-    .expect_err("must be rejected");
+    let err =
+        call_probe!(api, Some(BlockOverrides { random: Some(randao(1000)), ..Default::default() }))
+            .expect_err("must be rejected");
     let msg = err.to_string();
     assert!(msg.contains("must be less than 1000, got 1000"), "unexpected: {msg}");
 }
@@ -224,21 +213,17 @@ async fn pre_jenner_the_precompile_is_an_empty_account_but_validation_applies() 
     // Before activation 0x70 is a plain empty account (the probe's STATICCALL
     // returns no data, so the second word stays zero) …
     let api = bsc_eth_api!(spec(None));
-    let out = call_probe!(
-        api,
-        Some(BlockOverrides { random: Some(randao(55)), ..Default::default() })
-    )
-    .expect("call should succeed");
+    let out =
+        call_probe!(api, Some(BlockOverrides { random: Some(randao(55)), ..Default::default() }))
+            .expect("call should succeed");
     let (prevrandao, milli) = words(&out);
     assert_eq!(milli, 0, "0x70 must behave as an empty account before Jenner");
     assert_eq!(prevrandao, 55, "0x44 still serves the override");
 
     // Validation applies even before the precompile is active.
-    let err = call_probe!(
-        api,
-        Some(BlockOverrides { random: Some(randao(1000)), ..Default::default() })
-    )
-    .expect_err("validation applies before activation too");
+    let err =
+        call_probe!(api, Some(BlockOverrides { random: Some(randao(1000)), ..Default::default() }))
+            .expect_err("validation applies before activation too");
     assert!(err.to_string().contains("must be less than 1000"));
 }
 
@@ -267,10 +252,8 @@ async fn eth_call_many_inherits_the_bsc_semantics() {
         transactions: vec![probe_request()],
         block_override: Some(BlockOverrides { random: Some(randao(1000)), ..Default::default() }),
     };
-    let err = api
-        .call_many(vec![bad], None, Some(probe_state()))
-        .await
-        .expect_err("must be rejected");
+    let err =
+        api.call_many(vec![bad], None, Some(probe_state())).await.expect_err("must be rejected");
     assert!(err.to_string().contains("must be less than 1000"));
 }
 
@@ -278,7 +261,7 @@ async fn eth_call_many_inherits_the_bsc_semantics() {
 async fn eth_estimate_gas_executes_the_precompile() {
     let api = bsc_eth_api!(spec(Some(JENNER_AT)));
     let gas = api
-        .estimate_gas(probe_request(), None, Some(probe_state()))
+        .estimate_gas(probe_request(), None, Some(probe_state()), None)
         .await
         .expect("estimate should succeed");
     assert!(gas > U256::from(21_000u64), "probe + STATICCALL(0x70) must cost more than a transfer");

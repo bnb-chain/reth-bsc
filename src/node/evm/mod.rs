@@ -24,7 +24,8 @@ use reth::{
 use reth_evm::{precompiles::PrecompilesMap, Database, Evm, EvmEnv};
 use revm::{
     context::{
-        result::{EVMError, HaltReason, ResultAndState}, CfgEnv,
+        result::{EVMError, HaltReason, ResultAndState},
+        CfgEnv,
     },
     Context, ExecuteEvm, InspectEvm, Inspector, SystemCallEvm,
 };
@@ -32,6 +33,7 @@ use revm::{
 mod assembler;
 mod builder;
 pub mod config;
+mod finish_metrics;
 pub use config::BscEvmConfig;
 mod executor;
 pub use executor::{BscBlockExecutor, LaneAdmission};

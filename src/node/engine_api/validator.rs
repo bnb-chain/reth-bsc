@@ -9,27 +9,30 @@ use reth::{
     builder::{
         invalid_block_hook::InvalidBlockHookExt,
         rpc::{
-            BasicEngineValidator, ChangesetCache, EngineValidator, EngineValidatorBuilder,
-            PayloadValidatorBuilder,
+            BasicEngineValidator, EngineValidator, EngineValidatorBuilder, PayloadValidatorBuilder,
         },
         AddOnsContext,
     },
-    consensus::ConsensusError,
+    payload::{BuiltPayloadExecutedBlock, PayloadBuilderResources},
 };
 use reth_chain_state::ExecutedBlock;
 use reth_chainspec::EthChainSpec;
 use reth_engine_primitives::{ExecutionPayload, InvalidBlockHooks, PayloadValidator};
 use reth_engine_tree::tree::{
     error::{InsertBlockErrorKind, InsertPayloadError},
-    payload_processor::multiproof::StateRootHandle,
     payload_validator::{TreeCtx, ValidationOutcome},
-    CacheWaitDurations, EngineApiTreeState, SavedCache, WaitForCaches,
+    CacheWaitDurations, EngineApiTreeState, TxPoolPrewarmSource, TxPoolPrewarmTransaction,
+    TxPoolPrewarmTransactions, WaitForCaches,
 };
 use reth_evm::{ConfigureEngineEvm, ConfigureEvm};
+use reth_network_p2p::full_block::SealedBlockWithAccessList;
 use reth_payload_primitives::{InvalidPayloadAttributesError, NewPayloadError, PayloadTypes};
 use reth_primitives_traits::{Block, RecoveredBlock, SealedBlock};
-use reth_provider::HeaderProvider;
-use reth_trie_common::HashedPostState;
+use reth_provider::{HeaderProvider, ProviderResult};
+use reth_storage_overlay::OverlayManager;
+use reth_transaction_pool::{
+    BestTransactions, BestTransactionsAttributes, PoolTransaction, TransactionPool,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -70,7 +73,7 @@ where
         self,
         ctx: &AddOnsContext<'_, Node>,
         tree_config: TreeConfig,
-        changeset_cache: ChangesetCache,
+        overlay_manager: OverlayManager<BscPrimitives>,
     ) -> eyre::Result<Self::EngineValidator> {
         let validator = BscPayloadValidatorBuilder.build(ctx).await?;
         let data_dir = ctx.config.datadir.clone().resolve_datadir(ctx.config.chain.chain());
@@ -86,16 +89,28 @@ where
         let invalid_block_hook =
             InvalidBlockHooks(vec![Box::new(evidence_reporter.clone()), configured_hook]);
 
-        let inner = BasicEngineValidator::new(
+        let txpool_prewarming = tree_config.txpool_prewarming();
+        let mut inner = BasicEngineValidator::new(
             ctx.node.provider().clone(),
             Arc::new(ctx.node.consensus().clone()),
             ctx.node.evm_config().clone(),
             validator,
             tree_config,
             Box::new(invalid_block_hook),
-            changeset_cache,
+            overlay_manager,
             ctx.node.task_executor().clone(),
         );
+        let mining = crate::node::miner::config::get_global_mining_config()
+            .cloned()
+            .unwrap_or_else(crate::node::miner::config::MiningConfig::from_env)
+            .is_mining_enabled();
+        crate::node::miner::prewarm::configure(txpool_prewarming && mining);
+        // Mining owns its attempt-scoped prefetch workers and shared read cache. Running the
+        // canonical-head worker as well would duplicate speculative execution on validators.
+        // Non-mining nodes retain the engine's validation prewarming path.
+        if txpool_prewarming && !mining {
+            inner = inner.with_txpool_prewarming(PoolPrewarmSource(ctx.node.pool().clone()));
+        }
 
         Ok(BscEngineValidatorWithEvidence {
             inner,
@@ -189,7 +204,7 @@ where
 
     fn validate_block(
         &mut self,
-        block: SealedBlock<BscBlock>,
+        block: SealedBlockWithAccessList<BscBlock>,
         ctx: TreeCtx<'_, BscPrimitives>,
     ) -> ValidationOutcome<BscPrimitives> {
         let outcome = self.inner.validate_block(block, ctx);
@@ -197,21 +212,25 @@ where
         outcome
     }
 
-    fn on_inserted_executed_block(&self, block: ExecutedBlock<BscPrimitives>) {
+    fn on_inserted_executed_block(
+        &self,
+        block: BuiltPayloadExecutedBlock<BscPrimitives>,
+    ) -> ProviderResult<ExecutedBlock<BscPrimitives>> {
         self.inner.on_inserted_executed_block(block)
     }
 
-    fn cache_for(&self, block_hash: B256) -> Option<SavedCache> {
-        self.inner.cache_for(block_hash)
+    fn on_canonical_head_changed(&self, hash: B256, state: &EngineApiTreeState<BscPrimitives>) {
+        self.inner.on_canonical_head_changed(hash, state)
     }
 
-    fn sparse_trie_handle_for(
+    fn payload_builder_resources(
         &self,
         parent_hash: B256,
-        parent_state_root: B256,
-        state: &EngineApiTreeState<BscPrimitives>,
-    ) -> Option<StateRootHandle> {
-        self.inner.sparse_trie_handle_for(parent_hash, parent_state_root, state)
+        parent_header: &alloy_consensus::Header,
+        timestamp: u64,
+        state: &mut EngineApiTreeState<BscPrimitives>,
+    ) -> PayloadBuilderResources {
+        self.inner.payload_builder_resources(parent_hash, parent_header, timestamp, state)
     }
 }
 
@@ -222,6 +241,44 @@ where
 {
     fn wait_for_caches(&self) -> CacheWaitDurations {
         self.inner.wait_for_caches()
+    }
+}
+
+/// Transaction-pool candidates for engine cache prewarming (`--engine.txpool-prewarming`).
+#[derive(Debug)]
+struct PoolPrewarmSource<Pool>(Pool);
+
+impl<Pool> TxPoolPrewarmSource<BscPrimitives> for PoolPrewarmSource<Pool>
+where
+    Pool: TransactionPool<
+            Transaction: PoolTransaction<Consensus = reth_primitives_traits::TxTy<BscPrimitives>>,
+        > + Clone
+        + Send
+        + Sync
+        + std::fmt::Debug
+        + 'static,
+{
+    fn best_transactions(
+        &self,
+        parent_hash: B256,
+    ) -> Option<TxPoolPrewarmTransactions<BscPrimitives>> {
+        let block_info = self.0.block_info();
+        if block_info.last_seen_block_hash != parent_hash {
+            return None
+        }
+
+        let mut best = self.0.best_transactions_with_attributes(BestTransactionsAttributes::new(
+            block_info.pending_basefee,
+            block_info.pending_blob_fee.map(|fee| u64::try_from(fee).unwrap_or(u64::MAX)),
+        ));
+        best.allow_updates_out_of_order();
+        best.skip_blobs();
+
+        Some(Box::new(best.map(|transaction| TxPoolPrewarmTransaction {
+            hash: *transaction.hash(),
+            sender: transaction.sender(),
+            transaction: transaction.transaction.clone_into_consensus(),
+        })))
     }
 }
 
@@ -241,7 +298,9 @@ impl BscEngineValidator {
 fn payload_failed_locally(outcome: &ValidationOutcome<BscPrimitives>) -> bool {
     let Err(InsertPayloadError::Block(error)) = outcome else { return false };
     match error.kind() {
-        InsertBlockErrorKind::Consensus(_) => false,
+        InsertBlockErrorKind::Consensus(_) | InsertBlockErrorKind::BlockAccessListDecode(_) => {
+            false
+        }
         InsertBlockErrorKind::Execution(error) => error.as_internal().is_some(),
         InsertBlockErrorKind::Provider(_) | InsertBlockErrorKind::Other(_) => true,
     }
@@ -286,6 +345,13 @@ impl BscExecutionData {
 impl From<BscBlock> for BscExecutionData {
     fn from(block: BscBlock) -> Self {
         Self::new(block)
+    }
+}
+
+impl From<crate::node::engine::BscBuiltPayload> for BscExecutionData {
+    fn from(payload: crate::node::engine::BscBuiltPayload) -> Self {
+        let hash = payload.block.hash();
+        Self::new_with_hash(payload.block.clone_block(), hash)
     }
 }
 
@@ -368,14 +434,6 @@ impl PayloadValidator<BscPayloadTypes> for BscEngineValidator {
         let sealed_block = self.convert_payload_to_block(payload)?;
         sealed_block.try_recover().map_err(|e| NewPayloadError::Other(e.into()))
     }
-
-    fn validate_block_post_execution_with_hashed_state(
-        &self,
-        _state_updates: &HashedPostState,
-        _block: &RecoveredBlock<Self::Block>,
-    ) -> Result<(), ConsensusError> {
-        Ok(())
-    }
 }
 
 /// Execution payload validator.
@@ -422,6 +480,7 @@ where
 mod tests {
     use super::*;
     use crate::{consensus::payment_lane::LaneError, node::evm::error::lane_reject};
+    use reth::consensus::ConsensusError;
     use reth_engine_tree::tree::error::InsertBlockError;
 
     #[test]
@@ -445,6 +504,15 @@ mod tests {
             ),
             (InsertBlockErrorKind::Consensus(ConsensusError::RequestsHashMissing), false),
             (
+                InsertBlockErrorKind::BlockAccessListDecode(
+                    reth_engine_primitives::BlockAccessListDecodeError::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "malformed access list",
+                    )),
+                ),
+                false,
+            ),
+            (
                 InsertBlockErrorKind::Provider(reth_provider::ProviderError::StateForHashNotFound(
                     B256::ZERO,
                 )),
@@ -459,7 +527,10 @@ mod tests {
         let malformed =
             Err(InsertPayloadError::Payload(PayloadError::InvalidVersionedHashes.into()));
         assert!(!payload_failed_locally(&malformed));
-        assert!(!payload_failed_locally(&Ok((ExecutedBlock::default(), None))));
+        assert!(!payload_failed_locally(&Ok(reth_engine_tree::tree::ValidationOutput {
+            executed_block: ExecutedBlock::default(),
+            execution_timing_stats: None,
+        })));
     }
 
     #[test]

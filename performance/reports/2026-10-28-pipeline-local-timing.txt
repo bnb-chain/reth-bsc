@@ -1,0 +1,5 @@
+running 1 test
+controlled milliseconds: ordinary=[450, 900, 1500]; private_ready=[400, 1000]; pipeline_publication=[450, 900, 1350]; publication_gain=150ms
+test node::miner::pipeline::tests::controlled_timing_buffers_an_isolated_slow_block_without_early_publication ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 878 filtered out; finished in 0.00s

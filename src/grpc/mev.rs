@@ -1,12 +1,14 @@
 //! BEP-675 BidBlock gRPC ingress compatible with go-bsc.
 
-use crate::grpc::mev_proto::{
-    bid_block_service_server::{BidBlockService, BidBlockServiceServer},
-    BidBlockRequest, BidBlockResponse,
+use crate::{
+    grpc::mev_proto::{
+        bid_block_service_server::{BidBlockService, BidBlockServiceServer},
+        BidBlockRequest, BidBlockResponse,
+    },
+    metrics::BscMevGrpcMetrics,
+    node::miner::bid_block::{BidBlock, BidBlockArgs},
+    rpc::mev::MevApiImpl,
 };
-use crate::metrics::BscMevGrpcMetrics;
-use crate::node::miner::bid_block::{BidBlock, BidBlockArgs};
-use crate::rpc::mev::MevApiImpl;
 use alloy_primitives::{Bytes as AlloyBytes, B256};
 use alloy_rlp::Decodable;
 use async_trait::async_trait;
@@ -14,21 +16,26 @@ use bytes::Bytes;
 use futures::FutureExt;
 use jsonrpsee::types::ErrorObjectOwned;
 use prost::Message;
-use std::any::Any;
-use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
-use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
-use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
-use tokio::task::JoinHandle;
+use std::{
+    any::Any,
+    collections::HashMap,
+    net::SocketAddr,
+    panic::AssertUnwindSafe,
+    sync::Arc,
+    task::{Context, Poll},
+    time::{Duration, Instant},
+};
+use tokio::{
+    sync::{oneshot, OwnedSemaphorePermit, Semaphore},
+    task::JoinHandle,
+};
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::codegen::{http, BoxFuture, Service};
-use tonic::service::interceptor::InterceptedService;
-use tonic::service::Interceptor;
-use tonic::transport::Server;
-use tonic::{Code, Request, Response, Status};
+use tonic::{
+    codegen::{http, BoxFuture, Service},
+    service::{interceptor::InterceptedService, Interceptor},
+    transport::Server,
+    Code, Request, Response, Status,
+};
 use tonic_health::ServingStatus;
 
 /// `/mev.v1.BidBlockService/SendBidBlock`, matching go-bsc's public protobuf contract.
@@ -285,8 +292,8 @@ impl MevGrpcApi {
 
         let decode_started = Instant::now();
         let mut encoded = request.bid_block_rlp.as_slice();
-        let bid_block =
-            BidBlock::decode(&mut encoded).map_err(|_| mev_status(-38001, "invalid BidBlock RLP"))?;
+        let bid_block = BidBlock::decode(&mut encoded)
+            .map_err(|_| mev_status(-38001, "invalid BidBlock RLP"))?;
         self.metrics.decode_duration_seconds.record(decode_started.elapsed().as_secs_f64());
         if !encoded.is_empty() {
             return Err(mev_status(-38001, "invalid BidBlock RLP"));

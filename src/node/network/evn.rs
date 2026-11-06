@@ -1,5 +1,8 @@
 use alloy_primitives::Address;
-use std::sync::{OnceLock, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    OnceLock,
+};
 use tokio::sync::broadcast;
 
 /// EVN configuration
@@ -17,7 +20,9 @@ pub struct EvnConfig {
 static GLOBAL_EVN_CONFIG: OnceLock<EvnConfig> = OnceLock::new();
 
 /// Sets the global EVN config. Returns an error if already set.
-pub fn set_global_evn_config(cfg: EvnConfig) -> Result<(), EvnConfig> { GLOBAL_EVN_CONFIG.set(cfg) }
+pub fn set_global_evn_config(cfg: EvnConfig) -> Result<(), EvnConfig> {
+    GLOBAL_EVN_CONFIG.set(cfg)
+}
 
 /// Convenience: set only enabled flag.
 pub fn set_global_evn_enabled(enabled: bool) -> Result<(), bool> {
@@ -30,7 +35,9 @@ pub fn set_global_evn_enabled(enabled: bool) -> Result<(), bool> {
 }
 
 /// Returns the global EVN config if set.
-pub fn get_global_evn_config() -> Option<&'static EvnConfig> { GLOBAL_EVN_CONFIG.get() }
+pub fn get_global_evn_config() -> Option<&'static EvnConfig> {
+    GLOBAL_EVN_CONFIG.get()
+}
 
 /// Returns true if EVN is enabled globally either via explicit global set or
 /// via environment variable fallback.
@@ -62,10 +69,14 @@ pub fn set_evn_synced(synced: bool) {
 }
 
 /// Returns whether EVN is considered synced/armed.
-pub fn is_evn_synced() -> bool { EVN_SYNCED.load(Ordering::Relaxed) }
+pub fn is_evn_synced() -> bool {
+    EVN_SYNCED.load(Ordering::Relaxed)
+}
 
 /// EVN is ready only when enabled and synced (post-initial-sync)
-pub fn is_evn_ready() -> bool { is_evn_enabled() && is_evn_synced() }
+pub fn is_evn_ready() -> bool {
+    is_evn_enabled() && is_evn_synced()
+}
 
 /// Returns a receiver for EVN armed notifications; creates the channel if missing.
 pub fn subscribe_evn_armed() -> broadcast::Receiver<()> {

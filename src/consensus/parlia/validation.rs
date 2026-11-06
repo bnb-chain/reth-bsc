@@ -1,20 +1,21 @@
-use reth::consensus::{Consensus, ConsensusError, HeaderValidator};
-use reth::primitives::SealedHeader;
-use reth_chainspec::{EthChainSpec, EthereumHardforks, EthereumHardfork};
-use crate::consensus::parlia::util::calculate_millisecond_timestamp;
-use crate::hardforks::BscHardforks;
-use crate::consensus::eip4844::is_blob_eligible_block;
 use super::{Parlia, EMPTY_WITHDRAWALS_HASH};
+use crate::{
+    consensus::{eip4844::is_blob_eligible_block, parlia::util::calculate_millisecond_timestamp},
+    hardforks::BscHardforks,
+    BscBlock,
+};
 use alloy_consensus::{Header, Transaction, EMPTY_OMMER_ROOT_HASH};
-use alloy_primitives::B256;
-use reth_primitives_traits::GotExpected;
 use alloy_eips::eip4844::{DATA_GAS_PER_BLOB, MAX_DATA_GAS_PER_BLOCK_DENCUN};
-use crate::BscBlock;
-use reth_primitives_traits::Block;
+use alloy_primitives::B256;
+use reth::{
+    consensus::{Consensus, ConsensusError, HeaderValidator},
+    primitives::SealedHeader,
+};
+use reth_chainspec::{EthChainSpec, EthereumHardfork, EthereumHardforks};
+use reth_primitives_traits::{Block, GotExpected};
 use std::{sync::Arc, time::SystemTime};
 
 const MAX_RLP_BLOCK_SIZE_OSAKA: usize = 8 * 1024 * 1024;
-
 
 pub const fn validate_header_gas(header: &Header) -> Result<(), ConsensusError> {
     if header.gas_used > header.gas_limit {
@@ -118,7 +119,9 @@ fn validate_mix_digest_for_parlia(
 ) -> Result<(), ConsensusError> {
     if !lorentz_active {
         if header.mix_hash != B256::ZERO {
-            return Err(ConsensusError::Other(Arc::new(std::io::Error::other("non-zero mix digest"))));
+            return Err(ConsensusError::Other(Arc::new(std::io::Error::other(
+                "non-zero mix digest",
+            ))));
         }
         return Ok(());
     }
@@ -144,9 +147,7 @@ fn validate_withdrawals_root_for_bsc(
         return Ok(());
     }
 
-    let got = header
-        .withdrawals_root
-        .ok_or(ConsensusError::WithdrawalsRootMissing)?;
+    let got = header.withdrawals_root.ok_or(ConsensusError::WithdrawalsRootMissing)?;
     if got != EMPTY_WITHDRAWALS_HASH {
         return Err(ConsensusError::BodyWithdrawalsRootDiff(
             GotExpected { got, expected: EMPTY_WITHDRAWALS_HASH }.into(),
@@ -199,7 +200,9 @@ fn validate_optional_trailing_fields_for_bsc(header: &SealedHeader) -> Result<()
     Ok(())
 }
 
-impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 'static> Parlia<ChainSpec> {
+impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 'static>
+    Parlia<ChainSpec>
+{
     /// The standalone checks of go-bsc `VerifyUnsealedHeader`, in its order. Extra data is not
     /// checked (a BidBlock's is replaced by the validator's), nor is the future-timestamp bound
     /// (a bid targets the next slot).
@@ -217,12 +220,12 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
 
         if self.spec.is_bohr_active_at_timestamp(header.number, header.timestamp) {
             if header.parent_beacon_block_root.is_none() ||
-               header.parent_beacon_block_root.unwrap() != B256::default()
+                header.parent_beacon_block_root.unwrap() != B256::default()
             {
                 return Err(ConsensusError::ParentBeaconBlockRootUnexpected)
             }
         } else if header.parent_beacon_block_root.is_some() {
-           return Err(ConsensusError::ParentBeaconBlockRootUnexpected)
+            return Err(ConsensusError::ParentBeaconBlockRootUnexpected)
         }
 
         let prague_active =
@@ -255,7 +258,9 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
     }
 }
 
-impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 'static> HeaderValidator for Parlia<ChainSpec> {
+impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 'static>
+    HeaderValidator for Parlia<ChainSpec>
+{
     fn validate_header(&self, header: &SealedHeader) -> Result<(), ConsensusError> {
         validate_header_not_from_future(header, present_unix_seconds())?;
 
@@ -274,8 +279,9 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
     }
 }
 
-
-impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 'static> Consensus<BscBlock> for Parlia<ChainSpec> {
+impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 'static>
+    Consensus<BscBlock> for Parlia<ChainSpec>
+{
     fn validate_body_against_header(
         &self,
         _body: &<BscBlock as Block>::Body,
@@ -311,8 +317,8 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
 
         // EIP-4844: Shard Blob Transactions
         if BscHardforks::is_cancun_active_at_timestamp(&*self.spec, block.number, block.timestamp) {
-            if !is_blob_eligible_block(&*self.spec, block.number, block.timestamp)
-                && block.body().transactions().any(|tx| tx.is_eip4844())
+            if !is_blob_eligible_block(&*self.spec, block.number, block.timestamp) &&
+                block.body().transactions().any(|tx| tx.is_eip4844())
             {
                 return Err(ConsensusError::Other(Arc::new(std::io::Error::other(
                     "blob transactions not allowed in this block",
@@ -322,11 +328,8 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
             // each blob tx
             let header_blob_gas_used =
                 block.blob_gas_used.ok_or(ConsensusError::BlobGasUsedMissing)?;
-            let total_blob_gas: u64 = block
-                .body()
-                .transactions()
-                .map(|tx| tx.blob_gas_used().unwrap_or(0))
-                .sum();
+            let total_blob_gas: u64 =
+                block.body().transactions().map(|tx| tx.blob_gas_used().unwrap_or(0)).sum();
             if total_blob_gas != header_blob_gas_used {
                 return Err(ConsensusError::BlobGasUsedDiff(GotExpected {
                     got: header_blob_gas_used,
@@ -372,11 +375,8 @@ mod tests {
         // 999ms remainder => valid
         let mut valid_mix = [0u8; 32];
         valid_mix[24..].copy_from_slice(&999u64.to_be_bytes());
-        let header = sealed(Header {
-            timestamp: 10,
-            mix_hash: B256::from(valid_mix),
-            ..Default::default()
-        });
+        let header =
+            sealed(Header { timestamp: 10, mix_hash: B256::from(valid_mix), ..Default::default() });
         assert!(validate_mix_digest_for_parlia(&header, true).is_ok());
 
         // 1000ms remainder => invalid (would spill into next second)
@@ -435,7 +435,8 @@ mod tests {
             Err(ConsensusError::WithdrawalsRootMissing)
         ));
 
-        let header = sealed(Header { withdrawals_root: Some(B256::from([1u8; 32])), ..Default::default() });
+        let header =
+            sealed(Header { withdrawals_root: Some(B256::from([1u8; 32])), ..Default::default() });
         assert!(validate_withdrawals_root_for_bsc(&header, true).is_err());
 
         let header =
@@ -462,7 +463,8 @@ mod tests {
             Err(ConsensusError::RequestsHashMissing)
         ));
 
-        let header = sealed(Header { requests_hash: Some(B256::from([2u8; 32])), ..Default::default() });
+        let header =
+            sealed(Header { requests_hash: Some(B256::from([2u8; 32])), ..Default::default() });
         assert!(validate_requests_hash_for_bsc(&header, true).is_ok());
         assert!(matches!(
             validate_requests_hash_for_bsc(&header, false),
@@ -519,7 +521,8 @@ mod tests {
     fn unsealed_header_fields_rejects_trailing_optional_fields() {
         use crate::chainspec::BscChainSpec;
         use reth_chainspec::ChainSpecBuilder;
-        let parlia = Parlia::new(Arc::new(BscChainSpec::from(ChainSpecBuilder::mainnet().build())), 200);
+        let parlia =
+            Parlia::new(Arc::new(BscChainSpec::from(ChainSpecBuilder::mainnet().build())), 200);
 
         // Non-epoch height, vanity+seal extra data, pre-Cancun timestamp: every other optional
         // field is legitimately absent, so this header's only variable is the one under test.
@@ -534,10 +537,8 @@ mod tests {
             .validate_unsealed_header_fields(&sealed(valid.clone()))
             .expect("baseline header must pass");
 
-        let with_bal = Header {
-            block_access_list_hash: Some(B256::from([4u8; 32])),
-            ..valid.clone()
-        };
+        let with_bal =
+            Header { block_access_list_hash: Some(B256::from([4u8; 32])), ..valid.clone() };
         let err = parlia
             .validate_unsealed_header_fields(&sealed(with_bal))
             .expect_err("BlockAccessListHash must be rejected")
@@ -561,7 +562,8 @@ mod tests {
     fn unsealed_header_fields_skips_wall_clock_future_check() {
         use crate::chainspec::BscChainSpec;
         use reth_chainspec::ChainSpecBuilder;
-        let parlia = Parlia::new(Arc::new(BscChainSpec::from(ChainSpecBuilder::mainnet().build())), 200);
+        let parlia =
+            Parlia::new(Arc::new(BscChainSpec::from(ChainSpecBuilder::mainnet().build())), 200);
 
         // Far-future timestamp AND empty extra (so check_header_extra would also reject). The
         // discriminating signal is *which* error each path returns first.
@@ -569,7 +571,10 @@ mod tests {
 
         // Sync path: the future bound is checked first → TimestampIsInFuture.
         assert!(
-            matches!(parlia.validate_header(&header), Err(ConsensusError::TimestampIsInFuture { .. })),
+            matches!(
+                parlia.validate_header(&header),
+                Err(ConsensusError::TimestampIsInFuture { .. })
+            ),
             "sync validate_header must reject a future timestamp"
         );
 

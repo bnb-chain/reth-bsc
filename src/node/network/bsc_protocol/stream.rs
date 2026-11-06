@@ -4,13 +4,16 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use reth_eth_wire::multiplex::ProtocolConnection;
 use reth_network_api::PeerId;
-use std::{collections::HashMap, sync::Arc};
 use std::{
+    collections::HashMap,
     pin::Pin,
+    sync::Arc,
     task::{ready, Context, Poll},
 };
-use tokio::sync::{mpsc::UnboundedReceiver, oneshot};
-use tokio::time::Duration;
+use tokio::{
+    sync::{mpsc::UnboundedReceiver, oneshot},
+    time::Duration,
+};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 /// TTL for pending range requests before being pruned
@@ -72,11 +75,13 @@ impl VoteRateLimiter {
 }
 
 use super::protocol::proto::BscProtoMessageId;
-use crate::node::network::blocks_by_range::{
-    build_blocks_by_range_response, BlocksByRangePacket, GetBlocksByRangePacket,
-    MAX_REQUEST_RANGE_BLOCKS_COUNT,
+use crate::node::network::{
+    blocks_by_range::{
+        build_blocks_by_range_response, BlocksByRangePacket, GetBlocksByRangePacket,
+        MAX_REQUEST_RANGE_BLOCKS_COUNT,
+    },
+    votes::{handle_votes_broadcast, BscCapPacket, VotesPacket},
 };
-use crate::node::network::votes::{handle_votes_broadcast, BscCapPacket, VotesPacket};
 
 /// Commands that can be sent to the BSC connection.
 #[allow(dead_code)]
@@ -379,9 +384,8 @@ impl BscProtocolConnection {
                 }
             }
             x if x == BscProtoMessageId::BlocksByRange as u8 => {
-                match crate::node::network::blocks_by_range::decode_blocks_by_range(
-                    &mut &slice[..],
-                ) {
+                match crate::node::network::blocks_by_range::decode_blocks_by_range(&mut &slice[..])
+                {
                     Ok(res) => {
                         tracing::debug!(
                             target: "bsc_protocol",
@@ -597,8 +601,13 @@ mod tests {
         pending.insert(7u64, (tx, std::time::Instant::now()));
 
         let frame = frame_of(BlocksByRangePacket { request_id: 7, blocks: Vec::new() });
-        let reply =
-            BscProtocolConnection::dispatch(&frame, &mut pending, None, 2, &mut VoteRateLimiter::new());
+        let reply = BscProtocolConnection::dispatch(
+            &frame,
+            &mut pending,
+            None,
+            2,
+            &mut VoteRateLimiter::new(),
+        );
 
         assert!(reply.is_none(), "a range response needs no reply");
         assert!(pending.is_empty(), "the waiter must be consumed");
@@ -636,7 +645,10 @@ mod tests {
     #[test]
     fn vote_rate_limiter_admits_exactly_the_budget() {
         let mut l = VoteRateLimiter::new();
-        assert!(!l.is_over_limit_after_receiving(VOTE_RATE_LIMIT_PER_PERIOD), "budget itself must pass");
+        assert!(
+            !l.is_over_limit_after_receiving(VOTE_RATE_LIMIT_PER_PERIOD),
+            "budget itself must pass"
+        );
         assert!(l.is_over_limit_after_receiving(1), "one vote past the budget must trip");
     }
 
@@ -657,7 +669,10 @@ mod tests {
         assert!(l.is_over_limit_after_receiving(VOTE_RATE_LIMIT_PER_PERIOD + 1));
 
         l.force_period_expiry();
-        assert!(!l.is_over_limit_after_receiving(VOTE_RATE_LIMIT_PER_PERIOD + 1), "window roll allows");
+        assert!(
+            !l.is_over_limit_after_receiving(VOTE_RATE_LIMIT_PER_PERIOD + 1),
+            "window roll allows"
+        );
         assert_eq!(l.period_counter, 0, "the rolling packet is not charged");
         assert!(!l.is_over_limit_after_receiving(VOTE_RATE_LIMIT_PER_PERIOD), "fresh budget");
     }
@@ -685,7 +700,6 @@ mod tests {
         );
         assert_eq!(votes::len(), before + 1, "peer must be served after the window rolls");
     }
-
 
     /// Only the first vote of a packet is admitted, and that is correct.
     ///
@@ -742,5 +756,4 @@ mod tests {
             );
         }
     }
-
 }

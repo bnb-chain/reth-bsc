@@ -222,9 +222,7 @@ impl BidBlockPermissionManager {
     }
 
     fn system_clock() -> Box<dyn Fn() -> u64 + Send + Sync> {
-        Box::new(|| {
-            SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
-        })
+        Box::new(|| SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0))
     }
 
     /// Restores the journal. Expired records are kept for `violation_count`; only active ones deny.
@@ -296,7 +294,13 @@ impl BidBlockPermissionManager {
     }
 
     /// Deny `builder` for the default lockout window.
-    pub fn revoke(&self, builder: Address, reason: impl Into<String>, block_hash: B256, block_num: u64) {
+    pub fn revoke(
+        &self,
+        builder: Address,
+        reason: impl Into<String>,
+        block_hash: B256,
+        block_num: u64,
+    ) {
         self.revoke_for(builder, reason, block_hash, block_num, BID_BLOCK_REVOKE_DURATION_SECS);
     }
 
@@ -350,9 +354,8 @@ impl BidBlockPermissionManager {
         let duration_secs =
             if duration_secs == 0 { BID_BLOCK_REVOKE_DURATION_SECS } else { duration_secs };
         let duration_secs = match revoked.get(&builder) {
-            Some(rec) if rec.is_active(now) => {
-                duration_secs.max(rec.revoked_at.saturating_add(rec.duration_secs).saturating_sub(now))
-            }
+            Some(rec) if rec.is_active(now) => duration_secs
+                .max(rec.revoked_at.saturating_add(rec.duration_secs).saturating_sub(now)),
             _ => duration_secs,
         };
         revoked.insert(
@@ -489,7 +492,13 @@ mod tests {
     fn revoke_for_uses_custom_duration_and_defaults_on_zero() {
         let (mgr, now) = manager_with_fake_clock();
 
-        mgr.revoke_for(BUILDER, "gas price", B256::ZERO, 7, BID_BLOCK_GAS_PRICE_LOW_REVOKE_DURATION_SECS);
+        mgr.revoke_for(
+            BUILDER,
+            "gas price",
+            B256::ZERO,
+            7,
+            BID_BLOCK_GAS_PRICE_LOW_REVOKE_DURATION_SECS,
+        );
         assert_eq!(
             mgr.get_status(BUILDER).reset_at,
             1_000 + BID_BLOCK_GAS_PRICE_LOW_REVOKE_DURATION_SECS
@@ -629,8 +638,8 @@ mod tests {
 
     /// Fresh journal path in a per-test temp directory (the go `testJournalPath` counterpart).
     fn test_journal_path(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("bid-block-revokes-{}-{name}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("bid-block-revokes-{}-{name}", std::process::id()));
         // A stale directory from an aborted earlier run must not leak state into this one.
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create test journal dir");
@@ -785,8 +794,14 @@ mod tests {
 
         let blob = String::from_utf8(std::fs::read(&path).expect("read journal")).unwrap();
         for key in [
-            "\"version\"", "\"revokes\"", "\"revokedAt\"", "\"duration\"", "\"reason\"",
-            "\"blockHash\"", "\"blockNum\"", "\"violationCount\"",
+            "\"version\"",
+            "\"revokes\"",
+            "\"revokedAt\"",
+            "\"duration\"",
+            "\"reason\"",
+            "\"blockHash\"",
+            "\"blockNum\"",
+            "\"violationCount\"",
         ] {
             assert!(blob.contains(key), "missing journal key {key}; got: {blob}");
         }

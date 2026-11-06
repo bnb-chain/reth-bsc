@@ -33,9 +33,9 @@ pub fn head() -> Head {
 #[cfg(test)]
 mod tests {
     use super::head;
+    use crate::chainspec::local::bsc_local;
     use alloy_primitives::hex;
     use reth_chainspec::{ForkHash, ForkId};
-    use crate::chainspec::local::bsc_local;
 
     #[test]
     fn can_create_forkid() {

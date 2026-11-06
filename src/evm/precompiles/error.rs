@@ -1,5 +1,5 @@
-use std::borrow::Cow;
 use revm::precompile::PrecompileHalt;
+use std::borrow::Cow;
 
 /// BSC specific precompile errors.
 #[derive(Debug, PartialEq)]
@@ -17,7 +17,9 @@ pub enum BscPrecompileError {
 impl From<BscPrecompileError> for PrecompileHalt {
     fn from(error: BscPrecompileError) -> Self {
         match error {
-            BscPrecompileError::InvalidInput => PrecompileHalt::Other(Cow::Borrowed("invalid input")),
+            BscPrecompileError::InvalidInput => {
+                PrecompileHalt::Other(Cow::Borrowed("invalid input"))
+            }
             BscPrecompileError::CometBftApplyBlockFailed => {
                 PrecompileHalt::Other(Cow::Borrowed("apply block failed"))
             }

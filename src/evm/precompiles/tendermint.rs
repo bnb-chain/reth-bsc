@@ -3,35 +3,56 @@
 use alloy_primitives::Bytes;
 use parity_bytes::BytesRef;
 use revm::precompile::{
-    u64_to_address, PrecompileHalt, PrecompileOutput, PrecompileResult, Precompile, PrecompileId,
+    u64_to_address, Precompile, PrecompileHalt, PrecompileId, PrecompileOutput, PrecompileResult,
 };
 use std::borrow::Cow;
 use tendermint::lite::light_client;
 
 /// Tendermint precompile for BSC.
-pub(crate) const TENDERMINT_HEADER_VALIDATION: Precompile =
-    Precompile::new(PrecompileId::Custom(Cow::Borrowed("HEADER_VALIDATE")), u64_to_address(100), tendermint_header_validation_run);
+pub(crate) const TENDERMINT_HEADER_VALIDATION: Precompile = Precompile::new(
+    PrecompileId::Custom(Cow::Borrowed("HEADER_VALIDATE")),
+    u64_to_address(100),
+    tendermint_header_validation_run,
+);
 
 /// Tendermint precompile for BSC after Nano hardfork.
-pub(crate) const TENDERMINT_HEADER_VALIDATION_NANO: Precompile =
-    Precompile::new(PrecompileId::Custom(Cow::Borrowed("HEADER_VALIDATE_NANO")), u64_to_address(100), tendermint_header_validation_run_nano);
+pub(crate) const TENDERMINT_HEADER_VALIDATION_NANO: Precompile = Precompile::new(
+    PrecompileId::Custom(Cow::Borrowed("HEADER_VALIDATE_NANO")),
+    u64_to_address(100),
+    tendermint_header_validation_run_nano,
+);
 
 /// Tendermint precompile disabled from Pasteur (legacy v1 light client deprecated).
-pub(crate) const TENDERMINT_HEADER_VALIDATION_DEPRECATED: Precompile =
-    Precompile::new(PrecompileId::Custom(Cow::Borrowed("HEADER_VALIDATE_DEPRECATED")), u64_to_address(100), tendermint_header_validation_run_deprecated);
+pub(crate) const TENDERMINT_HEADER_VALIDATION_DEPRECATED: Precompile = Precompile::new(
+    PrecompileId::Custom(Cow::Borrowed("HEADER_VALIDATE_DEPRECATED")),
+    u64_to_address(100),
+    tendermint_header_validation_run_deprecated,
+);
 
 /// Run the Tendermint header validation precompile after Nano hardfork.
-fn tendermint_header_validation_run_nano(_input: &[u8], _gas_limit: u64, reservoir: u64) -> PrecompileResult {
+fn tendermint_header_validation_run_nano(
+    _input: &[u8],
+    _gas_limit: u64,
+    reservoir: u64,
+) -> PrecompileResult {
     Ok(PrecompileOutput::halt(PrecompileHalt::other("suspended"), reservoir))
 }
 
 /// Run the deprecated (Pasteur) Tendermint header validation precompile: rejects all input.
-fn tendermint_header_validation_run_deprecated(_input: &[u8], _gas_limit: u64, reservoir: u64) -> PrecompileResult {
+fn tendermint_header_validation_run_deprecated(
+    _input: &[u8],
+    _gas_limit: u64,
+    reservoir: u64,
+) -> PrecompileResult {
     Ok(PrecompileOutput::halt(PrecompileHalt::other("deprecated"), reservoir))
 }
 
 /// Run the Tendermint header validation precompile.
-fn tendermint_header_validation_run(input: &[u8], gas_limit: u64, reservoir: u64) -> PrecompileResult {
+fn tendermint_header_validation_run(
+    input: &[u8],
+    gas_limit: u64,
+    reservoir: u64,
+) -> PrecompileResult {
     const TENDERMINT_HEADER_VALIDATION_BASE: u64 = 3_000;
 
     if TENDERMINT_HEADER_VALIDATION_BASE > gas_limit {
@@ -42,7 +63,11 @@ fn tendermint_header_validation_run(input: &[u8], gas_limit: u64, reservoir: u64
     let mut bytes = BytesRef::Flexible(&mut output);
     let res = light_client::TmHeaderVerifier::execute(input, &mut bytes);
     match res {
-        Ok(()) => Ok(PrecompileOutput::new(TENDERMINT_HEADER_VALIDATION_BASE, Bytes::from(output), reservoir)),
+        Ok(()) => Ok(PrecompileOutput::new(
+            TENDERMINT_HEADER_VALIDATION_BASE,
+            Bytes::from(output),
+            reservoir,
+        )),
         Err(str) => Ok(PrecompileOutput::halt(PrecompileHalt::other(str), reservoir)),
     }
 }
