@@ -9,9 +9,12 @@ use crate::{
     chainspec::BscChainSpec,
     consensus::{parlia::vote_pool, ParliaConsensusErr},
     node::{
-        consensus::BscForkChoiceEngine, engine::BscBuiltPayload,
-        engine_api::payload::BscPayloadTypes, evm::util::insert_header_to_cache_with_hash,
-        miner::startup_diagnostics, network::BscNewBlock,
+        consensus::{BscConsensus, BscForkChoiceEngine},
+        engine::BscBuiltPayload,
+        engine_api::payload::BscPayloadTypes,
+        evm::util::insert_header_to_cache_with_hash,
+        miner::startup_diagnostics,
+        network::BscNewBlock,
     },
     BscBlock, BscBlockBody,
 };
@@ -35,7 +38,7 @@ use reth_network_api::{PeerId, Peers, ReputationChangeKind};
 use reth_node_ethereum::EthEngineTypes;
 use reth_payload_builder_primitives::Events;
 use reth_payload_primitives::{BuiltPayload, PayloadTypes};
-use reth_primitives_traits::{AlloyBlockHeader, Block, NodePrimitives, SealedBlock};
+use reth_primitives_traits::{AlloyBlockHeader, Block, NodePrimitives, SealedBlock, SealedHeader};
 use reth_provider::{
     BlockHashReader, BlockNumReader, BlockReaderIdExt, HeaderProvider, ReceiptProvider,
 };
@@ -124,6 +127,8 @@ where
     engine: ConsensusEngineHandle<BscPayloadTypes>,
     /// The fork choice engine for BSC
     forkchoice_engine: BscForkChoiceEngine<Provider>,
+    /// Cheap header/parent checks before diffusion, without waiting for child execution.
+    propagation_consensus: BscConsensus<BscChainSpec>,
     /// Receive the new block from the network
     from_network: Receiver<IncomingBlock>,
     /// Local blocks, isolated from remote ingress and backpressured by propagation.
@@ -307,6 +312,7 @@ where
         from_hashes: Receiver<IncomingHashes>,
         to_network: PropagationSender,
     ) -> Self {
+        let propagation_consensus = BscConsensus::new(chain_spec.clone());
         let forkchoice_engine = BscForkChoiceEngine::new(provider, engine.clone(), chain_spec);
 
         if let Err(e) = crate::shared::set_fork_choice_engine(forkchoice_engine.clone()) {
@@ -317,6 +323,7 @@ where
         Self {
             engine: engine.clone(),
             forkchoice_engine,
+            propagation_consensus,
             from_network,
             from_local,
             from_hashes,
@@ -908,6 +915,34 @@ where
         self.head_fetches.cancel(&block_hash);
     }
 
+    /// Geth treats a NewBlock sender as having at least its parent. Only diffuse
+    /// early when that exact parent is available through the same provider used
+    /// by ETH header requests. Seeing the child bytes is not sufficient.
+    fn can_propagate_before_import(&self, block: &BlockMsg) -> bool {
+        let header = SealedHeader::seal_slow(block.block.0.block.header.clone());
+        if header.hash() != block.hash {
+            return false;
+        }
+        let parent = match self.forkchoice_engine.provider.header(header.parent_hash) {
+            Ok(Some(parent)) => SealedHeader::seal_slow(parent),
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::debug!(target: "bsc::block_import", block_hash = %block.hash,
+                    parent_hash = %header.parent_hash, %error,
+                    "Deferring block propagation: parent header lookup failed");
+                return false;
+            }
+        };
+        if let Err(error) = self.propagation_consensus.validate_header(&header).and_then(|()| {
+            self.propagation_consensus.validate_header_against_parent(&header, &parent)
+        }) {
+            tracing::debug!(target: "bsc::block_import", block_hash = %block.hash, %error,
+                "Deferring block propagation until Engine validation");
+            return false;
+        }
+        true
+    }
+
     /// Add a new block import task to the pending imports
     fn on_new_block(&mut self, block: BlockMsg, peer_id: PeerId) {
         self.on_new_block_inner(block, peer_id, false);
@@ -1060,13 +1095,13 @@ where
             &block.block.0.block.header,
         );
 
-        if !fetched {
-            // send to EVN peers first
+        let propagate_early = !fetched && self.can_propagate_before_import(&block);
+        if propagate_early {
+            // Send to EVN peers before child execution, once its parent is queryable.
             if let Err(e) = self.transfer_to_evn_peers(block.clone()) {
                 tracing::warn!(target: "bsc::block_import", "Failed to transfer block to EVN peers: number = {:?}, hash = {:?}, error = {}", block.block.0.block.header.number, block.hash, e);
             }
             // Send ValidHeader announcement to trigger NewBlock diffusion from few peers
-            // TODO: add header validation later
             self.send_remote_event(BlockImportEvent::Announcement(BlockValidation::ValidHeader {
                 block: block.clone(),
             }));
@@ -1075,10 +1110,44 @@ where
         tracing::debug!(target: "bsc::block_import", "Sending new block to import service: number = {:?}, hash = {:?}", block.block.0.block.header.number, block.hash);
         let hash = block.hash;
         let payload_fut = self.new_payload_inner(block, peer_id, fetched);
+        let post_validation_full_propagation = !propagate_early;
+        let provider = self.forkchoice_engine.provider.clone();
         // Keep the slot until the actual Engine response. Dropping a timed-out
         // waiter would not cancel the payload already in the Engine queue.
-        self.pending_imports
-            .push(Box::pin(async move { RemoteImportResult { hash, outcome: payload_fut.await } }));
+        self.pending_imports.push(Box::pin(async move {
+            let mut outcome = payload_fut.await;
+            if post_validation_full_propagation {
+                if let Some(Outcome {
+                    result:
+                        Ok(
+                            BlockValidation::ValidBlock { block } |
+                            BlockValidation::ValidHeader { block },
+                        ),
+                    ..
+                }) = &mut outcome
+                {
+                    // Recovery/validation can finish while the parent is still only in the
+                    // Engine's non-canonical tree. Do not advertise it as ETH-queryable yet.
+                    let parent_hash = block.block.0.block.header.parent_hash;
+                    match provider.header(parent_hash) {
+                        // Genesis has no parent to serve.
+                        _ if block.block.0.block.header.number == 0 => {}
+                        Ok(Some(parent)) if parent.hash_slow() == parent_hash => {}
+                        result => {
+                            tracing::debug!(target: "bsc::block_import", %hash, %parent_hash,
+                                ?result, "Suppressing deferred block propagation: parent is not queryable");
+                            return RemoteImportResult { hash, outcome: None };
+                        }
+                    }
+                    // Share the post-validation full-block path with fetched blocks.
+                    // A ValidBlock outcome alone would announce only the child's hash.
+                    let block = block.clone();
+                    outcome.as_mut().expect("outcome was matched").result =
+                        Ok(BlockValidation::ValidHeader { block });
+                }
+            }
+            RemoteImportResult { hash, outcome }
+        }));
     }
 
     /// Fetch near-head announcements as single blocks; recover ancestors only
@@ -1557,7 +1626,7 @@ where
             this.queued_blocks.remove(&hash);
             if let Some(mut outcome) = outcome {
                 if let Ok(BlockValidation::ValidHeader { block }) = &outcome.result {
-                    // Fetched blocks reach full diffusion only after Engine validation.
+                    // Fetched and deferred blocks reach full diffusion after Engine validation.
                     this.send_remote_event(BlockImportEvent::Announcement(
                         BlockValidation::ValidHeader { block: block.clone() },
                     ));
@@ -1667,6 +1736,159 @@ mod tests {
             .await;
     }
 
+    fn propagation_test_parent() -> Header {
+        Header { number: 10, timestamp: 1, gas_limit: 200_000_000, ..Default::default() }
+    }
+
+    fn propagation_test_child(parent: &Header) -> BlockMsg {
+        let block = BscBlock {
+            header: Header {
+                number: parent.number + 1,
+                timestamp: parent.timestamp + 1,
+                parent_hash: parent.hash_slow(),
+                gas_limit: parent.gas_limit,
+                difficulty: U256::from(2),
+                extra_data: vec![0; 97].into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        NewBlockMessage {
+            hash: block.header.hash_slow(),
+            block: Arc::new(BscNewBlock(NewBlock { block, td: U128::from(102) })),
+        }
+    }
+
+    #[tokio::test]
+    async fn full_block_with_queryable_parent_propagates_before_engine_execution() {
+        let parent = propagation_test_parent();
+        let mut provider = MockProvider::new();
+        provider.insert(parent.clone(), U256::from(100));
+        let (mut service, mut engine, mut events) = fetched_fixture(provider);
+        let message = propagation_test_child(&parent);
+        assert!(service.can_propagate_before_import(&message));
+        service.on_new_block(message.clone(), PeerId::random());
+        let BlockImportEvent::Announcement(BlockValidation::ValidHeader { block }) =
+            events.try_recv().expect("full block must not wait for child execution")
+        else {
+            panic!("expected full-block propagation")
+        };
+        assert_eq!(block.hash, message.hash);
+        assert!(engine.try_recv().is_err(), "Engine future has not even been polled");
+        assert_eq!(service.pending_imports.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn full_block_does_not_propagate_with_missing_or_invalid_parent_header() {
+        let parent = propagation_test_parent();
+        for has_parent in [false, true] {
+            let mut provider = MockProvider::new();
+            if has_parent {
+                provider.insert(parent.clone(), U256::from(100));
+            }
+            let (mut service, mut engine, mut events) = fetched_fixture(provider);
+            let mut message = propagation_test_child(&parent);
+            if has_parent {
+                // Parent exists, but this child does not follow its height.
+                Arc::make_mut(&mut message.block).0.block.header.number += 1;
+                message.hash = message.block.0.block.header.hash_slow();
+            }
+            service.on_new_block(message, PeerId::random());
+            assert!(events.try_recv().is_err(), "unsafe NewBlock must not escape");
+            assert_eq!(service.pending_imports.len(), 1, "import/recovery must still run");
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
+            let BeaconEngineMessage::NewPayload { tx, .. } = engine.try_recv().unwrap() else {
+                panic!("Engine import must still be admitted")
+            };
+            tx.send(Ok(PayloadStatus::new(
+                PayloadStatusEnum::Invalid { validation_error: "invalid child".into() },
+                None,
+            )))
+            .unwrap();
+            assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
+            assert!(events.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_full_block_propagates_after_parent_becomes_queryable_and_import_is_valid() {
+        let parent = propagation_test_parent();
+        let mut provider = MockProvider::new();
+        provider.insert(Header { number: 9, ..Default::default() }, U256::from(98));
+        provider.td_by_hash.insert(parent.hash_slow(), U256::from(100));
+        let shared_headers = provider.concurrent_headers.clone();
+        let (mut service, mut engine, mut events) = fetched_fixture(provider);
+        let message = propagation_test_child(&parent);
+        service.on_new_block(message.clone(), PeerId::random());
+        assert!(events.try_recv().is_err());
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
+        let BeaconEngineMessage::NewPayload { tx, .. } = engine.try_recv().unwrap() else {
+            panic!("new payload expected")
+        };
+        // Simulate the parent being imported by the concurrent shared recovery path.
+        shared_headers.write().insert(parent.hash_slow(), parent);
+        assert!(events.try_recv().is_err(), "parent alone does not validate the child");
+        tx.send(Ok(PayloadStatus::new(PayloadStatusEnum::Valid, None))).unwrap();
+        assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
+        assert!(events.try_recv().is_err(), "forkchoice must complete before deferred diffusion");
+        let BeaconEngineMessage::ForkchoiceUpdated { tx, .. } = engine.try_recv().unwrap() else {
+            panic!("forkchoice expected")
+        };
+        tx.send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::new(PayloadStatusEnum::Valid, None))))
+            .unwrap();
+        assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
+        let BlockImportEvent::Announcement(BlockValidation::ValidHeader { block }) =
+            events.try_recv().expect("deferred full block must eventually be forwarded")
+        else {
+            panic!("expected deferred full-block diffusion")
+        };
+        assert_eq!(block.hash, message.hash);
+        assert!(matches!(events.try_recv().unwrap(), BlockImportEvent::Outcome(_)));
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn deferred_full_block_stays_retryable_if_engine_valid_parent_is_not_queryable() {
+        let parent = propagation_test_parent();
+        let mut provider = MockProvider::new();
+        provider.insert(Header { number: 9, ..Default::default() }, U256::from(98));
+        provider.td_by_hash.insert(parent.hash_slow(), U256::from(100));
+        let shared_headers = provider.concurrent_headers.clone();
+        let (mut service, mut engine, mut events) = fetched_fixture(provider);
+        let message = propagation_test_child(&parent);
+        let peer = PeerId::random();
+        service.on_new_block(message.clone(), peer);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
+        let BeaconEngineMessage::NewPayload { tx, .. } = engine.try_recv().unwrap() else {
+            panic!("new payload expected")
+        };
+        tx.send(Ok(PayloadStatus::new(PayloadStatusEnum::Valid, None))).unwrap();
+        assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
+        let BeaconEngineMessage::ForkchoiceUpdated { tx, .. } = engine.try_recv().unwrap() else {
+            panic!("forkchoice expected")
+        };
+        tx.send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::new(PayloadStatusEnum::Valid, None))))
+            .unwrap();
+        assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
+        assert!(events.try_recv().is_err(), "Engine validation alone must not authorize diffusion");
+        assert!(!service.processed_blocks.contains(&message.hash));
+        assert!(!service.queued_blocks.contains(&message.hash));
+        assert!(service.pending_imports.is_empty());
+
+        shared_headers.write().insert(parent.hash_slow(), parent);
+        service.on_new_block(message.clone(), peer);
+        let BlockImportEvent::Announcement(BlockValidation::ValidHeader { block }) =
+            events.try_recv().expect("a safe retry must not be lost to deduplication")
+        else {
+            panic!("full-block propagation expected")
+        };
+        assert_eq!(block.hash, message.hash);
+        assert_eq!(service.pending_imports.len(), 1);
+    }
+
     #[tokio::test]
     async fn missing_blob_does_not_queue_or_forward_and_can_be_retried() {
         use crate::node::network::data_availability::tests::blob_block;
@@ -1707,7 +1929,8 @@ mod tests {
         service.on_new_block(good, PeerId::random());
         assert!(service.queued_blocks.contains(&hash));
         assert_eq!(service.pending_imports.len(), 1);
-        assert!(matches!(events.try_recv().unwrap(), BlockImportEvent::Announcement(_)));
+        // Body availability permits import, but its unknown parent still forbids early diffusion.
+        assert!(events.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1907,11 +2130,15 @@ mod tests {
     #[tokio::test]
     async fn can_handle_invalid_new_payload() {
         // When new_payload returns Invalid, the peer should NOT be penalized.
-        // The only event emitted is the early ValidHeader announcement from
-        // on_new_block; no BlockImportOutcome error should follow.
-        let mut fixture = TestFixture::new(EngineResponses::invalid_new_payload()).await;
+        // A header-valid block with a queryable parent may be announced early;
+        // an Engine execution rejection must still not penalize its sender.
+        let parent = propagation_test_parent();
+        let mut provider = MockProvider::new();
+        provider.insert(parent.clone(), U256::from(100));
+        let mut fixture =
+            TestFixture::new_with_provider(EngineResponses::invalid_new_payload(), provider).await;
         fixture
-            .assert_block_import(|outcome| {
+            .assert_block_import_with_block(propagation_test_child(&parent), |outcome| {
                 matches!(
                     outcome,
                     BlockImportEvent::Announcement(BlockValidation::ValidHeader { .. })
@@ -3182,6 +3409,7 @@ mod tests {
                 ..Default::default()
             };
             let (mut service, mut engine, mut events) = fetched_fixture(provider);
+            let shared_headers = service.forkchoice_engine.provider.concurrent_headers.clone();
             let peer = PeerId::random();
             let recovery_peer = PeerId::random();
             let (tx, mut ranges) = mpsc::unbounded_channel();
@@ -3243,6 +3471,11 @@ mod tests {
                         BeaconEngineMessage::ForkchoiceUpdated { state, tx, .. } => {
                             if payloads.len() < 3 {
                                 assert_eq!(state.head_block_hash, parent.header.hash_slow());
+                                // Simulate canonicalization making the recovered parent
+                                // available to the same provider that serves ETH headers.
+                                shared_headers
+                                    .write()
+                                    .insert(parent.header.hash_slow(), parent.header.clone());
                             }
                             let status = if payloads.len() == 3 && !fcu_valid {
                                 PayloadStatusEnum::Invalid {
