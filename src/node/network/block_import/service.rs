@@ -183,6 +183,17 @@ fn log_recovery_error(
 ) {
     use crate::node::network::block_import::fork_recover::ForkRecoverError;
     match err {
+        ForkRecoverError::BelowFinalized { base, finalized } => {
+            tracing::debug!(
+                target: "bsc::block_import",
+                %head_hash,
+                head_num,
+                base,
+                finalized,
+                source,
+                "Skipping recovery below local finality"
+            );
+        }
         ForkRecoverError::ImportHalted { num, committed: Some(committed) } => {
             tracing::info!(
                 target: "bsc::block_import",
@@ -980,7 +991,7 @@ where
         const MAX_STALE_BLOCK_DISTANCE: u64 = 64;
         if let Ok(info) = self.forkchoice_engine.provider.chain_info() {
             let block_number = block.block.0.block.header.number;
-            if block_number + MAX_STALE_BLOCK_DISTANCE < info.best_number {
+            if block_number.saturating_add(MAX_STALE_BLOCK_DISTANCE) < info.best_number {
                 let gap = info.best_number - block_number;
                 tracing::debug!(
                     target: "bsc::block_import",
@@ -1326,12 +1337,7 @@ where
     }
 
     fn finalized_number(&self, local_tip: u64) -> Result<u64, reth_provider::ProviderError> {
-        Ok(self
-            .forkchoice_engine
-            .provider
-            .header_by_number(local_tip)?
-            .and_then(|header| self.forkchoice_engine.get_finalized_number_and_hash(&header))
-            .map_or(0, |(number, _)| number))
+        Ok(self.forkchoice_engine.finalized_number_at_head(local_tip)?.unwrap_or(0))
     }
 
     /// See [`resolve_bsc_peer_static`].
