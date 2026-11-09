@@ -16,7 +16,7 @@ use crate::{
         engine_api::payload::BscPayloadTypes,
         evm::util::insert_header_to_cache_with_hash,
         miner::startup_diagnostics,
-        network::BscNewBlock,
+        network::{BscNetworkPrimitives, BscNewBlock},
     },
     BscBlock, BscBlockBody, BscPrimitives,
 };
@@ -34,7 +34,7 @@ use reth_eth_wire_types::broadcast::NewBlockHashes;
 use reth_network::{
     import::{BlockImportError, BlockImportEvent, BlockImportOutcome, BlockValidation},
     message::{BlockRequest, NewBlockMessage, PeerMessage, PeerResponse},
-    FetchClient, NetworkHandle,
+    BlockAnnouncementGuard, FetchClient, NetworkHandle,
 };
 use reth_network_api::{PeerId, Peers, ReputationChangeKind};
 use reth_node_ethereum::EthEngineTypes;
@@ -1479,14 +1479,25 @@ where
         {
             if let Some(net) = crate::shared::get_network_handle() {
                 let peers = crate::node::network::evn_peers::snapshot();
+                let guard = block_announcement_guard(self.publication.clone());
                 for (peer_id, info) in peers {
                     // Send to EVN peers or proxyed peers
                     let is_proxyed =
                         crate::node::network::bsc_protocol::registry::is_proxyed_peer(&peer_id);
                     if info.is_evn || is_proxyed {
                         // Send full NewBlock to EVN/proxyed peers to avoid re-fetching.
-                        net.send_eth_message(peer_id, PeerMessage::NewBlock(block.clone()));
-                        tracing::debug!(target: "bsc::block_import", "Sent full NewBlock to EVN/proxyed peer: number = {:?}, hash = {:?}, peer = {:?}", block.block.0.block.header.number, block.hash, peer_id);
+                        match net.try_send_block_announcement(
+                            peer_id,
+                            PeerMessage::NewBlock(block.clone()),
+                            guard.clone(),
+                        ) {
+                            Ok(()) => {
+                                tracing::debug!(target: "bsc::block_import", number = block.block.0.block.header.number, hash = %block.hash, %peer_id, "Queued full NewBlock to EVN/proxyed peer")
+                            }
+                            Err(error) => {
+                                tracing::debug!(target: "bsc::block_import", %error, hash = %block.hash, %peer_id, "Rejected full NewBlock manager admission")
+                            }
+                        }
                     }
                 }
             }
@@ -1559,26 +1570,50 @@ where
             }
 
             let hashes = NewBlockHashes(vec![BlockHashNumber { hash, number: num }]);
+            let guard = block_announcement_guard(publication);
             let target_count = targets.len();
+            let mut queued = 0;
             for peer_id in targets {
-                tracing::debug!(
-                    target: "bsc::block_import",
-                    %peer_id,
-                    local_num = num,
-                    %hash,
-                    "Sending head announce to peer"
-                );
-                net.send_eth_message(peer_id, PeerMessage::NewBlockHashes(hashes.clone()));
+                match net.try_send_block_announcement(
+                    peer_id,
+                    PeerMessage::NewBlockHashes(hashes.clone()),
+                    guard.clone(),
+                ) {
+                    Ok(()) => queued += 1,
+                    Err(error) => {
+                        tracing::debug!(target: "bsc::block_import", %error, %peer_id, %hash, "Rejected head announcement manager admission")
+                    }
+                }
             }
             tracing::debug!(
                 target: "bsc::block_import",
                 local_num = num,
-                sent_to = target_count,
+                queued,
+                attempted = target_count,
                 total_peers = peers.len(),
-                "Announced head to peers"
+                "Queued head announcements to peers"
             );
         });
     }
+}
+
+/// Recheck public data after waiting in the manager queue. This runs in NetworkManager's poll,
+/// so it must remain cache-only. Session/transport waiting can still outlive cache retention.
+fn block_announcement_guard(
+    publication: Option<Publication>,
+) -> Option<BlockAnnouncementGuard<BscNetworkPrimitives>> {
+    publication.map(|publication| {
+        Arc::new(move |message: &PeerMessage<BscNetworkPrimitives>| match message {
+            PeerMessage::NewBlock(block) => publication.full_ready(block.clone()).is_some(),
+            PeerMessage::NewBlockHashes(hashes) => hashes.0.iter().all(|entry| {
+                publication
+                    .retained
+                    .republish(entry.hash)
+                    .is_some_and(|(block, _)| block.header.number == entry.number)
+            }),
+            _ => false,
+        }) as BlockAnnouncementGuard<BscNetworkPrimitives>
+    })
 }
 
 /// Decide which peers to send `NewBlockHashes(local_head)` to.
@@ -1914,7 +1949,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::chainspec::bsc::bsc_mainnet;
+    use crate::{
+        chainspec::bsc::bsc_mainnet,
+        node::network::announced_blocks::{AnnouncedBlocks, Classification},
+    };
 
     use super::*;
     use alloy_primitives::{BlockHash, BlockNumber, B256, U128, U256};
@@ -1931,6 +1969,7 @@ mod tests {
         collections::HashMap,
         sync::Arc,
         task::{Context, Poll},
+        time::Duration,
     };
 
     #[tokio::test]
@@ -1970,6 +2009,59 @@ mod tests {
             hash: block.header.hash_slow(),
             block: Arc::new(BscNewBlock(NewBlock { block, td: U128::from(102) })),
         }
+    }
+
+    #[test]
+    fn manager_guard_rechecks_real_retained_parent_and_child_without_provider_io() {
+        let parent = propagation_test_parent();
+        let child = propagation_test_child(&parent);
+        let cache = Arc::new(AnnouncedBlocks::new(Duration::from_secs(1800), 1, u64::MAX));
+        let publication =
+            Publication::new(cache.clone(), |_| panic!("manager guard must not read provider"));
+        let guard = block_announcement_guard(Some(publication)).unwrap();
+        let full = PeerMessage::NewBlock(child.clone());
+        let hashes = PeerMessage::NewBlockHashes(NewBlockHashes(vec![BlockHashNumber {
+            hash: child.hash,
+            number: child.block.0.block.header.number,
+        }]));
+        assert!(cache.retain(
+            Arc::new(BscBlock { header: parent, ..Default::default() }),
+            U256::from(100),
+            Classification::Canonical,
+            cache.view_version()
+        ));
+        assert!(guard(&full), "public exact parent allows early full propagation");
+        assert!(!guard(&hashes), "child is not yet publicly retained");
+        assert!(cache.retain(
+            Arc::new(child.block.0.block.clone()),
+            U256::from(102),
+            Classification::Canonical,
+            cache.view_version()
+        ));
+        assert!(!guard(&full), "child admission evicted the parent while manager work waited");
+        assert!(guard(&hashes));
+        assert!(cache.retain(
+            Arc::new(BscBlock::default()),
+            U256::ZERO,
+            Classification::Sidechain,
+            cache.view_version()
+        ));
+        assert!(!guard(&hashes), "capacity eviction invalidates a queued hash announcement");
+
+        let expired = Arc::new(AnnouncedBlocks::new(Duration::ZERO, 1, u64::MAX));
+        assert!(expired.retain(
+            Arc::new(child.block.0.block.clone()),
+            U256::from(102),
+            Classification::Canonical,
+            expired.view_version()
+        ));
+        let guard =
+            block_announcement_guard(Some(Publication::new(expired, |_| panic!("no IO")))).unwrap();
+        assert!(!guard(&hashes), "expiry is also checked after queue waiting");
+        assert!(
+            block_announcement_guard(None).is_none(),
+            "legacy test configurations stay supported"
+        );
     }
 
     #[tokio::test]
