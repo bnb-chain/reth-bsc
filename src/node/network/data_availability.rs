@@ -19,6 +19,25 @@ pub(crate) fn validate_data_availability(
 }
 
 fn validate_at(block: &mut BscBlock, chain_spec: &BscChainSpec, now: u64) -> eyre::Result<()> {
+    validate_available_data(block, chain_spec, now, true)
+}
+
+/// Stored canonical blocks have already passed cryptographic validation. Recheck completeness
+/// and correspondence when assembling their network body from the independently pruned blob store.
+pub(crate) fn validate_stored_data_availability(
+    block: &mut BscBlock,
+    chain_spec: &BscChainSpec,
+) -> eyre::Result<()> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    validate_available_data(block, chain_spec, now, false)
+}
+
+fn validate_available_data(
+    block: &mut BscBlock,
+    chain_spec: &BscChainSpec,
+    now: u64,
+    verify_proofs: bool,
+) -> eyre::Result<()> {
     if !chain_spec.is_cancun_active_at_timestamp(block.header.timestamp) {
         ensure!(
             block.body.sidecars.as_ref().is_none_or(Vec::is_empty),
@@ -64,10 +83,21 @@ fn validate_at(block: &mut BscBlock, chain_spec: &BscChainSpec, now: u64) -> eyr
             sidecar.tx_index == tx_index as u64 && sidecar.tx_hash == *tx.hash(),
             "sidecar transaction metadata mismatch at tx {tx_index}"
         );
-        sidecar
-            .inner
-            .validate(tx.blob_versioned_hashes().unwrap_or_default(), EnvKzgSettings::Default.get())
-            .wrap_err_with(|| format!("invalid blob sidecar at tx {tx_index}"))?;
+        let hashes = tx.blob_versioned_hashes().unwrap_or_default();
+        if verify_proofs {
+            sidecar
+                .inner
+                .validate(hashes, EnvKzgSettings::Default.get())
+                .wrap_err_with(|| format!("invalid blob sidecar at tx {tx_index}"))?;
+        } else {
+            ensure!(
+                sidecar.inner.blobs.len() == hashes.len() &&
+                    sidecar.inner.commitments.len() == hashes.len() &&
+                    sidecar.inner.proofs.len() == hashes.len() &&
+                    sidecar.inner.versioned_hashes().eq(hashes.iter().copied()),
+                "incomplete or mismatched blob sidecar at tx {tx_index}"
+            );
+        }
     }
     Ok(())
 }

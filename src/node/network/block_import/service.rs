@@ -3,11 +3,13 @@ use super::{
     handle::ImportHandle,
     metrics::Queue,
     propagation::{self, PropagationSender},
+    publication::Publication,
     IMPORT_QUEUE_CAPACITY,
 };
 use crate::{
     chainspec::BscChainSpec,
     consensus::{parlia::vote_pool, ParliaConsensusErr},
+    hardforks::BscHardforks,
     node::{
         consensus::{BscConsensus, BscForkChoiceEngine},
         engine::BscBuiltPayload,
@@ -16,7 +18,7 @@ use crate::{
         miner::startup_diagnostics,
         network::BscNewBlock,
     },
-    BscBlock, BscBlockBody,
+    BscBlock, BscBlockBody, BscPrimitives,
 };
 use alloy_consensus::{BlockBody, Header};
 use alloy_eips::BlockNumberOrTag;
@@ -40,7 +42,8 @@ use reth_payload_builder_primitives::Events;
 use reth_payload_primitives::{BuiltPayload, PayloadTypes};
 use reth_primitives_traits::{AlloyBlockHeader, Block, NodePrimitives, SealedBlock, SealedHeader};
 use reth_provider::{
-    BlockHashReader, BlockNumReader, BlockReaderIdExt, HeaderProvider, ReceiptProvider,
+    BlockHashReader, BlockNumReader, BlockReaderIdExt, CanonStateNotification,
+    CanonStateNotifications, HeaderProvider, ReceiptProvider,
 };
 use std::{
     future::Future,
@@ -52,6 +55,7 @@ use std::{
     task::{Context, Poll},
 };
 use tokio::sync::mpsc::{self, OwnedPermit, Receiver};
+use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 
 /// Network message containing a new block
 pub(crate) type BlockMsg = NewBlockMessage<BscNewBlock>;
@@ -166,6 +170,47 @@ where
     /// Periodic timer for head announcement.
     announce_interval: tokio::time::Interval,
     pipeline_targets: super::pipeline_targets::PipelineTargets,
+    /// Installed by the BSC node builder together with the actual ETH hash source.
+    publication: Option<Publication>,
+    canonical_notifications: Option<BroadcastStream<CanonStateNotification<BscPrimitives>>>,
+    pending_canonical: Option<PendingCanonical>,
+}
+
+/// One existing notification, consumed incrementally without cloning its execution data. The
+/// retained network cache receives only hash/header/body/TD, never this chain or its state.
+struct PendingCanonical {
+    notification: CanonStateNotification<BscPrimitives>,
+    after: Option<u64>,
+    reverting: bool,
+}
+
+impl PendingCanonical {
+    fn next_hash(&mut self) -> Option<(B256, u64, bool)> {
+        loop {
+            let chain = if self.reverting {
+                self.notification.reverted()
+            } else {
+                Some(self.notification.committed())
+            };
+            let next = chain.as_ref().and_then(|chain| {
+                use std::ops::Bound::{Excluded, Unbounded};
+                chain
+                    .blocks()
+                    .range((self.after.map_or(Unbounded, Excluded), Unbounded))
+                    .next()
+                    .map(|(number, block)| (*number, block.hash()))
+            });
+            if let Some((number, hash)) = next {
+                self.after = Some(number);
+                return Some((hash, number, self.reverting));
+            }
+            if !self.reverting {
+                return None;
+            }
+            self.reverting = false;
+            self.after = None;
+        }
+    }
 }
 
 /// Log a `recover_ancestors` error at a level matching its severity.
@@ -354,6 +399,9 @@ where
             ),
             recovery_gate: sync_config.recovery_gate.clone(),
             pipeline_targets: super::pipeline_targets::PipelineTargets::new(engine.clone()),
+            publication: None,
+            canonical_notifications: None,
+            pending_canonical: None,
             announce_interval: {
                 // 3s ≈ 6-7 BSC slots (450ms each). Fast enough to break fork
                 // livelocks, slow enough to be negligible overhead.
@@ -371,8 +419,25 @@ where
         self
     }
 
-    fn send_remote_event(&self, event: ImportEvent) {
+    fn send_remote_event(&self, mut event: ImportEvent) {
+        if self
+            .publication
+            .as_ref()
+            .is_some_and(|publication| !publication.prepare_event(&mut event))
+        {
+            return;
+        }
         self.to_network.send_remote(event);
+    }
+
+    pub(crate) fn with_publication(
+        mut self,
+        publication: Publication,
+        notifications: CanonStateNotifications<BscPrimitives>,
+    ) -> Self {
+        self.publication = Some(publication);
+        self.canonical_notifications = Some(BroadcastStream::new(notifications));
+        self
     }
 
     /// Process a new payload and return the outcome
@@ -387,6 +452,7 @@ where
         let failed_heads = self.failed_heads.clone();
         let recovery_gate = self.recovery_gate.clone();
         let sync_config = self.sync_config.clone();
+        let publication = self.publication.clone();
 
         let announced_hash = block.hash;
         let block_hash = block.block.0.block.header.hash_slow();
@@ -441,7 +507,7 @@ where
                             } else {
                                 tracing::debug!(target: "bsc::block_import", "Succeed to update fork choice for new payload: number = {:?}, hash = {:?}", header.number, block_hash);
                             }
-                            if fetched {
+                            if fetched && publication.is_none() {
                                 match fetched_block_td(&forkchoice_engine, &header) {
                                     Ok(Some(td)) => Arc::make_mut(&mut block.block).0.td = td,
                                     Ok(None) => {
@@ -544,8 +610,8 @@ where
                         );
                             let local_tip =
                                 forkchoice_engine.provider.best_block_number().unwrap_or(0);
-                            let near_head = block_number.saturating_sub(local_tip)
-                                <= sync_config.args.near_head_distance;
+                            let near_head = block_number.saturating_sub(local_tip) <=
+                                sync_config.args.near_head_distance;
                             let peer = if fetched {
                                 let peers = crate::node::network::bsc_protocol::registry::list_live_v2_announcers_for(block_hash);
                                 peers
@@ -602,7 +668,7 @@ where
                                 failed_heads.mark_failed(block_hash);
                                 return None;
                             }
-                            if fetched {
+                            if fetched && publication.is_none() {
                                 match fetched_block_td(&forkchoice_engine, &header) {
                                     Ok(Some(td)) => Arc::make_mut(&mut block.block).0.td = td,
                                     result => {
@@ -642,10 +708,13 @@ where
     fn on_new_mined_block(
         &mut self,
         payload: BscBuiltPayload,
-        block_msg: NewBlockMessage<BscNewBlock>,
+        mut block_msg: NewBlockMessage<BscNewBlock>,
         propagation: OwnedPermit<BlockMsg>,
     ) {
         startup_diagnostics::import_started(block_msg.hash);
+        if let Some(publication) = &self.publication {
+            publication.prepare_full(&mut block_msg);
+        }
         let block = &block_msg.block.0.block;
         // insert header to cache
         {
@@ -799,7 +868,7 @@ where
             block: sealed.clone_block(),
             td: U128::from(new_td.to::<u128>()),
         });
-        let block_msg = NewBlockMessage { hash: block_hash, block: Arc::new(new_block) };
+        let mut block_msg = NewBlockMessage { hash: block_hash, block: Arc::new(new_block) };
 
         // Cache + register stats like a self-mined block so range responses and vote-delay metrics
         // work for it (mirrors `on_new_mined_block`).
@@ -809,6 +878,9 @@ where
 
         // 1. Broadcast first — before verification. go-bsc posts the sealed block, then runs
         //    InsertChain. Announce header + full block so peers diffuse it immediately.
+        if let Some(publication) = &self.publication {
+            publication.prepare_full(&mut block_msg);
+        }
         if let Err(e) = self.transfer_to_evn_peers(block_msg.clone()) {
             tracing::warn!(target: "bsc::block_import", number = block_number, hash = %block_hash, error = %e, "BidBlock: failed to transfer to EVN peers");
         }
@@ -934,14 +1006,24 @@ where
         if header.hash() != block.hash {
             return false;
         }
-        let parent = match self.forkchoice_engine.provider.header(header.parent_hash) {
-            Ok(Some(parent)) => SealedHeader::seal_slow(parent),
-            Ok(None) => return false,
-            Err(error) => {
-                tracing::debug!(target: "bsc::block_import", block_hash = %block.hash,
+        let parent = if let Some(publication) = &self.publication {
+            if !publication.prepare_parent(block) {
+                return false;
+            }
+            let Some((parent, _)) = publication.retained.get(header.parent_hash) else {
+                return false;
+            };
+            SealedHeader::seal_slow(parent.header.clone())
+        } else {
+            match self.forkchoice_engine.provider.header(header.parent_hash) {
+                Ok(Some(parent)) => SealedHeader::seal_slow(parent),
+                Ok(None) => return false,
+                Err(error) => {
+                    tracing::debug!(target: "bsc::block_import", block_hash = %block.hash,
                     parent_hash = %header.parent_hash, %error,
                     "Deferring block propagation: parent header lookup failed");
-                return false;
+                    return false;
+                }
             }
         };
         if let Err(error) = self.propagation_consensus.validate_header(&header).and_then(|()| {
@@ -1059,8 +1141,8 @@ where
         }
         // Reject overload before cloning or validating the body. A rejected block
         // remains retryable. Far-ahead targets have their own bounded admission.
-        if delta <= self.sync_config.args.max_depth
-            && self.pending_imports.len() >= MAX_PENDING_IMPORTS
+        if delta <= self.sync_config.args.max_depth &&
+            self.pending_imports.len() >= MAX_PENDING_IMPORTS
         {
             Queue::RemoteImports.full(MAX_PENDING_IMPORTS, "drop");
             return;
@@ -1123,6 +1205,7 @@ where
         let payload_fut = self.new_payload_inner(block, peer_id, fetched);
         let post_validation_full_propagation = !propagate_early;
         let provider = self.forkchoice_engine.provider.clone();
+        let publication = self.publication.clone();
         // Keep the slot until the actual Engine response. Dropping a timed-out
         // waiter would not cancel the payload already in the Engine queue.
         self.pending_imports.push(Box::pin(async move {
@@ -1140,7 +1223,11 @@ where
                     // Recovery/validation can finish while the parent is still only in the
                     // Engine's non-canonical tree. Do not advertise it as ETH-queryable yet.
                     let parent_hash = block.block.0.block.header.parent_hash;
-                    match provider.header(parent_hash) {
+                    if let Some(publication) = &publication {
+                        if !publication.prepare_full(block) {
+                            return RemoteImportResult { hash, outcome: None };
+                        }
+                    } else { match provider.header(parent_hash) {
                         // Genesis has no parent to serve.
                         _ if block.block.0.block.header.number == 0 => {}
                         Ok(Some(parent)) if parent.hash_slow() == parent_hash => {}
@@ -1149,6 +1236,7 @@ where
                                 ?result, "Suppressing deferred block propagation: parent is not queryable");
                             return RemoteImportResult { hash, outcome: None };
                         }
+                    }
                     }
                     // Share the post-validation full-block path with fetched blocks.
                     // A ValidBlock outcome alone would announce only the child's hash.
@@ -1340,13 +1428,40 @@ where
         Ok(self.forkchoice_engine.finalized_number_at_head(local_tip)?.unwrap_or(0))
     }
 
+    /// One checked head/finality observation per publication batch. A missing snapshot after
+    /// fast finality activation is unknown, not finalized zero; ordinary head gossip can retry.
+    fn publication_bounds(&self) -> Option<(u64, u64)> {
+        let provider = &self.forkchoice_engine.provider;
+        let head = provider.chain_info().ok()?;
+        let header = provider.header(head.best_hash).ok()??;
+        if header.number != head.best_number || header.hash_slow() != head.best_hash {
+            return None;
+        }
+        let finalized =
+            if self.forkchoice_engine.chain_spec().is_plato_active_at_block(header.number) {
+                self.forkchoice_engine.get_finalized_number_and_hash(&header)?.0
+            } else {
+                0
+            };
+        Some((head.best_number, finalized))
+    }
+
     /// See [`resolve_bsc_peer_static`].
     fn resolve_bsc_peer(&self, announcer: PeerId) -> Option<PeerId> {
         resolve_bsc_peer_static(announcer)
     }
 
     /// Transfer the block to EVN peers if from proxied validators or validator address.
-    fn transfer_to_evn_peers(&self, block: BlockMsg) -> Result<(), Box<dyn std::error::Error>> {
+    fn transfer_to_evn_peers(&self, mut block: BlockMsg) -> Result<(), Box<dyn std::error::Error>> {
+        let block = if let Some(publication) = &self.publication {
+            if !publication.prepare_full(&mut block) {
+                return Ok(());
+            }
+            let Some(block) = publication.full_ready(block) else { return Ok(()) };
+            block
+        } else {
+            block
+        };
         let mining_config = crate::node::miner::config::get_global_mining_config()
             .ok_or("Mining config is not set")?;
         let cfg =
@@ -1358,9 +1473,9 @@ where
         let coinbase = header_ref.beneficiary;
         // If from proxied validators or validator address, target EVN peers with ETH
         // NewBlockHashes.
-        if cfg.proxyed_validators.contains(&coinbase)
-            || (mining_config.enabled
-                && mining_config.validator_address.unwrap_or_default() == coinbase)
+        if cfg.proxyed_validators.contains(&coinbase) ||
+            (mining_config.enabled &&
+                mining_config.validator_address.unwrap_or_default() == coinbase)
         {
             if let Some(net) = crate::shared::get_network_handle() {
                 let peers = crate::node::network::evn_peers::snapshot();
@@ -1388,28 +1503,18 @@ where
     /// other's head after the initial handshake.
     fn spawn_head_announcement(&self) {
         let provider = self.forkchoice_engine.provider.clone();
+        let publication = self.publication.clone();
 
         tokio::spawn(async move {
             // Resolve local head.
-            let num = match provider.best_block_number() {
-                Ok(n) if n > 0 => n,
+            let (num, hash) = match provider.chain_info() {
+                Ok(info) if info.best_number > 0 => (info.best_number, info.best_hash),
                 Ok(_) => {
                     tracing::debug!(target: "bsc::block_import", "Skip head announce: local best_block_number is 0");
                     return;
                 }
                 Err(e) => {
                     tracing::debug!(target: "bsc::block_import", error = %e, "Skip head announce: failed to read best_block_number");
-                    return;
-                }
-            };
-            let hash = match provider.block_hash(num) {
-                Ok(Some(h)) => h,
-                Ok(None) => {
-                    tracing::debug!(target: "bsc::block_import", num, "Skip head announce: no hash for best_block_number");
-                    return;
-                }
-                Err(e) => {
-                    tracing::debug!(target: "bsc::block_import", num, error = %e, "Skip head announce: block_hash lookup failed");
                     return;
                 }
             };
@@ -1441,6 +1546,16 @@ where
 
             if targets.is_empty() {
                 return;
+            }
+
+            if let Some(publication) = &publication {
+                if !publication.prepare_hash(hash) {
+                    return;
+                }
+                let Some((block, _)) = publication.retained.republish(hash) else { return };
+                if block.header.number != num {
+                    return;
+                }
             }
 
             let hashes = NewBlockHashes(vec![BlockHashNumber { hash, number: num }]);
@@ -1504,6 +1619,77 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
 
+        let mut publication_bounds = None;
+        // At most one block or stream event per budget item. Large commits/reorgs continue
+        // on the next poll, so ordinary import/peer work gets a turn between batches.
+        for n in 0..POLL_BATCH {
+            let Some(publication) = &this.publication else { break };
+            if let Some(pending) = &mut this.pending_canonical {
+                if let Some((hash, number, reverted)) = pending.next_hash() {
+                    if reverted {
+                        publication.retained.canonical_change([hash], []);
+                    } else {
+                        publication.retained.canonical_change([], [hash]);
+                        let bounds =
+                            *publication_bounds.get_or_insert_with(|| this.publication_bounds());
+                        let ready_to_announce = match bounds {
+                            Some((tip, finalized))
+                                if !obsolete_announcement(
+                                    number,
+                                    tip,
+                                    finalized,
+                                    this.sync_config.args.stale_distance,
+                                ) =>
+                            {
+                                true
+                            }
+                            Some(_) => {
+                                metrics::counter!("bsc.network.retention.publication_skipped_total", "reason" => "obsolete").increment(1);
+                                false
+                            }
+                            None => {
+                                metrics::counter!("bsc.network.retention.publication_skipped_total", "reason" => "head_unavailable").increment(1);
+                                false
+                            }
+                        };
+                        if ready_to_announce && publication.prepare_hash(hash) {
+                            if let Some(block) = publication.hash_message(hash) {
+                                this.send_remote_event(BlockImportEvent::Announcement(
+                                    BlockValidation::ValidBlock { block },
+                                ));
+                            }
+                        }
+                    }
+                } else {
+                    this.pending_canonical = None;
+                }
+            } else {
+                let Some(notifications) = &mut this.canonical_notifications else { break };
+                let Poll::Ready(notification) = notifications.poll_next_unpin(cx) else { break };
+                match notification {
+                    Some(Ok(notification)) => {
+                        this.pending_canonical =
+                            Some(PendingCanonical { notification, after: None, reverting: true });
+                    }
+                    Some(Err(BroadcastStreamRecvError::Lagged(missed))) => {
+                        publication.retained.notifications_lagged(missed);
+                    }
+                    None => {
+                        publication.retained.notifications_lagged(0);
+                        metrics::counter!(
+                            "bsc.network.retention.canonical_notifications_closed_total"
+                        )
+                        .increment(1);
+                        this.canonical_notifications = None;
+                        break;
+                    }
+                }
+            }
+            if n + 1 == POLL_BATCH {
+                cx.waker().wake_by_ref();
+            }
+        }
+
         // Receive new blocks from network
         for n in 0..POLL_BATCH {
             if n + 1 == POLL_BATCH {
@@ -1559,6 +1745,7 @@ where
                     this.head_fetches.cancel(&block.hash);
                     let future =
                         this.new_payload(block, crate::shared::get_local_peer_id_or_default());
+                    let publication = this.publication.clone();
                     this.pending_local_imports.push(Box::pin(async move {
                         let outcome = future.await;
                         // The fallback requests Engine validation. Only propagate the pair once
@@ -1573,7 +1760,12 @@ where
                                 Some(block.hash),
                             );
                             crate::shared::cache_full_block(block.block.0.block.clone());
-                            permit.send(block.clone());
+                            let mut prepared = block.clone();
+                            if let Some(publication) = &publication {
+                                publication.prepare_full(&mut prepared);
+                                publication.prepare_hash(prepared.hash);
+                            }
+                            permit.send(prepared);
                         }
                         outcome
                     }));
@@ -1673,6 +1865,21 @@ where
         // Each tick spawns a detached task so we never block the poll loop on
         // the async `get_all_peers()` query.
         while this.announce_interval.poll_tick(cx).is_ready() {
+            if let Some(publication) = &this.publication {
+                publication.retained.maintain();
+                for probe in publication.retained.classification_batch(POLL_BATCH) {
+                    match this.forkchoice_engine.provider.block_hash(probe.number) {
+                        Ok(canonical) => {
+                            publication.retained.apply_classification(probe, canonical)
+                        }
+                        Err(error) => {
+                            metrics::counter!("bsc.network.retention.classification_errors_total")
+                                .increment(1);
+                            tracing::debug!(target: "bsc::block_import", %error, "Retained block classification deferred");
+                        }
+                    }
+                }
+            }
             this.spawn_head_announcement();
         }
 
@@ -3284,6 +3491,215 @@ mod tests {
         (service, rx, receiver)
     }
 
+    #[tokio::test]
+    async fn canonical_notification_replays_each_ready_hash_with_poll_budget() {
+        use super::super::publication::ReadyBlock;
+        use crate::node::network::announced_blocks::AnnouncedBlocks;
+        use reth_execution_types::Chain;
+        use reth_primitives_traits::RecoveredBlock;
+        use std::sync::atomic::AtomicUsize;
+        let mut blocks = Vec::new();
+        let mut parent_hash = B256::ZERO;
+        for number in 1..=65 {
+            let block = BscBlock {
+                header: Header { number, parent_hash, ..Default::default() },
+                ..Default::default()
+            };
+            parent_hash = block.header.hash_slow();
+            blocks.push(block);
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let reads = calls.clone();
+        let available = blocks.clone();
+        let publication = Publication::new(Arc::new(AnnouncedBlocks::default()), move |hash| {
+            reads.fetch_add(1, Ordering::Relaxed);
+            Ok(available.iter().find(|b| b.header.hash_slow() == hash).map(|b| ReadyBlock {
+                block: Arc::new(b.clone()),
+                td: U256::from(b.header.number),
+            }))
+        });
+        let mut provider = MockProvider::new();
+        provider.insert(blocks.last().unwrap().header.clone(), U256::from(65));
+        let (mut service, _engine, mut events) = fetched_fixture(provider);
+        let config =
+            super::super::config::BlockSyncArgs { stale_distance: 100, ..Default::default() }
+                .into_config()
+                .unwrap();
+        service = service.with_sync_config(config);
+        let (tx, rx) = tokio::sync::broadcast::channel(4);
+        service = service.with_publication(publication.clone(), rx);
+        let chain = Arc::new(Chain::new(
+            blocks.iter().cloned().map(|b| RecoveredBlock::new_unhashed(b, vec![])),
+            Default::default(),
+            Default::default(),
+        ));
+        tx.send(CanonStateNotification::Commit { new: chain.clone() }).unwrap();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut announced = Vec::new();
+        for poll in 0..4 {
+            let before = calls.load(Ordering::Relaxed);
+            assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
+            assert!(calls.load(Ordering::Relaxed) - before <= POLL_BATCH);
+            if poll == 0 {
+                assert!(service.pending_canonical.is_some());
+            }
+            while let Ok(event) = events.try_recv() {
+                let Some(BlockImportEvent::Announcement(BlockValidation::ValidBlock { block })) =
+                    publication.filter_event(event)
+                else {
+                    panic!("ready hash expected")
+                };
+                announced.push(block.hash);
+            }
+        }
+        assert_eq!(announced, blocks.iter().map(|b| b.header.hash_slow()).collect::<Vec<_>>());
+        assert!(service.pending_canonical.is_none());
+        tx.send(CanonStateNotification::Reorg { old: chain, new: Arc::new(Chain::default()) })
+            .unwrap();
+        for _ in 0..4 {
+            assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
+        }
+        assert!(events.try_recv().is_err(), "pure revert never announces an empty tip");
+        assert_eq!(calls.load(Ordering::Relaxed), 65, "revert does no body/provider lookup");
+        // A catch-up notification far behind the current head updates classification but does
+        // not read/admit old bodies or turn the retention cache into a historical gossip cache.
+        service
+            .forkchoice_engine
+            .provider
+            .insert(Header { number: 1000, ..Default::default() }, U256::from(1000));
+        service.publication = Some(Publication::new(Arc::new(AnnouncedBlocks::default()), |_| {
+            panic!("obsolete publication must not read a body")
+        }));
+        let historical = Arc::new(Chain::new(
+            blocks.into_iter().map(|b| RecoveredBlock::new_unhashed(b, vec![])),
+            Default::default(),
+            Default::default(),
+        ));
+        tx.send(CanonStateNotification::Commit { new: historical }).unwrap();
+        for _ in 0..4 {
+            assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
+        }
+        assert!(events.try_recv().is_err());
+        assert!(service
+            .publication
+            .as_ref()
+            .unwrap()
+            .retained
+            .classification_batch(100)
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn retained_sidebranch_parent_allows_validated_full_with_provider_parent_absent() {
+        use crate::node::network::announced_blocks::{AnnouncedBlocks, Classification};
+        for fetched in [false, true] {
+            let parent = propagation_test_parent();
+            let cache = Arc::new(AnnouncedBlocks::default());
+            cache.retain(
+                Arc::new(BscBlock { header: parent.clone(), ..Default::default() }),
+                U256::from(100),
+                Classification::Sidechain,
+                0,
+            );
+            let publication = Publication::new(cache, |_| Ok(None));
+            let mut provider = MockProvider::new();
+            provider.insert(Header { number: 9, ..Default::default() }, U256::from(98));
+            // Forkchoice's already-executed chain metadata remains separate from ETH serving.
+            provider.td_by_hash.insert(parent.hash_slow(), U256::from(100));
+            let (mut service, mut engine, mut events) = fetched_fixture(provider);
+            let (_tx, rx) = tokio::sync::broadcast::channel(4);
+            service = service.with_publication(publication.clone(), rx);
+            let mut message = propagation_test_child(&parent);
+            // Force the post-validation path; the mock Engine, not the propagation checks,
+            // authorizes this fixture's execution and forkchoice.
+            Arc::make_mut(&mut message.block).0.block.header.extra_data = Default::default();
+            message.hash = message.block.0.block.header.hash_slow();
+            service.on_new_block_inner(message.clone(), PeerId::random(), fetched);
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
+            let BeaconEngineMessage::NewPayload { tx, .. } = engine.try_recv().unwrap() else {
+                panic!("execution must run")
+            };
+            tx.send(Ok(PayloadStatus::new(PayloadStatusEnum::Valid, None))).unwrap();
+            assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
+            let BeaconEngineMessage::ForkchoiceUpdated { tx, .. } = engine.try_recv().unwrap()
+            else {
+                panic!("forkchoice must run")
+            };
+            tx.send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::new(
+                PayloadStatusEnum::Valid,
+                None,
+            ))))
+            .unwrap();
+            assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
+            let event = events.try_recv().expect("retained parent authorizes post-validation full");
+            let Some(BlockImportEvent::Announcement(BlockValidation::ValidHeader { block })) =
+                publication.filter_event(event)
+            else {
+                panic!("full announcement expected")
+            };
+            assert_eq!(block.hash, message.hash);
+            assert_eq!(block.block.0.td, U128::from(102));
+            assert!(events.try_recv().is_err(), "unready child hash is withheld");
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_public_parent_skips_full_but_import_and_canonical_hash_continue() {
+        use super::super::publication::ReadyBlock;
+        use crate::node::network::announced_blocks::AnnouncedBlocks;
+        use reth_execution_types::Chain;
+        use reth_primitives_traits::RecoveredBlock;
+        let parent = propagation_test_parent();
+        let mut provider = MockProvider::new();
+        provider.insert(Header { number: 9, ..Default::default() }, U256::from(98));
+        provider.td_by_hash.insert(parent.hash_slow(), U256::from(100));
+        let ready = Arc::new(parking_lot::Mutex::new(None::<BscBlock>));
+        let source = ready.clone();
+        let publication = Publication::new(Arc::new(AnnouncedBlocks::default()), move |hash| {
+            Ok(source
+                .lock()
+                .as_ref()
+                .filter(|b| b.header.hash_slow() == hash)
+                .map(|b| ReadyBlock { block: Arc::new(b.clone()), td: U256::from(102) }))
+        });
+        let (mut service, mut engine, mut events) = fetched_fixture(provider);
+        let (canonical_tx, rx) = tokio::sync::broadcast::channel(4);
+        service = service.with_publication(publication.clone(), rx);
+        let block = propagation_test_child(&parent);
+        service.on_new_block(block.clone(), PeerId::random());
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
+        let BeaconEngineMessage::NewPayload { tx, .. } = engine.try_recv().unwrap() else {
+            panic!("missing public parent must not stop execution")
+        };
+        tx.send(Ok(PayloadStatus::new(PayloadStatusEnum::Valid, None))).unwrap();
+        assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
+        let BeaconEngineMessage::ForkchoiceUpdated { tx, .. } = engine.try_recv().unwrap() else {
+            panic!("missing public parent must not stop forkchoice")
+        };
+        tx.send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::new(PayloadStatusEnum::Valid, None))))
+            .unwrap();
+        assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
+        assert!(events.try_recv().is_err());
+        *ready.lock() = Some(block.block.0.block.clone());
+        let chain = Chain::new(
+            [RecoveredBlock::new_unhashed(block.block.0.block.clone(), vec![])],
+            Default::default(),
+            Default::default(),
+        );
+        canonical_tx.send(CanonStateNotification::Commit { new: Arc::new(chain) }).unwrap();
+        assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
+        let Some(BlockImportEvent::Announcement(BlockValidation::ValidBlock { block: announced })) =
+            publication.filter_event(events.try_recv().unwrap())
+        else {
+            panic!("canonical-ready child must replay hash")
+        };
+        assert_eq!(announced.hash, block.hash);
+        assert!(events.try_recv().is_err());
+        assert!(engine.try_recv().is_err(), "hash replay never reexecutes or changes forkchoice");
+    }
+
     #[test]
     fn hash_admission_filters_finalized_stale_and_handles_u64_edges() {
         assert!(obsolete_announcement(99, 100, 99, MAX_UNCLE_DISTANCE));
@@ -3660,39 +4076,49 @@ mod tests {
             let mut target_fcu = false;
             for _ in 0..16 {
                 assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
-                match engine.try_recv() {
-                    Ok(BeaconEngineMessage::NewPayload { payload, tx, .. }) => {
-                        assert_eq!(payload.block.header.number, 12);
-                        target_valid = true;
-                        tx.send(Ok(PayloadStatus::new(PayloadStatusEnum::Valid, None))).unwrap();
-                    }
-                    Ok(BeaconEngineMessage::ForkchoiceUpdated { state, tx, .. }) => {
-                        if state.head_block_hash
-                            == (if newer_head { better.hash_slow() } else { hash })
-                        {
+                let mut target_probe = None;
+                // Drain the current Engine batch before completing a target probe. Parent
+                // recovery can preserve the same better-head hash as the target's final FCU;
+                // hash alone cannot identify which future owns a queued response channel.
+                while let Ok(message) = engine.try_recv() {
+                    match message {
+                        BeaconEngineMessage::NewPayload { payload, tx, .. } => {
+                            assert_eq!(payload.block.header.number, 12);
+                            assert_eq!(payload.block.header.hash_slow(), hash);
+                            assert!(!target_valid, "a Valid target must not be imported again");
+                            assert!(
+                                target_probe.replace(tx).is_none(),
+                                "only one target probe may be in flight"
+                            );
+                        }
+                        BeaconEngineMessage::ForkchoiceUpdated { state, tx, .. } => {
+                            let expected_head = if newer_head {
+                                better.hash_slow()
+                            } else if target_valid {
+                                hash
+                            } else {
+                                parent.header.hash_slow()
+                            };
+                            assert_eq!(state.head_block_hash, expected_head);
+                            // Every FCU remains strict, including parent recovery and the
+                            // target/better-head update after target execution is Valid.
+                            tx.send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::new(
+                                PayloadStatusEnum::Valid,
+                                None,
+                            ))))
+                            .unwrap();
                             if target_valid {
                                 target_fcu = true;
                             }
-                        } else {
-                            assert_eq!(
-                                state.head_block_hash,
-                                parent.header.hash_slow(),
-                                "recovery may still finish a parent FCU already in flight"
-                            );
-                            assert!(
-                                !newer_head,
-                                "parent recovery must also preserve a better current head"
-                            );
                         }
-                        tx.send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::new(
-                            PayloadStatusEnum::Valid,
-                            None,
-                        ))))
-                        .unwrap();
+                        _ => panic!("unexpected engine message"),
                     }
-                    Ok(_) => panic!("unexpected engine message"),
-                    Err(_) if service.pending_imports.is_empty() => break,
-                    Err(_) => {}
+                }
+                if let Some(tx) = target_probe {
+                    tx.send(Ok(PayloadStatus::new(PayloadStatusEnum::Valid, None))).unwrap();
+                    target_valid = true;
+                } else if service.pending_imports.is_empty() {
+                    break;
                 }
             }
             assert!(
