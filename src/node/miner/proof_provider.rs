@@ -8,7 +8,7 @@ use reth_provider::{
     StorageSettingsCache,
 };
 use reth_storage_overlay::{
-    database_state_frontiers, OverlayBuilder, OverlayStateProvider, OverlayStateProviderFactory,
+    OverlayBuilder, OverlayReadError, OverlayStateProvider, OverlayStateProviderFactory,
     OwnedProvider, StateTrieOverlay,
 };
 use reth_tasks::Runtime;
@@ -211,18 +211,21 @@ where
             return provider
         }
         let start = Instant::now();
-        let provider = self.factory.database_provider_ro()?;
+        let view = self.builder.open_read_view(&self.factory)?;
+        let provider = view.provider;
+        let builder = view.builder;
         stage("database_provider", start, self.fallback);
         let start = Instant::now();
-        let (trie, finish) = database_state_frontiers(&provider)?;
+        let (trie, finish) = builder.read_frontiers().ok_or_else(|| {
+            reth_provider::ProviderError::other(OverlayReadError::SnapshotMismatch)
+        })?;
         stage("frontiers", start, self.fallback);
         let overlay = self.cache.get_or_build(
             (self.parent, trie.hash, finish.hash),
             self.fallback,
-            || self.builder.build_state_trie_overlay_at_frontiers(&provider, trie, finish, true),
+            || builder.build_state_trie_overlay_at_frontiers(&provider, trie, finish, true),
         )?;
-        Ok(OverlayStateProvider::new(provider, self.builder.clone())
-            .with_state_trie_overlay(overlay))
+        Ok(OverlayStateProvider::new(provider, builder).with_state_trie_overlay(overlay))
     }
 }
 
