@@ -38,6 +38,7 @@ use reth_provider::{
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
+use transaction_policy::BscTransactionPropagationPolicy;
 
 pub(crate) mod announced_blocks;
 pub mod block_import;
@@ -47,6 +48,7 @@ pub(crate) mod data_availability;
 pub mod evn;
 pub mod evn_peers;
 pub mod handshake;
+mod transaction_policy;
 pub(crate) mod upgrade_status;
 pub(crate) mod votes;
 pub(crate) mod bsc_protocol {
@@ -470,7 +472,12 @@ where
         let network_config = self.network_config(ctx)?;
         let network =
             NetworkManager::builder(network_config).await?.with_eth_block_source(announced_blocks);
-        let handle = ctx.start_network(network, pool);
+        let handle = ctx.start_network_with(
+            network,
+            pool,
+            ctx.config().network.transactions_manager_config(),
+            BscTransactionPropagationPolicy::new(ctx.config().network.tx_propagation_policy),
+        );
         info!(target: "reth::cli", enode=%handle.local_node_record(), "P2P networking initialized");
 
         let local_peer_id = handle.peer_id();
