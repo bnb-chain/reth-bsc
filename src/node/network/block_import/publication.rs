@@ -54,9 +54,8 @@ impl Publication {
         Self::new(retained, move |hash| {
             capture_canonical_block(
                 hash,
-                || provider.block_by_hash(hash),
+                || provider.block_with_td_by_hash(hash),
                 |number| provider.block_hash(number),
-                |number| provider.header_td_by_number(number),
                 &chain_spec,
             )
         })
@@ -217,17 +216,16 @@ impl Publication {
     }
 }
 
-/// Initial admission accepts only an exact canonical provider block. The two canonical checks
-/// reject observed reorgs around the height-keyed TD read; they are not an atomic snapshot and do
-/// not prove absence of an A-to-B-to-A interleaving. Once retained, TD is immutable and hash-keyed.
+/// Body/sidecar validation stays here; the provider proves that TD belongs to the exact header.
+/// Canonical checks remain a best-effort admission policy, not an atomic canonical snapshot.
+/// An A-to-B-to-A interleaving cannot substitute B's TD for the exact A/TD pair.
 fn capture_canonical_block(
     hash: B256,
-    block: impl FnOnce() -> ProviderResult<Option<BscBlock>>,
+    block: impl FnOnce() -> ProviderResult<Option<(BscBlock, U256)>>,
     mut canonical_hash: impl FnMut(u64) -> ProviderResult<Option<B256>>,
-    td: impl FnOnce(u64) -> ProviderResult<Option<U256>>,
     chain_spec: &BscChainSpec,
 ) -> ProviderResult<Option<ReadyBlock>> {
-    let Some(mut block) = block()? else { return Ok(None) };
+    let Some((mut block, td)) = block()? else { return Ok(None) };
     let number = block.header.number;
     if block.header.hash_slow() != hash || canonical_hash(number)? != Some(hash) {
         return Ok(None);
@@ -248,7 +246,6 @@ fn capture_canonical_block(
         skipped("incomplete_body");
         return Ok(None);
     }
-    let Some(td) = td(number)? else { return Ok(None) };
     if canonical_hash(number)? != Some(hash) {
         return Ok(None);
     }
@@ -265,7 +262,13 @@ mod tests {
     use super::*;
     use alloy_consensus::Header;
     use parking_lot::Mutex;
-    use reth_primitives_traits::BlockBody;
+    use reth_chain_state::{ExecutedBlock, NewCanonicalChain};
+    use reth_chainspec::EthChainSpec;
+    use reth_primitives_traits::{BlockBody, RecoveredBlock};
+    use reth_provider::{
+        providers::BlockchainProvider, test_utils::create_test_provider_factory_with_node_types,
+        BlockHashReader, BlockWriter,
+    };
     use std::{
         cell::Cell,
         sync::atomic::{AtomicUsize, Ordering},
@@ -294,15 +297,12 @@ mod tests {
     fn capture_checks_exact_hash_body_and_canonical_td_view() {
         let block = block(1, B256::ZERO);
         let hash = block.header.hash_slow();
-        let read = || Ok(Some((*block).clone()));
+        let read = || Ok(Some(((*block).clone(), U256::from(22))));
         let canonical = |_| Ok(Some(hash));
-        let td = |_| Ok(Some(U256::from(22)));
-        let ready = capture_canonical_block(hash, read, canonical, td, &spec()).unwrap().unwrap();
+        let ready = capture_canonical_block(hash, read, canonical, &spec()).unwrap().unwrap();
         assert_eq!(ready.td, U256::from(22));
         assert_eq!(ready.block, block);
-        assert!(capture_canonical_block(B256::ZERO, read, canonical, td, &spec())
-            .unwrap()
-            .is_none());
+        assert!(capture_canonical_block(B256::ZERO, read, canonical, &spec()).unwrap().is_none());
         let reads = Cell::new(0);
         assert!(capture_canonical_block(
             hash,
@@ -311,7 +311,6 @@ mod tests {
                 reads.set(reads.get() + 1);
                 Ok(Some(if reads.get() == 1 { hash } else { B256::ZERO }))
             },
-            td,
             &spec()
         )
         .unwrap()
@@ -322,13 +321,102 @@ mod tests {
         let corrupt_hash = corrupt.header.hash_slow();
         assert!(capture_canonical_block(
             corrupt_hash,
-            || Ok(Some(corrupt)),
+            || Ok(Some((corrupt, U256::from(22)))),
             |_| Ok(Some(corrupt_hash)),
-            |_| panic!("invalid body must not reach TD lookup"),
             &spec()
         )
         .unwrap()
         .is_none());
+    }
+
+    #[test]
+    fn capture_keeps_exact_td_when_canonical_view_returns_to_same_hash() {
+        let parent = block(1, B256::ZERO);
+        let hash = parent.header.hash_slow();
+        let pairs = Cell::new(0);
+        let canonical_reads = Cell::new(0);
+        let ready = capture_canonical_block(
+            hash,
+            || {
+                pairs.set(pairs.get() + 1);
+                Ok(Some(((*parent).clone(), U256::from(41))))
+            },
+            |_| {
+                canonical_reads.set(canonical_reads.get() + 1);
+                // Both observations can see A although the live view visited B between them.
+                Ok(Some(hash))
+            },
+            &spec(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(pairs.get(), 1);
+        assert_eq!(canonical_reads.get(), 2);
+        assert_eq!(ready.td, U256::from(41));
+        let cache = Arc::new(AnnouncedBlocks::default());
+        let publication = Publication::new(cache, move |_| {
+            Ok(Some(ReadyBlock { block: parent.clone(), td: U256::from(41) }))
+        });
+        let mut child = message(&block(2, hash), 999);
+        assert!(publication.prepare_full(&mut child));
+        assert_eq!(child.block.0.td, U128::from(43));
+        assert!(publication.full_ready(child).is_some());
+        assert!(capture_canonical_block(
+            hash,
+            || Ok(None),
+            |_| panic!("unproven TD must not pass admission"),
+            &spec(),
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn provider_publication_uses_new_branch_td_before_durable_unwind() -> eyre::Result<()> {
+        let chain_spec = Arc::new(spec());
+        let factory = create_test_provider_factory_with_node_types::<crate::node::BscNode>(
+            chain_spec.clone(),
+        );
+        let genesis =
+            BscBlock { header: chain_spec.genesis_header().clone(), ..Default::default() };
+        // Other chainspec tests can set the process-wide genesis alias. This reorg fixture
+        // anchors at a real common durable block, independently of that unrelated alias.
+        let common = (*block(1, genesis.header.hash_slow())).clone();
+        let mut old = (*block(2, common.header.hash_slow())).clone();
+        old.header.difficulty = U256::from(2);
+        let mut parent = old.clone();
+        parent.header.difficulty = U256::from(1);
+        let parent_hash = parent.header.hash_slow();
+        let writer = factory.provider_rw()?;
+        for block in [genesis.clone(), common.clone(), old] {
+            writer.insert_block(&RecoveredBlock::new_unhashed(block, Vec::new()))?;
+        }
+        writer.commit()?;
+        let provider = BlockchainProvider::new(factory)?;
+        provider.canonical_in_memory_state().update_chain(NewCanonicalChain::Commit {
+            new: vec![ExecutedBlock::new(
+                Arc::new(RecoveredBlock::new_unhashed(parent.clone(), Vec::new())),
+                Default::default(),
+                Default::default(),
+            )],
+        });
+        let common_td = genesis.header.difficulty + common.header.difficulty;
+        assert_eq!(provider.block_hash(2)?, Some(parent_hash));
+        assert_eq!(provider.header_td_by_number(2)?, Some(common_td + U256::from(2)));
+        assert_eq!(
+            provider.block_with_td_by_hash(parent_hash)?.unwrap().1,
+            common_td + U256::from(1)
+        );
+
+        let retained = Arc::new(AnnouncedBlocks::default());
+        let publication = Publication::from_provider(retained.clone(), provider, chain_spec);
+        let mut child = message(&block(3, parent_hash), 999);
+        assert!(publication.prepare_full(&mut child));
+        assert_eq!(retained.get(parent_hash).unwrap().1, common_td + U256::from(1));
+        let wire = publication.full_ready(child).unwrap();
+        assert_eq!(U256::from(wire.block.0.td), common_td + U256::from(3));
+        assert_eq!(wire.block.0.block.header.parent_hash, parent_hash);
+        Ok(())
     }
 
     #[test]
@@ -338,9 +426,8 @@ mod tests {
         let hash = block.header.hash_slow();
         let ready = capture_canonical_block(
             hash,
-            || Ok(Some(block)),
+            || Ok(Some((block, U256::from(10)))),
             |_| Ok(Some(hash)),
-            |_| Ok(Some(U256::from(10))),
             &spec(),
         )
         .unwrap()
@@ -365,9 +452,8 @@ mod tests {
         let publication = Publication::new(Arc::new(AnnouncedBlocks::default()), move |hash| {
             capture_canonical_block(
                 hash,
-                || Ok(Some(source.lock().clone())),
+                || Ok(Some((source.lock().clone(), U256::from(20)))),
                 |_| Ok(Some(hash)),
-                |_| Ok(Some(U256::from(20))),
                 &spec(),
             )
         });
