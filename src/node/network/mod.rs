@@ -16,6 +16,8 @@ use crate::{
 use alloy_primitives::{Address, U256};
 use alloy_rlp::{Decodable, Encodable};
 use alloy_rpc_types::TransactionRequest as RpcTransactionRequest;
+use announced_blocks::AnnouncedBlocks;
+use block_import::publication::Publication;
 use handshake::BscHandshake;
 use reth::{
     api::{FullNodeTypes, TxTy},
@@ -30,11 +32,14 @@ use reth_ethereum_primitives::{PooledTransactionVariant, TransactionSigned};
 use reth_network::{NetworkConfig, NetworkHandle, NetworkManager, PeersConfig, SessionsConfig};
 use reth_network_api::PeersInfo;
 use reth_network_peers::NodeRecord;
-use reth_provider::{BlockNumReader, HeaderProvider, StateProviderFactory};
+use reth_provider::{
+    BlockNumReader, CanonStateSubscriptions, HeaderProvider, StateProviderFactory,
+};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
 
+pub(crate) mod announced_blocks;
 pub mod block_import;
 pub(crate) mod blocks_by_range;
 pub mod bootnodes;
@@ -168,6 +173,7 @@ pub type BscNetworkPrimitives =
 pub struct BscNetworkBuilder {
     sync_config: Arc<block_import::config::BlockSyncConfig>,
     engine_handle_rx: Arc<Mutex<Option<oneshot::Receiver<ConsensusEngineHandle<BscPayloadTypes>>>>>,
+    announced_blocks: Arc<AnnouncedBlocks>,
 }
 
 fn apply_bsc_eth_protocol_overrides(hello: &mut HelloMessageWithProtocols) {
@@ -240,6 +246,7 @@ impl BscNetworkBuilder {
         Self {
             engine_handle_rx,
             sync_config: Arc::new(block_import::config::BlockSyncConfig::default()),
+            announced_blocks: Arc::default(),
         }
     }
 }
@@ -268,7 +275,7 @@ impl BscNetworkBuilder {
     where
         Node: FullNodeTypes<Types = BscNode>,
     {
-        let Self { engine_handle_rx, sync_config } = self;
+        let Self { engine_handle_rx, sync_config, announced_blocks } = self;
 
         // Check if CLI bootnodes are provided and set bootnode override
         if let Some(cli_bootnodes) = ctx.config().network.resolved_bootnodes() {
@@ -305,6 +312,10 @@ impl BscNetworkBuilder {
         // Clone needed values before moving into the async closure
         let provider = ctx.provider().clone();
         let chain_spec = ctx.chain_spec().clone();
+        let publication =
+            Publication::from_provider(announced_blocks, provider.clone(), chain_spec.clone());
+        let import_publication = publication.clone();
+        let canonical_notifications = provider.subscribe_to_canonical_state();
 
         // Install a cached full block provider so BSC BlocksByRange replies can include
         // full bodies when blocks are in the provider (DB + canonical in-memory state),
@@ -365,6 +376,7 @@ impl BscNetworkBuilder {
                 to_network,
             )
             .with_sync_config(sync_config)
+            .with_publication(import_publication, canonical_notifications)
             .await
             {
                 tracing::error!(target: "bsc::network", ?err, "Block import service exited");
@@ -378,7 +390,7 @@ impl BscNetworkBuilder {
             .boot_nodes(ctx.chain_spec().bootnodes().unwrap_or_default())
             .set_head(ctx.chain_spec().head())
             .with_pow()
-            .block_import(Box::new(BscBlockImport::new(handle)))
+            .block_import(Box::new(BscBlockImport::new(handle).with_publication(publication)))
             .eth_rlpx_handshake(Arc::new(BscHandshake::default()))
             // Advertise both bsc/2 (with range messages) and bsc/1 (votes only)
             .add_rlpx_sub_protocol(bsc_protocol::protocol::handler::BscProtocolHandlerV2)
@@ -454,8 +466,10 @@ where
         ctx: &BuilderContext<Node>,
         pool: Pool,
     ) -> eyre::Result<Self::Network> {
+        let announced_blocks = self.announced_blocks.clone();
         let network_config = self.network_config(ctx)?;
-        let network = NetworkManager::builder(network_config).await?;
+        let network =
+            NetworkManager::builder(network_config).await?.with_eth_block_source(announced_blocks);
         let handle = ctx.start_network(network, pool);
         info!(target: "reth::cli", enode=%handle.local_node_record(), "P2P networking initialized");
 
