@@ -20,7 +20,6 @@ use alloy_primitives::{Bytes, B256};
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
 use reth::{
     api::FullNodeTypes,
-    beacon_consensus::EthBeaconConsensus,
     builder::{components::ConsensusBuilder, BuilderContext},
     consensus::{Consensus, ConsensusError, FullConsensus, HeaderValidator, ReceiptRootBloom},
     consensus_common::validation::{
@@ -81,7 +80,6 @@ where
 /// Provides basic checks as outlined in the execution specs.
 #[derive(Debug, Clone)]
 pub struct BscConsensus<ChainSpec> {
-    base: EthBeaconConsensus<ChainSpec>,
     parlia: Arc<Parlia<ChainSpec>>,
     chain_spec: Arc<ChainSpec>,
 }
@@ -132,11 +130,7 @@ fn validate_bsc_gas_limit_against_parent<ChainSpec: BscHardforks>(
 
 impl<ChainSpec: EthChainSpec + BscHardforks + 'static> BscConsensus<ChainSpec> {
     pub fn new(chain_spec: Arc<ChainSpec>) -> Self {
-        Self {
-            base: EthBeaconConsensus::new(chain_spec.clone()),
-            parlia: Arc::new(Parlia::new(chain_spec.clone(), 200)),
-            chain_spec,
-        }
+        Self { parlia: Arc::new(Parlia::new(chain_spec.clone(), 200)), chain_spec }
     }
 }
 
@@ -237,7 +231,7 @@ impl<ChainSpec: EthChainSpec<Header = Header> + BscHardforks + 'static> Consensu
         header: &SealedHeader,
     ) -> Result<(), ConsensusError> {
         // tracing::debug!("Validating body against header, block_number: {:?}", header.number);
-        Consensus::<BscBlock>::validate_body_against_header(&self.base, body, header)
+        self.parlia.validate_body_against_header(body, header)
     }
 
     /// body stage validation.
@@ -246,8 +240,15 @@ impl<ChainSpec: EthChainSpec<Header = Header> + BscHardforks + 'static> Consensu
         block: &SealedBlock<BscBlock>,
     ) -> Result<(), ConsensusError> {
         // tracing::debug!("Validating block pre-execution, block_number: {:?}", block.header().number);
-        self.parlia.validate_block_pre_execution(block)?;
-        Ok(())
+        self.parlia.validate_block_pre_execution(block)
+    }
+
+    fn validate_block_pre_execution_with_tx_root(
+        &self,
+        block: &SealedBlock<BscBlock>,
+        transaction_root: Option<B256>,
+    ) -> Result<(), ConsensusError> {
+        self.parlia.validate_block_pre_execution_with_tx_root(block, transaction_root)
     }
 }
 
@@ -1209,6 +1210,17 @@ where
     /// Returns a reference to the chain specification.
     pub fn chain_spec(&self) -> &Arc<BscChainSpec> {
         &self.chain_spec
+    }
+
+    /// The Parlia-finalized block number of the local canonical head, as sent in
+    /// forkchoice updates. `None` before fast finality or without a snapshot.
+    pub(crate) fn finalized_number(&self) -> Result<Option<u64>, reth_provider::ProviderError> {
+        let best = self.provider.best_block_number()?;
+        Ok(self
+            .provider
+            .header_by_number(best)?
+            .and_then(|head| self.get_finalized_number_and_hash(&head))
+            .map(|(number, _)| number))
     }
 
     /// Updates the fork choice based on the incoming header.

@@ -1,4 +1,6 @@
-use crate::{chainspec::BscChainSpec, BscBlock};
+use crate::{
+    chainspec::BscChainSpec, node::primitives::BscBlobTransactionSidecar, BscBlock, BscBlockBody,
+};
 use alloy_consensus::Transaction;
 use alloy_eips::eip4844::env_settings::EnvKzgSettings;
 use eyre::{ensure, WrapErr};
@@ -72,10 +74,44 @@ fn validate_at(block: &mut BscBlock, chain_spec: &BscChainSpec, now: u64) -> eyr
     Ok(())
 }
 
+/// Validate one sidecar against the body it is stored with, before its bytes are
+/// written to the blob store and served as canonical for `tx_hash`.
+///
+/// Every body write passes through here, so this also covers the staged body
+/// downloader, whose `GetBlockBodies` responses `validate_data_availability`
+/// never sees. Nothing in the header commits to sidecars, so a peer can pair the
+/// genuine transactions with forged blobs and still pass the body checks. The
+/// block hash is not checked: it is unknown at write time, and the read path
+/// re-attaches the canonical one.
+pub(crate) fn validate_sidecar_for_storage(
+    body: &BscBlockBody,
+    block_number: u64,
+    sidecar: &BscBlobTransactionSidecar,
+) -> eyre::Result<()> {
+    ensure!(sidecar.version == 0, "unsupported sidecar version {}", sidecar.version);
+    ensure!(
+        sidecar.block_number == block_number,
+        "sidecar block number mismatch: expected {block_number}, got {}",
+        sidecar.block_number
+    );
+    let tx = usize::try_from(sidecar.tx_index)
+        .ok()
+        .and_then(|index| body.inner.transactions.get(index))
+        .filter(|tx| *tx.hash() == sidecar.tx_hash)
+        .ok_or_else(|| {
+            eyre::eyre!("no transaction {} at index {}", sidecar.tx_hash, sidecar.tx_index)
+        })?;
+    let versioned_hashes =
+        tx.blob_versioned_hashes().ok_or_else(|| eyre::eyre!("not a blob transaction"))?;
+    sidecar
+        .inner
+        .validate(versioned_hashes, EnvKzgSettings::Default.get())
+        .wrap_err("invalid blob sidecar")
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::node::primitives::BscBlobTransactionSidecar;
     use alloy_consensus::{Header, TxEip4844, TxLegacy};
     use alloy_eips::eip4844::{
         builder::{SidecarBuilder, SimpleCoder},

@@ -24,7 +24,8 @@ use revm::{
     state::{Account as RevmAccount, EvmState},
 };
 use alloy_consensus::{Header, TxReceipt, Transaction as AlloyTransaction, SignableTransaction};
-use alloy_primitives::{Address, BlockNumber, TxKind, U256, hex};
+use alloy_consensus::TxLegacy;
+use alloy_primitives::{Address, B256, BlockNumber, ChainId, TxKind, U256, hex};
 use std::collections::HashMap;
 use tracing::warn;
 use reth_primitives_traits::{GotExpected, SignerRecoverable};
@@ -36,6 +37,20 @@ fn turn_length_matches(turn_length_from_header: Option<u8>, expected_turn_length
         (turn_length_from_header, expected_turn_length),
         (Some(header), Some(expected)) if header == expected
     )
+}
+
+/// The hash go-bsc's `applyTransaction` matches a block's system tx by: `p.signer.Hash`, whose
+/// legacy signing hash always appends the configured chain id (`LegacyTx.sigHash`), so an
+/// unprotected pre-EIP-155 system tx matches the EIP-155 template. Alloy's `signature_hash` drops
+/// the EIP-155 fields when `chain_id` is `None`, so hash such a tx with the template's chain id;
+/// every other tx keeps its own signing hash.
+fn system_tx_signer_hash(tx: &TransactionSigned, chain_id: Option<ChainId>) -> B256 {
+    match tx.as_legacy() {
+        Some(legacy) if legacy.tx().chain_id.is_none() => {
+            TxLegacy { chain_id, ..legacy.tx().clone() }.signature_hash()
+        }
+        _ => tx.signature_hash(),
+    }
 }
 
 
@@ -362,7 +377,9 @@ where
 
         let signed_tx = if self.ctx.mode == BscExecutionMode::Import {
             let hash = transaction.signature_hash();
-            if self.system_txs.is_empty() || hash != self.system_txs[0].signature_hash() {
+            if self.system_txs.is_empty() ||
+                hash != system_tx_signer_hash(&self.system_txs[0], transaction.chain_id())
+            {
                 // slash tx could fail and not in the block
                 if let Some(to) = transaction.to() {
                     if to == SLASH_CONTRACT &&
@@ -480,6 +497,18 @@ where
 
         let result_and_state = self.evm.transact(tx_env.into_tx_env()).map_err(BlockExecutionError::other)?;
         let ResultAndState { result, state } = result_and_state;
+        // go-bsc's `applyMessage` returns the revert/halt as an error, and Finalize propagates it
+        // for every mandatory system tx, invalidating the block. Fail before anything is
+        // committed or reported to the state hook. Slash is the exception: go-bsc only logs its
+        // failure.
+        if !result.is_success() && tx_to != Some(SLASH_CONTRACT) {
+            self.executor_metrics.system_contract_errors_total.increment(1);
+            warn!("system tx failed: {:?}", result);
+            return Err(BscBlockExecutionError::Validation(BscBlockValidationError::SystemTxFailed {
+                to: tx_to.unwrap_or_default(),
+            })
+            .into());
+        }
         let mut temp_state = state.clone();
         temp_state.remove(&SYSTEM_ADDRESS);
         self.system_caller.on_state(StateChangeSource::Transaction(self.receipts.len()), &temp_state);

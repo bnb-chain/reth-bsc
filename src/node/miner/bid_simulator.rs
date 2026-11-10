@@ -9,6 +9,7 @@ use crate::node::evm::config::{
 };
 use crate::node::evm::LaneAdmission;
 use crate::node::miner::bsc_miner::MiningContext;
+use crate::node::miner::config::{get_global_mining_config, MiningConfig};
 use crate::node::miner::payload::DELAY_LEFT_OVER;
 use crate::node::miner::util::{epoch_validators_for_next_block, prepare_new_attributes};
 use crate::node::primitives::BscBlobTransactionSidecar;
@@ -16,6 +17,7 @@ use alloy_consensus::BlobTransactionSidecar;
 use alloy_consensus::BlockHeader as _;
 use alloy_consensus::Transaction;
 use alloy_evm::Evm;
+use alloy_evm::block::BlockExecutor;
 use alloy_primitives::U256;
 use alloy_primitives::{Address, Bytes, B256};
 use crate::consensus::parlia::util::calculate_millisecond_timestamp;
@@ -48,6 +50,9 @@ use tracing::{debug, trace, warn};
 const PAY_BID_TX_GAS_LIMIT: u64 = 25000;
 const TX_GAS: u64 = 21000;
 
+#[cfg(test)]
+mod sidecar_tests;
+
 #[derive(Clone)]
 pub struct Bid {
     pub builder: Address,
@@ -68,6 +73,30 @@ impl Bid {
     fn is_committed(&self) -> bool {
         self.committed
     }
+}
+
+/// Validate private bid blobs before execution or insertion into the blob store.
+/// `insert_blob` only stores data; it does not run transaction-pool validation.
+pub(crate) fn validate_bid_blob_sidecar(
+    tx: &TransactionSigned,
+    sidecar: Option<&BlobTransactionSidecar>,
+) -> Result<(), String> {
+    let Some(hashes) = tx.blob_versioned_hashes() else {
+        return Ok(());
+    };
+    let sidecar = sidecar.ok_or_else(|| format!("missing blob sidecar for {}", tx.hash()))?;
+    if hashes.is_empty() {
+        return Err("blob transaction has no versioned hashes".into());
+    }
+    if sidecar.blobs.len() != hashes.len()
+        || sidecar.commitments.len() != hashes.len()
+        || sidecar.proofs.len() != hashes.len()
+    {
+        return Err(format!("blob sidecar length mismatch for {}", tx.hash()));
+    }
+    sidecar
+        .validate(hashes, alloy_eips::eip4844::env_settings::EnvKzgSettings::Default.get())
+        .map_err(|err| format!("invalid blob sidecar for {}: {err}", tx.hash()))
 }
 
 /// go-bsc `canBeInterrupted`: a newly arrived bid may preempt the in-flight simulation only if
@@ -210,13 +239,34 @@ where
             best_bid_block: Arc::new(RwLock::new(HashMap::new())),
             pending_bid: Arc::new(RwLock::new(HashMap::new())),
             bid_receiving: true,
-            min_gas_price: U256::ZERO,
+            min_gas_price: U256::from(get_global_mining_config().map_or_else(
+                || MiningConfig::default().get_min_gas_tip(),
+                MiningConfig::get_min_gas_tip,
+            )),
             mev_metrics: crate::metrics::BscMevMetrics::default(),
             validator_commission,
             greedy_merge,
             no_interrupt_left_over,
             interrupt_counts: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    fn validate_bid_gas_price(&self, gas_fee: U256, gas_used: u64) -> Result<(), ()> {
+        if gas_used != 0 {
+            let bid_gas_price = gas_fee / U256::from(gas_used);
+            // Read at simulation time so miner_setGasPrice also applies to legacy bids.
+            let min_gas_price = crate::shared::get_miner_gas_tip()
+                .map(U256::from)
+                .unwrap_or(self.min_gas_price);
+            if bid_gas_price < min_gas_price {
+                debug!(
+                    "bid gas price is lower than min gas price, bid:{}, min:{}",
+                    bid_gas_price, min_gas_price
+                );
+                return Err(());
+            }
+        }
+        Ok(())
     }
 
     pub fn check_pending_bid(&self, block_number: u64, builder: Address, bid_hash: B256) -> bool {
@@ -741,16 +791,7 @@ where
             return Err(());
         }
 
-        if bid_runtime.gas_used != 0 {
-            let bid_gas_price = bid_runtime.gas_fee / U256::from(bid_runtime.gas_used);
-            if bid_gas_price < self.min_gas_price {
-                debug!(
-                    "bid gas price is lower than min gas price, bid:{}, min:{}",
-                    bid_gas_price, self.min_gas_price
-                );
-                return Err(());
-            }
-        }
+        self.validate_bid_gas_price(bid_runtime.gas_fee, bid_runtime.gas_used)?;
 
         // if enable greedy merge, fill bid env with transactions from mempool
         if self.greedy_merge {
@@ -1144,6 +1185,13 @@ where
         B::Executor: LaneAdmission,
         B::Primitives: reth_primitives_traits::NodePrimitives<SignedTx = TransactionSigned>,
     {
+        // Validate the entire builder prefix before executing any of it. This
+        // also protects callers that construct a Bid without going through RPC.
+        if !from_pool {
+            for tx in &recovered_txs {
+                validate_bid_blob_sidecar(tx, self.bid.blob_sidecars.get(tx.hash()))?;
+            }
+        }
         let base_fee: u64 = builder.evm().block().basefee();
         let min_gas_tip = crate::node::pool::tip::current_tip_floor();
         let blob_params = self.chain_spec.blob_params_at_timestamp(self.attributes.timestamp);
@@ -1233,9 +1281,35 @@ where
                     debug!(target: "payload_builder", tx=?tx_hash, ?self.block_blob_count, "skipping blob transaction because it would exceed the max blob count per block");
                     return Err("blob transaction limit exceeded".into());
                 }
-
-                self.block_blob_count += tx_blob_count;
             }
+
+            // Pool additions carry their sidecars in the pool, not in the bid.
+            // Resolve and validate before execution so a missing/invalid sidecar
+            // cannot leave an executed transaction without available blob data.
+            let sidecar = if is_blob_tx {
+                let sidecar = if from_pool {
+                    self.pool.get_blob(tx_hash)?.and_then(|sidecar| match sidecar.as_ref() {
+                        alloy_eips::eip7594::BlobTransactionSidecarVariant::Eip4844(inner) => {
+                            Some(inner.clone())
+                        }
+                        _ => None,
+                    })
+                } else {
+                    self.bid.blob_sidecars.get(&tx_hash).cloned()
+                };
+                if from_pool {
+                    if let Err(err) = validate_bid_blob_sidecar(&recovered_tx, sidecar.as_ref()) {
+                        trace!(%tx_hash, %err, "skipping pool transaction with invalid blob sidecar");
+                        skipped_senders.insert(signer);
+                        continue;
+                    }
+                }
+                sidecar
+            } else {
+                None
+            };
+
+            let tx_index = builder.executor().receipts().len() as u64;
 
             let tx_gas_used = match builder.execute_transaction(recovered_tx.clone()) {
                 Ok(tx_gas_used) => tx_gas_used,
@@ -1270,33 +1344,23 @@ where
                 }
             };
 
-            if is_blob_tx {
-                // Get sidecar from bid.blob_sidecars if available and convert to BscBlobTransactionSidecar
-                if let Some(sidecar) = self.bid.blob_sidecars.get(&tx_hash) {
-                    // Insert blob sidecar into pool's blob store
-                    use alloy_eips::eip7594::BlobTransactionSidecarVariant;
-                    if let Err(e) = self.pool.insert_blob(
-                        tx_hash,
-                        BlobTransactionSidecarVariant::Eip4844(sidecar.clone()),
-                    ) {
-                        debug!("Failed to insert blob sidecar for tx {:?}: {:?}", tx_hash, e);
-                        if from_pool {
-                            trace!("bidSimulator: failed to insert blob sidecar, ignore tx:{}, error:{}, recovered tx:{:?}", tx_hash, e, recovered_tx);
-                            skipped_senders.insert(signer);
-                            continue;
-                        }
-                        return Err("Failed to insert blob sidecar".into());
-                    }
-                    let bsc_sidecar = BscBlobTransactionSidecar {
-                        inner: sidecar.clone(),
-                        block_number: self.bid.block_number,
-                        block_hash: B256::ZERO, // Will be set when block is sealed
-                        tx_index: index as u64,
-                        tx_hash,
-                        version: 0,
-                    };
-                    self.blob_sidecars.push(bsc_sidecar);
+            if let Some(sidecar) = sidecar {
+                use alloy_eips::eip7594::BlobTransactionSidecarVariant;
+                if !from_pool {
+                    // The whole builder prefix passed validation above.
+                    self.pool
+                        .insert_blob(tx_hash, BlobTransactionSidecarVariant::Eip4844(sidecar.clone()))
+                        .map_err(|err| format!("failed to insert blob sidecar: {err}"))?;
                 }
+                self.block_blob_count += sidecar.blobs.len() as u64;
+                self.blob_sidecars.push(BscBlobTransactionSidecar {
+                    inner: sidecar,
+                    block_number: self.bid.block_number,
+                    block_hash: B256::ZERO, // Will be set when block is sealed
+                    tx_index,
+                    tx_hash,
+                    version: 0,
+                });
             }
 
             self.gas_used += tx_gas_used.tx_gas_used();
@@ -1401,6 +1465,64 @@ mod tests {
     use super::*;
     use crate::node::primitives::{BscBlock, BscBlockBody};
     use reth_primitives_traits::RecoveredBlock;
+
+    fn price_test_simulator() -> BidSimulator<
+        reth_provider::test_utils::MockEthProvider,
+        reth_transaction_pool::noop::NoopTransactionPool,
+    > {
+        struct EmptySnapshots;
+        impl SnapshotProvider for EmptySnapshots {
+            fn snapshot_by_hash(&self, _: &B256) -> Option<Snapshot> {
+                None
+            }
+            fn insert(&self, _: Snapshot) {}
+        }
+        let spec = Arc::new(BscChainSpec::from(
+            reth_chainspec::ChainSpecBuilder::mainnet().build(),
+        ));
+        BidSimulator::new(
+            reth_provider::test_utils::MockEthProvider::default(),
+            reth_transaction_pool::noop::NoopTransactionPool::default(),
+            spec.clone(),
+            Arc::new(crate::consensus::parlia::Parlia::new(spec, 200)),
+            Address::ZERO,
+            Arc::new(EmptySnapshots),
+            100,
+            false,
+            0,
+        )
+    }
+
+    #[test]
+    fn legacy_bid_price_fallback_uses_mining_configuration() {
+        let simulator = price_test_simulator();
+        let expected = get_global_mining_config().map_or_else(
+            || MiningConfig::default().get_min_gas_tip(),
+            MiningConfig::get_min_gas_tip,
+        );
+        assert_eq!(simulator.min_gas_price, U256::from(expected));
+    }
+
+    #[test]
+    fn legacy_bid_price_guard_observes_live_floor_updates() {
+        let _guard = crate::node::pool::tests::TipGuard::new(50_000_000);
+        let simulator = price_test_simulator();
+        let gas_used = 21_000;
+        for floor in [50_000_000, 75_000_000, 25_000_000] {
+            crate::shared::set_miner_gas_tip(floor);
+            for price in [floor - 1, floor, floor + 1] {
+                let gas_fee = U256::from(price) * U256::from(gas_used);
+                assert_eq!(
+                    simulator.validate_bid_gas_price(gas_fee, gas_used).is_ok(),
+                    price >= floor,
+                    "average price {price} with live floor {floor}",
+                );
+            }
+        }
+        assert!(simulator.validate_bid_gas_price(U256::ZERO, 0).is_ok());
+        crate::shared::set_miner_gas_tip(0);
+        assert!(simulator.validate_bid_gas_price(U256::ZERO, gas_used).is_ok());
+    }
 
     #[test]
     fn can_be_interrupted_requires_full_simulation_window() {

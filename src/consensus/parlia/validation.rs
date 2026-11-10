@@ -9,12 +9,22 @@ use alloy_consensus::{Header, Transaction, EMPTY_OMMER_ROOT_HASH};
 use alloy_primitives::B256;
 use reth_primitives_traits::GotExpected;
 use alloy_eips::eip4844::{DATA_GAS_PER_BLOB, MAX_DATA_GAS_PER_BLOCK_DENCUN};
-use crate::BscBlock;
+use crate::{BscBlock, BscBlockBody};
 use reth_primitives_traits::Block;
 use std::{sync::Arc, time::SystemTime};
 
 const MAX_RLP_BLOCK_SIZE_OSAKA: usize = 8 * 1024 * 1024;
 
+#[inline]
+fn validate_osaka_block_size(rlp_length: usize) -> Result<(), ConsensusError> {
+    if rlp_length > MAX_RLP_BLOCK_SIZE_OSAKA {
+        return Err(ConsensusError::BlockTooLarge {
+            rlp_length,
+            max_rlp_length: MAX_RLP_BLOCK_SIZE_OSAKA,
+        });
+    }
+    Ok(())
+}
 
 pub const fn validate_header_gas(header: &Header) -> Result<(), ConsensusError> {
     if header.gas_used > header.gas_limit {
@@ -274,34 +284,74 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
     }
 }
 
+/// Validate transaction, ommer, and withdrawal commitments independently of fork activation.
+/// Header validation separately enforces BSC's fork-specific field requirements.
+/// A supplied transaction root must be computed from this body by the caller.
+fn validate_body_commitments(
+    body: &BscBlockBody,
+    header: &Header,
+    transaction_root: Option<B256>,
+) -> Result<(), ConsensusError> {
+    use reth_primitives_traits::BlockBody;
 
-impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 'static> Consensus<BscBlock> for Parlia<ChainSpec> {
+    let ommers_hash = body.calculate_ommers_root();
+    if ommers_hash != Some(header.ommers_hash) {
+        return Err(ConsensusError::BodyOmmersHashDiff(
+            GotExpected {
+                got: ommers_hash.unwrap_or(EMPTY_OMMER_ROOT_HASH),
+                expected: header.ommers_hash,
+            }
+            .into(),
+        ));
+    }
+
+    let transaction_root = transaction_root.unwrap_or_else(|| body.calculate_tx_root());
+    if transaction_root != header.transactions_root {
+        return Err(ConsensusError::BodyTransactionRootDiff(
+            GotExpected { got: transaction_root, expected: header.transactions_root }.into(),
+        ));
+    }
+
+    match (header.withdrawals_root, body.calculate_withdrawals_root()) {
+        (Some(expected), Some(got)) if got != expected => {
+            return Err(ConsensusError::BodyWithdrawalsRootDiff(
+                GotExpected { got, expected }.into(),
+            ));
+        }
+        (Some(_), Some(_)) | (None, None) => {}
+        _ => return Err(ConsensusError::WithdrawalsRootUnexpected),
+    }
+
+    Ok(())
+}
+
+impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 'static>
+    Consensus<BscBlock> for Parlia<ChainSpec>
+{
     fn validate_body_against_header(
         &self,
-        _body: &<BscBlock as Block>::Body,
-        _header: &SealedHeader,
+        body: &<BscBlock as Block>::Body,
+        header: &SealedHeader,
     ) -> Result<(), ConsensusError> {
-        // is unused.
-        unimplemented!()
+        validate_body_commitments(body, header, None)
     }
 
     fn validate_block_pre_execution(
         &self,
         block: &reth_primitives_traits::SealedBlock<BscBlock>,
     ) -> Result<(), ConsensusError> {
-        // Check transaction root
-        if let Err(error) = block.ensure_transaction_root_valid() {
-            return Err(ConsensusError::BodyTransactionRootDiff(error.into()));
-        }
+        self.validate_block_pre_execution_with_tx_root(block, None)
+    }
+
+    fn validate_block_pre_execution_with_tx_root(
+        &self,
+        block: &reth_primitives_traits::SealedBlock<BscBlock>,
+        transaction_root: Option<B256>,
+    ) -> Result<(), ConsensusError> {
+        validate_body_commitments(block.body(), block.header(), transaction_root)?;
 
         if BscHardforks::is_osaka_active_at_timestamp(&*self.spec, block.number, block.timestamp) {
-            let rlp_length = BscBlock::rlp_length(block.header(), block.body());
-            if rlp_length > MAX_RLP_BLOCK_SIZE_OSAKA {
-                return Err(ConsensusError::BlockTooLarge {
-                    rlp_length,
-                    max_rlp_length: MAX_RLP_BLOCK_SIZE_OSAKA,
-                });
-            }
+            validate_osaka_block_size(BscBlock::canonical_rlp_length(block.header(), block.body()))?;
             // Note: Individual transaction gas limit validation (EIP-7825) is intentionally
             // NOT performed here because system transactions use i64::MAX gas limit.
             // The validation happens during EVM execution via cfg_env.tx_gas_limit_cap,
@@ -347,6 +397,64 @@ mod tests {
 
     fn sealed(header: Header) -> SealedHeader {
         RethSealedHeader::new(header, B256::ZERO)
+    }
+
+    #[test]
+    fn osaka_block_size_limit_boundary() {
+        // Check the boundary numerically without constructing oversized block payloads.
+        assert!(validate_osaka_block_size(MAX_RLP_BLOCK_SIZE_OSAKA - 1).is_ok());
+        assert!(validate_osaka_block_size(MAX_RLP_BLOCK_SIZE_OSAKA).is_ok());
+        let oversized = MAX_RLP_BLOCK_SIZE_OSAKA + 1;
+        assert!(matches!(
+            validate_osaka_block_size(oversized),
+            Err(ConsensusError::BlockTooLarge { rlp_length, max_rlp_length })
+                if rlp_length == oversized && max_rlp_length == MAX_RLP_BLOCK_SIZE_OSAKA
+        ));
+    }
+
+    /// The Osaka limit applies to go-bsc's `Block.Size()`, which excludes blob sidecars. A
+    /// block whose sidecars alone push its network encoding past 8 MiB must not be rejected as
+    /// too large by `validate_block_pre_execution`.
+    #[test]
+    fn osaka_block_size_check_ignores_sidecars() {
+        use crate::{
+            chainspec::BscChainSpec,
+            node::primitives::{BscBlobTransactionSidecar, BscBlockBody},
+        };
+        use alloy_eips::eip4844::{Blob, BlobTransactionSidecar, Bytes48};
+        use reth_primitives_traits::SealedBlock;
+
+        let blobs = 65;
+        let sidecar = BscBlobTransactionSidecar {
+            inner: BlobTransactionSidecar {
+                blobs: vec![Blob::default(); blobs],
+                commitments: vec![Bytes48::default(); blobs],
+                proofs: vec![Bytes48::default(); blobs],
+            },
+            block_number: 0,
+            block_hash: B256::ZERO,
+            tx_index: 0,
+            tx_hash: B256::ZERO,
+            version: 0,
+        };
+        // Mainnet activates Osaka at timestamp 1777343400.
+        let header = Header { number: 50_000_000, timestamp: 1_777_343_401, ..Default::default() };
+        let body = BscBlockBody {
+            inner: alloy_consensus::BlockBody {
+                transactions: Vec::new(),
+                ommers: Vec::new(),
+                withdrawals: None,
+            },
+            sidecars: Some(vec![sidecar]),
+        };
+        assert!(BscBlock::rlp_length(&header, &body) > MAX_RLP_BLOCK_SIZE_OSAKA);
+        assert!(BscBlock::canonical_rlp_length(&header, &body) <= MAX_RLP_BLOCK_SIZE_OSAKA);
+
+        let parlia =
+            Parlia::new(Arc::new(BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet())), 200);
+        let block = SealedBlock::seal_slow(BscBlock { header, body });
+        let result = parlia.validate_block_pre_execution(&block);
+        assert!(!matches!(result, Err(ConsensusError::BlockTooLarge { .. })), "{result:?}");
     }
 
     #[test]
