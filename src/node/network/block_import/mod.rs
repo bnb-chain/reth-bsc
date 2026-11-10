@@ -16,6 +16,7 @@ use std::{
 use crate::node::network::BscNewBlock;
 
 pub(crate) mod fork_recover;
+pub(crate) mod future_payload;
 pub mod handle;
 mod header_validation;
 pub mod service;
