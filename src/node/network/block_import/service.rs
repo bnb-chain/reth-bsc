@@ -1485,8 +1485,11 @@ where
                     let is_proxyed =
                         crate::node::network::bsc_protocol::registry::is_proxyed_peer(&peer_id);
                     if info.is_evn || is_proxyed {
+                        // TODO: plan ordinary and EVN targets as a per-block union, then assess
+                        // excluding EVN-covered peers from ordinary full-block fanout. Preserve
+                        // fallback for non-local/non-proxied blocks and keep connections intact.
                         // Send full NewBlock to EVN/proxyed peers to avoid re-fetching.
-                        match net.try_send_block_announcement(
+                        match net.try_send_block_announcement_once(
                             peer_id,
                             PeerMessage::NewBlock(block.clone()),
                             guard.clone(),
