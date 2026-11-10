@@ -21,6 +21,7 @@ use block_import::publication::Publication;
 use handshake::BscHandshake;
 use reth::{
     api::{FullNodeTypes, TxTy},
+    args::DefaultNetworkArgs,
     builder::{components::NetworkBuilder, BuilderContext},
     transaction_pool::{PoolTransaction, TransactionPool},
 };
@@ -44,6 +45,8 @@ pub(crate) mod announced_blocks;
 pub mod block_import;
 pub(crate) mod blocks_by_range;
 pub mod bootnodes;
+#[cfg(test)]
+mod broadcast_validation;
 pub(crate) mod data_availability;
 pub mod evn;
 pub mod evn_peers;
@@ -182,6 +185,15 @@ fn apply_bsc_eth_protocol_overrides(hello: &mut HelloMessageWithProtocols) {
     // BSC eth/70 retains total difficulty and omits UpgradeStatus, unlike Ethereum eth/70.
     // Use the supported legacy handshake until the BSC-specific wire format is implemented.
     hello.protocols.retain(|protocol| protocol.cap.name != "eth" || protocol.cap.version <= 68);
+}
+
+/// Network CLI defaults for BSC, installed before parsing node arguments.
+///
+/// Match Geth's 32768-entry per-peer transaction history. A short history can forget the
+/// source of a transaction before pending-pool propagation and send it back to that source.
+/// Explicit `--max-seen-tx-history` values still override this default.
+pub fn bsc_network_args() -> DefaultNetworkArgs {
+    DefaultNetworkArgs::default().with_max_seen_tx_history(32 * 1024)
 }
 
 fn apply_bsc_discv4_overrides<I>(discv4_config: &mut Option<Discv4Config>, boot_nodes: Option<I>)
@@ -472,13 +484,16 @@ where
         let network_config = self.network_config(ctx)?;
         let network =
             NetworkManager::builder(network_config).await?.with_eth_block_source(announced_blocks);
+        let transactions_manager_config = ctx.config().network.transactions_manager_config();
+        let tx_seen_history = transactions_manager_config.max_transactions_seen_by_peer_history;
+        metrics::gauge!("network.tx_peer_seen_history_limit").set(f64::from(tx_seen_history));
         let handle = ctx.start_network_with(
             network,
             pool,
-            ctx.config().network.transactions_manager_config(),
+            transactions_manager_config,
             BscTransactionPropagationPolicy::new(ctx.config().network.tx_propagation_policy),
         );
-        info!(target: "reth::cli", enode=%handle.local_node_record(), "P2P networking initialized");
+        info!(target: "reth::cli", enode=%handle.local_node_record(), tx_seen_history, "P2P networking initialized");
 
         let local_peer_id = handle.peer_id();
         if crate::shared::set_local_peer_id(*local_peer_id).is_err() {
