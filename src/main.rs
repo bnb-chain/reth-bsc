@@ -1,4 +1,4 @@
-use clap::{Args, Parser};
+use clap::{Args, CommandFactory, FromArgMatches};
 use reth::{
     builder::NodeHandle,
     cli::Cli,
@@ -168,7 +168,21 @@ fn user_set_gpo_ignore_price(mut args: impl Iterator<Item = String>) -> bool {
     args.any(|arg| arg == "--gpo.ignoreprice" || arg.starts_with("--gpo.ignoreprice="))
 }
 
+fn bsc_cli_command() -> clap::Command {
+    Cli::<BscChainSpecParser, BscCliArgs>::command().mut_subcommand("node", |node| {
+        node.mut_arg("max_seen_tx_history", |arg| {
+            // Upstream's derived long help hardcodes its own 320-entry default.
+            arg.help("Max number of seen transactions to remember per peer; BSC defaults to Geth's 32768-entry history.")
+                .long_help(None)
+        })
+    })
+}
+
 fn main() -> eyre::Result<()> {
+    reth_bsc::node::network::bsc_network_args()
+        .try_init()
+        .map_err(|_| eyre::eyre!("network defaults initialized before BSC defaults"))?;
+
     // Override reth's global version metadata so startup/P2P logs identify
     // this binary as Reth-BSC with its own version + commit.
     {
@@ -227,7 +241,8 @@ fn main() -> eyre::Result<()> {
     // Initialize bid package queue at startup
     reth_bsc::shared::init_bid_package_queue();
 
-    Cli::<BscChainSpecParser, BscCliArgs>::parse().run_with_components::<BscNode>(
+    let matches = bsc_cli_command().get_matches();
+    Cli::<BscChainSpecParser, BscCliArgs>::from_arg_matches(&matches)?.run_with_components::<BscNode>(
         |spec| {
             (
                 BscEvmConfig::new(spec.clone()),
@@ -742,6 +757,7 @@ fn main() -> eyre::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     fn args(v: &[&str]) -> std::vec::IntoIter<String> {
         v.iter().map(|s| s.to_string()).collect::<Vec<_>>().into_iter()
@@ -775,5 +791,28 @@ mod tests {
         assert_eq!(node.ext.block_sync.max_head_fetches, 48);
         assert_eq!(node.ext.block_sync.quick_timeout, std::time::Duration::from_millis(80));
         node.ext.block_sync.into_config().unwrap();
+    }
+
+    #[test]
+    fn explicit_transaction_history_overrides_network_default() {
+        let matches = bsc_cli_command()
+            .try_get_matches_from(["reth-bsc", "node", "--max-seen-tx-history", "64000"])
+            .unwrap();
+        let cli = Cli::<BscChainSpecParser, BscCliArgs>::from_arg_matches(&matches).unwrap();
+        let reth::cli::Commands::Node(node) = cli.command else { panic!("node command expected") };
+        assert_eq!(
+            node.network.transactions_manager_config().max_transactions_seen_by_peer_history,
+            64000
+        );
+    }
+
+    #[test]
+    fn transaction_history_help_describes_bsc_default() {
+        let help =
+            bsc_cli_command().try_get_matches_from(["reth-bsc", "node", "--help"]).unwrap_err();
+        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+        let text = help.to_string();
+        assert!(text.contains("BSC defaults to Geth's 32768-entry history"));
+        assert!(!text.contains("Default is 320 transaction hashes"));
     }
 }
