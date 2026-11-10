@@ -4,7 +4,8 @@ use crate::{metrics::BscBlockchainMetrics, BscPrimitives};
 use alloy_consensus::{BlockHeader, Header};
 use alloy_primitives::U256;
 use reth_provider::{
-    BlockIdReader, CanonStateNotification, CanonStateNotifications, HeaderProvider,
+    BlockBodyIndicesProvider, BlockIdReader, CanonStateNotification, CanonStateNotifications,
+    HeaderProvider,
 };
 use tokio::sync::broadcast::error::RecvError;
 
@@ -94,11 +95,19 @@ fn record_header(header: &Header, stage: &'static str) {
         .record(header.gas_used as f64);
 }
 
-/// Counts newly finalized headers after an explicit startup baseline. Reads are chunked and
-/// performed off the async executor. Errors leave the cursor at the last successfully read block.
+/// Counts newly finalized blocks and their transactions after an explicit startup baseline.
+/// Body indices supply the transaction count without loading or decoding transaction bodies.
+/// Reads are chunked and performed off the async executor. Errors leave the cursor at the last
+/// successfully read block.
 pub(super) async fn run_finalized<P>(provider: P)
 where
-    P: HeaderProvider<Header = Header> + BlockIdReader + Clone + Send + Sync + 'static,
+    P: HeaderProvider<Header = Header>
+        + BlockBodyIndicesProvider
+        + BlockIdReader
+        + Clone
+        + Send
+        + Sync
+        + 'static,
 {
     let mut cursor = None;
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -116,7 +125,7 @@ where
 
 fn scan_finalized<P>(provider: &P, cursor: Option<u64>) -> Option<u64>
 where
-    P: HeaderProvider<Header = Header> + BlockIdReader,
+    P: HeaderProvider<Header = Header> + BlockBodyIndicesProvider + BlockIdReader,
 {
     let tip = match provider.finalized_block_number() {
         Ok(Some(tip)) => tip,
@@ -126,17 +135,28 @@ where
             return cursor;
         }
     };
-    advance_finalized(tip, cursor, |number| provider.header_by_number(number).ok().flatten())
+    advance_finalized(tip, cursor, |number| {
+        match (provider.header_by_number(number), provider.block_body_indices(number)) {
+            (Ok(Some(header)), Ok(Some(indices))) => Some((header, indices.tx_count)),
+            (Err(error), _) | (_, Err(error)) => {
+                tracing::warn!(target: "bsc::forkchoice", number, %error,
+                    "Failed to read finalized block metrics");
+                None
+            }
+            _ => None,
+        }
+    })
 }
 
 fn advance_finalized(
     tip: u64,
     mut cursor: Option<u64>,
-    mut header: impl FnMut(u64) -> Option<Header>,
+    mut block: impl FnMut(u64) -> Option<(Header, u64)>,
 ) -> Option<u64> {
     let Some(last) = cursor else {
         metrics::gauge!("bsc.chain_diagnostics.finalized_baseline_height").set(tip as f64);
         metrics::gauge!("bsc.chain_diagnostics.finalized_scanned_height").set(tip as f64);
+        metrics::counter!("bsc.chain_diagnostics.finalized_transactions_total").increment(0);
         return Some(tip);
     };
     if tip < last {
@@ -144,9 +164,14 @@ fn advance_finalized(
         return cursor;
     }
     for number in last.saturating_add(1)..=tip.min(last.saturating_add(256)) {
-        match header(number) {
-            Some(header) if header.number == number => {
+        match block(number) {
+            Some((header, transaction_count)) if header.number == number => {
                 record_header(&header, "finalized");
+                // Includes system transactions, matching RPC block transaction counts.
+                // Advance only after both header and body indices are available, so retries
+                // neither lose transactions nor count an already scanned block twice.
+                metrics::counter!("bsc.chain_diagnostics.finalized_transactions_total")
+                    .increment(transaction_count);
                 cursor = Some(number);
             }
             _ => {
@@ -305,27 +330,78 @@ mod tests {
         let mut reads = Vec::new();
         let cursor = advance_finalized(104, baseline, |number| {
             reads.push(number);
-            (number != 103).then_some(Header {
-                number,
-                difficulty: U256::from(1),
-                ..Default::default()
-            })
+            (number != 103)
+                .then_some((Header { number, difficulty: U256::from(1), ..Default::default() }, 0))
         });
         assert_eq!(cursor, Some(102));
         assert_eq!(reads, [101, 102, 103]);
         reads.clear();
         let cursor = advance_finalized(104, cursor, |number| {
             reads.push(number);
-            Some(Header { number, difficulty: U256::from(2), ..Default::default() })
+            Some((Header { number, difficulty: U256::from(2), ..Default::default() }, 0))
         });
         assert_eq!(reads, [103, 104]);
         assert_eq!(cursor, Some(104));
         assert_eq!(advance_finalized(104, cursor, |_| panic!("already counted")), cursor);
         assert_eq!(advance_finalized(103, cursor, |_| panic!("regressed")), cursor);
         assert_eq!(
-            advance_finalized(1000, cursor, |number| Some(Header { number, ..Default::default() })),
+            advance_finalized(1000, cursor, |number| Some((
+                Header { number, ..Default::default() },
+                0
+            ))),
             Some(360)
         );
+    }
+
+    #[test]
+    fn finalized_transactions_count_empty_blocks_and_retry_incomplete_reads_once() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let baseline = advance_finalized(100, None, |_| panic!("must not count history"));
+            let cursor = advance_finalized(103, baseline, |number| match number {
+                101 => Some((Header { number, ..Default::default() }, 17)),
+                102 => Some((Header { number, ..Default::default() }, 0)),
+                // A header without its body indices is an incomplete metrics read.
+                103 => None,
+                _ => unreachable!(),
+            });
+            assert_eq!(cursor, Some(102));
+            let cursor = advance_finalized(103, cursor, |number| {
+                assert_eq!(number, 103);
+                Some((Header { number, ..Default::default() }, 23))
+            });
+            assert_eq!(cursor, Some(103));
+            assert_eq!(advance_finalized(103, cursor, |_| panic!("duplicate read")), cursor);
+            assert_eq!(advance_finalized(102, cursor, |_| panic!("regressed finality")), cursor);
+        });
+        let rendered = handle.render();
+        let transactions = rendered
+            .lines()
+            .find(|line| line.starts_with("bsc_chain_diagnostics_finalized_transactions_total "))
+            .unwrap();
+        assert_eq!(transactions.split_whitespace().last(), Some("40"));
+    }
+
+    #[test]
+    fn finalized_transactions_do_not_count_a_mismatched_header() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let cursor = advance_finalized(100, None, |_| panic!("baseline"));
+            assert_eq!(
+                advance_finalized(101, cursor, |_| {
+                    Some((Header { number: 99, ..Default::default() }, 500))
+                }),
+                cursor
+            );
+        });
+        let rendered = handle.render();
+        let transactions = rendered
+            .lines()
+            .find(|line| line.starts_with("bsc_chain_diagnostics_finalized_transactions_total "))
+            .unwrap();
+        assert_eq!(transactions.split_whitespace().last(), Some("0"));
     }
 
     #[test]
