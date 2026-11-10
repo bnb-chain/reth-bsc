@@ -1,4 +1,5 @@
 use crate::{BscBlock, BscBlockBody, BscPrimitives};
+use crate::node::network::data_availability::validate_sidecar_for_storage;
 use crate::node::primitives::BscBlobTransactionSidecar;
 use alloy_consensus::BlockHeader;
 use alloy_eips::eip2718::{EIP4844_TX_TYPE_ID, Typed2718};
@@ -30,11 +31,7 @@ where
     ) -> ProviderResult<()> {
         let (eth_bodies, sidecar_entries): (Vec<_>, Vec<_>) = bodies
             .into_iter()
-            .map(|(block_number, body)| {
-                let inner = body.map(|b| &b.inner);
-                let sidecars = body.and_then(|b| b.sidecars.as_ref());
-                ((block_number, inner), (block_number, sidecars))
-            })
+            .map(|(number, body)| ((number, body.map(|b| &b.inner)), (number, body)))
             .unzip();
         self.0.write_block_bodies(provider, eth_bodies)?;
         let first_block = sidecar_entries.first().map(|(number, _)| *number);
@@ -42,13 +39,7 @@ where
 
         // Write blob sidecars to the blob store keyed by tx hash.
         if let Some(blob_store) = crate::shared::get_global_blob_store() {
-            let mut to_insert: Vec<(B256, BlobTransactionSidecarVariant)> = Vec::new();
-            for sidecar in sidecar_entries.iter().filter_map(|(_, sidecars)| *sidecars).flatten() {
-                to_insert.push((
-                    sidecar.tx_hash,
-                    BlobTransactionSidecarVariant::Eip4844(sidecar.inner.clone()),
-                ));
-            }
+            let to_insert = verified_sidecars(&sidecar_entries);
             if !to_insert.is_empty() {
                 let tx_hashes: Vec<_> = to_insert.iter().map(|(h, _)| *h).collect();
                 if let Err(error) = blob_store.insert_all(to_insert) {
@@ -72,7 +63,10 @@ where
                     "blob_store_write: inserted sidecars"
                 );
             }
-        } else if sidecar_entries.iter().any(|(_, sidecars)| sidecars.is_some_and(|s| !s.is_empty())) {
+        } else if sidecar_entries
+            .iter()
+            .any(|(_, body)| body.and_then(|b| b.sidecars.as_ref()).is_some_and(|s| !s.is_empty()))
+        {
             tracing::warn!(
                 target: "bsc::storage",
                 first_block,
@@ -161,6 +155,38 @@ where
 
 /// Look up blob sidecars from the blob store.
 /// `blob_txs` contains `(tx_hash, tx_index_in_block)` pairs — only type-3 txs.
+/// Sidecars from `bodies` that may be stored, dropping any that do not match their
+/// body.
+///
+/// The blob store overwrites by tx hash and its contents are served as canonical,
+/// so an unchecked sidecar here would replace genuine data with a peer's bytes.
+/// A mismatch drops the sidecar rather than failing the write: the body itself is
+/// valid, and failing would stall the stage on data the header does not commit to.
+fn verified_sidecars(
+    bodies: &[(u64, Option<&BscBlockBody>)],
+) -> Vec<(B256, BlobTransactionSidecarVariant)> {
+    let mut verified = Vec::new();
+    for (block_number, body) in bodies {
+        let Some(body) = body else { continue };
+        for sidecar in body.sidecars.iter().flatten() {
+            match validate_sidecar_for_storage(body, *block_number, sidecar) {
+                Ok(()) => verified.push((
+                    sidecar.tx_hash,
+                    BlobTransactionSidecarVariant::Eip4844(sidecar.inner.clone()),
+                )),
+                Err(error) => tracing::warn!(
+                    target: "bsc::storage",
+                    block_number,
+                    tx_hash = %sidecar.tx_hash,
+                    error = %format_args!("{error:#}"),
+                    "blob_store_write: dropping sidecar that does not match its block"
+                ),
+            }
+        }
+    }
+    verified
+}
+
 fn read_sidecars_from_blob_store(
     blob_store: &Arc<dyn BlobStore>,
     block_number: u64,
@@ -252,5 +278,65 @@ impl ChainStorage<BscPrimitives> for BscStorage {
         Types: NodeTypesForProvider<Primitives = BscPrimitives>,
     {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node::network::data_availability::tests::blob_block;
+    use alloy_eips::eip4844::builder::{SidecarBuilder, SimpleCoder};
+
+    fn stored_tx_hashes(block: &BscBlock) -> Vec<B256> {
+        verified_sidecars(&[(block.header.number, Some(&block.body))])
+            .into_iter()
+            .map(|(tx_hash, _)| tx_hash)
+            .collect()
+    }
+
+    /// SRC-2715: the staged body downloader writes sidecars that no data-availability
+    /// check has seen. A peer can return the genuine transactions, which satisfy
+    /// the transaction root, beside forged sidecars that keep each real tx hash.
+    /// Those must never reach the blob store, which serves them as canonical.
+    #[test]
+    fn only_sidecars_matching_their_body_are_stored() {
+        let block = blob_block(100);
+        let sidecars = block.body.sidecars.clone().unwrap();
+        assert_eq!(
+            stored_tx_hashes(&block),
+            sidecars.iter().map(|s| s.tx_hash).collect::<Vec<_>>(),
+            "genuine sidecars are stored",
+        );
+
+        // KZG-valid, but for other data: the commitment cannot match the
+        // transaction's versioned hash.
+        let other =
+            SidecarBuilder::<SimpleCoder>::from_slice(b"forged blob").build_4844().unwrap();
+        let legacy_tx_hash = *block.body.inner.transactions[0].hash();
+        type Forge = Box<dyn Fn(&mut BscBlobTransactionSidecar)>;
+        let cases: Vec<(&str, Forge)> = vec![
+            ("blob byte", Box::new(|s| s.inner.blobs[0][31] ^= 1)),
+            ("other valid blob", Box::new(move |s| s.inner = other.clone())),
+            ("tx index", Box::new(|s| s.tx_index = 0)),
+            (
+                "legacy tx",
+                Box::new(move |s| {
+                    s.tx_index = 0;
+                    s.tx_hash = legacy_tx_hash;
+                }),
+            ),
+            ("out of range index", Box::new(|s| s.tx_index = u64::MAX)),
+            ("block number", Box::new(|s| s.block_number += 1)),
+            ("version", Box::new(|s| s.version = 1)),
+        ];
+        for (name, forge) in cases {
+            let mut forged = block.clone();
+            forge(&mut forged.body.sidecars.as_mut().unwrap()[0]);
+            assert_eq!(
+                stored_tx_hashes(&forged),
+                vec![sidecars[1].tx_hash],
+                "{name}: the forged sidecar is dropped and its genuine sibling kept",
+            );
+        }
     }
 }
