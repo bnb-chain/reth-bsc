@@ -88,6 +88,9 @@ pub enum ForkRecoverError {
     #[error("fork base {base} is below the finalized block {finalized}")]
     BelowFinalized { base: u64, finalized: u64 },
 
+    #[error("fork base {base} is below the finalized block {finalized}")]
+    BelowFinalized { base: u64, finalized: u64 },
+
     #[error("local provider error: {0}")]
     Provider(#[from] reth_provider::ProviderError),
 
@@ -762,6 +765,7 @@ where
         outcome = ?discovery.outcome,
         "Phase 1 complete"
     );
+    ensure_fork_above_finalized(&discovery.fork_blocks, forkchoice_engine.finalized_number_at_head(provider.best_block_number()?)?)?;
 
     import_discovered_header(
         RecoverTarget {
@@ -1663,6 +1667,61 @@ mod tests {
         let nums: Vec<u64> = out.fork_blocks.iter().map(|b| b.header.number).collect();
         assert_eq!(nums, vec![99, 98, 97, 96], "side headers still require Engine validation");
         assert_eq!(fetcher.calls().len(), 1);
+    }
+
+    // ---- SRC-2598: the first walk binds every block to the cursor ----
+    #[tokio::test]
+    async fn discover_rejects_spliced_ranges_on_the_first_walk() {
+        let mut provider = FakeProvider::default();
+        let (local, local_hashes) = linear_chain(0, 201, B256::ZERO, 0xC);
+        for h in &local {
+            provider.insert_canonical(h.clone());
+        }
+        // Declares a near-tip height but points at old canonical block 128.
+        let crafted = make_header(10_001, local_hashes[128], 0xD);
+        let crafted_hash = crafted.hash_slow();
+
+        let splices = [
+            // The reported splice: the old parent ends discovery on block 128.
+            vec![make_block(crafted.clone()), make_block(local[128].clone())],
+            // A response that does not start at the requested hash.
+            vec![make_block(local[200].clone())],
+        ];
+        for resp in splices {
+            let fetcher = ScriptedFetcher::new(vec![Ok(resp)]);
+            let err = discover_fork_blocks(
+                fake_peer(),
+                crafted_hash,
+                10_001,
+                &provider,
+                fetcher.as_ref(),
+                &(),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, ForkRecoverError::RecoveryAncestryMismatch { .. }), "{err}");
+        }
+    }
+
+    // ---- SRC-2598: a linked fork below finality never reaches Phase 2 ----
+    #[test]
+    fn fork_base_below_finalized_is_rejected() {
+        // Fork blocks newest -> oldest: [130', 129'] on canonical block 128.
+        let fork = |oldest: u64| {
+            vec![
+                make_block(make_header(oldest + 1, B256::ZERO, 0xD)),
+                make_block(make_header(oldest, B256::ZERO, 0xD)),
+            ]
+        };
+
+        let err = ensure_fork_above_finalized(&fork(129), Some(9_900)).unwrap_err();
+        assert!(
+            matches!(err, ForkRecoverError::BelowFinalized { base: 128, finalized: 9_900 }),
+            "{err}"
+        );
+        ensure_fork_above_finalized(&fork(129), Some(128)).expect("a fork may start at finality");
+        ensure_fork_above_finalized(&fork(129), None).expect("no floor before fast finality");
+        ensure_fork_above_finalized(&[], Some(9_900)).expect("nothing to import");
     }
 
     // ---- RecoverTarget constructor tests ----
