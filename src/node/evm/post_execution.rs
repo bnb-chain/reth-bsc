@@ -24,7 +24,8 @@ use revm::{
     state::{Account as RevmAccount, EvmState},
 };
 use alloy_consensus::{Header, TxReceipt, Transaction as AlloyTransaction, SignableTransaction};
-use alloy_primitives::{Address, BlockNumber, TxKind, U256, hex};
+use alloy_consensus::TxLegacy;
+use alloy_primitives::{Address, B256, BlockNumber, ChainId, TxKind, U256, hex};
 use std::collections::HashMap;
 use tracing::warn;
 use reth_primitives_traits::{GotExpected, SignerRecoverable};
@@ -36,6 +37,20 @@ fn turn_length_matches(turn_length_from_header: Option<u8>, expected_turn_length
         (turn_length_from_header, expected_turn_length),
         (Some(header), Some(expected)) if header == expected
     )
+}
+
+/// The hash go-bsc's `applyTransaction` matches a block's system tx by: `p.signer.Hash`, whose
+/// legacy signing hash always appends the configured chain id (`LegacyTx.sigHash`), so an
+/// unprotected pre-EIP-155 system tx matches the EIP-155 template. Alloy's `signature_hash` drops
+/// the EIP-155 fields when `chain_id` is `None`, so hash such a tx with the template's chain id;
+/// every other tx keeps its own signing hash.
+fn system_tx_signer_hash(tx: &TransactionSigned, chain_id: Option<ChainId>) -> B256 {
+    match tx.as_legacy() {
+        Some(legacy) if legacy.tx().chain_id.is_none() => {
+            TxLegacy { chain_id, ..legacy.tx().clone() }.signature_hash()
+        }
+        _ => tx.signature_hash(),
+    }
 }
 
 
@@ -362,7 +377,9 @@ where
 
         let signed_tx = if self.ctx.mode == BscExecutionMode::Import {
             let hash = transaction.signature_hash();
-            if self.system_txs.is_empty() || hash != self.system_txs[0].signature_hash() {
+            if self.system_txs.is_empty() ||
+                hash != system_tx_signer_hash(&self.system_txs[0], transaction.chain_id())
+            {
                 // slash tx could fail and not in the block
                 if let Some(to) = transaction.to() {
                     if to == SLASH_CONTRACT &&
