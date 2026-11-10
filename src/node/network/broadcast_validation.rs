@@ -141,73 +141,71 @@ fn block(number: u64) -> NewBlockMessage<NewBlock> {
 }
 
 #[tokio::test]
-async fn ordinary_and_direct_evn_entries_deliver_three_copies_of_one_block() {
-    let mut wire = LocalWire::new().await;
-    wire.connect().await;
-    let peer = *wire.b.peer_id();
-    let block = block(42);
-    wire.a.handle().announce_block((*block.block).clone(), block.hash);
-    wire.drive(
-        |wire, _| {
-            if wire.full_count(block.hash) == 1 {
-                Poll::Ready(())
-            } else {
-                Poll::Pending
-            }
-        },
-    )
-    .await;
-
-    // These are the public targeted calls used by early and completion EVN forwarding.
-    // No BSC EVM import is simulated here: observe the shared network's actual wire result.
-    for expected in [2, 3] {
+async fn ordinary_and_evn_share_dedup_in_both_entry_orders() {
+    for direct_first in [false, true] {
+        let mut wire = LocalWire::new().await;
+        wire.connect().await;
+        let peer = *wire.b.peer_id();
+        let block = block(42);
+        if direct_first {
+            assert_eq!(
+                wire.a.handle().try_send_block_announcement_once(
+                    peer,
+                    PeerMessage::NewBlock(block.clone()),
+                    None,
+                ),
+                Ok(())
+            );
+        } else {
+            wire.a.handle().announce_block((*block.block).clone(), block.hash);
+        }
+        wire.drive(
+            |wire, _| {
+                if wire.full_count(block.hash) == 1 {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            },
+        )
+        .await;
+        // Repeat both production routes, including EVN early/completion forwarding.
+        for _ in 0..2 {
+            assert_eq!(
+                wire.a.handle().try_send_block_announcement_once(
+                    peer,
+                    PeerMessage::NewBlock(block.clone()),
+                    None,
+                ),
+                Ok(())
+            );
+            wire.a.handle().announce_block((*block.block).clone(), block.hash);
+        }
+        let handle = wire.a.handle().clone();
+        let mut barrier = Box::pin(handle.get_peer_by_id(peer));
+        wire.drive(|_, cx| barrier.as_mut().poll(cx)).await.unwrap().unwrap();
+        let marker = self::block(99);
         assert_eq!(
             wire.a.handle().try_send_block_announcement(
                 peer,
-                PeerMessage::NewBlock(block.clone()),
+                PeerMessage::NewBlock(marker.clone()),
                 None,
             ),
             Ok(())
         );
-        wire.drive(|wire, _| {
-            if wire.full_count(block.hash) == expected {
-                Poll::Ready(())
-            } else {
-                Poll::Pending
-            }
-        })
+        wire.drive(
+            |wire, _| {
+                if wire.full_count(marker.hash) == 1 {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            },
+        )
         .await;
+        assert_eq!(wire.full_count(block.hash), 1);
+        println!("WIRE_BLOCK direct_first={direct_first} same_peer_same_hash_received=1");
     }
-    for _ in 0..2 {
-        wire.a.handle().announce_block((*block.block).clone(), block.hash);
-    }
-    let handle = wire.a.handle().clone();
-    let mut barrier = Box::pin(handle.get_peer_by_id(peer));
-    wire.drive(|_, cx| barrier.as_mut().poll(cx)).await.unwrap().unwrap();
-    let marker = self::block(99);
-    assert_eq!(
-        wire.a.handle().try_send_block_announcement(
-            peer,
-            PeerMessage::NewBlock(marker.clone()),
-            None,
-        ),
-        Ok(())
-    );
-    wire.drive(
-        |wire, _| {
-            if wire.full_count(marker.hash) == 1 {
-                Poll::Ready(())
-            } else {
-                Poll::Pending
-            }
-        },
-    )
-    .await;
-    assert_eq!(wire.full_count(block.hash), 3);
-    println!(
-        "WIRE_BLOCK ordinary=1 direct=2 ordinary_repeat_attempts=2 same_peer_same_hash_received={}",
-        wire.full_count(block.hash)
-    );
 }
 
 #[tokio::test]
@@ -229,7 +227,7 @@ async fn manager_acceptance_can_hide_session_rejection_but_ordinary_retry_works(
         );
     }
     assert_eq!(
-        wire.a.handle().try_send_block_announcement(
+        wire.a.handle().try_send_block_announcement_once(
             peer,
             PeerMessage::NewBlock(victim.clone()),
             None,
@@ -318,6 +316,92 @@ fn pool(propagate: bool) -> LocalPool {
         InMemoryBlobStore::default(),
         Default::default(),
     )
+}
+
+#[tokio::test]
+async fn targeted_hash_dedup_filters_known_items_but_forced_marker_is_delivered() {
+    let mut wire = LocalWire::new().await;
+    wire.connect().await;
+    let peer = *wire.b.peer_id();
+    let known = block(60);
+    wire.a.handle().announce_block((*known.block).clone(), known.hash);
+    wire.drive(
+        |wire, _| {
+            if wire.full_count(known.hash) == 1 {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        },
+    )
+    .await;
+    let other = reth_eth_wire::BlockHashNumber { hash: B256::repeat_byte(61), number: 61 };
+    let marker = reth_eth_wire::BlockHashNumber { hash: B256::repeat_byte(62), number: 62 };
+    let batch = reth_eth_wire::NewBlockHashes(vec![
+        reth_eth_wire::BlockHashNumber { hash: known.hash, number: 60 },
+        other.clone(),
+    ]);
+    assert_eq!(
+        wire.a.handle().try_send_block_announcement_once(
+            peer,
+            PeerMessage::NewBlockHashes(batch.clone()),
+            None,
+        ),
+        Ok(())
+    );
+    wire.drive(|wire, _| {
+        if wire
+            .b_blocks
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, NewBlockEvent::Hashes(_)))
+        {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+    // Now both items are known; repeating the batch must not produce a second frame.
+    assert_eq!(
+        wire.a.handle().try_send_block_announcement_once(
+            peer,
+            PeerMessage::NewBlockHashes(batch),
+            None,
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        wire.a.handle().try_send_block_announcement(
+            peer,
+            PeerMessage::NewBlockHashes(reth_eth_wire::NewBlockHashes(vec![marker.clone()])),
+            None,
+        ),
+        Ok(())
+    );
+    wire.drive(|wire, _| {
+        if wire.b_blocks.lock().unwrap().iter().any(
+            |event| matches!(event, NewBlockEvent::Hashes(hashes) if hashes.0 == [marker.clone()]),
+        ) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+    let frames: Vec<_> = wire
+        .b_blocks
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|event| match event {
+            NewBlockEvent::Hashes(hashes) => Some(hashes.0.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(frames, [vec![other], vec![marker]]);
+    println!("WIRE_HASH known_item_skipped=1 repeated_batch_skipped=1 forced_marker_delivered=1");
 }
 
 fn signed_tx(index: u64) -> TransactionSigned {
