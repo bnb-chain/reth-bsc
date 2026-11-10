@@ -234,9 +234,11 @@ where
         // even when the coinbase has no code. REVM returns success for empty code here in
         // `frame_init`, so `frame_run`'s guard below never sees it: reject the call first.
         // Depth and precompile checks precede `Run()` in geth, so leave those to REVM.
+        // Apply the same Pasteur activation as the bytecode guard below.
         // `CALL` to an empty coinbase skips `Run()` in geth too and must keep succeeding.
         if let FrameInput::Call(inputs) = &frame_input.frame_input {
-            if inputs.scheme == CallScheme::StaticCall &&
+            if self.cfg.spec >= BscHardfork::Pasteur &&
+                inputs.scheme == CallScheme::StaticCall &&
                 inputs.target_address == self.block.beneficiary &&
                 frame_input.depth <= CALL_STACK_LIMIT as usize &&
                 self.inner.precompiles.get(&inputs.target_address).is_none()
@@ -273,16 +275,9 @@ where
             frame.interpreter.input.target_address == coinbase
         };
 
-        if hits_coinbase {
-            // Ported from go-bsc (core/vm: "coinbase address cannot be used as contract
-            // address"): refuse to execute any bytecode whose storage/self context is the
-            // block's coinbase, whether reached via CALL/DELEGATECALL to pre-existing code
-            // or freshly deployed via CREATE/CREATE2. Without this, a contract could run
-            // "as" the coinbase and be mistaken for the validator itself by callers that
-            // gate on `caller == coinbase` (e.g. system transaction detection), or otherwise
-            // interfere with fee-distribution invariants that assume the coinbase never
-            // carries code. This mirrors go-ethereum's error-code semantics: burn the
-            // frame's remaining gas and revert its state changes, same as any other halt.
+        if self.cfg.spec >= BscHardfork::Pasteur && hits_coinbase {
+            // Reject bytecode execution in the coinbase's context from Pasteur.
+            // Halt the frame, consuming its remaining gas and reverting its state changes.
             let (ctx, _, _, frame_stack) = self.all_mut();
             let frame = frame_stack.get();
             let mut gas = frame.interpreter.gas;
@@ -777,7 +772,7 @@ mod tests {
         let coinbase = Address::from([0xC0; 20]);
         let caller = Address::from([0x11; 20]);
 
-        let cfg_env = CfgEnv::new_with_spec(BscHardfork::Osaka).with_chain_id(56);
+        let cfg_env = CfgEnv::new_with_spec(BscHardfork::Pasteur).with_chain_id(56);
         let block_env = BlockEnv {
             beneficiary: coinbase,
             prevrandao: Some(U256::from(1).into()),
@@ -827,6 +822,60 @@ mod tests {
         assert_eq!(slot, U256::ZERO, "SSTORE must not have executed");
     }
 
+    #[test]
+    fn coinbase_execution_is_gated_on_pasteur() {
+        for spec in [BscHardfork::Mendel, BscHardfork::Pasteur, BscHardfork::Jenner] {
+            for create in [false, true] {
+                let caller = Address::from([0x11; 20]);
+                let coinbase = caller.create(0);
+                let env = EvmEnv::new(
+                    CfgEnv::new_with_spec(spec).with_chain_id(56),
+                    BlockEnv {
+                        beneficiary: coinbase,
+                        prevrandao: Some(U256::from(1).into()),
+                        ..Default::default()
+                    }
+                    .into(),
+                );
+                let mut db = InMemoryDB::default();
+                db.insert_account_info(
+                    caller,
+                    AccountInfo { balance: U256::from(1_000_000u64), ..Default::default() },
+                );
+                // Return one byte; valid as either runtime or init code.
+                let code = Bytes::from_static(&[0x60, 0x01, 0x60, 0x00, 0xf3]);
+                if !create {
+                    db.insert_account_info(
+                        coinbase,
+                        AccountInfo::default().with_code(Bytecode::new_raw(code.clone())),
+                    );
+                }
+                let mut evm = BscEvm::new(env, db, NoOpInspector, false, false);
+                let tx = TxEnv::builder()
+                    .caller(caller)
+                    .chain_id(Some(56))
+                    .gas_limit(100_000)
+                    .gas_price(1)
+                    .kind(if create { TxKind::Create } else { TxKind::Call(coinbase) })
+                    .data(if create { code } else { Bytes::new() })
+                    .build()
+                    .unwrap();
+                let result = evm.transact_one(BscTxEnv::new(tx)).unwrap();
+                if spec < BscHardfork::Pasteur {
+                    assert!(result.is_success(), "{spec:?}, create={create}: {result:?}");
+                } else {
+                    assert!(
+                        matches!(result, ExecutionResult::Halt {
+                            reason: HaltReason::PrecompileError, ..
+                        }),
+                        "{spec:?}, create={create}: {result:?}"
+                    );
+                    assert_eq!(result.tx_gas_used(), 100_000);
+                }
+            }
+        }
+    }
+
     /// Same guard, but for a `CREATE` whose computed address happens to land on the coinbase.
     #[test]
     fn create_landing_on_coinbase_is_rejected() {
@@ -835,7 +884,7 @@ mod tests {
         // it can be used as the block's coinbase.
         let created_address = caller.create(0);
 
-        let cfg_env = CfgEnv::new_with_spec(BscHardfork::Osaka).with_chain_id(56);
+        let cfg_env = CfgEnv::new_with_spec(BscHardfork::Pasteur).with_chain_id(56);
         let block_env = BlockEnv {
             beneficiary: created_address,
             prevrandao: Some(U256::from(1).into()),
@@ -880,7 +929,7 @@ mod tests {
         let coinbase = Address::from([0xC0; 20]);
         let caller = Address::from([0x11; 20]);
 
-        let cfg_env = CfgEnv::new_with_spec(BscHardfork::Osaka).with_chain_id(56);
+        let cfg_env = CfgEnv::new_with_spec(BscHardfork::Pasteur).with_chain_id(56);
         let block_env = BlockEnv {
             beneficiary: coinbase,
             prevrandao: Some(U256::from(1).into()),
@@ -944,6 +993,7 @@ mod tests {
 
     /// Runs `probe` against a coinbase holding `coinbase_code`. Returns (slot 0, gas used).
     fn run_coinbase_guard_probe(
+        spec: BscHardfork,
         probe: Bytecode,
         coinbase_code: Option<Bytecode>,
         inspect: bool,
@@ -954,7 +1004,7 @@ mod tests {
         let caller = Address::from([0x11; 20]);
         let probe_address = Address::from([0x22; 20]);
 
-        let cfg_env = CfgEnv::new_with_spec(BscHardfork::Osaka).with_chain_id(56);
+        let cfg_env = CfgEnv::new_with_spec(spec).with_chain_id(56);
         let block_env = BlockEnv {
             beneficiary: coinbase,
             prevrandao: Some(U256::from(1).into()),
@@ -992,18 +1042,45 @@ mod tests {
         (slot, result.tx_gas_used())
     }
 
+    /// The empty-code fast path and bytecode execution must activate the guard together.
+    #[test]
+    fn staticcall_coinbase_guard_is_gated_on_pasteur() {
+        for spec in [BscHardfork::Mendel, BscHardfork::Pasteur, BscHardfork::Jenner] {
+            for inspect in [false, true] {
+                for code in [None, Some(Bytecode::new_raw(Bytes::from_static(&[0x00])))] {
+                    let (slot, _) = run_coinbase_guard_probe(
+                        spec,
+                        coinbase_guard_probe(STATICCALL, None),
+                        code,
+                        inspect,
+                    );
+                    let expected = if spec < BscHardfork::Pasteur { 2u64 } else { 1u64 };
+                    assert_eq!(slot, U256::from(expected), "{spec:?}, inspect={inspect}");
+                }
+            }
+        }
+    }
+
     /// go-bsc's `StaticCall` always enters `Run()`, which rejects the coinbase even when it has
     /// no code, and burns the forwarded gas. REVM's empty-code fast path must not bypass that.
     #[test]
     fn staticcall_to_empty_coinbase_fails_and_burns_forwarded_gas() {
         for inspect in [false, true] {
-            let (static_slot, static_gas) =
-                run_coinbase_guard_probe(coinbase_guard_probe(STATICCALL, None), None, inspect);
+            let (static_slot, static_gas) = run_coinbase_guard_probe(
+                BscHardfork::Pasteur,
+                coinbase_guard_probe(STATICCALL, None),
+                None,
+                inspect,
+            );
             assert_eq!(static_slot, U256::from(1), "STATICCALL to coinbase must fail");
 
             // Same probe with CALL, which skips `Run()` for empty code in geth too.
-            let (call_slot, call_gas) =
-                run_coinbase_guard_probe(coinbase_guard_probe(CALL, None), None, inspect);
+            let (call_slot, call_gas) = run_coinbase_guard_probe(
+                BscHardfork::Pasteur,
+                coinbase_guard_probe(CALL, None),
+                None,
+                inspect,
+            );
             assert_eq!(call_slot, U256::from(2), "CALL to an empty coinbase must succeed");
 
             // All 10_000 forwarded gas is burned; the CALL probe has one extra PUSH1 (3 gas).
@@ -1014,6 +1091,7 @@ mod tests {
     #[test]
     fn staticcall_to_coinbase_with_code_fails() {
         let (slot, _) = run_coinbase_guard_probe(
+            BscHardfork::Pasteur,
             coinbase_guard_probe(STATICCALL, None),
             Some(Bytecode::new_raw(Bytes::from(vec![0x00]))),
             false,
@@ -1024,8 +1102,12 @@ mod tests {
     #[test]
     fn staticcall_to_empty_non_coinbase_account_succeeds() {
         let other = Address::from([0x33; 20]);
-        let (slot, _) =
-            run_coinbase_guard_probe(coinbase_guard_probe(STATICCALL, Some(other)), None, false);
+        let (slot, _) = run_coinbase_guard_probe(
+            BscHardfork::Pasteur,
+            coinbase_guard_probe(STATICCALL, Some(other)),
+            None,
+            false,
+        );
         assert_eq!(slot, U256::from(2), "STATICCALL to an ordinary empty account must succeed");
     }
 
@@ -1034,8 +1116,12 @@ mod tests {
     #[test]
     fn delegatecall_and_callcode_to_empty_coinbase_succeed() {
         for opcode in [DELEGATECALL, CALLCODE] {
-            let (slot, _) =
-                run_coinbase_guard_probe(coinbase_guard_probe(opcode, None), None, false);
+            let (slot, _) = run_coinbase_guard_probe(
+                BscHardfork::Pasteur,
+                coinbase_guard_probe(opcode, None),
+                None,
+                false,
+            );
             assert_eq!(slot, U256::from(2), "opcode {opcode:#x} to an empty coinbase must succeed");
         }
     }
