@@ -1,3 +1,4 @@
+use super::health::RpcHealth;
 use crate::{
     evm::precompiles::cas20::info::{token_info_at, InfoError, ProviderHost, TokenInfo},
     hardforks::BscHardforks,
@@ -21,7 +22,8 @@ pub trait BscEthExtApi {
     #[method(name = "coinbase")]
     async fn coinbase(&self) -> RpcResult<Address>;
 
-    /// Returns whether the node has a canonical head.
+    /// Returns whether the sampled p75 of completed RPC calls is below five seconds.
+    /// Sampling requires metrics; otherwise returns true.
     #[method(name = "health")]
     async fn health(&self) -> RpcResult<bool>;
 
@@ -47,15 +49,16 @@ pub struct BscEthExtApiImpl<P> {
     provider: P,
     blocking_io_guard: Arc<Semaphore>,
     validator_address: Address,
+    health: RpcHealth,
 }
 
 impl<P> BscEthExtApiImpl<P> {
-    pub fn new(provider: P, blocking_io_guard: Arc<Semaphore>) -> Self {
+    pub fn new(provider: P, blocking_io_guard: Arc<Semaphore>, health: RpcHealth) -> Self {
         let validator_address = crate::node::miner::config::get_global_mining_config()
             .and_then(|cfg| cfg.validator_address)
             .unwrap_or(Address::ZERO);
 
-        Self { provider, blocking_io_guard, validator_address }
+        Self { provider, blocking_io_guard, validator_address, health }
     }
 
     async fn blocking_read<T: Send + 'static>(
@@ -149,7 +152,7 @@ where
     }
 
     async fn health(&self) -> RpcResult<bool> {
-        Ok(crate::shared::get_best_canonical_block_number().is_some())
+        Ok(self.health.is_healthy())
     }
 
     async fn cas20_token_info(
@@ -188,7 +191,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn blocking_read_keeps_runtime_free_and_holds_permit_after_cancellation() {
         let guard = Arc::new(Semaphore::new(1));
-        let api = Arc::new(BscEthExtApiImpl::new((), guard.clone()));
+        let api = Arc::new(BscEthExtApiImpl::new((), guard.clone(), RpcHealth::default()));
         let runtime_thread = thread::current().id();
         let (started_tx, started_rx) = oneshot::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -221,7 +224,7 @@ mod tests {
     #[tokio::test]
     async fn blocking_read_propagates_errors_and_releases_permits_on_panic() {
         let guard = Arc::new(Semaphore::new(1));
-        let api = BscEthExtApiImpl::new((), guard.clone());
+        let api = BscEthExtApiImpl::new((), guard.clone(), RpcHealth::default());
         let err =
             api.blocking_read::<()>(|| Err(invalid_params("block not found"))).await.unwrap_err();
         assert_eq!(err.code(), -32000);

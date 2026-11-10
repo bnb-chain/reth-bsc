@@ -9,6 +9,7 @@
 | `eth_blockNumber` | Support |  |
 | `eth_chainID` | Support |  |
 | `eth_syncing` | Support |  |
+| `eth_health` | Support | With metrics enabled, healthy when sampled completed RPC latency p75 is below 5 seconds. Otherwise returns true. See below. |
 | `eth_gasPrice` | Support |  |
 | `eth_maxPriorityFeePerGas` | Support |  |
 | `eth_feeHistory` | Support |  |
@@ -79,4 +80,25 @@
 | `eth_getBlobSidecars` | Planned |  |
 | `eth_getTransactionsByBlockNumber` | Support |  |
 | `eth_getTransactionDataAndReceipt` | Support |  |
+
+### RPC health
+
+`eth_health` returns `false` when the 75th percentile of sampled, completed RPC
+method durations is at least five seconds. Sampling uses Go-BSC's exponentially
+decaying reservoir (1,028 observations, alpha 0.015) and percentile interpolation.
+Sampling is opt-in: enable `--metrics <ADDR:PORT>` (for example,
+`--metrics 127.0.0.1:9001`) or configure `--metrics.prometheus.push.url`.
+With neither configured, no health timing wrappers are installed and `eth_health`
+returns `true` without assessing RPC latency, matching Go-BSC's metrics-disabled
+behavior. An empty sample also returns `true` when metrics are enabled.
+
+HTTP, WebSocket, and IPC share the sample. Each executed batch entry contributes
+separately. Successful and failed method calls are included, including health
+probes after their response is computed. Subscribe/unsubscribe callbacks and
+subscription lifetimes are excluded.
+
+Pending calls do not contribute until they complete. Fast calls, including health
+probes, can restore a healthy result; idle time alone does not clear old samples.
+This endpoint does not measure synchronization progress, chain-head age, or
+in-flight saturation, and is not a complete readiness check.
 
