@@ -201,7 +201,8 @@ where
             self.0.recovered_block(block).await?.ok_or(EthApiError::HeaderNotFound(block))?;
         let mut parent = base_block.sealed_header().clone();
 
-        self.0.spawn_with_state_at_block(block, move |this, mut db| {
+        self.0
+            .spawn_with_state_at_block(block, move |this, mut db| {
                 let mut blocks: Vec<SimulatedBlock<RpcBlock<Eth::NetworkTypes>>> =
                     Vec::with_capacity(block_state_calls.len());
 
@@ -251,12 +252,18 @@ where
 
                     let SimBlock { block_overrides, state_overrides, calls } = block;
 
-                    evm_env.block_env.inner_mut().prevrandao = Some(B256::ZERO);
+                    // Parlia keeps its parent's difficulty in synthetic headers.
+                    // The opcode view is separate from mixHash, whose zero default
+                    // represents a .000 millisecond remainder. Explicit overrides
+                    // below may replace either value independently.
+                    evm_env.block_env.inner.difficulty = parent.difficulty();
+                    evm_env.block_env.inner.prevrandao = Some(B256::ZERO);
+                    evm_env.block_env.opcode_44_override = Some(parent.difficulty());
 
                     if let Some(block_overrides) = block_overrides {
-                        if block_overrides.gas_limit.is_some_and(|limit|
-                            limit > evm_env.block_env.gas_limit() && limit > this.call_gas_limit())
-                        {
+                        if block_overrides.gas_limit.is_some_and(|limit| {
+                            limit > evm_env.block_env.gas_limit() && limit > this.call_gas_limit()
+                        }) {
                             return Err(EthApiError::other(EthSimulateError::GasLimitReached).into())
                         }
                         apply_block_overrides(

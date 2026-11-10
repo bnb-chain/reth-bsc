@@ -76,11 +76,7 @@ macro_rules! check_routes {
         };
         let context = StateContext { block_number: Some(hash.into()), ..Default::default() };
         let results = api
-            .call_many(
-                vec![bundle.clone(), bundle.clone()],
-                Some(context),
-                Some(state.clone()),
-            )
+            .call_many(vec![bundle.clone(), bundle.clone()], Some(context), Some(state.clone()))
             .await
             .unwrap();
         assert_eq!(results.len(), 2);
@@ -258,7 +254,7 @@ async fn simulation_converts_both_directions_with_and_without_inspection() {
             for trace_transfers in [false, true] {
                 for validation in [false, true] {
                     for (difficulty, random, expected) in [
-                        (None, None, 0),
+                        (None, None, 2),
                         (Some(U256::ZERO), None, 0),
                         (Some(U256::from(7)), None, 7),
                         (Some(U256::from(7)), Some(B256::from(U256::from(9))), 9),
@@ -287,7 +283,7 @@ async fn simulation_converts_both_directions_with_and_without_inspection() {
                         let synthetic = &result[0].inner.header.inner;
                         assert_eq!(
                             synthetic.difficulty,
-                            difficulty.unwrap_or_default(),
+                            difficulty.unwrap_or(U256::from(2)),
                             "EVM representation must not rewrite the requested header difficulty"
                         );
                         assert_eq!(
