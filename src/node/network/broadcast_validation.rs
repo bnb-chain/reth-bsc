@@ -1,15 +1,20 @@
 //! Local wire-level reproductions against the pinned network dependency; no remote nodes.
 
 use super::*;
+use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{map::B256Set, B256, U128};
 use futures::future::poll_fn;
-use reth_eth_wire::{EthNetworkPrimitives, EthVersion};
-use reth_ethereum_primitives::Block;
+use reth_eth_wire::{EthNetworkPrimitives, EthVersion, NewPooledTransactionHashes68};
+use reth_ethereum_primitives::{Block, TxType};
 use reth_metrics::common::mpsc::{memory_bounded_channel, MemoryBoundedReceiver};
 use reth_network::{
     import::{BlockImport, BlockImportEvent, NewBlockEvent},
     message::{NewBlockMessage, PeerMessage},
-    transactions::{NetworkTransactionEvent, TransactionsManager, TransactionsManagerConfig},
+    transactions::{
+        config::{StrictEthAnnouncementFilter, TransactionPropagationKind},
+        policy::NetworkPolicies,
+        NetworkTransactionEvent, TransactionsManager, TransactionsManagerConfig,
+    },
     NetworkConfigBuilder,
 };
 use reth_network_api::{PeerId, Peers};
@@ -559,5 +564,181 @@ async fn source_echo_reproduction_uses_real_pool_pending_and_wire() {
         assert_eq!(target_pool.pool_size().pending, batch as usize);
         assert_eq!(source_pending.try_recv(), Err(mpsc::error::TryRecvError::Empty));
         println!("WIRE_TX history={history} batch={batch} chunk={chunk_size} target_pending={} echo_items={} full_echoes={full_echoes} hash_echoes={hash_echoes} source_new_pending=0", pending.len(), echoed.len());
+    }
+}
+
+#[tokio::test]
+async fn proactive_broadcast_switch_keeps_wire_requests_and_ingress() {
+    for disabled in [false, true] {
+        let mut wire = LocalWire::new().await;
+        let source_pool = pool(true);
+        let target_pool = pool(true);
+        let signed: Vec<_> = (10..12).map(signed_tx).collect();
+        let hashes: Vec<_> = signed.iter().map(|tx| *tx.tx_hash()).collect();
+        let pooled: Vec<_> = signed
+            .iter()
+            .cloned()
+            .map(|tx| {
+                EthPooledTransaction::try_from_consensus(tx.try_into_recovered().unwrap()).unwrap()
+            })
+            .collect();
+        target_pool.add_external_transactions(vec![pooled[0].clone()]).await[0].as_ref().unwrap();
+        let (source_input, source_rx) =
+            memory_bounded_channel(1024 * 1024, "bsc_outbound_source_test");
+        let (target_input, target_rx) =
+            memory_bounded_channel(1024 * 1024, "bsc_outbound_target_test");
+        // Keep source transactions serveable; suppress its automatic gossip via policy,
+        // rather than the pool's propagate bit, which would also prohibit responses.
+        let mut source_manager = TransactionsManager::with_policy(
+            wire.a.handle().clone(),
+            source_pool.clone(),
+            source_rx,
+            TransactionsManagerConfig::default(),
+            NetworkPolicies::new(
+                BscTransactionPropagationPolicy::new(TransactionPropagationKind::All, true),
+                StrictEthAnnouncementFilter::default(),
+            ),
+        );
+        let mut target_manager = TransactionsManager::with_policy(
+            wire.b.handle().clone(),
+            target_pool.clone(),
+            target_rx,
+            TransactionsManagerConfig::default(),
+            NetworkPolicies::new(
+                BscTransactionPropagationPolicy::new(TransactionPropagationKind::All, disabled),
+                StrictEthAnnouncementFilter::default(),
+            ),
+        );
+        wire.connect().await;
+        let source_peer = *wire.a.peer_id();
+        let target_peer = *wire.b.peer_id();
+        // Let the real session event trigger the initial pool announcement before commands.
+        wire.drive(|_, cx| {
+            assert!(Pin::new(&mut target_manager).poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        target_pool.add_external_transactions(vec![pooled[1].clone()]).await[0].as_ref().unwrap();
+        let handle = target_manager.handle();
+        handle.propagate(hashes[1]);
+        handle.propagate_transactions(hashes.clone());
+        handle.propagate_transactions_to(hashes.clone(), source_peer);
+        handle.propagate_hashes_to(hashes.clone(), source_peer);
+        handle.broadcast_transactions(signed.clone());
+        let mut barrier = Box::pin(handle.get_peer_transaction_hashes(source_peer));
+        wire.drive(|_, cx| {
+            assert!(Pin::new(&mut target_manager).poll(cx).is_pending());
+            barrier.as_mut().poll(cx)
+        })
+        .await
+        .unwrap();
+        let network = wire.b.handle().clone();
+        let mut network_barrier = Box::pin(network.get_peer_by_id(source_peer));
+        wire.drive(|_, cx| network_barrier.as_mut().poll(cx)).await.unwrap().unwrap();
+        // This raw sentinel bypasses policy and follows all prior gossip on the same FIFO.
+        // It bounds the absence check without relying on a sleep or a priority block message.
+        let sentinel = signed_tx(100_000);
+        let sentinel_hash = *sentinel.tx_hash();
+        wire.b.handle().send_transactions(source_peer, vec![Arc::new(sentinel)]);
+        let mut bodies = B256Set::default();
+        let mut announcements = B256Set::default();
+        wire.drive(|wire, cx| {
+            let mut reached_sentinel = false;
+            while let Poll::Ready(Some(mut event)) = wire.a_txs.poll_recv(cx) {
+                match &mut event {
+                    NetworkTransactionEvent::IncomingTransactions { msg, .. } => {
+                        reached_sentinel |= msg.0.iter().any(|tx| *tx.tx_hash() == sentinel_hash);
+                        msg.0.retain(|tx| *tx.tx_hash() != sentinel_hash);
+                        bodies.extend(msg.0.iter().map(|tx| *tx.tx_hash()));
+                    }
+                    NetworkTransactionEvent::IncomingPooledTransactionHashes { msg, .. } => {
+                        announcements.extend(msg.iter_hashes().copied());
+                    }
+                    _ => {}
+                }
+                source_input.try_send(event).unwrap();
+            }
+            if reached_sentinel {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+        if disabled {
+            assert!(bodies.is_empty(), "all proactive body paths must be suppressed");
+            assert!(announcements.is_empty(), "startup and targeted hashes must be suppressed");
+        } else {
+            assert_eq!(bodies, hashes.iter().copied().collect());
+            assert_eq!(announcements, hashes.iter().copied().collect());
+        }
+
+        // The same peer can still explicitly fetch a body from the suppressed validator.
+        let source_handle = source_manager.handle();
+        let mut response = Box::pin(
+            source_handle.get_pooled_transactions_from(target_peer, vec![hashes[1], B256::ZERO]),
+        );
+        let received = wire
+            .drive(|wire, cx| {
+                while let Poll::Ready(Some(event)) = wire.a_txs.poll_recv(cx) {
+                    source_input.try_send(event).unwrap();
+                }
+                while let Poll::Ready(Some(event)) = wire.b_txs.poll_recv(cx) {
+                    target_input.try_send(event).unwrap();
+                }
+                assert!(Pin::new(&mut source_manager).poll(cx).is_pending());
+                assert!(Pin::new(&mut target_manager).poll(cx).is_pending());
+                response.as_mut().poll(cx)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.iter().map(|tx| *tx.tx_hash()).collect::<Vec<_>>(), [hashes[1]]);
+
+        let pushed = signed_tx(20);
+        let pushed_hash = *pushed.tx_hash();
+        wire.a.handle().send_transactions(target_peer, vec![Arc::new(pushed)]);
+        let fetched = signed_tx(21);
+        let fetched_hash = *fetched.tx_hash();
+        let fetched_size = fetched.encode_2718_len();
+        source_pool
+            .add_external_transactions(vec![EthPooledTransaction::try_from_consensus(
+                fetched.try_into_recovered().unwrap(),
+            )
+            .unwrap()])
+            .await[0]
+            .as_ref()
+            .unwrap();
+        wire.a.handle().send_transactions_hashes(
+            target_peer,
+            NewPooledTransactionHashes68 {
+                types: vec![TxType::Eip1559 as u8],
+                sizes: vec![fetched_size],
+                hashes: vec![fetched_hash],
+            }
+            .into(),
+        );
+        let mut requested = false;
+        wire.drive(|wire, cx| {
+            while let Poll::Ready(Some(event)) = wire.a_txs.poll_recv(cx) {
+                if let NetworkTransactionEvent::GetPooledTransactions { request, .. } = &event {
+                    requested |= request.0.contains(&fetched_hash);
+                }
+                source_input.try_send(event).unwrap();
+            }
+            while let Poll::Ready(Some(event)) = wire.b_txs.poll_recv(cx) {
+                target_input.try_send(event).unwrap();
+            }
+            assert!(Pin::new(&mut source_manager).poll(cx).is_pending());
+            assert!(Pin::new(&mut target_manager).poll(cx).is_pending());
+            if target_pool.get(&pushed_hash).is_some() && target_pool.get(&fetched_hash).is_some() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+        assert!(requested, "hash ingress still initiates a real transaction fetch");
+        println!("OUTBOUND_POLICY disabled={disabled} body_hashes={} announced_hashes={} response=1 pushed=1 fetched=1", bodies.len(), announcements.len());
     }
 }

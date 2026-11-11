@@ -153,6 +153,13 @@ pub struct BscCliArgs {
     /// Block download, ancestor recovery, and active startup catch-up tuning.
     #[command(flatten)]
     pub block_sync: reth_bsc::node::network::block_import::config::BlockSyncArgs,
+
+    /// Disable unsolicited transaction bodies and hash announcements to all peers.
+    /// Receiving transactions, fetching them, and serving explicit requests remain enabled
+    /// under the existing ingress and propagation policies. Intended for validators fed by
+    /// fullnodes in controlled topologies; disabled by default.
+    #[arg(long = "bsc.disable-proactive-tx-broadcast")]
+    pub disable_proactive_tx_broadcast: bool,
 }
 
 /// BSC default for `--gpo.ignoreprice` (wei), matching geth and pre-v2.2 reth-bsc.
@@ -540,7 +547,9 @@ fn main() -> eyre::Result<()> {
             let mev_grpc_handle_for_rpc = Arc::clone(&mev_grpc_handle);
 
             let (node, engine_handle_tx) = BscNode::new();
-            let node = node.with_block_sync(block_sync.clone());
+            let node = node
+                .with_block_sync(block_sync.clone())
+                .with_disable_proactive_tx_broadcast(args.disable_proactive_tx_broadcast);
             let NodeHandle { node, node_exit_future: exit_future } =
                 builder.node(node)
                     .extend_rpc_modules(move |ctx| {
@@ -814,5 +823,26 @@ mod tests {
         let text = help.to_string();
         assert!(text.contains("BSC defaults to Geth's 32768-entry history"));
         assert!(!text.contains("Default is 320 transaction hashes"));
+    }
+
+    #[test]
+    fn proactive_transaction_broadcast_switch_is_opt_in() {
+        for disabled in [false, true] {
+            let mut argv = vec!["reth-bsc", "node"];
+            if disabled {
+                argv.push("--bsc.disable-proactive-tx-broadcast");
+            }
+            let matches = bsc_cli_command().try_get_matches_from(argv).unwrap();
+            let cli = Cli::<BscChainSpecParser, BscCliArgs>::from_arg_matches(&matches).unwrap();
+            let reth::cli::Commands::Node(node) = cli.command else {
+                panic!("node command expected")
+            };
+            assert_eq!(node.ext.disable_proactive_tx_broadcast, disabled);
+            assert!(!node.network.disable_tx_gossip);
+            assert_eq!(
+                node.network.tx_propagation_policy,
+                reth_network::transactions::config::TransactionPropagationKind::All
+            );
+        }
     }
 }
