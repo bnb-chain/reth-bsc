@@ -1,7 +1,10 @@
 //! One monotonic budget shared by all attempts for a local payload job.
 
 use reth_tasks::ManualCancel;
-use std::time::{Duration, Instant};
+use std::{
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant},
+};
 
 // Bound overlap while an obsolete synchronous transaction is returning to a cancellation check.
 pub(crate) static LOCAL_BUILD_PERMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
@@ -11,10 +14,12 @@ const MIN_LATE_TRANSACTION_WINDOW: Duration = Duration::from_millis(50);
 /// Separates stopping transaction selection from discarding an invalid or expired candidate.
 #[derive(Debug, Clone)]
 pub struct BuildControl {
-    pub(crate) transactions_until: Instant,
-    pub(crate) finish_until: Instant,
+    transactions_until: Instant,
+    finish_until: Instant,
     cancel: ManualCancel,
     allow_late_finish: bool,
+    /// The first selection entry fixes the shared deadline for every attempt in this job.
+    selection_deadline: Option<Arc<OnceLock<Instant>>>,
 }
 
 impl BuildControl {
@@ -33,11 +38,13 @@ impl BuildControl {
             finish_until: started + budget,
             cancel,
             allow_late_finish: false,
+            selection_deadline: None,
         }
     }
 
     /// QA experiment: allow late completion and give a late parent at least 50 ms
-    /// for transaction selection. Preserve the completion reserve and cancellation.
+    /// from job creation. First-in-turn jobs can defer their floor to selection entry.
+    /// Preserve the completion reserve and cancellation.
     /// Call once at job creation, only for opted-in in-turn jobs; retries clone it.
     pub(crate) fn with_late_finish(
         mut self,
@@ -61,13 +68,20 @@ impl BuildControl {
     }
 
     pub(crate) fn stop_transactions(&self, now: Instant) -> bool {
-        self.cancel.is_cancelled() || now >= self.transactions_until
+        // Prewarming starts during preparation, before the first selection entry arms its floor.
+        if self.cancel.is_cancelled() {
+            return true;
+        }
+        match &self.selection_deadline {
+            Some(deadline) => deadline.get().is_some_and(|deadline| now >= *deadline),
+            None => now >= self.transactions_until,
+        }
     }
 
     pub(crate) fn check_active(&self, now: Instant) -> Result<(), &'static str> {
         if self.cancel.is_cancelled() {
             Err("payload build canceled")
-        } else if !self.allow_late_finish && now >= self.finish_until {
+        } else if !self.allow_late_finish && now >= self.finish_until() {
             Err("payload build completion deadline exceeded")
         } else {
             Ok(())
@@ -81,8 +95,38 @@ impl BuildControl {
         Ok(if self.allow_late_finish {
             poll
         } else {
-            self.finish_until.saturating_duration_since(now).min(poll)
+            self.finish_until().saturating_duration_since(now).min(poll)
         })
+    }
+
+    /// Arm one preparation-free floor for the first block of an opted-in in-turn job.
+    /// Call only at job creation; retries must clone this control instead.
+    pub(crate) fn with_first_transaction_window(mut self, first_in_turn: bool) -> Self {
+        if self.allow_late_finish && first_in_turn {
+            self.selection_deadline = Some(Arc::new(OnceLock::new()));
+        }
+        self
+    }
+
+    /// Start the one shared selection window after permit acquisition and preparation.
+    /// Later attempts observe the first deadline instead of renewing it.
+    pub(crate) fn start_transaction_selection(&self, now: Instant) -> Result<(), &'static str> {
+        if let Some(deadline) = &self.selection_deadline {
+            self.check_active(now)?;
+            deadline.get_or_init(|| self.transactions_until.max(now + MIN_LATE_TRANSACTION_WINDOW));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn transactions_until(&self) -> Instant {
+        self.selection_deadline
+            .as_ref()
+            .and_then(|deadline| deadline.get().copied())
+            .unwrap_or(self.transactions_until)
+    }
+
+    pub(crate) fn finish_until(&self) -> Instant {
+        self.transactions_until() + self.finish_until.duration_since(self.transactions_until)
     }
 }
 
@@ -226,5 +270,129 @@ mod tests {
         assert!(enabled.stop_transactions(start));
         assert!(enabled.check_active(start).is_err());
         assert!(enabled.root_wait(start).is_err());
+    }
+
+    #[test]
+    fn first_selection_recovers_preparation_time_once_across_preexisting_clones() {
+        let start = Instant::now();
+        let reserve = Duration::from_millis(30);
+        for slot in [Duration::ZERO, Duration::from_millis(82)] {
+            let job = BuildControl::new(
+                start,
+                Duration::from_millis(450),
+                reserve,
+                slot,
+                ManualCancel::default(),
+            )
+            .with_late_finish(true, start, reserve)
+            .with_first_transaction_window(true);
+            let attempt = job.clone();
+            let prewarm = job.clone();
+            let retry = job.clone();
+            let entry = start + Duration::from_millis(200);
+            // Preparation and its prewarmer must not consume the pending floor.
+            assert!(!prewarm.stop_transactions(entry));
+            attempt.start_transaction_selection(entry).unwrap();
+            let deadline = entry + MIN_LATE_TRANSACTION_WINDOW;
+            assert_eq!(job.transactions_until(), deadline);
+            assert_eq!(prewarm.transactions_until(), deadline);
+            assert_eq!(job.finish_until(), deadline + reserve);
+            assert!(!attempt.stop_transactions(deadline - Duration::from_millis(1)));
+            assert!(attempt.stop_transactions(deadline));
+            assert!(prewarm.stop_transactions(deadline));
+
+            retry.start_transaction_selection(deadline + Duration::from_millis(80)).unwrap();
+            assert_eq!(retry.transactions_until(), deadline);
+            assert_eq!(retry.finish_until(), deadline + reserve);
+            assert!(retry.stop_transactions(deadline + Duration::from_millis(80)));
+        }
+    }
+
+    #[test]
+    fn first_selection_keeps_a_healthy_deadline() {
+        let start = Instant::now();
+        let reserve = Duration::from_millis(30);
+        let control = BuildControl::new(
+            start,
+            Duration::from_millis(450),
+            reserve,
+            Duration::from_millis(450),
+            ManualCancel::default(),
+        )
+        .with_late_finish(true, start, reserve)
+        .with_first_transaction_window(true);
+        control.start_transaction_selection(start + Duration::from_millis(100)).unwrap();
+        assert_eq!(control.transactions_until(), start + Duration::from_millis(420));
+        assert_eq!(control.finish_until(), start + Duration::from_millis(450));
+    }
+
+    #[test]
+    fn selection_entry_floor_requires_first_in_turn_and_late_finish() {
+        let start = Instant::now();
+        let reserve = Duration::from_millis(30);
+        for (late_finish, first_in_turn) in [(false, true), (true, false), (false, false)] {
+            let control = BuildControl::new(
+                start,
+                Duration::from_millis(450),
+                reserve,
+                Duration::ZERO,
+                ManualCancel::default(),
+            )
+            .with_late_finish(late_finish, start, reserve)
+            .with_first_transaction_window(first_in_turn);
+            let original = control.transactions_until();
+            let entry = start + Duration::from_millis(200);
+            assert!(control.stop_transactions(entry));
+            control.start_transaction_selection(entry).unwrap();
+            assert_eq!(control.transactions_until(), original);
+        }
+    }
+
+    #[test]
+    fn selection_entry_floor_never_revives_a_canceled_job() {
+        let start = Instant::now();
+        let cancel = ManualCancel::default();
+        let reserve = Duration::from_millis(30);
+        let control = BuildControl::new(
+            start,
+            Duration::from_millis(450),
+            reserve,
+            Duration::ZERO,
+            cancel.clone(),
+        )
+        .with_late_finish(true, start, reserve)
+        .with_first_transaction_window(true);
+        let original = control.transactions_until();
+        cancel.cancel();
+        assert!(control.stop_transactions(start));
+        assert_eq!(
+            control.start_transaction_selection(start + Duration::from_secs(1)),
+            Err("payload build canceled")
+        );
+        assert_eq!(control.transactions_until(), original);
+        assert_eq!(control.root_wait(start), Err("payload build canceled"));
+    }
+
+    #[test]
+    fn cancellation_still_interrupts_the_recovered_selection_window() {
+        let start = Instant::now();
+        let cancel = ManualCancel::default();
+        let reserve = Duration::from_millis(30);
+        let control = BuildControl::new(
+            start,
+            Duration::from_millis(450),
+            reserve,
+            Duration::ZERO,
+            cancel.clone(),
+        )
+        .with_late_finish(true, start, reserve)
+        .with_first_transaction_window(true);
+        let entry = start + Duration::from_millis(200);
+        control.start_transaction_selection(entry).unwrap();
+        assert!(!control.stop_transactions(entry));
+        cancel.cancel();
+        assert!(control.stop_transactions(entry));
+        assert_eq!(control.check_active(entry), Err("payload build canceled"));
+        assert_eq!(control.root_wait(entry), Err("payload build canceled"));
     }
 }
