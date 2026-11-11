@@ -179,6 +179,7 @@ pub struct BscNetworkBuilder {
     sync_config: Arc<block_import::config::BlockSyncConfig>,
     engine_handle_rx: Arc<Mutex<Option<oneshot::Receiver<ConsensusEngineHandle<BscPayloadTypes>>>>>,
     announced_blocks: Arc<AnnouncedBlocks>,
+    disable_proactive_tx_broadcast: bool,
 }
 
 fn apply_bsc_eth_protocol_overrides(hello: &mut HelloMessageWithProtocols) {
@@ -261,6 +262,7 @@ impl BscNetworkBuilder {
             engine_handle_rx,
             sync_config: Arc::new(block_import::config::BlockSyncConfig::default()),
             announced_blocks: Arc::default(),
+            disable_proactive_tx_broadcast: false,
         }
     }
 }
@@ -279,6 +281,13 @@ impl BscNetworkBuilder {
         self
     }
 
+    /// Disable unsolicited transaction bodies and hashes without changing request permissions.
+    /// Defaults to false; inbound transactions and explicit fetches remain enabled.
+    pub fn with_disable_proactive_tx_broadcast(mut self, disabled: bool) -> Self {
+        self.disable_proactive_tx_broadcast = disabled;
+        self
+    }
+
     /// Returns the [`NetworkConfig`] that contains the settings to launch the p2p network.
     ///
     /// This applies the configured [`BscNetworkBuilder`] settings.
@@ -289,7 +298,7 @@ impl BscNetworkBuilder {
     where
         Node: FullNodeTypes<Types = BscNode>,
     {
-        let Self { engine_handle_rx, sync_config, announced_blocks } = self;
+        let Self { engine_handle_rx, sync_config, announced_blocks, .. } = self;
 
         // Check if CLI bootnodes are provided and set bootnode override
         if let Some(cli_bootnodes) = ctx.config().network.resolved_bootnodes() {
@@ -481,19 +490,25 @@ where
         pool: Pool,
     ) -> eyre::Result<Self::Network> {
         let announced_blocks = self.announced_blocks.clone();
+        let disable_proactive_tx_broadcast = self.disable_proactive_tx_broadcast;
         let network_config = self.network_config(ctx)?;
         let network =
             NetworkManager::builder(network_config).await?.with_eth_block_source(announced_blocks);
         let transactions_manager_config = ctx.config().network.transactions_manager_config();
         let tx_seen_history = transactions_manager_config.max_transactions_seen_by_peer_history;
         metrics::gauge!("network.tx_peer_seen_history_limit").set(f64::from(tx_seen_history));
+        metrics::gauge!("network.tx_proactive_broadcast_disabled")
+            .set(if disable_proactive_tx_broadcast { 1.0 } else { 0.0 });
         let handle = ctx.start_network_with(
             network,
             pool,
             transactions_manager_config,
-            BscTransactionPropagationPolicy::new(ctx.config().network.tx_propagation_policy),
+            BscTransactionPropagationPolicy::new(
+                ctx.config().network.tx_propagation_policy,
+                disable_proactive_tx_broadcast,
+            ),
         );
-        info!(target: "reth::cli", enode=%handle.local_node_record(), tx_seen_history, "P2P networking initialized");
+        info!(target: "reth::cli", enode=%handle.local_node_record(), tx_seen_history, disable_proactive_tx_broadcast, "P2P networking initialized");
 
         let local_peer_id = handle.peer_id();
         if crate::shared::set_local_peer_id(*local_peer_id).is_err() {

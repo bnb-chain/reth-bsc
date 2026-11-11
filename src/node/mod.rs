@@ -113,6 +113,7 @@ where
 pub struct BscNode {
     block_sync: Arc<BlockSyncConfig>,
     engine_handle_rx: Arc<Mutex<Option<oneshot::Receiver<ConsensusEngineHandle<BscPayloadTypes>>>>>,
+    disable_proactive_tx_broadcast: bool,
 }
 
 impl BscNode {
@@ -122,6 +123,7 @@ impl BscNode {
             Self {
                 block_sync: Arc::new(BlockSyncConfig::default()),
                 engine_handle_rx: Arc::new(Mutex::new(Some(rx))),
+                disable_proactive_tx_broadcast: false,
             },
             tx,
         )
@@ -139,6 +141,13 @@ impl BscNode {
     /// Configure block retrieval and share its recovery gate with startup catch-up.
     pub fn with_block_sync(mut self, config: Arc<BlockSyncConfig>) -> Self {
         self.block_sync = config;
+        self
+    }
+
+    /// Configure outbound-only transaction broadcast suppression before building the node.
+    /// Defaults to false and does not restrict receiving or serving transaction requests.
+    pub fn with_disable_proactive_tx_broadcast(mut self, disabled: bool) -> Self {
+        self.disable_proactive_tx_broadcast = disabled;
         self
     }
 
@@ -163,7 +172,8 @@ impl BscNode {
             .payload(BscPayloadServiceBuilder::default())
             .network(
                 BscNetworkBuilder::new(self.engine_handle_rx.clone())
-                    .with_sync_config(self.block_sync.clone()),
+                    .with_sync_config(self.block_sync.clone())
+                    .with_disable_proactive_tx_broadcast(self.disable_proactive_tx_broadcast),
             )
             .consensus(BscConsensusBuilder::default())
     }
