@@ -15,8 +15,10 @@ interrupted, so checks reject overruns when those calls return.
 
 With `BSC_MINING_ALLOW_LATE_FINISH=1`, in-turn jobs instead retain at least 50 ms
 from job creation for transaction selection and may finish past the completion deadline.
-Cancellation remains active, and retries reuse the same deadlines. The floor includes
-preparation and permit waits. See [minimum transaction window](miner-minimum-window.md)
+Cancellation remains active, and retries reuse the same deadlines. First-in-turn
+jobs additionally arm a shared, one-time 50 ms floor at actual transaction-loop
+entry, excluding preparation and permit waits; other jobs keep the job-start floor.
+See [minimum transaction window](miner-minimum-window.md)
 for the opt-in QA policy and its validation limits.
 
 The miner owns a persistent, bounded runtime including root/hash session workers,
