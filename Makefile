@@ -18,7 +18,7 @@ maxperf: ## Builds `reth-bsc` with the most aggressive optimisations.
 	RUSTFLAGS="-C target-cpu=native" cargo build --bin reth-bsc --profile maxperf --features jemalloc,asm-keccak
 
 .PHONY: maxperf-musl
-maxperf-musl: ## Static musl build via glibc->musl cross (runs on old glibc, e.g. Amazon Linux 2). See BUILD_MUSL.md.
+maxperf-musl: ## Static musl build via glibc->musl cross (runs on old glibc, e.g. Amazon Linux 2). See https://app.clickup.com/25652588/docs/revbc-65897/revbc-365597.
 	docker run --rm \
 		-v "$(CURDIR)":/src -w /src \
 		-v "$(CURDIR)/.cargo-musl/registry":/root/.cargo/registry \
