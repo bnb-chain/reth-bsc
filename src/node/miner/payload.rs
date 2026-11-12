@@ -922,8 +922,9 @@ where
                     ),
                 );
                 work.skip(SkipReason::GasLimit, iteration_started);
-                if gas_limit_skips.rejected() {
-                    gas_skip_limit_reached = true;
+                gas_skip_limit_reached = gas_limit_skips.rejected();
+                work.gas_limit_skip_peak = gas_limit_skips.peak() as u64;
+                if gas_skip_limit_reached {
                     selection_exit = super::selection_diagnostics::SelectionExit::GasSkipLimit;
                     break;
                 }

@@ -27,8 +27,17 @@ jobs:
   test:
     name: Cargo Test
     runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@v4
+      - name: Free disk space for Rust tests
+        run: |
+          # Hosted-runner SDKs unused by this job compete with Cargo's build artifacts.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y liburing-dev pkg-config libclang-dev
       - uses: actions-rs/toolchain@v1

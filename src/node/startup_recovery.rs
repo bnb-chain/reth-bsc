@@ -85,11 +85,23 @@ impl StartupRecovery {
                 checkpoint.hash,
                 header.hash(),
             );
-            if provider.finalized_block_num_hash()?.is_some_and(|finalized| {
-                finalized.number >= checkpoint.number &&
-                    finalized.number <= head.best_number &&
-                    (finalized.number != checkpoint.number || finalized.hash == checkpoint.hash)
+            if let Some(finalized) = provider.finalized_block_num_hash()?.filter(|finalized| {
+                finalized.number >= checkpoint.number && finalized.number <= head.best_number
             }) {
+                let canonical = provider.sealed_header(finalized.number)?.ok_or_else(|| {
+                    eyre::eyre!(
+                        "BSC startup recovery: missing canonical header at Engine finalized #{} ({})",
+                        finalized.number,
+                        finalized.hash,
+                    )
+                })?;
+                eyre::ensure!(
+                    canonical.hash() == finalized.hash,
+                    "BSC startup recovery: Engine finalized hash conflict at #{}: canonical {}, marker {}",
+                    finalized.number,
+                    canonical.hash(),
+                    finalized.hash,
+                );
                 return Ok(None);
             }
             head.best_hash
@@ -123,7 +135,9 @@ impl StartupRecovery {
             {
                 Ok(Ok(response)) => match response.payload_status.status {
                     PayloadStatusEnum::Invalid { validation_error } => {
-                        eyre::bail!("BSC startup recovery: Engine rejected finalized recovery: {validation_error}");
+                        eyre::bail!(
+                            "BSC startup recovery: Engine rejected finalized recovery: {validation_error}"
+                        );
                     }
                     // VALID acknowledges an FCU. Re-read execution and finality before signing.
                     PayloadStatusEnum::Valid if self.recovery_target(&provider)?.is_none() => {
@@ -459,6 +473,56 @@ mod tests {
                 conflicting.hash(),
             )
         );
+        assert!(!recovery.is_ready());
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn higher_conflicting_engine_finality_cannot_release_signing() {
+        let factory = create_test_provider_factory();
+        write_header(&factory, &header(24));
+        let provider = BlockchainProvider::with_latest(factory, header(24)).unwrap();
+        let conflicting =
+            SealedHeader::seal_slow(Header { number: 22, timestamp: 1, ..Default::default() });
+        provider.set_finalized(conflicting.clone());
+        let recovery = StartupRecovery::new(Some(checkpoint(21)));
+        let (sender, mut requests) = mpsc::unbounded_channel();
+        let error = recovery.run(provider, ConsensusEngineHandle::new(sender)).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "BSC startup recovery: Engine finalized hash conflict at #22: canonical {}, marker {}",
+                header(22).hash(),
+                conflicting.hash(),
+            )
+        );
+        assert!(!recovery.is_ready());
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn higher_canonical_engine_finality_releases_signing() {
+        let factory = create_test_provider_factory();
+        write_header(&factory, &header(24));
+        let provider = BlockchainProvider::with_latest(factory, header(24)).unwrap();
+        provider.set_finalized(header(22));
+        let recovery = StartupRecovery::new(Some(checkpoint(21)));
+        let (sender, mut requests) = mpsc::unbounded_channel();
+        recovery.run(provider, ConsensusEngineHandle::new(sender)).await.unwrap();
+        assert!(recovery.is_ready());
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn missing_higher_engine_finality_header_keeps_signing_gated() {
+        let factory = create_test_provider_factory();
+        write_header(&factory, &header(21));
+        let provider = BlockchainProvider::with_latest(factory, header(24)).unwrap();
+        provider.set_finalized(header(22));
+        let recovery = StartupRecovery::new(Some(checkpoint(21)));
+        let (sender, mut requests) = mpsc::unbounded_channel();
+        let error = recovery.run(provider, ConsensusEngineHandle::new(sender)).await.unwrap_err();
+        assert!(error.to_string().contains("missing canonical header at Engine finalized #22"));
         assert!(!recovery.is_ready());
         assert!(requests.try_recv().is_err());
     }
