@@ -177,7 +177,7 @@ pub async fn run_with_config<P>(
                                 None => Ok(true),
                             };
                             match replace {
-                                Ok(true) => pending_target = Some(target),
+                                Ok(true) => pending_target = Some(*target),
                                 Ok(false) => {}
                                 Err(error) => tracing::error!(target: "bsc::startup_sync", %error,
                                     "Unable to compare validated pending heads"),
@@ -219,7 +219,7 @@ enum Assessment {
     Complete,
     Retry,
     /// Every payload was VALID, but the preferred head has not become canonical yet.
-    Pending(Header),
+    Pending(Box<Header>),
 }
 
 async fn assess_peer<P>(
@@ -394,12 +394,12 @@ where
     // A successful FCU may merely mean SYNCING. Check actual canonical state and compare the
     // validated competitor again; VALID alone does not establish catch-up completion.
     consider_persisted_head(&current, provider, forkchoice).await?;
-    if current.hash_slow() == target.hash_slow()
-        || !forkchoice.is_need_reorg(&target, &current).await?
+    if current.hash_slow() == target.hash_slow() ||
+        !forkchoice.is_need_reorg(&target, &current).await?
     {
         Ok(Assessment::Complete)
     } else {
-        Ok(Assessment::Pending(target))
+        Ok(Assessment::Pending(Box::new(target)))
     }
 }
 

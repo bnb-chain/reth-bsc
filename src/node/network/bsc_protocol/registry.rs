@@ -108,7 +108,8 @@ pub fn is_v2_peer(peer: PeerId) -> bool {
 }
 
 /// Snapshot of peers that negotiated bsc/2 (i.e. support `GetBlocksByRange`).
-pub fn list_v2_peers() -> Vec<PeerId> {
+#[cfg(test)]
+fn list_v2_peers() -> Vec<PeerId> {
     match REGISTRY.read() {
         Ok(guard) => guard.iter().filter_map(|(p, e)| (e.version >= 2).then_some(*p)).collect(),
         Err(_) => Vec::new(),
@@ -218,8 +219,8 @@ static REQ_COUNTER: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(1));
 ///
 /// Defensive: rejects peers that did not negotiate bsc/2. `GetBlocksByRange`
 /// (msg 0x02) is unknown to bsc/1 peers — sending it gets us kicked with
-/// `SubprotocolSpecific`. Callers should normally pick from [`list_v2_peers`];
-/// this guard catches any bypass.
+/// `SubprotocolSpecific`. Callers must select a bsc/2 peer known to have the requested
+/// block; this guard catches protocol-version mismatches.
 pub async fn request_blocks_by_range(
     peer: PeerId,
     start_height: u64,
@@ -542,8 +543,7 @@ pub(crate) fn plan_v2_failover_peers(
 /// Dropping the winning hop cancels all remaining waiters (late packets are ignored).
 pub async fn request_blocks_by_range_with_failover(
     preferred: PeerId,
-    start_height: u64,
-    start_hash: B256,
+    target: reth_eth_wire::BlockHashNumber,
     count: u64,
     timeout_dur: Duration,
     max_attempts: usize,
@@ -551,6 +551,7 @@ pub async fn request_blocks_by_range_with_failover(
     chain_spec: &crate::chainspec::BscChainSpec,
 ) -> Result<BlocksByRangePacket, String> {
     use futures::{stream::FuturesUnordered, StreamExt};
+    let reth_eth_wire::BlockHashNumber { number: start_height, hash: start_hash } = target;
     let mut attempted = HashSet::new();
     let mut pending = FuturesUnordered::new();
     let started = tokio::time::Instant::now();
@@ -702,8 +703,7 @@ mod version_tests {
         record_announcer(hash, peers[4]); // v1 is ineligible even though it announced.
         let request = request_blocks_by_range_with_failover(
             peers[0],
-            100,
-            hash,
+            reth_eth_wire::BlockHashNumber { number: 100, hash },
             4,
             Duration::from_secs(5),
             3,
@@ -797,8 +797,7 @@ mod version_tests {
             Duration::from_secs(5),
             request_blocks_by_range_with_failover(
                 peers[0],
-                block.header.number,
-                hash,
+                reth_eth_wire::BlockHashNumber { number: block.header.number, hash },
                 1,
                 Duration::from_secs(1),
                 2,

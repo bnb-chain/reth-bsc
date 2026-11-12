@@ -1,7 +1,9 @@
 //! Bounded single-block announcement fetches, independent of ancestor recovery.
 
-use super::super::{bsc_protocol::registry, data_availability, BscNetworkPrimitives};
-use super::config::{BlockSyncArgs, BlockSyncConfig};
+use super::{
+    super::{bsc_protocol::registry, data_availability, BscNetworkPrimitives},
+    config::{BlockSyncArgs, BlockSyncConfig},
+};
 use crate::{chainspec::BscChainSpec, consensus::parlia::EMPTY_WITHDRAWALS_HASH, BscBlock};
 use alloy_primitives::{map::B256Map, B256};
 use eyre::{ensure, WrapErr};
@@ -36,6 +38,7 @@ const QUICK_TIMEOUT: Duration = Duration::from_millis(400);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 type HeadFetch = BoxFuture<'static, (B256, Option<eyre::Result<(BscBlock, PeerId)>>)>;
+type HeadFetchResult = (B256, eyre::Result<(BscBlock, PeerId)>);
 
 type Download = BoxFuture<'static, Result<(BscBlock, PeerId), String>>;
 
@@ -243,8 +246,8 @@ impl HeadFetches {
 
     /// Start a single-block fetch if this hash is idle and capacity is available.
     pub(crate) fn start(&mut self, target: BlockHashNumber, peer: PeerId, spec: Arc<BscChainSpec>) {
-        if self.active.contains_key(&target.hash)
-            || self.pending.len() >= usize::from(self.config.args.max_head_fetches)
+        if self.active.contains_key(&target.hash) ||
+            self.pending.len() >= usize::from(self.config.args.max_head_fetches)
         {
             return;
         }
@@ -259,19 +262,19 @@ impl HeadFetches {
         hash: B256,
         future: impl Future<Output = eyre::Result<(BscBlock, PeerId)>> + Send + 'static,
     ) {
-        if self.active.contains_key(&hash)
-            || self.pending.len() >= usize::from(self.config.args.max_head_fetches)
+        if self.active.contains_key(&hash) ||
+            self.pending.len() >= usize::from(self.config.args.max_head_fetches)
         {
             return;
         }
         let (handle, registration) = AbortHandle::new_pair();
         self.active.insert(hash, handle);
         self.pending.push(Box::pin(async move {
-            let result = match Abortable::new(future, registration).await {
-                Ok(result) => Some(result),
-                Err(_) => None,
+            let Ok(result) = Abortable::new(future, registration).await else {
+                // Cancellation reclaims the slot without reporting a download failure.
+                return (hash, None);
             };
-            (hash, result)
+            (hash, Some(result))
         }));
     }
 
@@ -288,10 +291,7 @@ impl HeadFetches {
     }
 
     /// Drive requests, reclaiming completed and canceled entries before returning results.
-    pub(crate) fn poll(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<(B256, eyre::Result<(BscBlock, PeerId)>)>> {
+    pub(crate) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Option<HeadFetchResult>> {
         loop {
             match self.pending.poll_next_unpin(cx) {
                 Poll::Ready(Some((hash, result))) => {
@@ -307,6 +307,10 @@ impl HeadFetches {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "quick and ETH request sources are injected independently for deterministic fetch tests"
+)]
 async fn fetch_head(
     target: &BlockHashNumber,
     preferred: PeerId,
@@ -460,8 +464,8 @@ pub(crate) fn validate_block(
         "announced block mismatch"
     );
     // BSC bodies can omit the empty Cancun withdrawals list while retaining its root.
-    if block.header.withdrawals_root == Some(EMPTY_WITHDRAWALS_HASH)
-        && block.body.inner.withdrawals.is_none()
+    if block.header.withdrawals_root == Some(EMPTY_WITHDRAWALS_HASH) &&
+        block.body.inner.withdrawals.is_none()
     {
         block.body.inner.withdrawals = Some(Default::default());
     }

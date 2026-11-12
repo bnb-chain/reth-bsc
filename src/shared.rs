@@ -1057,8 +1057,8 @@ static ENGINE_OVERLAY_BLOCK_SOURCE: OnceLock<OverlayManager<crate::BscPrimitives
 /// Publishes the block source before the engine starts validating payloads.
 pub(crate) fn set_engine_overlay_block_source(
     source: OverlayManager<crate::BscPrimitives>,
-) -> Result<(), OverlayManager<crate::BscPrimitives>> {
-    ENGINE_OVERLAY_BLOCK_SOURCE.set(source)
+) -> Result<(), Box<OverlayManager<crate::BscPrimitives>>> {
+    ENGINE_OVERLAY_BLOCK_SOURCE.set(source).map_err(Box::new)
 }
 
 /// Returns the live executed-block source; mining keeps its own computation caches and workers.
