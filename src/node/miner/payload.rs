@@ -33,7 +33,6 @@ use crate::{
 };
 use alloy_consensus::{BlockHeader, Transaction};
 use alloy_eips::eip4895::Withdrawals;
-use alloy_evm::Evm;
 use alloy_primitives::U256;
 use once_cell::sync::Lazy;
 use reth::transaction_pool::{
@@ -45,9 +44,10 @@ use reth_chainspec::EthChainSpec;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_ethereum_primitives::TransactionSigned;
 use reth_evm::{
-    block::{BlockExecutionError, BlockValidationError},
+    cached::CachedReads,
+    database::StateProviderDatabase,
     execute::{BlockBuilder, BlockBuilderOutcome},
-    ConfigureEvm, NextBlockEnvAttributes,
+    BlockExecutionError, BlockValidationError, ConfigureEvm, EvmEnv, NextBlockEnvAttributes,
 };
 use reth_execution_types::BlockExecutionOutput;
 use reth_node_ethereum::engine::EthPayloadAttributes;
@@ -57,9 +57,7 @@ use reth_primitives_traits::{
     SealedBlock, SealedHeader, SignerRecoverable,
 };
 use reth_provider::{EvmStateProviderAdapter, StateProviderFactory};
-use reth_revm::{cached::CachedReads, database::StateProviderDatabase, db::State};
 use reth_tasks::ManualCancel;
-use revm::context_interface::Block as EvmBlock;
 use std::{
     collections::HashMap,
     sync::{
@@ -644,7 +642,7 @@ where
         let (state, read_phase) =
             ObservedStateDb::new(&mut cached_reads, state, kind, self.ctx.is_inturn);
         let state = state.with_shared_prewarm(parent_hash, prewarm_cache.clone());
-        let mut db = State::builder().with_database(state).with_bundle_update().build();
+        let mut db = state;
 
         // Sinks transport current_validators / turn_length from the builder (which is consumed by
         // `finish`) back to this layer so they can be written to cache after
@@ -703,6 +701,10 @@ where
 
         let evm_setup =
             super::perf_tuning::Phase::new(kind.label(), self.ctx.is_inturn, "evm_context");
+        let prewarm_env = self
+            .evm_config
+            .next_evm_env(&parent_header, &next_env_attributes)
+            .map_err(PayloadBuilderError::other)?;
         let mut builder = self
             .evm_config
             .builder_for_next_block(&mut db, &parent_header, next_env_attributes)
@@ -720,7 +722,10 @@ where
         // wait. When no spawner is registered, `trie_handle` is empty and this is a no-op
         // (synchronous fallback).
         if let Some(handle) = trie_handle.lock().unwrap().as_mut() {
-            builder.evm_mut().db_mut().set_state_hook(Some(Box::new(handle.take_execution_hook())));
+            let mut hook = handle.take_execution_hook();
+            builder.set_state_hook(move |state| {
+                reth_execution_types::OnStateHook::on_state(&mut hook, state)
+            });
             debug!(
                 target: "payload_builder",
                 trace_id,
@@ -755,10 +760,14 @@ where
             parent_header.number + 1,
             attributes.timestamp,
         );
-        let block_gas_limit: u64 =
-            builder.evm_mut().block().gas_limit().saturating_sub(system_txs_gas);
+        let block_gas_limit: u64 = builder
+            .evm_env()
+            .block_env()
+            .gas_limit
+            .saturating_to::<u64>()
+            .saturating_sub(system_txs_gas);
 
-        let base_fee = builder.evm_mut().block().basefee();
+        let base_fee = builder.evm_env().block_env().basefee.saturating_to::<u64>();
         trace!("build_payload: base_fee={}", base_fee);
 
         let mut sidecars_map = HashMap::new();
@@ -789,6 +798,9 @@ where
         if !blob_eligible {
             max_blob_count = 0;
         }
+        let selection_pool_start = self.pool.pool_size().into();
+        let mut iterator_yielded = 0u64;
+        let selection_exit;
         let mut best_tx_list = self.pool.best_transactions_with_attributes(
             BestTransactionsAttributes::new(base_fee, blob_fee.map(|fee| fee as u64)),
         );
@@ -797,10 +809,22 @@ where
         }
 
         // Total time spent selecting + executing user transactions.
-        let prewarm_env = reth_evm::EvmEnv {
-            cfg_env: builder.evm_mut().cfg_env().clone(),
-            block_env: builder.evm_mut().block().clone(),
-        };
+        selection_setup.complete();
+        let execution_phase =
+            super::perf_tuning::Phase::new(kind.label(), self.ctx.is_inturn, "execution");
+        let exec_start = std::time::Instant::now();
+        // Arm the shared floor once at actual execution entry, after preparation.
+        if let Some(control) = &build_control {
+            control.begin_execution(exec_start).map_err(std::io::Error::other)?;
+            work.refresh_deadlines(control);
+        }
+        // Everything before `exec_start` is treated as "prepare" time for this payload attempt.
+        let prepare_duration = exec_start.duration_since(build_start);
+        read_phase.selection();
+        if let Some(cache) = &prewarm_cache {
+            cache.execution_started();
+        }
+        work.execution_started(exec_start);
         let prewarm = super::prewarm::start(
             prewarm_cache.clone(),
             self.pool.clone(),
@@ -810,23 +834,17 @@ where
             base_fee,
             blob_fee.map(|fee| fee as u64),
             min_gas_tip,
+            block_gas_limit.saturating_sub(cumulative_gas_used),
             cancel.clone(),
             build_control.clone(),
         );
-        selection_setup.complete();
-        let execution_phase =
-            super::perf_tuning::Phase::new(kind.label(), self.ctx.is_inturn, "execution");
-        let exec_start = std::time::Instant::now();
-        // Everything before `exec_start` is treated as "prepare" time for this payload attempt.
-        let prepare_duration = exec_start.duration_since(build_start);
-        read_phase.selection();
-        if let Some(cache) = &prewarm_cache {
-            cache.execution_started();
-        }
-        work.execution_started(exec_start);
+
         let mut gas_limit_skips = super::perf_tuning::GasLimitSkips::configured();
         let mut gas_skip_limit_reached = false;
         loop {
+            if let Some(prewarm) = &prewarm {
+                prewarm.remaining_gas(block_gas_limit.saturating_sub(cumulative_gas_used));
+            }
             work.selection_stage(SelectionStage::Control);
             let iteration_started = std::time::Instant::now();
             if cancel.is_cancelled() ||
@@ -834,10 +852,19 @@ where
                     .as_ref()
                     .is_some_and(|control| control.stop_transactions(std::time::Instant::now()))
             {
+                selection_exit = if cancel.is_cancelled() {
+                    super::selection_diagnostics::SelectionExit::Cancelled
+                } else {
+                    super::selection_diagnostics::SelectionExit::Deadline
+                };
                 break;
             }
             work.selection_stage(SelectionStage::Iterator);
-            let Some(pool_tx) = best_tx_list.next() else { break };
+            let Some(pool_tx) = best_tx_list.next() else {
+                selection_exit = super::selection_diagnostics::SelectionExit::IteratorExhausted;
+                break;
+            };
+            iterator_yielded += 1;
             if let Some(prewarm) = &prewarm {
                 prewarm.selected(pool_tx.sender(), pool_tx.nonce());
             }
@@ -898,6 +925,7 @@ where
                 gas_skip_limit_reached = gas_limit_skips.rejected();
                 work.gas_limit_skip_peak = gas_limit_skips.peak() as u64;
                 if gas_skip_limit_reached {
+                    selection_exit = super::selection_diagnostics::SelectionExit::GasSkipLimit;
                     break;
                 }
                 continue;
@@ -1141,6 +1169,22 @@ where
                 sidecars_map.insert(*tx.hash(), sidecar);
             }
         }
+        let selection_diagnostics = super::selection_diagnostics::SelectionDiagnostics {
+            block_number: parent_header.number + 1,
+            start: selection_pool_start,
+            end: self.pool.pool_size().into(),
+            exit: selection_exit,
+            yielded: iterator_yielded,
+            executed: work.executed,
+            skipped: work.skipped,
+            gas_used: cumulative_gas_used,
+            gas_limit: block_gas_limit,
+            remaining_seconds: build_control.as_ref().map_or(0.0, |c| {
+                c.transactions_until()
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_secs_f64()
+            }),
+        };
         if let Some(cache) = &prewarm_cache {
             cache.execution_finished();
         }
@@ -1149,15 +1193,19 @@ where
         work.selection_stage(SelectionStage::Control);
         let exec_duration = exec_start.elapsed();
         read_phase.finish();
+        metrics::histogram!("bsc.miner_gas_limit_skip_streak",
+            "kind" => kind.label(),
+            "turn" => if self.ctx.is_inturn { "inturn" } else { "outofturn" })
+        .record(gas_limit_skips.peak() as f64);
         if let Some(control) = &build_control {
             let now = std::time::Instant::now();
             let reason = if cancel.is_cancelled() {
                 "cancelled"
             } else if gas_skip_limit_reached {
                 "gas_skip_limit"
-            } else if !control.allows_late_finish() && now >= control.finish_until {
+            } else if !control.allows_late_finish() && now >= control.finish_until() {
                 "completion_deadline"
-            } else if now >= control.transactions_until {
+            } else if now >= control.transactions_until() {
                 "transaction_deadline"
             } else {
                 "pool_or_gas_limit"
@@ -1167,7 +1215,7 @@ where
             metrics::counter!("bsc_miner_build_stop_total", "turn" => turn, "reason" => reason)
                 .increment(1);
             metrics::histogram!("bsc_miner_execution_budget_overrun_seconds", "turn" => turn)
-                .record(now.saturating_duration_since(control.transactions_until).as_secs_f64());
+                .record(now.saturating_duration_since(control.transactions_until()).as_secs_f64());
             debug!(target: "payload_builder", trace_id, reason, cumulative_gas_used,
                 exec_duration_ms = exec_duration.as_millis(), "Stopped selecting payload transactions");
         } else {
@@ -1182,6 +1230,14 @@ where
         if let Some(control) = &build_control {
             control.check_active(std::time::Instant::now()).map_err(std::io::Error::other)?;
         }
+
+        selection_diagnostics.record(
+            "selection",
+            kind.label(),
+            if self.ctx.is_inturn { "inturn" } else { "outofturn" },
+            selection_diagnostics.gas_used,
+            selection_diagnostics.gas_limit,
+        );
 
         // add system txs to payload.
         let finalize_start = std::time::Instant::now();
@@ -1204,6 +1260,7 @@ where
         let _ = &state_root_precomputed;
         let BlockBuilderOutcome {
             execution_result,
+            execution_state,
             hashed_state,
             trie_updates,
             block,
@@ -1212,7 +1269,8 @@ where
 
         if let Some(control) = build_control.as_ref().filter(|control| control.allows_late_finish())
         {
-            let overrun = std::time::Instant::now().saturating_duration_since(control.finish_until);
+            let overrun =
+                std::time::Instant::now().saturating_duration_since(control.finish_until());
             if !overrun.is_zero() {
                 // Completed local candidates, not canonical blocks or accepted submissions.
                 metrics::counter!("bsc_miner_late_finish_completed_total").increment(1);
@@ -1301,8 +1359,9 @@ where
 
         let requests = execution_result.requests.clone();
         let execution_outcome =
-            BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
+            BlockExecutionOutput { state: execution_state, result: execution_result };
         let executed_block = BuiltPayloadExecutedBlock {
+            shared_trie_data: None,
             recovered_block: Arc::new(block),
             execution_output: Arc::new(execution_outcome),
             hashed_state: Arc::new(hashed_state),
@@ -1314,6 +1373,7 @@ where
         let pending_turn_length = turn_length_sink.lock().unwrap().take();
 
         let payload = BscBuiltPayload {
+            selection_diagnostics: Some(selection_diagnostics),
             diagnostics: None,
             block: sealed_block.clone(),
             fees: total_fees,
@@ -1370,7 +1430,7 @@ where
         let state = StateProviderDatabase::new(EvmStateProviderAdapter(&state_provider));
         let (state, read_phase) =
             ObservedStateDb::new(&mut cached_reads, state, AttemptKind::Empty, self.ctx.is_inturn);
-        let mut db = State::builder().with_database(state).with_bundle_update().build();
+        let mut db = state;
 
         // Sinks for empty-payload builds (same delayed-seal mechanism as normal builds).
         let validator_cache_sink: ValidatorCacheSink = Arc::new(Mutex::new(None));
@@ -1418,7 +1478,10 @@ where
         // Install before pre-execution; finish() also streams all system transactions,
         // closes this candidate's hook, and consumes only its own root result.
         if let Some(handle) = trie_handle.lock().unwrap().as_mut() {
-            builder.evm_mut().db_mut().set_state_hook(Some(Box::new(handle.take_execution_hook())));
+            let mut hook = handle.take_execution_hook();
+            builder.set_state_hook(move |state| {
+                reth_execution_types::OnStateHook::on_state(&mut hook, state)
+            });
         }
 
         // Total time spent executing pre-execution changes (no user txs for empty payloads).
@@ -1447,6 +1510,7 @@ where
         // Without the sparse-trie flag/spawner, finish keeps the legacy synchronous path.
         let BlockBuilderOutcome {
             execution_result,
+            execution_state,
             hashed_state,
             trie_updates,
             block,
@@ -1479,8 +1543,9 @@ where
 
         let requests = execution_result.requests.clone();
         let execution_outcome =
-            BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
+            BlockExecutionOutput { state: execution_state, result: execution_result };
         let executed_block = BuiltPayloadExecutedBlock {
+            shared_trie_data: None,
             recovered_block: Arc::new(block),
             execution_output: Arc::new(execution_outcome),
             hashed_state: Arc::new(hashed_state),
@@ -1492,6 +1557,7 @@ where
         let pending_turn_length = turn_length_sink.lock().unwrap().take();
 
         let payload = BscBuiltPayload {
+            selection_diagnostics: None,
             diagnostics: None,
             block: sealed_block.clone(),
             fees: total_fees,
@@ -1742,7 +1808,7 @@ where
                 std::time::Duration::from_millis(STATE_ROOT_WAIT_MARGIN_MS),
                 self.root_reserve,
                 total_budget,
-                control.transactions_until.saturating_duration_since(start_time),
+                control.transactions_until().saturating_duration_since(start_time),
             );
         }
         // One sample per job (not per retry): slot_remaining is the original slot budget;
@@ -1752,8 +1818,10 @@ where
         metrics::histogram!("bsc.build_diagnostics.job_slot_remaining_seconds", "turn" => turn)
             .record(slot_remaining.as_secs_f64());
         metrics::histogram!("bsc.build_diagnostics.job_transaction_window_seconds", "turn" => turn)
-            .record(control.transactions_until.saturating_duration_since(start_time).as_secs_f64());
-        self.timeout = control.transactions_until.saturating_duration_since(start_time);
+            .record(
+                control.transactions_until().saturating_duration_since(start_time).as_secs_f64(),
+            );
+        self.timeout = control.transactions_until().saturating_duration_since(start_time);
         self.build_args.build_control = Some(control);
         let initial_wait = initial_out_of_turn_build_wait(&self.parlia, &self.mining_ctx);
         if !initial_wait.is_zero() {
@@ -3298,27 +3366,7 @@ fn finalize_payload(
     })?;
 
     let final_hash = plain_block.header.hash_slow();
-    if let Some((validators, vote_addresses)) = payload.pending_validators.take() {
-        VALIDATOR_CACHE.lock().unwrap().insert(final_hash, (validators, vote_addresses));
-        tracing::debug!(
-            "Updated validator cache after finalize, block_number: {}, block_hash: {}",
-            plain_block.header.number,
-            final_hash
-        );
-    }
-    if let Some(turn_length) = payload.pending_turn_length.take() {
-        TURN_LENGTH_CACHE.lock().unwrap().insert(final_hash, turn_length);
-        tracing::debug!(
-            "Updated turn length cache after finalize, block_number: {}, block_hash: {}",
-            plain_block.header.number,
-            final_hash
-        );
-    }
-    crate::consensus::payment_lane::meta::inherit_if_untouched(
-        &payload.executed_block.execution_output.state,
-        parent_header.hash(),
-        final_hash,
-    );
+    publish_payload_caches(payload, parent_header.hash(), final_hash);
     // Both payload blocks must carry sidecars with the final sealed hash.
     plain_block.body.sidecars = payload.block.body().sidecars.clone();
     if let Some(sidecars) = &mut plain_block.body.sidecars {
@@ -3331,6 +3379,35 @@ fn finalize_payload(
         Arc::new(RecoveredBlock::new_sealed(payload.block.as_ref().clone(), senders));
 
     Ok(())
+}
+
+/// Publish metadata for an already sealed block without modifying its identity.
+fn publish_payload_caches(
+    payload: &mut BscBuiltPayload,
+    parent_hash: alloy_primitives::B256,
+    final_hash: alloy_primitives::B256,
+) {
+    if let Some((validators, vote_addresses)) = payload.pending_validators.take() {
+        VALIDATOR_CACHE.lock().unwrap().insert(final_hash, (validators, vote_addresses));
+        tracing::debug!(
+            "Updated validator cache after finalize, block_number: {}, block_hash: {}",
+            payload.block().number(),
+            final_hash
+        );
+    }
+    if let Some(turn_length) = payload.pending_turn_length.take() {
+        TURN_LENGTH_CACHE.lock().unwrap().insert(final_hash, turn_length);
+        tracing::debug!(
+            "Updated turn length cache after finalize, block_number: {}, block_hash: {}",
+            payload.block().number(),
+            final_hash
+        );
+    }
+    crate::consensus::payment_lane::meta::inherit_if_untouched(
+        &payload.executed_block.execution_output.state,
+        parent_hash,
+        final_hash,
+    );
 }
 
 #[cfg(test)]
@@ -3999,6 +4076,7 @@ mod tests {
             let mut executed_block = block.clone();
             executed_block.body.sidecars = None;
             let mut payload = super::BscBuiltPayload {
+                selection_diagnostics: None,
                 diagnostics: None,
                 block: Arc::new(block.into()),
                 fees: U256::ZERO,
@@ -4007,6 +4085,7 @@ mod tests {
                 exec_duration: Duration::ZERO,
                 trie_root_duration: Duration::ZERO,
                 executed_block: reth_payload_primitives::BuiltPayloadExecutedBlock {
+                    shared_trie_data: None,
                     recovered_block: Arc::new(RecoveredBlock::new_unhashed(
                         executed_block,
                         senders.clone(),

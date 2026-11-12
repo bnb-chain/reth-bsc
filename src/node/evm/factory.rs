@@ -1,56 +1,17 @@
 use crate::{
-    evm::{
-        api::{BscContext, BscEvm},
-        block_env::BscBlockEnv,
-        transaction::BscTxEnv,
-    },
-    hardforks::bsc::BscHardfork,
+    evm::precompiles::native::BscNativePrecompiles, system_contracts::is_invoke_system_contract,
 };
-use reth_evm::{precompiles::PrecompilesMap, Database, EvmEnv, EvmFactory};
-use reth_revm::Inspector;
-use revm::{
-    context::{
-        result::{EVMError, HaltReason},
-        DBErrorMarker,
-    },
-    inspector::NoOpInspector,
-};
+use reth_bsc_evm::{env::BscEvmEnv, evm::BscEvm};
+use reth_evm::DynDatabase;
 
-/// Factory producing [`BscEvm`].
+/// Factory producing the native BSC EVM with its complete fork-specific precompile set.
 #[derive(Debug, Default, Clone, Copy)]
 #[non_exhaustive]
 pub struct BscEvmFactory;
 
-impl EvmFactory for BscEvmFactory {
-    type Evm<DB: Database, I: Inspector<BscContext<DB>>> = BscEvm<DB, I>;
-    type Context<DB: Database> = BscContext<DB>;
-    type Tx = BscTxEnv;
-    type Error<DBError: core::error::Error + Send + Sync + 'static + DBErrorMarker> =
-        EVMError<DBError>;
-    type HaltReason = HaltReason;
-    type Spec = BscHardfork;
-    type BlockEnv = BscBlockEnv;
-    type Precompiles = PrecompilesMap;
-
-    fn create_evm<DB: Database>(
-        &self,
-        db: DB,
-        input: EvmEnv<BscHardfork, BscBlockEnv>,
-    ) -> Self::Evm<DB, NoOpInspector> {
-        // Check if we're in a trace/debug context by examining the database type
-        // CacheDB is used in trace scenarios where we need to replay transactions
-        let type_name = std::any::type_name::<DB>();
-        let is_trace = type_name.contains("CacheDB");
-
-        BscEvm::new(input, db, NoOpInspector {}, false, is_trace)
-    }
-
-    fn create_evm_with_inspector<DB: Database, I: Inspector<Self::Context<DB>>>(
-        &self,
-        db: DB,
-        input: EvmEnv<BscHardfork, BscBlockEnv>,
-        inspector: I,
-    ) -> Self::Evm<DB, I> {
-        BscEvm::new(input, db, inspector, true, true)
+impl BscEvmFactory {
+    pub fn create_evm<'a>(&self, db: impl DynDatabase + 'a, env: BscEvmEnv) -> BscEvm<'a> {
+        let precompiles = BscNativePrecompiles::new(&env);
+        BscEvm::new(env, db, precompiles, is_invoke_system_contract)
     }
 }

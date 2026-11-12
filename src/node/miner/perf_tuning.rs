@@ -62,6 +62,7 @@ impl Drop for Phase {
         metrics::histogram!("bsc.miner_build_phase_seconds", "kind" => self.kind, "turn" => self.turn, "phase" => self.phase, "outcome" => if self.completed { "completed" } else { "early_exit" }).record(self.start.elapsed().as_secs_f64());
     }
 }
+
 const DEFAULT_GAS_LIMIT_SKIP_LIMIT: usize = 5_000;
 
 /// Bounds consecutive gas-limit rejections without changing transaction validity.
@@ -150,6 +151,7 @@ mod tests {
             line.ends_with(" 1")));
         assert!(!text.contains("block_hash="));
     }
+
     #[test]
     fn gas_limit_scan_stops_at_the_limit_and_resets_between_streaks() {
         assert_eq!(parse_gas_limit_skip_limit(None), Ok(5_000));

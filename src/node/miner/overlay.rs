@@ -399,8 +399,8 @@ mod tests {
         };
         let mut normal_hook = normal.take_execution_hook();
         let mut empty_hook = empty.take_execution_hook();
-        normal_hook.on_state(update(3));
-        empty_hook.on_state(update(2));
+        normal_hook.on_state(crate::node::evm::test_utils::update(update(3)));
+        empty_hook.on_state(crate::node::evm::test_utils::update(update(2)));
         drop(empty_hook);
         let expected = |nonce| {
             serial_root(
@@ -450,7 +450,7 @@ mod tests {
         let cancelled_hook = cancelled.take_execution_hook();
         let mut fallback = spawn(&empty_manager, &empty_runtime, true);
         let mut hook = fallback.take_execution_hook();
-        hook.on_state(update(2));
+        hook.on_state(crate::node::evm::test_utils::update(update(2)));
         drop(hook);
         drop(cancelled_hook);
         drop(cancelled);
@@ -466,7 +466,7 @@ mod tests {
         for cancel_first in [false, true] {
             let mut previous = spawn(&normal_manager, &runtime, false);
             let mut hook = previous.take_execution_hook();
-            hook.on_state(update(3));
+            hook.on_state(crate::node::evm::test_utils::update(update(3)));
             drop(hook);
             if !cancel_first {
                 assert_eq!(
@@ -484,7 +484,7 @@ mod tests {
             next_manager.insert_block(parent.clone());
             let mut child = spawn(&next_manager, &runtime, false);
             let mut hook = child.take_execution_hook();
-            hook.on_state(update(4));
+            hook.on_state(crate::node::evm::test_utils::update(update(4)));
             drop(hook);
             assert_eq!(
                 child

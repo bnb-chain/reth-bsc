@@ -2,6 +2,7 @@
 use crate::hardforks::{bsc::BscHardfork, BscHardforks};
 use alloy_consensus::Header;
 use alloy_eips::eip7840::BlobParams;
+use alloy_evm::eth::spec::EthExecutorSpec;
 use alloy_genesis::Genesis;
 use alloy_primitives::{Address, B256, U256};
 use reth_chainspec::{
@@ -9,7 +10,6 @@ use reth_chainspec::{
     EthereumHardforks, ForkCondition, ForkFilter, ForkId, Hardforks, Head, NamedChain,
 };
 use reth_discv4::NodeRecord;
-use reth_evm::eth::spec::EthExecutorSpec;
 use std::{fmt::Display, sync::Arc};
 
 pub mod bootnode_override;

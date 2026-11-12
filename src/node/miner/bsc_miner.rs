@@ -51,7 +51,7 @@ pub struct MiningContext {
     pub parent_header: reth_primitives_traits::SealedHeader,
     pub parent_snapshot: Arc<crate::consensus::parlia::snapshot::Snapshot>,
     pub is_inturn: bool,
-    pub cached_reads: Option<reth_revm::cached::CachedReads>,
+    pub cached_reads: Option<reth_evm::cached::CachedReads>,
     /// Block timestamp in milliseconds, computed via `block_time_for_ramanujan_fork`.
     pub block_timestamp_ms: u64,
     /// End timestamp of the mining job (UNIX epoch ms), computed via `delay_for_ramanujan_fork`.
@@ -430,7 +430,7 @@ where
     fn maybe_pre_cached(
         &self,
         parent: alloy_primitives::B256,
-    ) -> Option<reth_revm::cached::CachedReads> {
+    ) -> Option<reth_evm::cached::CachedReads> {
         let _stage = super::startup_diagnostics::HandoffStage::new(
             "cached_reads_clone",
             super::startup_diagnostics::handoff_source(parent),
@@ -705,15 +705,16 @@ where
             super::startup_diagnostics::HandoffStage::new("job_attributes", source);
         let parent_header = mining_ctx.parent_header.clone();
         let block_number = parent_header.number() + 1;
+        let gas_limit = crate::shared::get_miner_gas_limit().unwrap_or(self.desired_gas_limit);
+        let min_gas_tip = crate::shared::get_miner_gas_tip()
+            .map(|v| v as u128)
+            .unwrap_or(self.desired_min_gas_tip);
         let attributes = prepare_new_attributes(
             &mut mining_ctx,
             self.parlia.clone(),
             &parent_header,
             self.validator_address,
         );
-
-        // Read dynamic config from shared state (updated by miner_* RPC), fall back to init values
-        let gas_limit = crate::shared::get_miner_gas_limit().unwrap_or(self.desired_gas_limit);
 
         drop(attributes_stage);
         let arguments_stage =
@@ -740,9 +741,7 @@ where
             ),
             cancel: ManualCancel::default(),
             trace_id: crate::node::miner::payload::generate_trace_id(),
-            min_gas_tip: crate::shared::get_miner_gas_tip()
-                .map(|v| v as u128)
-                .unwrap_or(self.desired_min_gas_tip),
+            min_gas_tip,
             // Filled in by BscPayloadJob::start when sparse-trie state-root is enabled
             // and the engine has registered a spawner. Falls back to legacy path when None.
             state_root_precomputed: std::sync::Arc::new(std::sync::Mutex::new(None)),

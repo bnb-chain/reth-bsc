@@ -14,7 +14,7 @@ use reth_bsc::{
 use std::{path::PathBuf, sync::Arc};
 
 // We use jemalloc for performance reasons
-#[cfg(all(feature = "jemalloc", unix))]
+#[cfg(all(any(feature = "jemalloc", feature = "jemalloc-prefixed"), unix))]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -177,6 +177,11 @@ fn main() -> eyre::Result<()> {
         let git_sha_long = env!("RETH_BSC_GIT_SHA_LONG");
 
         let mut md = default_reth_version_metadata();
+        #[cfg(feature = "jemalloc-prefixed")]
+        {
+            md.vergen_cargo_features =
+                Cow::Owned(format!("{},jemalloc-prefixed", md.vergen_cargo_features));
+        }
         // Capture the upstream Reth identity before we overwrite these fields, so
         // both the BSC and upstream builds can be reported in `reth --version`.
         let upstream_reth_version = md.cargo_pkg_version.clone();

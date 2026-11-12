@@ -379,3 +379,53 @@ impl<'f, 'a> Ctx<'f, 'a> {
 pub(crate) fn had_no_code(code_hash: B256) -> bool {
     code_hash == B256::ZERO || code_hash == alloy_primitives::KECCAK256_EMPTY
 }
+
+impl Cas20State for evm2::Evm<'_, reth_bsc_evm::types::BscEvmTypes> {
+    fn sload(&mut self, address: Address, key: U256) -> Result<StateLoad<U256>, String> {
+        access_list::storage(address, key);
+        let loaded = evm2::interpreter::Host::sload(self, &address, &key, false)
+            .map_err(|e| e.to_string())?;
+        Ok(StateLoad::new(loaded.value, loaded.is_cold))
+    }
+    fn sstore(
+        &mut self,
+        address: Address,
+        key: U256,
+        value: U256,
+    ) -> Result<StateLoad<SStoreResult>, String> {
+        access_list::storage(address, key);
+        let loaded = evm2::interpreter::Host::sstore(self, &address, &key, &value, false)
+            .map_err(|e| e.to_string())?;
+        Ok(StateLoad::new(
+            SStoreResult {
+                original_value: loaded.original_value,
+                present_value: loaded.present_value,
+                new_value: loaded.new_value,
+            },
+            loaded.is_cold,
+        ))
+    }
+    fn code_hash(&mut self, address: Address) -> Result<StateLoad<B256>, String> {
+        access_list::account(address);
+        let loaded = evm2::interpreter::Host::load_account(self, &address, false, false)
+            .map_err(|e| e.to_string())?;
+        Ok(StateLoad::new(loaded.code_hash, loaded.is_cold))
+    }
+    fn set_code(&mut self, address: Address, code: Bytecode) -> Result<(), String> {
+        access_list::account(address);
+        self.state_mut()
+            .account(&address)
+            .map_err(|e| e.to_string())?
+            .set_code_slow(evm2::bytecode::Bytecode::new_legacy(code.original_bytes()));
+        Ok(())
+    }
+    fn log(&mut self, log: Log) {
+        evm2::Evm::log(self, log);
+    }
+    fn block_timestamp(&self) -> u64 {
+        self.block().timestamp.saturating_to()
+    }
+    fn chain_id(&self) -> u64 {
+        self.version().chain_id
+    }
+}

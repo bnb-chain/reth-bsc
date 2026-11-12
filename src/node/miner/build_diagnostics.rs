@@ -43,7 +43,7 @@ pub(crate) enum SkipReason {
     BlobIneligible,
     BlobSidecar,
 }
-const SKIP_REASONS: [&str; 8] = [
+pub(crate) const SKIP_REASONS: [&str; 8] = [
     "nonce_too_low",
     "invalid_transaction",
     "gas_limit",
@@ -85,7 +85,7 @@ pub(crate) struct BuildWorkObservation {
     pub(crate) scanned: u64,
     pub(crate) executed: u64,
     pub(crate) gas_limit_skip_peak: u64,
-    skipped: [u64; 8],
+    pub(crate) skipped: [u64; 8],
     skipped_time: Duration,
     first_invalid_error: Option<String>,
     selection_phase: Option<(SelectionStage, Instant)>,
@@ -110,7 +110,7 @@ impl BuildWorkObservation {
             // Rebuilds share the job's deadline, so they may enter with a smaller window.
             metrics::histogram!("bsc.build_diagnostics.attempt_transaction_window_seconds", "kind" => kind.label(),
                 "turn" => if inturn { "inturn" } else { "outofturn" })
-                .record(control.transactions_until.saturating_duration_since(started).as_secs_f64());
+                .record(control.transactions_until().saturating_duration_since(started).as_secs_f64());
         }
         Self {
             kind: kind.label(),
@@ -121,8 +121,8 @@ impl BuildWorkObservation {
             acquired: None,
             executing: None,
             stopped: None,
-            transaction_deadline: control.map(|c| c.transactions_until),
-            finish_deadline: control.map(|c| c.finish_until),
+            transaction_deadline: control.map(|c| c.transactions_until()),
+            finish_deadline: control.map(|c| c.finish_until()),
             reason: "incomplete",
             completed: false,
             scanned: 0,
@@ -139,6 +139,11 @@ impl BuildWorkObservation {
     pub(crate) fn permit_acquired(&mut self) {
         self.acquired = Some(Instant::now());
         metrics::gauge!("bsc.build_diagnostics.permit_waiters", "kind" => self.kind, "turn" => self.turn).decrement(1.0);
+    }
+
+    pub(crate) fn refresh_deadlines(&mut self, control: &super::build_control::BuildControl) {
+        self.transaction_deadline = Some(control.transactions_until());
+        self.finish_deadline = Some(control.finish_until());
     }
 
     pub(crate) fn execution_started(&mut self, now: Instant) {
@@ -303,6 +308,8 @@ impl Drop for BuildWorkObservation {
 /// Metadata follows a candidate through cloning and finalization; it retains no task resources.
 #[derive(Debug)]
 pub(crate) struct CandidateDiagnostics {
+    selection: Option<super::selection_diagnostics::SelectionDiagnostics>,
+    gas_limit: u64,
     pub(crate) id: u64,
     pub(crate) kind: &'static str,
     turn: &'static str,
@@ -315,6 +322,18 @@ impl CandidateDiagnostics {
     /// Selection is counted once even if a candidate is cloned. This is not chain inclusion.
     pub(crate) fn selected(&self) {
         if !self.selected.swap(true, Ordering::Relaxed) {
+            if let Some(selection) = &self.selection {
+                selection.record("selected", self.kind, self.turn, self.gas, self.gas_limit);
+            } else {
+                super::selection_diagnostics::record_fill(
+                    "selected",
+                    self.kind,
+                    self.turn,
+                    if self.kind == "empty" { "empty_fallback" } else { "no_selection_metadata" },
+                    self.gas,
+                    self.gas_limit,
+                );
+            }
             metrics::counter!("bsc.build_diagnostics.selected_total", "kind" => self.kind, "turn" => self.turn).increment(1);
         }
     }
@@ -322,6 +341,10 @@ impl CandidateDiagnostics {
 impl Drop for CandidateDiagnostics {
     fn drop(&mut self) {
         if !self.selected.load(Ordering::Relaxed) {
+            let reason = "not_selected_or_unattributed";
+            metrics::counter!("bsc.miner_unselected_candidates_total", "kind" => self.kind, "reason" => reason).increment(1);
+            metrics::counter!("bsc.miner_unselected_candidate_transactions_total", "kind" => self.kind, "reason" => reason).increment(self.transactions as u64);
+
             metrics::counter!("bsc.build_diagnostics.unselected_completed_total", "kind" => self.kind, "turn" => self.turn).increment(1);
             metrics::histogram!("bsc.build_diagnostics.unselected_execution_seconds", "kind" => self.kind, "turn" => self.turn).record(self.execution_seconds);
             metrics::histogram!("bsc.build_diagnostics.unselected_gas", "kind" => self.kind, "turn" => self.turn).record(self.gas as f64);
@@ -376,6 +399,8 @@ impl AttemptObservation {
             metrics::histogram!("bsc.build_diagnostics.transactions", "kind" => self.kind, "turn" => self.turn).record(payload.block.body().transaction_count() as f64);
             metrics::histogram!("bsc.build_diagnostics.gas", "kind" => self.kind, "turn" => self.turn).record(payload.block.header().gas_used() as f64);
             payload.diagnostics = Some(Arc::new(CandidateDiagnostics {
+                selection: payload.selection_diagnostics,
+                gas_limit: payload.block.header().gas_limit(),
                 id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
                 kind: self.kind,
                 turn: self.turn,
@@ -584,7 +609,7 @@ mod tests {
             let mut work =
                 BuildWorkObservation::new(AttemptKind::Regular, true, 1, 1, Some(&control));
             work.permit_acquired();
-            work.execution_started(control.transactions_until - Duration::from_millis(80));
+            work.execution_started(control.transactions_until() - Duration::from_millis(80));
             // Only the observation boundary is synthetic; reset before Drop's elapsed timing.
             work.executing = Some(Instant::now());
             work.selection_stopped("transaction_deadline");
@@ -593,7 +618,7 @@ mod tests {
             let mut expired =
                 BuildWorkObservation::new(AttemptKind::Rebuild, true, 1, 1, Some(&control));
             expired.permit_acquired();
-            expired.execution_started(control.transactions_until + Duration::from_millis(1));
+            expired.execution_started(control.transactions_until() + Duration::from_millis(1));
             expired.executing = Some(Instant::now());
         });
         let rendered = handle.render();
@@ -678,6 +703,8 @@ mod tests {
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, || {
             let candidate = Arc::new(CandidateDiagnostics {
+                selection: Some(super::super::selection_diagnostics::tests::sample()),
+                gas_limit: 200,
                 id: 1,
                 kind: "speculative",
                 turn: "outofturn",
@@ -692,6 +719,8 @@ mod tests {
             drop(candidate);
             drop(clone);
             let candidate = Arc::new(CandidateDiagnostics {
+                selection: None,
+                gas_limit: 200,
                 id: 2,
                 kind: "speculative",
                 turn: "outofturn",
@@ -705,6 +734,14 @@ mod tests {
             drop(clone);
         });
         let rendered = handle.render();
+        assert!(rendered.lines().any(|l| l.starts_with("bsc_miner_selection_outcomes_total{") &&
+            l.contains("selected") &&
+            l.ends_with(" 1")));
+        assert!(rendered.lines().any(|l| {
+            l.starts_with("bsc_miner_unselected_candidate_transactions_total{") &&
+                l.contains("not_selected_or_unattributed") &&
+                l.ends_with(" 2")
+        }));
         for name in ["selected_total", "unselected_completed_total"] {
             let prefix = format!("bsc_build_diagnostics_{name}{{");
             let line = rendered.lines().find(|l| l.starts_with(&prefix)).unwrap();

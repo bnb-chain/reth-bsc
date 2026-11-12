@@ -3,8 +3,8 @@ use super::{
     executor::BscBlockExecutor,
     factory::BscEvmFactory,
 };
-use crate::evm::transaction::BscTxEnv;
 
+use super::util::NativeBlockEnv;
 use crate::{
     consensus::{
         parlia::{
@@ -18,27 +18,24 @@ use crate::{
     node::evm::error::{lane_reject, BscBlockExecutionError, BscBlockValidationError},
     system_contracts::{feynman_fork::ValidatorElectionInfo, SystemContract},
 };
-use alloy_consensus::{BlockHeader, Header, TxReceipt};
-use alloy_primitives::{BlockHash, BlockNumber, B256};
+use alloy_consensus::{transaction::Recovered, BlockHeader, Header, TxLegacy, TxReceipt};
+use alloy_primitives::{Address, BlockHash, BlockNumber, Bytes, TxKind, B256, U256};
 use bit_set::BitSet;
 use blst::{
     min_pk::{PublicKey, Signature},
     BLST_ERROR,
 };
+use evm2::{ethereum::TxEnvelope, TxResult};
+use reth_bsc_evm::types::BscEvmTypes;
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use reth_ethereum_primitives::TransactionSigned;
 use reth_evm::{
-    eth::receipt_builder::ReceiptBuilder, execute::BlockExecutionError, Database, Evm, EvmFactory,
-    FromRecoveredTx, FromTxWithEncoded, IntoTxEnv,
+    database::StateProviderDatabase, BlockExecutionError, DynDatabase, Evm, ReceiptBuilder,
 };
+type BlockEnv = evm2::env::BlockEnv<BscEvmTypes>;
 use reth_primitives_traits::{GotExpected, SealedHeader};
 use reth_provider::EvmStateProvider;
-use reth_revm::{database::StateProviderDatabase, db::State};
-use revm::{
-    context::{result::ExecutionResult, BlockEnv, TxEnv},
-    context_interface::block::Block,
-    primitives::{Address, Bytes, TxKind, U256},
-};
+
 use schnellru::{ByLength, LruMap};
 use std::{
     collections::HashMap,
@@ -104,13 +101,14 @@ pub(crate) fn view_call_at_header<DB, Spec>(
     data: Bytes,
 ) -> Result<Bytes, BlockExecutionError>
 where
-    DB: Database,
+    DB: DynDatabase,
     Spec: EthChainSpec + crate::hardforks::BscHardforks + Clone,
 {
     let tx_env = view_call_tx_env(to, data.clone(), header.gas_limit, spec.chain().id());
     let mut evm = BscEvmFactory::default().create_evm(db, evm_env_for_header(spec, header));
     // Use `Evm::transact` so system-transaction overrides still apply.
-    let result = Evm::transact(&mut evm, tx_env).map_err(BlockExecutionError::other)?.result;
+    let result =
+        evm.transact_system_transaction(&tx_env).map_err(BlockExecutionError::other)?.result;
     view_call_output(to, &data, result)
 }
 
@@ -129,7 +127,7 @@ where
     S: EvmStateProvider,
     Spec: EthChainSpec + crate::hardforks::BscHardforks + Clone,
 {
-    let mut db = State::builder().with_database(StateProviderDatabase::new(state)).build();
+    let mut db = evm2::evm::Db::new(StateProviderDatabase::new(state));
     let system_contracts = SystemContract::new(spec.clone());
 
     let (to, data) = system_contracts.get_all_validators();
@@ -182,7 +180,7 @@ where
     S: EvmStateProvider,
     Spec: EthChainSpec + crate::hardforks::BscHardforks + Clone,
 {
-    let mut db = State::builder().with_database(StateProviderDatabase::new(state)).build();
+    let mut db = evm2::evm::Db::new(StateProviderDatabase::new(state));
     let system_contracts = SystemContract::new(spec.clone());
     let is_luban = spec.is_luban_active_at_block(parent.number());
     let (to, data) = if is_luban {
@@ -215,40 +213,35 @@ pub(crate) enum CallBlockEnv {
 }
 
 /// The transaction shape used for read-only system-contract calls.
-fn view_call_tx_env(to: Address, data: Bytes, gas_limit: u64, chain_id: u64) -> BscTxEnv {
-    BscTxEnv {
-        base: TxEnv {
-            caller: Address::default(),
-            kind: TxKind::Call(to),
-            nonce: 0,
+fn view_call_tx_env(
+    to: Address,
+    data: Bytes,
+    gas_limit: u64,
+    chain_id: u64,
+) -> Recovered<TxEnvelope> {
+    Recovered::new_unchecked(
+        TxEnvelope::Legacy(TxLegacy {
+            to: TxKind::Call(to),
+            input: data,
             gas_limit,
-            value: U256::ZERO,
-            data,
-            gas_price: 0,
             chain_id: Some(chain_id),
-            gas_priority_fee: None,
-            access_list: Default::default(),
-            blob_hashes: Vec::new(),
-            max_fee_per_blob_gas: 0,
-            tx_type: 0,
-            authorization_list: Default::default(),
-        },
-        is_system_transaction: true,
-    }
+            ..Default::default()
+        }),
+        Address::ZERO,
+    )
 }
 
 /// Extracts the return data of a read-only system-contract call.
-fn view_call_output<H>(
+fn view_call_output(
     to: Address,
     data: &Bytes,
-    result: ExecutionResult<H>,
+    result: TxResult<BscEvmTypes>,
 ) -> Result<Bytes, BlockExecutionError> {
-    if !result.is_success() {
+    if !result.status {
         tracing::error!("Failed to eth call, to: {:?}, data: {:?}", to, data);
         return Err(BlockExecutionError::msg("ETH call failed"));
     }
-    let output =
-        result.into_output().ok_or_else(|| BlockExecutionError::msg("ETH call output is None"))?;
+    let output = result.output;
     // Treat empty returndata as an invalid read instead of letting ABI unpack panic.
     if output.is_empty() {
         tracing::error!("Empty eth call output, to: {:?}, data: {:?}", to, data);
@@ -257,15 +250,8 @@ fn view_call_output<H>(
     Ok(output)
 }
 
-impl<'a, EVM, Spec, R: ReceiptBuilder> BscBlockExecutor<'a, EVM, Spec, R>
+impl<'a, Spec, R: ReceiptBuilder> BscBlockExecutor<'a, Spec, R>
 where
-    EVM: Evm<
-        DB: alloy_evm::block::StateDB,
-        Tx: FromRecoveredTx<R::Transaction>
-                + FromRecoveredTx<TransactionSigned>
-                + FromTxWithEncoded<TransactionSigned>,
-        BlockEnv = crate::evm::block_env::BscBlockEnv,
-    >,
     Spec: EthereumHardforks
         + crate::hardforks::BscHardforks
         + EthChainSpec
@@ -273,10 +259,6 @@ where
         + Clone
         + 'static,
     R: ReceiptBuilder<Transaction = TransactionSigned, Receipt: TxReceipt>,
-    <R as ReceiptBuilder>::Transaction: Unpin + From<TransactionSigned>,
-    <EVM as alloy_evm::Evm>::Tx: FromTxWithEncoded<<R as ReceiptBuilder>::Transaction>,
-    BscTxEnv: IntoTxEnv<<EVM as alloy_evm::Evm>::Tx>,
-    R::Transaction: Into<TransactionSigned>,
 {
     /// Validate block fields that depend on Parlia, the header, and the parent snapshot.
     pub(crate) fn check_new_block(&mut self, block: &BlockEnv) -> Result<(), BlockExecutionError> {
@@ -469,7 +451,7 @@ where
             self.spec.chain().id(),
         );
         let result_and_state =
-            self.evm.transact(tx_env.into_tx_env()).map_err(BlockExecutionError::other)?;
+            self.evm.transact_system_transaction(&tx_env).map_err(BlockExecutionError::other)?;
         view_call_output(to, &data, result_and_state.result)
     }
 
@@ -529,7 +511,7 @@ where
             "parent-env call must run while executing the parent's direct child"
         );
 
-        view_call_at_header(self.evm.db_mut(), &self.spec, &parent, to, data)
+        view_call_at_header(self.evm.state_db_mut(), &self.spec, &parent, to, data)
     }
 
     /// Reads the active validator set.
@@ -967,15 +949,8 @@ where
 }
 
 /// Reject late reads to avoid caching this block's mutations under its parent's hash.
-impl<'a, EVM, Spec, R: ReceiptBuilder> LaneParentState for BscBlockExecutor<'a, EVM, Spec, R>
+impl<'a, Spec, R: ReceiptBuilder> LaneParentState for BscBlockExecutor<'a, Spec, R>
 where
-    EVM: Evm<
-        DB: alloy_evm::block::StateDB,
-        Tx: FromRecoveredTx<R::Transaction>
-                + FromRecoveredTx<TransactionSigned>
-                + FromTxWithEncoded<TransactionSigned>,
-        BlockEnv = crate::evm::block_env::BscBlockEnv,
-    >,
     Spec: EthereumHardforks
         + crate::hardforks::BscHardforks
         + EthChainSpec
@@ -983,10 +958,6 @@ where
         + Clone
         + 'static,
     R: ReceiptBuilder<Transaction = TransactionSigned, Receipt: TxReceipt>,
-    <R as ReceiptBuilder>::Transaction: Unpin + From<TransactionSigned>,
-    <EVM as alloy_evm::Evm>::Tx: FromTxWithEncoded<<R as ReceiptBuilder>::Transaction>,
-    BscTxEnv: IntoTxEnv<<EVM as alloy_evm::Evm>::Tx>,
-    R::Transaction: Into<TransactionSigned>,
 {
     fn call_lane_getter(&mut self, to: Address, data: Bytes) -> Result<Bytes, LaneError> {
         if !self.db_at_parent_state {
@@ -999,21 +970,18 @@ where
         // Execution errors abort validation locally; getter reverts/halts indicate bad config.
         let result = self
             .evm
-            .transact(tx_env.into_tx_env())
+            .transact_system_transaction(&tx_env)
             .map_err(|err| LaneError::StateUnavailable(err.to_string()))?
             .result;
 
         // Report the reason without retaining potentially large return data.
-        let reason = match result {
-            ExecutionResult::Success { output, .. } => {
-                let data = output.into_data();
-                if !data.is_empty() {
-                    return Ok(data);
-                }
-                "returned no data".to_string()
+        let reason = if result.status {
+            if !result.output.is_empty() {
+                return Ok(result.output);
             }
-            ExecutionResult::Revert { .. } => "reverted".to_string(),
-            ExecutionResult::Halt { reason, .. } => format!("halted: {reason:?}"),
+            "empty return data".to_string()
+        } else {
+            format!("failed: {:?}", result.stop)
         };
         Err(LaneError::CorruptConfig(format!("getter at {to} {reason}")))
     }

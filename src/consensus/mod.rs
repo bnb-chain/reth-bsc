@@ -1,8 +1,8 @@
 use alloy_consensus::constants::ETH_TO_WEI;
-use alloy_primitives::{address, Address, B256};
+use alloy_primitives::B256;
 use reth_provider::ProviderError;
 
-pub const SYSTEM_ADDRESS: Address = address!("0xfffffffffffffffffffffffffffffffffffffffe");
+pub use reth_bsc_evm::SYSTEM_ADDRESS;
 /// The reward percent to system
 pub const SYSTEM_REWARD_PERCENT: usize = 4;
 /// The max reward in system reward contract

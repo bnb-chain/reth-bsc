@@ -1,7 +1,10 @@
 //! One monotonic budget shared by all attempts for a local payload job.
 
 use reth_tasks::ManualCancel;
-use std::time::{Duration, Instant};
+use std::{
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant},
+};
 
 // Bound overlap while an obsolete synchronous transaction is returning to a cancellation check.
 pub(crate) static LOCAL_BUILD_PERMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
@@ -11,10 +14,12 @@ const MIN_LATE_TRANSACTION_WINDOW: Duration = Duration::from_millis(50);
 /// Separates stopping transaction selection from discarding an invalid or expired candidate.
 #[derive(Debug, Clone)]
 pub struct BuildControl {
-    pub(crate) transactions_until: Instant,
-    pub(crate) finish_until: Instant,
+    transactions_until: Instant,
+    finish_until: Instant,
     cancel: ManualCancel,
     allow_late_finish: bool,
+    reserve: Duration,
+    execution_deadlines: Arc<OnceLock<(Instant, Instant)>>,
 }
 
 impl BuildControl {
@@ -33,12 +38,15 @@ impl BuildControl {
             finish_until: started + budget,
             cancel,
             allow_late_finish: false,
+            reserve,
+            execution_deadlines: Arc::new(OnceLock::new()),
         }
     }
 
     /// QA experiment: allow late completion and give a late parent at least 50 ms
     /// for transaction selection. Preserve the completion reserve and cancellation.
-    /// Call once at job creation, only for opted-in in-turn jobs; retries clone it.
+    /// This provisional floor keeps job scheduling alive. The actual floor is armed
+    /// once at execution entry; retries and background workers share its deadlines.
     pub(crate) fn with_late_finish(
         mut self,
         enabled: bool,
@@ -46,6 +54,7 @@ impl BuildControl {
         reserve: Duration,
     ) -> Self {
         self.allow_late_finish = enabled;
+        self.reserve = reserve;
         if enabled {
             let minimum = started + MIN_LATE_TRANSACTION_WINDOW;
             if self.transactions_until < minimum {
@@ -56,18 +65,42 @@ impl BuildControl {
         self
     }
 
+    pub(crate) fn transactions_until(&self) -> Instant {
+        self.execution_deadlines.get().map_or(self.transactions_until, |d| d.0)
+    }
+
+    pub(crate) fn finish_until(&self) -> Instant {
+        self.execution_deadlines.get().map_or(self.finish_until, |d| d.1)
+    }
+
+    /// Only the first actual execution can arm the floor. No retry may renew it.
+    pub(crate) fn begin_execution(&self, now: Instant) -> Result<(), &'static str> {
+        self.check_active(now)?;
+        if self.allow_late_finish {
+            self.execution_deadlines.get_or_init(|| {
+                let transaction = self.transactions_until.max(now + MIN_LATE_TRANSACTION_WINDOW);
+                let finish = self.finish_until.max(transaction + self.reserve);
+                let extension = transaction.saturating_duration_since(self.transactions_until);
+                metrics::counter!("bsc.miner_execution_floor_total", "outcome" => if extension.is_zero() { "unchanged" } else { "extended" }).increment(1);
+                metrics::histogram!("bsc.miner_execution_floor_extension_seconds").record(extension.as_secs_f64());
+                (transaction, finish)
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn allows_late_finish(&self) -> bool {
         self.allow_late_finish
     }
 
     pub(crate) fn stop_transactions(&self, now: Instant) -> bool {
-        self.cancel.is_cancelled() || now >= self.transactions_until
+        self.cancel.is_cancelled() || now >= self.transactions_until()
     }
 
     pub(crate) fn check_active(&self, now: Instant) -> Result<(), &'static str> {
         if self.cancel.is_cancelled() {
             Err("payload build canceled")
-        } else if !self.allow_late_finish && now >= self.finish_until {
+        } else if !self.allow_late_finish && now >= self.finish_until() {
             Err("payload build completion deadline exceeded")
         } else {
             Ok(())
@@ -81,7 +114,7 @@ impl BuildControl {
         Ok(if self.allow_late_finish {
             poll
         } else {
-            self.finish_until.saturating_duration_since(now).min(poll)
+            self.finish_until().saturating_duration_since(now).min(poll)
         })
     }
 }
@@ -89,6 +122,60 @@ impl BuildControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preparation_does_not_consume_floor_and_preexisting_retry_cannot_renew_it() {
+        let start = Instant::now();
+        let reserve = Duration::from_millis(30);
+        let control = BuildControl::new(
+            start,
+            Duration::from_millis(450),
+            reserve,
+            Duration::ZERO,
+            ManualCancel::default(),
+        )
+        .with_late_finish(true, start, reserve);
+        let retry = control.clone();
+        let execution = start + Duration::from_millis(200);
+        control.begin_execution(execution).unwrap();
+        assert_eq!(control.transactions_until(), execution + Duration::from_millis(50));
+        assert_eq!(control.finish_until(), execution + Duration::from_millis(80));
+        assert!(!retry.stop_transactions(execution + Duration::from_millis(49)));
+        retry.begin_execution(execution + Duration::from_millis(100)).unwrap();
+        assert_eq!(retry.transactions_until(), control.transactions_until());
+        assert!(retry.stop_transactions(execution + Duration::from_millis(50)));
+    }
+
+    #[test]
+    fn execution_floor_preserves_healthy_budget_opt_out_and_cancellation() {
+        let start = Instant::now();
+        let reserve = Duration::from_millis(30);
+        let cancel = ManualCancel::default();
+        let original = BuildControl::new(
+            start,
+            Duration::from_millis(450),
+            reserve,
+            Duration::from_secs(1),
+            cancel.clone(),
+        );
+        let enabled = original.clone().with_late_finish(true, start, reserve);
+        enabled.begin_execution(start + Duration::from_millis(20)).unwrap();
+        assert_eq!(enabled.transactions_until(), start + Duration::from_millis(420));
+        // The disabled clone never arms the shared state; its original healthy budget remains.
+        let disabled = BuildControl::new(
+            start,
+            Duration::from_millis(450),
+            reserve,
+            Duration::from_secs(1),
+            cancel.clone(),
+        );
+        disabled.begin_execution(start + Duration::from_millis(410)).unwrap();
+        assert_eq!(disabled.transactions_until(), start + Duration::from_millis(420));
+        cancel.cancel();
+        assert!(enabled.begin_execution(start + Duration::from_secs(1)).is_err());
+        assert!(enabled.stop_transactions(start));
+        assert!(enabled.root_wait(start).is_err());
+    }
 
     #[test]
     fn backoff_and_retries_do_not_extend_the_budget() {

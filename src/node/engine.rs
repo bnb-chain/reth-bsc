@@ -38,6 +38,9 @@ pub enum BuildKind {
 /// included into [`BscBlock`].
 #[derive(Debug, Clone)]
 pub struct BscBuiltPayload {
+    /// Selection evidence only; never part of consensus or transaction-pool state.
+    pub(crate) selection_diagnostics:
+        Option<crate::node::miner::selection_diagnostics::SelectionDiagnostics>,
     /// Attempt metadata; deliberately excluded from block contents and consensus.
     pub(crate) diagnostics:
         Option<Arc<crate::node::miner::build_diagnostics::CandidateDiagnostics>>,
@@ -154,19 +157,22 @@ where
         // `overlay_builder_for_parent`: anchor at `parent_hash` and feed the in-memory canonical
         // chain to a miner-owned overlay cache so proof workers can resolve a
         // not-yet-persisted parent without merging every ancestor on each build.
+        let _ = crate::node::miner::perf_tuning::GasLimitSkips::configured();
         for name in ["BSC_MINING_PIPELINED_BUILD", "BSC_MINING_PIPELINE_DEPTH"] {
             if std::env::var_os(name).is_some() {
                 tracing::warn!(target: "bsc::miner", name, "Private mining pipeline was removed; ignoring obsolete setting");
             }
         }
+        let overlay_cache = Arc::new(parking_lot::Mutex::new(
+            crate::node::miner::overlay::MinerOverlayCache::default(),
+        ));
         if mining_config.use_sparse_trie_state_root {
             use crate::node::miner::proof_provider::{
                 MinerProofOverlayCache, MinerProofProviderFactory,
             };
             use alloy_consensus::Header;
             use reth_engine_tree::tree::state_root_strategy::{
-                spawn_payload_builder_state_root,
-                spawn_payload_builder_state_root_with_cache_origin,
+                spawn_payload_builder_state_root, spawn_payload_builder_state_root_with_cache_wait,
             };
             use reth_primitives_traits::SealedHeader;
             use reth_storage_overlay::OverlayManager;
@@ -229,9 +235,6 @@ where
             tracing::info!(target: "bsc::miner", root_reuse_enabled, "Miner completed-parent sparse trie handoff configured");
             let root_cache =
                 parking_lot::Mutex::new(crate::node::miner::root_reuse::MinerRootCache::default());
-            let overlay_cache =
-                parking_lot::Mutex::new(crate::node::miner::overlay::MinerOverlayCache::default());
-
             let proof_overlay_cache = Arc::new(MinerProofOverlayCache::new(runtime.clone()));
             let spawn_fn: crate::shared::SparseTrieSpawnFn = std::sync::Arc::new(
                 move |parent: SealedHeader<Header>, kind| {
@@ -285,7 +288,7 @@ where
                         matches!(kind, crate::shared::MinerRootKind::Normal)
                     {
                         let preserved = root_cache.lock().take(&parent);
-                        let (handle, pending) = spawn_payload_builder_state_root_with_cache_origin(
+                        let (handle, pending) = spawn_payload_builder_state_root_with_cache_wait(
                             executor,
                             overlay_factory,
                             parent,
@@ -294,6 +297,7 @@ where
                             Some(blocks),
                             preserved,
                             "miner",
+                            None,
                             |factory, anchor, roots| factory.with_reused_sparse_trie(anchor, roots),
                         );
                         let retired = root_cache.lock().insert(parent_hash, pending);

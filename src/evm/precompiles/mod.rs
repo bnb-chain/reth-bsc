@@ -23,6 +23,7 @@ mod double_sign;
 mod error;
 mod iavl;
 pub(crate) mod milli_timestamp;
+pub mod native;
 mod tendermint;
 mod tm_secp256k1;
 
