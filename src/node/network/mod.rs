@@ -1,42 +1,44 @@
 #![allow(clippy::owned_cow)]
 use crate::{
-    BscBlock, chainspec::BscChainSpec, node::{
-        BscNode, engine_api::payload::BscPayloadTypes, network::{
-            block_import::{BscBlockImport, handle::ImportHandle},
+    chainspec::BscChainSpec,
+    node::{
+        engine_api::payload::BscPayloadTypes,
+        miner::signer::{is_signer_initialized, sign_system_transaction},
+        network::{
+            block_import::{handle::ImportHandle, BscBlockImport},
             evn_peers::{get_onchain_nodeids_set, peer_id_to_node_id},
-        }, primitives::{BscBlobTransactionSidecar, BscPrimitives}
-    }
+        },
+        primitives::{BscBlobTransactionSidecar, BscPrimitives},
+        BscNode,
+    },
+    BscBlock,
 };
 use alloy_primitives::{Address, U256};
 use alloy_rlp::{Decodable, Encodable};
+use alloy_rpc_types::TransactionRequest as RpcTransactionRequest;
 use handshake::BscHandshake;
 use reth::{
     api::{FullNodeTypes, TxTy},
     builder::{components::NetworkBuilder, BuilderContext},
     transaction_pool::{PoolTransaction, TransactionPool},
 };
+use reth_chainspec::EthChainSpec;
 use reth_discv4::Discv4Config;
 use reth_engine_primitives::ConsensusEngineHandle;
-use reth_eth_wire::{BasicNetworkPrimitives, NewBlock, NewBlockPayload};
-use reth_ethereum_primitives::PooledTransactionVariant;
+use reth_eth_wire::{BasicNetworkPrimitives, HelloMessageWithProtocols, NewBlock, NewBlockPayload};
+use reth_ethereum_primitives::{PooledTransactionVariant, TransactionSigned};
 use reth_network::{NetworkConfig, NetworkHandle, NetworkManager, PeersConfig, SessionsConfig};
 use reth_network_api::PeersInfo;
 use reth_network_peers::NodeRecord;
 use reth_provider::{BlockNumReader, HeaderProvider, StateProviderFactory};
-use reth_ethereum_primitives::TransactionSigned;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
-use alloy_rpc_types::{
-    TransactionRequest as RpcTransactionRequest,
-};
-use crate::node::miner::signer::{is_signer_initialized, sign_system_transaction};
-use reth_chainspec::EthChainSpec;
 
 pub mod block_import;
 pub(crate) mod blocks_by_range;
-mod data_availability;
 pub mod bootnodes;
+mod data_availability;
 pub mod evn;
 pub mod evn_peers;
 pub mod handshake;
@@ -167,10 +169,14 @@ pub struct BscNetworkBuilder {
     engine_handle_rx: Arc<Mutex<Option<oneshot::Receiver<ConsensusEngineHandle<BscPayloadTypes>>>>>,
 }
 
-fn apply_bsc_discv4_overrides<I>(
-    discv4_config: &mut Option<Discv4Config>,
-    boot_nodes: Option<I>,
-) where
+fn apply_bsc_eth_protocol_overrides(hello: &mut HelloMessageWithProtocols) {
+    // BSC eth/70 retains total difficulty and omits UpgradeStatus, unlike Ethereum eth/70.
+    // Use the supported legacy handshake until the BSC-specific wire format is implemented.
+    hello.protocols.retain(|protocol| protocol.cap.name != "eth" || protocol.cap.version <= 68);
+}
+
+fn apply_bsc_discv4_overrides<I>(discv4_config: &mut Option<Discv4Config>, boot_nodes: Option<I>)
+where
     I: IntoIterator<Item = NodeRecord>,
 {
     let Some(discv4_config) = discv4_config.as_mut() else {
@@ -270,25 +276,17 @@ impl BscNetworkBuilder {
 
         let network_builder = ctx.network_config_builder()?;
 
-        let (to_import_net, from_network) = mpsc::unbounded_channel();
-        let (to_import_mined, from_builder) = mpsc::unbounded_channel();
-        let (to_import_bid, from_bid_block) = mpsc::unbounded_channel();
-        let (to_network, import_outcome) = mpsc::unbounded_channel();
+        let (to_import_net, from_network) = mpsc::channel(block_import::IMPORT_QUEUE_CAPACITY);
+        let (to_local, from_local) = mpsc::channel(block_import::propagation::LOCAL_BLOCK_CAPACITY);
+        let (to_network, import_outcome) = block_import::propagation::channel();
 
-        let (to_hashes, from_hashes) = mpsc::unbounded_channel();
+        let (to_hashes, from_hashes) = mpsc::channel(block_import::IMPORT_QUEUE_CAPACITY);
         let handle = ImportHandle::new(to_import_net.clone(), to_hashes, import_outcome);
 
-        // Expose the sender globally so that the miner can submit newly mined blocks
-        if crate::shared::set_block_import_mined_sender(to_import_mined.clone()).is_err() {
-            warn!(target: "bsc", "Block import mined sender already initialised; overriding skipped");
-        }
-        if crate::shared::set_block_import_sender(to_import_net.clone()).is_err() {
-            warn!(target: "bsc", "Block import network sender already initialised; overriding skipped");
-        }
-        // Expose the BEP-675 BidBlock sender so the miner can submit a selected (sealed, unexecuted)
-        // BidBlock for broadcast-then-verify (zero-simulate).
-        if crate::shared::set_bid_block_import_sender(to_import_bid.clone()).is_err() {
-            warn!(target: "bsc", "BidBlock import sender already initialised; overriding skipped");
+        // Share bounded local ingress between mined blocks and selected BEP-675 BidBlocks.
+        // Selected sealed, unexecuted BidBlocks still use broadcast-then-verify (zero-simulate).
+        if crate::shared::set_local_block_import_sender(to_local).is_err() {
+            warn!(target: "bsc", "Local block import sender already initialised; overriding skipped");
         }
 
         // Import the necessary types for block import service
@@ -352,8 +350,7 @@ impl BscNetworkBuilder {
                 chain_spec,
                 handle,
                 from_network,
-                from_builder,
-                from_bid_block,
+                from_local,
                 from_hashes,
                 to_network,
             )
@@ -364,7 +361,8 @@ impl BscNetworkBuilder {
             }
         });
 
-        // TODO: update network with the latest canonical head, but has a fork id issue, can fix it later.
+        // TODO: update network with the latest canonical head, but has a fork id issue, can fix it
+        // later.
         let mut network_builder = network_builder
             .boot_nodes(ctx.chain_spec().bootnodes().unwrap_or_default())
             .set_head(ctx.chain_spec().head())
@@ -382,6 +380,7 @@ impl BscNetworkBuilder {
 
         let peer_id = network_builder.get_peer_id();
         let mut network_config = ctx.build_network_config(network_builder);
+        apply_bsc_eth_protocol_overrides(&mut network_config.hello_message);
         apply_bsc_discv4_overrides(
             &mut network_config.discovery_v4_config,
             ctx.chain_spec().bootnodes(),
@@ -454,10 +453,8 @@ where
             warn!(target: "reth::cli", "Failed to set global local peer ID - already set");
         } else {
             let node_id = alloy_primitives::keccak256(local_peer_id);
-            let node_id_short = format!(
-                "{:016x}",
-                u64::from_be_bytes(node_id.0[..8].try_into().expect("8 bytes"))
-            );
+            let node_id_short =
+                format!("{:016x}", u64::from_be_bytes(node_id.0[..8].try_into().expect("8 bytes")));
             info!(
                 target: "reth::cli",
                 peer_id = %local_peer_id,
@@ -474,7 +471,6 @@ where
         if crate::node::network::evn::is_evn_enabled() {
             spawn_evn_sync_watcher(ctx, handle.clone());
         }
-
 
         Ok(handle)
     }
@@ -562,16 +558,27 @@ async fn register_nodeids_actions<P: StateProviderFactory>(
     to_add: Vec<[u8; 32]>,
     to_remove: Vec<[u8; 32]>,
 ) -> Result<(), eyre::Error> {
-    let best_block_number = crate::shared::get_best_canonical_block_number().ok_or(eyre::eyre!("Best block number not found"))?;
-    let h = crate::shared::get_canonical_header_by_number(best_block_number).ok_or(eyre::eyre!("Header not found"))?;
+    let best_block_number = crate::shared::get_best_canonical_block_number()
+        .ok_or(eyre::eyre!("Best block number not found"))?;
+    let h = crate::shared::get_canonical_header_by_number(best_block_number)
+        .ok_or(eyre::eyre!("Header not found"))?;
     let state = provider.state_by_block_hash(h.hash_slow())?;
-    let acc = state.basic_account(&validator)?.ok_or(eyre::eyre!("Account not found for validator"))?;
+    let acc =
+        state.basic_account(&validator)?.ok_or(eyre::eyre!("Account not found for validator"))?;
     let mut next_nonce = acc.nonce;
     let chain_id = chain_spec.chain().id();
 
     let onchain_nodeids_set = get_onchain_nodeids_set();
-    let to_add: Vec<[u8; 32]>= to_add.iter().filter(|id| !onchain_nodeids_set.contains(&alloy_primitives::hex::encode(**id))).copied().collect();
-    let to_remove: Vec<[u8; 32]>= to_remove.iter().filter(|id| onchain_nodeids_set.contains(&alloy_primitives::hex::encode(**id))).copied().collect();
+    let to_add: Vec<[u8; 32]> = to_add
+        .iter()
+        .filter(|id| !onchain_nodeids_set.contains(&alloy_primitives::hex::encode(**id)))
+        .copied()
+        .collect();
+    let to_remove: Vec<[u8; 32]> = to_remove
+        .iter()
+        .filter(|id| onchain_nodeids_set.contains(&alloy_primitives::hex::encode(**id)))
+        .copied()
+        .collect();
     debug!(target: "bsc::evn", to_add = ?to_add, to_remove = ?to_remove, onchain_nodeids_set = ?onchain_nodeids_set, "refreshed to_add and to_remove");
     let mut signed_batch: Vec<TransactionSigned> = Vec::new();
     if !to_add.is_empty() {
@@ -646,7 +653,10 @@ async fn register_nodeids_actions<P: StateProviderFactory>(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_bsc_discv4_overrides, apply_bsc_peer_stability_overrides};
+    use super::{
+        apply_bsc_discv4_overrides, apply_bsc_eth_protocol_overrides,
+        apply_bsc_peer_stability_overrides,
+    };
     use reth_discv4::{Discv4Config, NatResolver};
     use reth_network::{PeersConfig, SessionsConfig};
     use reth_network_peers::NodeRecord;
@@ -654,6 +664,19 @@ mod tests {
         net::{IpAddr, Ipv4Addr},
         time::Duration,
     };
+
+    #[test]
+    fn negotiates_eth68_with_go_bsc_eth70_peer() {
+        use reth_eth_wire::{
+            capability::SharedCapabilities, Capability, EthVersion, HelloMessageWithProtocols,
+        };
+
+        let mut hello = HelloMessageWithProtocols::builder(Default::default()).build();
+        apply_bsc_eth_protocol_overrides(&mut hello);
+        let remote = vec![Capability::eth(EthVersion::Eth70), Capability::eth(EthVersion::Eth68)];
+        let shared = SharedCapabilities::try_new(hello.protocols, remote).unwrap();
+        assert_eq!(shared.eth_version().unwrap(), EthVersion::Eth68);
+    }
 
     #[test]
     fn bsc_discv4_overrides_preserve_external_ip_resolver() {

@@ -210,7 +210,7 @@ async fn ordinary_build_filter_skips_descendants_without_evicting_them() {
     let mut included = vec![];
     while let Some(tx) = best.next() {
         if !meets_tip_floor(tx.effective_tip_per_gas(0), 10) {
-            best.mark_invalid(&tx, &InvalidPoolTransactionError::Underpriced);
+            best.mark_invalid(&tx, InvalidPoolTransactionError::Underpriced);
             continue;
         }
         included.push(*tx.hash());

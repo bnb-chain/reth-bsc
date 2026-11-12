@@ -28,7 +28,7 @@ impl Decodable for UpgradeStatus {
         if message_id != UPGRADE_STATUS_MESSAGE_ID {
             return Err(alloy_rlp::Error::Custom("Invalid message ID"));
         }
-        
+
         // BSC sends: 0x0b (message id) followed by [[disable_peer_tx_broadcast]]
         // The remaining bytes should be the extension wrapped in an extra list
         let extension: Vec<UpgradeStatusExtension> = Decodable::decode(buf)?;
@@ -85,14 +85,29 @@ impl Decodable for UpgradeStatusExtension {
 mod tests {
     use super::*;
     use alloy_primitives::hex;
-    
+
     #[test]
     fn test_decode_bsc_upgrade_status() {
         // Raw wire message captured from a BSC peer.
         let cases = vec![
-            ("0bc180", UpgradeStatus { extension: UpgradeStatusExtension { disable_peer_tx_broadcast: false } }),
-            ("0bc2c180", UpgradeStatus { extension: UpgradeStatusExtension { disable_peer_tx_broadcast: false } }),
-            ("0bc2c101", UpgradeStatus { extension: UpgradeStatusExtension { disable_peer_tx_broadcast: true } }),
+            (
+                "0bc180",
+                UpgradeStatus {
+                    extension: UpgradeStatusExtension { disable_peer_tx_broadcast: false },
+                },
+            ),
+            (
+                "0bc2c180",
+                UpgradeStatus {
+                    extension: UpgradeStatusExtension { disable_peer_tx_broadcast: false },
+                },
+            ),
+            (
+                "0bc2c101",
+                UpgradeStatus {
+                    extension: UpgradeStatusExtension { disable_peer_tx_broadcast: true },
+                },
+            ),
         ];
         for (raw, expected) in cases {
             let raw = hex::decode(raw).unwrap();
@@ -101,7 +116,10 @@ mod tests {
             println!("decoded: {:?}", decoded);
             assert_eq!(expected, decoded);
             let mut enc = BytesMut::new();
-            UpgradeStatus { extension: UpgradeStatusExtension { disable_peer_tx_broadcast: false } }.encode(&mut enc);
+            UpgradeStatus {
+                extension: UpgradeStatusExtension { disable_peer_tx_broadcast: false },
+            }
+            .encode(&mut enc);
             println!("enc: {:x?}", enc.freeze());
         }
     }

@@ -144,8 +144,8 @@ impl<'r, 'f, 'a> Store<'r, 'f, 'a> {
             return false;
         }
         let Some(load) = self.ctx.frame.sstore(self.at, slot, value) else { return false };
-        let cost = STORAGE_GAS.sstore_static_gas()
-            + STORAGE_GAS.sstore_dynamic_gas(true, &load.data, load.is_cold);
+        let cost = STORAGE_GAS.sstore_static_gas() +
+            STORAGE_GAS.sstore_dynamic_gas(true, &load.data, load.is_cold);
         self.ctx.frame.gas.refund += STORAGE_GAS.sstore_refund(true, &load.data);
         self.ctx.charge_gas(cost)
     }

@@ -1,12 +1,15 @@
-use super::config::{
-    revm_spec_by_timestamp_and_block_number, BscBlockExecutionCtx, BscExecutionMode,
+use super::{
+    config::{revm_spec_by_timestamp_and_block_number, BscBlockExecutionCtx, BscExecutionMode},
+    patch::HertzPatchManager,
 };
-use super::patch::HertzPatchManager;
-use crate::consensus::parlia::SnapshotProvider;
 use crate::{
     consensus::{
-        parlia::{Parlia, Snapshot, VoteAddress},
-        SYSTEM_ADDRESS,
+        parlia::{
+            util::calculate_millisecond_timestamp, Parlia, Snapshot, SnapshotProvider, VoteAddress,
+        },
+        payment_lane::{
+            state::LaneState, LaneError, LaneLiveState, LaneType, PAYMENT_LANE_CONTRACT,
+        },
     },
     evm::{
         blacklist::{self, BlacklistedAddressError},
@@ -18,29 +21,26 @@ use crate::{
         BscBlockchainMetrics, BscConsensusMetrics, BscExecutorMetrics, BscRewardsMetrics,
         BscVoteMetrics,
     },
-    node::evm::config::BscExecutionSharedCtx,
+    node::evm::{
+        config::BscExecutionSharedCtx,
+        error::{lane_reject, BscBlockExecutionError, BscBlockValidationError},
+    },
     system_contracts::{
         feynman_fork::ValidatorElectionInfo, get_upgrade_system_contracts, is_system_transaction,
         SystemContract,
     },
 };
-use alloy_consensus::{Header, Transaction as _, TxReceipt, TxType};
-use alloy_eips::eip2935::{HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE};
-use alloy_eips::{eip7685::Requests, Encodable2718};
+use alloy_consensus::{constants::KECCAK_EMPTY, Header, Transaction as _, TxReceipt, TxType};
+use alloy_eips::{
+    eip2935::{HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE},
+    eip7685::Requests,
+    Encodable2718,
+};
 use alloy_evm::{
-    block::{
-        ExecutableTx, GasOutput, StateChangePostBlockSource, StateChangePreBlockSource,
-        StateChangeSource, TxResult,
-    },
+    block::{ExecutableTx, GasOutput, TxResult},
     eth::receipt_builder::ReceiptBuilderCtx,
 };
-use crate::node::evm::error::{lane_reject, BscBlockExecutionError, BscBlockValidationError};
-use crate::consensus::payment_lane::{
-    state::LaneState, LaneError, LaneLiveState, LaneType, PAYMENT_LANE_CONTRACT,
-};
-use alloy_consensus::constants::KECCAK_EMPTY;
-use alloy_primitives::keccak256;
-use alloy_primitives::{hex, uint, Address, BlockNumber, Bytes, U256};
+use alloy_primitives::{hex, keccak256, uint, Address, BlockNumber, Bytes, U256};
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use reth_ethereum_primitives::TransactionSigned;
 use reth_evm::{
@@ -48,16 +48,15 @@ use reth_evm::{
     eth::receipt_builder::ReceiptBuilder,
     execute::{BlockExecutionError, BlockExecutor},
     system_calls::SystemCaller,
-    Evm, FromRecoveredTx, FromTxWithEncoded, IntoTxEnv, OnStateHook,
+    Evm, FromRecoveredTx, FromTxWithEncoded, IntoTxEnv,
 };
 use reth_primitives_traits::Recovered;
 use reth_provider::BlockExecutionResult;
-use revm::Database as _;
 use revm::{
     context::result::{ExecutionResult, Output, ResultAndState, ResultGas, SuccessReason},
     context_interface::{block::Block, result::InvalidTransaction},
     state::{Account as RevmAccount, Bytecode, EvmState},
-    DatabaseCommit,
+    Database as _, DatabaseCommit,
 };
 use std::{collections::HashMap, sync::Arc};
 use tracing::{debug, error, info, trace, warn};
@@ -152,6 +151,7 @@ where
     pub(super) rewards_metrics: BscRewardsMetrics,
     /// Deferred error from commit_transaction (e.g. hertz patch), returned from finish().
     pub(super) deferred_error: Option<BlockExecutionError>,
+    execution_diagnostics: crate::node::miner::state_read_diagnostics::ExecutionObservation,
 }
 
 impl<'a, EVM, Spec, R: ReceiptBuilder> BscBlockExecutor<'a, EVM, Spec, R>
@@ -197,7 +197,12 @@ where
 
         let parlia = Arc::new(Parlia::new(Arc::new(spec.clone()), 200));
         let spec_clone = spec.clone();
+        let execution_diagnostics =
+            crate::node::miner::state_read_diagnostics::ExecutionObservation::new(
+                ctx.finish_diagnostics,
+            );
         Self {
+            execution_diagnostics,
             spec,
             evm,
             gas_used: 0,
@@ -235,14 +240,14 @@ where
 
     /// Applies system contract upgrades if the Feynman fork is not yet active.
     ///
-    /// `source` identifies the upgrade to the state hook and therefore to the incremental
-    /// state-root computation; pre-Feynman upgrades run at block begin, later ones at block end.
+    /// Pre-Feynman upgrades run at block begin, later ones at block end. The upgraded state reaches
+    /// the incremental state-root computation automatically: the DB-level state hook streams on
+    /// every `commit` (see the note in `commit_transaction`).
     fn upgrade_contracts(
         &mut self,
         block_number: BlockNumber,
         block_timestamp: u64,
         parent_timestamp: u64,
-        source: StateChangeSource,
     ) -> Result<(), BlockExecutionError> {
         trace!(
             target: "bsc::executor::upgrade",
@@ -269,7 +274,7 @@ where
                     code_len = code.len(),
                     "Upgrading system contract"
                 );
-                self.upgrade_system_contract(address, code, source)?;
+                self.upgrade_system_contract(address, code)?;
             }
         }
 
@@ -293,14 +298,7 @@ where
                     parent_timestamp,
                     "Upgrading system contracts at block begin (before Feynman)"
                 );
-                self.upgrade_contracts(
-                    block_number,
-                    block_timestamp,
-                    parent_timestamp,
-                    StateChangeSource::PreBlock(StateChangePreBlockSource::Other(
-                        "bsc_system_contract_upgrade",
-                    )),
-                )?;
+                self.upgrade_contracts(block_number, block_timestamp, parent_timestamp)?;
             }
 
             // HistoryStorageAddress is a special system contract in BSC, which can't be upgraded
@@ -337,14 +335,7 @@ where
                     parent_timestamp,
                     "Upgrading system contracts at block end (Feynman active)"
                 );
-                self.upgrade_contracts(
-                    block_number,
-                    block_timestamp,
-                    parent_timestamp,
-                    StateChangeSource::PostBlock(StateChangePostBlockSource::Other(
-                        "bsc_system_contract_upgrade",
-                    )),
-                )?;
+                self.upgrade_contracts(block_number, block_timestamp, parent_timestamp)?;
             }
         }
         Ok(())
@@ -379,32 +370,33 @@ where
         &mut self,
         address: Address,
         code: Bytecode,
-        source: StateChangeSource,
     ) -> Result<(), BlockExecutionError> {
-        let changes = {
-            let mut info = self
-                .evm
-                .db_mut()
-                .basic(address)
-                .map_err(BlockExecutionError::other)?
-                .unwrap_or_default();
-            info.code_hash = code.hash_slow();
-            info.code = Some(code);
-            let mut account = RevmAccount::from(info);
-            account.mark_touch();
-            let mut changes: EvmState = Default::default();
-            changes.insert(address, account);
-            self.commit_state(changes.clone());
-            changes
-        };
+        let info = self
+            .evm
+            .db_mut()
+            .basic(address)
+            .map_err(BlockExecutionError::other)?
+            .unwrap_or_default();
+        // Build the account from the PRE-upgrade info and mutate afterwards.
+        // `impl From<AccountInfo> for Account` snapshots the value it is given into
+        // `original_info`, and reth's `evm_state_to_hashed_post_state` decides whether an
+        // account changed with `info != original_info()`. Mutating before the conversion makes
+        // those two equal, so the state-root task silently drops the new code hash while
+        // the commit below still applies it -- the sparse root then disagrees with the serial
+        // one and the block seals an invalid state root.
+        let mut account = RevmAccount::from(info);
+        account.info.code_hash = code.hash_slow();
+        account.info.code = Some(code);
+        account.mark_touch();
+        let mut changes: EvmState = Default::default();
+        changes.insert(address, account);
 
-        // The state root is computed incrementally from the state hook (sparse trie /
-        // `StateRootTask`), so a bare `db.commit` is invisible to it: the account's new
-        // `code_hash` never reaches the trie and the block commits a root describing the
-        // un-upgraded contract. That is what split bsc-qanet at the Pasteur transition
-        // (block 21323714) - geth computed the true root and rejected the block while every
-        // reth node agreed on the stale one. Report the change like `commit_transaction` does.
-        self.system_caller.on_state(source, &changes);
+        // The upgraded account's new `code_hash` must reach the incremental state-root
+        // computation, or the block commits a root describing the un-upgraded contract (this
+        // split bsc-qanet at the Pasteur transition, block 21323714: geth computed the true root
+        // and rejected the block while every reth node agreed on the stale one). The DB-level
+        // state hook streams every `commit` to the state-root task, so committing alone suffices.
+        self.commit_state(changes);
         Ok(())
     }
 
@@ -420,8 +412,10 @@ where
         for address in [cas20::ACTIVATION_REGISTRY_ADDRESS, cas20::POLICY_REGISTRY_ADDRESS] {
             let db = self.evm.db_mut();
             let old_info = db.basic(address).map_err(BlockExecutionError::other)?;
-            let mut info = old_info.unwrap_or_default();
-            if info.code_hash != revm::primitives::KECCAK_EMPTY && info.code_hash != alloy_primitives::B256::ZERO {
+            let info = old_info.unwrap_or_default();
+            if info.code_hash != revm::primitives::KECCAK_EMPTY &&
+                info.code_hash != alloy_primitives::B256::ZERO
+            {
                 error!(
                     target: "bsc::executor::cas20",
                     block_number,
@@ -432,19 +426,19 @@ where
                 continue;
             }
             let code = cas20::marker_bytecode();
-            info.code_hash = code.hash_slow();
-            info.code = Some(code);
+            // Build from the pre-seed info and mutate afterwards: `From<AccountInfo>` snapshots
+            // its input into `original_info`, and the state-root task skips accounts whose
+            // `info == original_info()`, so mutating first would drop the sentinel from the
+            // sealed root while `commit` still applies it.
             let mut account = RevmAccount::from(info);
+            account.info.code_hash = code.hash_slow();
+            account.info.code = Some(code);
             account.mark_touch();
             let mut changes: EvmState = Default::default();
             changes.insert(address, account);
-            db.commit(changes.clone());
-            // As for every other block-begin write: the incremental state root only
-            // sees what the hook is told.
-            self.system_caller.on_state(
-                StateChangeSource::PreBlock(StateChangePreBlockSource::Other("bsc_cas20_registry_sentinel")),
-                &changes,
-            );
+            // As for every other block-begin write, the DB-level state hook streams this
+            // commit to the incremental state-root task.
+            db.commit(changes);
             info!(target: "bsc::executor::cas20", block_number, ?address, "Seeded CAS20 registry sentinel (Jenner transition)");
         }
         Ok(())
@@ -479,26 +473,22 @@ where
             "HistoryStorageAddress account before deployment"
         );
 
-        let mut new_info = old_info.unwrap_or_default();
-        new_info.code_hash = keccak256(HISTORY_STORAGE_CODE.clone());
-        new_info.code = Some(Bytecode::new_raw(Bytes::from_static(&HISTORY_STORAGE_CODE)));
-        new_info.nonce = 1_u64;
-        new_info.balance = U256::ZERO;
-        let mut account = RevmAccount::from(new_info);
+        // Same ordering requirement as `upgrade_system_contract`: construct from the
+        // pre-deployment info so `original_info` holds the old value, then mutate. Building
+        // from the already-mutated info makes `info == original_info()` and the deployment
+        // never reaches the incremental state-root computation.
+        let mut account = RevmAccount::from(old_info.unwrap_or_default());
+        account.info.code_hash = keccak256(HISTORY_STORAGE_CODE.clone());
+        account.info.code = Some(Bytecode::new_raw(Bytes::from_static(&HISTORY_STORAGE_CODE)));
+        account.info.nonce = 1_u64;
+        account.info.balance = U256::ZERO;
         account.mark_touch();
         let mut changes: EvmState = Default::default();
         changes.insert(HISTORY_STORAGE_ADDRESS, account);
-        self.commit_state(changes.clone());
-
-        // Same reasoning as `upgrade_system_contract`: the incremental state-root pipeline only
-        // sees changes reported through the hook, so this deployment must be announced or the
-        // Prague transition block commits a root without it.
-        self.system_caller.on_state(
-            StateChangeSource::PreBlock(StateChangePreBlockSource::Other(
-                "bsc_history_storage_account",
-            )),
-            &changes,
-        );
+        // Same reasoning as `upgrade_system_contract`: the DB-level state hook streams this
+        // deployment to the incremental state-root pipeline on `commit`, so the Prague transition
+        // block commits a root that includes it.
+        self.commit_state(changes);
 
         info!(
             target: "bsc::executor::prague",
@@ -535,11 +525,7 @@ where
             self.evm.block().number().to::<u64>(),
             self.evm.block().timestamp().to::<u64>(),
         );
-        self.evm
-            .block()
-            .gas_limit()
-            .saturating_sub(reserved)
-            .saturating_sub(self.gas_used)
+        self.evm.block().gas_limit().saturating_sub(reserved).saturating_sub(self.gas_used)
     }
 
     /// Validates total block gas after all system transactions have executed.
@@ -712,7 +698,8 @@ where
         let block_number = block_env.number().to::<u64>();
         self.consensus_metrics.current_block_height.set(block_number as f64);
 
-        // pre check and prepare some intermediate data for commit parlia snapshot in finish function.
+        // pre check and prepare some intermediate data for commit parlia snapshot in finish
+        // function.
         if self.ctx.mode == BscExecutionMode::Import {
             self.check_new_block(&block_env)
                 .map_err(crate::node::evm::error::mark_pre_execution_error)?;
@@ -755,160 +742,168 @@ where
         &mut self,
         tx: impl ExecutableTx<Self>,
     ) -> Result<BscTxResult<E::HaltReason>, BlockExecutionError> {
-        use alloy_evm::RecoveredTx as _;
+        let started = self.execution_diagnostics.start();
+        let result = (|| {
+            use alloy_evm::RecoveredTx as _;
 
-        let (tx_env, recovered) = tx.into_parts();
-        let signer = *recovered.signer();
-        let tx_signed: TransactionSigned = recovered.tx().clone();
-        let tx_type = tx_signed.tx_type();
+            let (tx_env, recovered) = tx.into_parts();
+            let signer = *recovered.signer();
+            let tx_signed: TransactionSigned = recovered.tx().clone();
+            let tx_type = tx_signed.tx_type();
 
-        // Detect system transactions: skip EVM execution, accumulate for later.
-        let is_system = is_system_transaction(&tx_signed, signer, self.evm.block().beneficiary());
+            // Detect system transactions: skip EVM execution, accumulate for later.
+            let is_system =
+                is_system_transaction(&tx_signed, signer, self.evm.block().beneficiary());
 
-        let lane_type =
-            self.lane.clone().classify(self, is_system, &tx_signed).map_err(lane_reject)?;
+            let lane_type =
+                self.lane.clone().classify(self, is_system, &tx_signed).map_err(lane_reject)?;
 
-        if is_system {
-            self.system_txs.push(tx_signed.clone());
-            let dummy = ResultAndState {
-                result: ExecutionResult::Success {
-                    reason: SuccessReason::Stop,
-                    gas: ResultGas::default(),
-                    logs: vec![],
-                    output: Output::Call(Bytes::new()),
-                },
-                state: Default::default(),
+            if is_system {
+                self.system_txs.push(tx_signed.clone());
+                let dummy = ResultAndState {
+                    result: ExecutionResult::Success {
+                        reason: SuccessReason::Stop,
+                        gas: ResultGas::default(),
+                        logs: vec![],
+                        output: Output::Call(Bytes::new()),
+                    },
+                    state: Default::default(),
+                };
+                return Ok(BscTxResult {
+                    inner: dummy,
+                    blob_gas_used: 0,
+                    tx_type,
+                    tx: tx_signed,
+                    is_system: true,
+                    lane_type,
+                });
+            }
+
+            // From Cancun, system transactions must be at the end of the block.
+            if self.ctx.mode == BscExecutionMode::Import &&
+                !self.system_txs.is_empty() &&
+                BscHardforks::is_cancun_active_at_timestamp(
+                    &self.spec,
+                    self.evm.block().number().to::<u64>(),
+                    self.evm.block().timestamp().to::<u64>(),
+                )
+            {
+                return Err(BscBlockExecutionError::Validation(
+                    BscBlockValidationError::UnexpectedNormalTx,
+                )
+                .into());
+            }
+
+            // Nano consensus rule: a blacklisted sender or recipient makes the block invalid.
+            if self.spec.is_nano_active_at_block(self.evm.block().number().to::<u64>()) &&
+                blacklist::check_tx_basic_blacklist(signer, tx_signed.to())
+            {
+                return Err(BlockValidationError::InvalidTx {
+                    hash: tx_signed.trie_hash(),
+                    error: Box::new(BlacklistedAddressError()),
+                }
+                .into());
+            }
+
+            // The Hertz patches replay historical state fixes, so they only apply to a block that
+            // already exists.
+            if self.ctx.mode == BscExecutionMode::Import {
+                self.hertz_patch_manager.patch_before_tx(&tx_signed, self.evm.db_mut())?;
+            }
+
+            let block_available_gas = self.evm.block().gas_limit() - self.gas_used;
+            let tx_gas_limit = tx_signed.gas_limit();
+            if tx_gas_limit > block_available_gas {
+                return Err(BlockValidationError::TransactionGasLimitMoreThanAvailableBlockGas {
+                    transaction_gas_limit: tx_gas_limit,
+                    block_available_gas,
+                }
+                .into());
+            }
+
+            let tx_hash = tx_signed.trie_hash();
+            let block_number = self.evm.block().number().to::<u64>();
+            let timestamp = self.evm.block().timestamp().to::<u64>();
+            let spec =
+                revm_spec_by_timestamp_and_block_number(self.spec.clone(), timestamp, block_number);
+            let (to, selector, input_len) = {
+                let to = tx_signed.to();
+                let input = tx_signed.input();
+                let selector = if input.len() >= 4 { Some(hex::encode(&input[..4])) } else { None };
+                (to, selector, input.len())
             };
-            return Ok(BscTxResult {
-                inner: dummy,
-                blob_gas_used: 0,
+
+            // Greedy merge checks admission before execution. Mining checks it here and returns
+            // InvalidTx so the pool loop skips this sender instead of aborting the build.
+            if self.ctx.mode == BscExecutionMode::Mining &&
+                self.lane.on() &&
+                !self.lane_admits(&tx_signed, lane_type, self.producer_shared_gas())
+            {
+                return Err(BlockValidationError::InvalidTx {
+                    hash: tx_hash,
+                    error: Box::new(InvalidTransaction::CallerGasLimitMoreThanBlock),
+                }
+                .into());
+            }
+
+            precompiles::push_precompile_trace_context(
+                precompiles::PrecompileTraceContext::from_parts(
+                    block_number,
+                    spec,
+                    false,
+                    Some(tx_hash),
+                    to,
+                    selector,
+                    input_len,
+                ),
+            );
+            struct PrecompileTracePopGuard;
+            impl Drop for PrecompileTracePopGuard {
+                fn drop(&mut self) {
+                    precompiles::pop_precompile_trace_context();
+                }
+            }
+            let _precompile_trace_pop_guard = PrecompileTracePopGuard;
+
+            let blob_gas_used =
+                if BscHardforks::is_cancun_active_at_timestamp(&self.spec, block_number, timestamp)
+                {
+                    tx_signed.blob_gas_used().unwrap_or_default()
+                } else {
+                    0
+                };
+
+            let started = self.execution_diagnostics.start();
+            let result = self.evm.transact(tx_env);
+            self.execution_diagnostics.record(1, started);
+            let inner = result.map_err(|err| BlockExecutionError::evm(err, tx_hash))?;
+
+            Ok(BscTxResult {
+                inner,
+                blob_gas_used,
                 tx_type,
                 tx: tx_signed,
-                is_system: true,
+                is_system: false,
                 lane_type,
-            });
-        }
-
-        // From Cancun, system transactions must be at the end of the block.
-        if self.ctx.mode == BscExecutionMode::Import &&
-            !self.system_txs.is_empty() &&
-            BscHardforks::is_cancun_active_at_timestamp(
-                &self.spec,
-                self.evm.block().number().to::<u64>(),
-                self.evm.block().timestamp().to::<u64>(),
-            )
-        {
-            return Err(BscBlockExecutionError::Validation(
-                BscBlockValidationError::UnexpectedNormalTx,
-            )
-            .into());
-        }
-
-        // Nano consensus rule: a blacklisted sender or recipient makes the block invalid.
-        if self.spec.is_nano_active_at_block(self.evm.block().number().to::<u64>()) &&
-            blacklist::check_tx_basic_blacklist(signer, tx_signed.to())
-        {
-            return Err(BlockValidationError::InvalidTx {
-                hash: tx_signed.trie_hash(),
-                error: Box::new(BlacklistedAddressError()),
-            }
-            .into());
-        }
-
-        // The Hertz patches replay historical state fixes, so they only apply to a block that
-        // already exists.
-        if self.ctx.mode == BscExecutionMode::Import {
-            self.hertz_patch_manager.patch_before_tx(&tx_signed, self.evm.db_mut())?;
-        }
-
-        let block_available_gas = self.evm.block().gas_limit() - self.gas_used;
-        let tx_gas_limit = tx_signed.gas_limit();
-        if tx_gas_limit > block_available_gas {
-            return Err(BlockValidationError::TransactionGasLimitMoreThanAvailableBlockGas {
-                transaction_gas_limit: tx_gas_limit,
-                block_available_gas,
-            }
-            .into());
-        }
-
-        let tx_hash = tx_signed.trie_hash();
-        let block_number = self.evm.block().number().to::<u64>();
-        let timestamp = self.evm.block().timestamp().to::<u64>();
-        let spec =
-            revm_spec_by_timestamp_and_block_number(self.spec.clone(), timestamp, block_number);
-        let (to, selector, input_len) = {
-            let to = tx_signed.to();
-            let input = tx_signed.input();
-            let selector = if input.len() >= 4 { Some(hex::encode(&input[..4])) } else { None };
-            (to, selector, input.len())
-        };
-
-        // Greedy merge checks admission before execution. Mining checks it here and returns
-        // InvalidTx so the pool loop skips this sender instead of aborting the build.
-        if self.ctx.mode == BscExecutionMode::Mining
-            && self.lane.on()
-            && !self.lane_admits(&tx_signed, lane_type, self.producer_shared_gas())
-        {
-            return Err(BlockValidationError::InvalidTx {
-                hash: tx_hash,
-                error: Box::new(InvalidTransaction::CallerGasLimitMoreThanBlock),
-            }
-            .into());
-        }
-
-        precompiles::push_precompile_trace_context(
-            precompiles::PrecompileTraceContext::from_parts(
-                block_number,
-                spec,
-                false,
-                Some(tx_hash),
-                to,
-                selector,
-                input_len,
-            ),
-        );
-        struct PrecompileTracePopGuard;
-        impl Drop for PrecompileTracePopGuard {
-            fn drop(&mut self) {
-                precompiles::pop_precompile_trace_context();
-            }
-        }
-        let _precompile_trace_pop_guard = PrecompileTracePopGuard;
-
-        let blob_gas_used =
-            if BscHardforks::is_cancun_active_at_timestamp(&self.spec, block_number, timestamp) {
-                tx_signed.blob_gas_used().unwrap_or_default()
-            } else {
-                0
-            };
-
-        let inner =
-            self.evm.transact(tx_env).map_err(|err| BlockExecutionError::evm(err, tx_hash))?;
-
-        Ok(BscTxResult {
-            inner,
-            blob_gas_used,
-            tx_type,
-            tx: tx_signed,
-            is_system: false,
-            lane_type,
-        })
+            })
+        })();
+        self.execution_diagnostics.record(0, started);
+        result
     }
 
-    fn commit_transaction(
-        &mut self,
-        output: BscTxResult<E::HaltReason>,
-    ) -> GasOutput {
+    fn commit_transaction(&mut self, output: BscTxResult<E::HaltReason>) -> GasOutput {
         if output.is_system {
             return GasOutput::new(0);
         }
 
+        let started = self.execution_diagnostics.start();
         let ResultAndState { result, state } = output.inner;
 
-        let mut temp_state = state.clone();
-        temp_state.remove(&SYSTEM_ADDRESS);
-        self.system_caller
-            .on_state(StateChangeSource::Transaction(self.receipts.len()), &temp_state);
+        // NOTE(reth-v2.4.1): previously streamed post-tx state (excluding SYSTEM_ADDRESS) to the
+        // state-root task via `system_caller.on_state(..)`. v2.4.1 installs the state hook at the
+        // DB level and streams automatically on `commit`, so the manual call is removed; the final
+        // state root is computed over the full committed state regardless. Re-introduce the
+        // SYSTEM_ADDRESS exclusion via the DB hook if it turns out to be required for BSC.
 
         let gas_used = result.tx_gas_used();
         self.gas_used += gas_used;
@@ -933,6 +928,7 @@ where
             }
         }
 
+        self.execution_diagnostics.record(2, started);
         GasOutput::new(gas_used)
     }
 
@@ -1038,13 +1034,14 @@ where
             .sum();
         self.blockchain_metrics.block_tx_size_bytes.set(tx_size_bytes as f64);
 
-        // Calculate block receive time difference
-        // This is the difference between current block timestamp and parent block timestamp
-        let current_timestamp = self.evm.block().timestamp().to::<u64>();
+        // Record the block timestamp interval, including BSC's sub-second component.
         if let Some(parent_header) = &self.inner_ctx.parent_header {
-            let parent_timestamp = parent_header.timestamp;
-            let time_diff = (current_timestamp as i64) - (parent_timestamp as i64);
-            self.blockchain_metrics.block_receive_time_diff_seconds.set(time_diff as f64);
+            let current_timestamp_ms = self.evm.block().milli_timestamp();
+            let parent_timestamp_ms = calculate_millisecond_timestamp(parent_header);
+            let time_diff_ms = current_timestamp_ms as i128 - parent_timestamp_ms as i128;
+            self.blockchain_metrics
+                .block_receive_time_diff_seconds
+                .set(time_diff_ms as f64 / 1000.0);
         }
 
         // Note: For gas-related metrics, use reth's ExecutorMetrics:
@@ -1061,10 +1058,6 @@ where
                 blob_gas_used: self.blob_gas_used,
             },
         ))
-    }
-
-    fn set_state_hook(&mut self, hook: Option<Box<dyn OnStateHook>>) {
-        self.system_caller.with_state_hook(hook);
     }
 
     fn evm_mut(&mut self) -> &mut Self::Evm {
@@ -1105,6 +1098,136 @@ mod tests {
     const VALIDATOR: Address = address!("0x2000000000000000000000000000000000000002");
     const SYSTEM_TX: (Address, Address) = (VALIDATOR, VALIDATOR_CONTRACT);
     const NORMAL_TX: (Address, Address) = (NORMAL, NORMAL);
+
+    #[test]
+    fn miner_observation_preserves_execution_gas_state_and_validation_error() {
+        use crate::node::miner::state_read_diagnostics::ExecutionObservation;
+        use metrics_exporter_prometheus::PrometheusBuilder;
+        use revm::Database;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let run = |enabled: bool| {
+            let spec = parse_genesis_json(
+                r#"{
+                "config": {"chainId": 714, "ramanujanBlock": 0},
+                "difficulty": "0x1", "gasLimit": "0x2625a00", "alloc": {}
+            }"#,
+            )
+            .unwrap();
+            let block = SealedBlock::seal_slow(BscBlock {
+                header: Header { number: 1, gas_limit: 40_000_000, ..Default::default() },
+                body: Default::default(),
+            });
+            let config = BscEvmConfig::bsc(spec);
+            let mut db = State::builder().with_database(InMemoryDB::default()).build();
+            let mut executor = config.executor_for_block(&mut db, &block).unwrap();
+            executor.execution_diagnostics =
+                ExecutionObservation::new(enabled.then_some(("regular", "inturn")));
+            let tx = TransactionSigned::new_unhashed(
+                Transaction::Legacy(TxLegacy {
+                    to: TxKind::Call(NORMAL),
+                    gas_limit: 21_000,
+                    ..Default::default()
+                }),
+                Signature::test_signature(),
+            );
+            let tx = Recovered::new_unchecked(tx, NORMAL);
+            let output = executor.execute_transaction_without_commit(tx.clone()).unwrap();
+            let gas = executor.commit_transaction(output).tx_gas_used();
+            let error = executor
+                .execute_transaction_without_commit(tx)
+                .err()
+                .expect("reused nonce must fail")
+                .to_string();
+            let receipts = executor.receipts.clone();
+            drop(executor);
+            let account = db.basic(NORMAL).unwrap();
+            (gas, error, receipts, account)
+        };
+        metrics::with_local_recorder(&recorder, || {
+            let baseline = run(false);
+            assert!(!handle.render().contains("bsc_build_diagnostics_transaction_stage"));
+            let observed = run(true);
+            assert_eq!(baseline, observed);
+            assert_eq!(observed.0, 21_000);
+            assert_eq!(observed.3.unwrap().nonce, 1);
+        });
+        let rendered = handle.render();
+        for (stage, count) in [("executor_prepare", 2), ("evm_transact", 2), ("receipt_commit", 1)]
+        {
+            assert!(
+                rendered.lines().any(|l| l
+                    .starts_with("bsc_build_diagnostics_transaction_stage_calls_total") &&
+                    l.contains(stage) &&
+                    l.ends_with(&format!(" {count}"))),
+                "{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn block_interval_metric_preserves_milliseconds() {
+        use crate::{
+            consensus::parlia::util::set_millisecond_part_of_timestamp,
+            metrics::BscBlockchainMetrics, node::evm::config::BscExecutionMode,
+        };
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let spec = parse_genesis_json(
+            r#"{
+                "config": {"chainId": 714, "ramanujanBlock": 0},
+                "difficulty": "0x1", "gasLimit": "0x2625a00", "alloc": {}
+            }"#,
+        )
+        .expect("genesis should parse");
+        let evm_config = BscEvmConfig::bsc(spec);
+
+        for (parent_ms, current_ms, expected_seconds) in [
+            (1_000_100, 1_000_550, 0.45), // Both blocks within the same second.
+            (1_000_800, 1_001_250, 0.45), // Cross a second boundary.
+            (1_000_500, 1_001_250, 0.75),
+            (1_000_750, 1_002_250, 1.5),
+            (1_000_000, 1_003_000, 3.0), // Legacy whole-second timestamps.
+        ] {
+            let mut parent = Header {
+                number: 100,
+                timestamp: parent_ms / 1000,
+                gas_limit: 40_000_000,
+                ..Default::default()
+            };
+            set_millisecond_part_of_timestamp(parent_ms, &mut parent);
+            let mut header = Header {
+                number: parent.number + 1,
+                timestamp: current_ms / 1000,
+                gas_limit: parent.gas_limit,
+                ..Default::default()
+            };
+            set_millisecond_part_of_timestamp(current_ms, &mut header);
+            let block = SealedBlock::seal_slow(BscBlock { header, body: Default::default() });
+            let mut db = State::builder().with_database(InMemoryDB::default()).build();
+            let mut executor = evm_config.executor_for_block(&mut db, &block).unwrap();
+            executor.inner_ctx.parent_header = Some(parent);
+            // Exercise finish's metric emission without requiring Parlia system transactions.
+            executor.ctx.mode = BscExecutionMode::Simulation;
+            let recorder = PrometheusBuilder::new().build_recorder();
+            executor.blockchain_metrics = metrics::with_local_recorder(&recorder, || {
+                BscBlockchainMetrics::new_with_labels(&[] as &[(&str, &str)])
+            });
+            executor.finish().expect("empty block should finish");
+
+            let output = recorder.handle().render();
+            let value = output
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("bsc_blockchain_block_receive_time_diff_seconds ")
+                })
+                .expect("block interval gauge should be exported")
+                .parse::<f64>()
+                .unwrap();
+            assert_eq!(value, expected_seconds, "parent={parent_ms}ms, block={current_ms}ms");
+        }
+    }
 
     /// Imports `txs`, zero-gas-price calls given as `(from, to)`, into a block mined by
     /// `VALIDATOR`, so a call from it to a system contract is a system transaction.
@@ -1177,5 +1300,59 @@ mod tests {
             .expect("order is not enforced before Cancun");
         import(NANO_BLOCK, CANCUN_TIME, &[NORMAL_TX, SYSTEM_TX])
             .expect("system txs at the end are allowed");
+    }
+}
+
+#[cfg(test)]
+mod original_info_ordering_tests {
+    use super::*;
+    use revm::state::AccountInfo;
+
+    /// `impl From<AccountInfo> for Account` snapshots whatever it is handed into
+    /// `original_info`, and reth's `evm_state_to_hashed_post_state` decides whether an account
+    /// changed with `info != original_info()`. So a hand-built account must be constructed
+    /// from the PRE-state info and mutated afterwards; building it from already-mutated info
+    /// makes the two equal and the change is silently dropped from the state-root task's
+    /// delta while `db.commit` still applies it, producing a wrong sealed state root.
+    ///
+    /// Guards the ordering in `upgrade_system_contract` and
+    /// `apply_history_storage_account`.
+    #[test]
+    fn mutating_after_conversion_keeps_original_info_distinct() {
+        let old = AccountInfo { nonce: 7, balance: U256::from(1_000u64), ..Default::default() };
+
+        // Correct ordering: construct from the pre-state, then mutate.
+        let mut account = RevmAccount::from(old.clone());
+        account.info.code_hash = keccak256([0xaa_u8, 0xbb]);
+        account.mark_touch();
+
+        assert_ne!(
+            account.info,
+            account.original_info(),
+            "account built from pre-state info must read as changed"
+        );
+        assert_eq!(account.original_info(), old, "original_info must hold the pre-state value");
+    }
+
+    /// The inverse: the ordering this fix removed. Kept so the failure mode stays visible --
+    /// if this ever stops holding, revm changed its semantics and the guard above can be
+    /// revisited.
+    #[test]
+    fn mutating_before_conversion_hides_the_change() {
+        let info = AccountInfo {
+            nonce: 7,
+            balance: U256::from(1_000u64),
+            code_hash: keccak256([0xaa_u8, 0xbb]),
+            ..Default::default()
+        };
+
+        let mut account = RevmAccount::from(info);
+        account.mark_touch();
+
+        assert_eq!(
+            account.info,
+            account.original_info(),
+            "mutating before conversion makes the change invisible to the state-root task"
+        );
     }
 }

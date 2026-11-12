@@ -3,14 +3,17 @@
 use alloy_primitives::Bytes;
 use bls_on_arkworks as bls;
 use revm::precompile::{
-    u64_to_address, PrecompileHalt, PrecompileOutput, PrecompileResult, Precompile, PrecompileId,
+    u64_to_address, Precompile, PrecompileHalt, PrecompileId, PrecompileOutput, PrecompileResult,
 };
 use std::{borrow::Cow, vec::Vec};
 
 use super::error::BscPrecompileError;
 
-pub(crate) const BLS_SIGNATURE_VALIDATION: Precompile =
-    Precompile::new(PrecompileId::Custom(Cow::Borrowed("BLS_SIGNATURE_VERIFY")), u64_to_address(102), bls_signature_validation_run);
+pub(crate) const BLS_SIGNATURE_VALIDATION: Precompile = Precompile::new(
+    PrecompileId::Custom(Cow::Borrowed("BLS_SIGNATURE_VERIFY")),
+    u64_to_address(102),
+    bls_signature_validation_run,
+);
 
 const BLS_MSG_HASH_LENGTH: u64 = 32;
 const BLS_SIGNATURE_LENGTH: u64 = 96;
@@ -111,7 +114,8 @@ mod tests {
         input.extend_from_slice(&pub_key);
 
         let excepted_output = Bytes::from(vec![1]);
-        let result = match bls_signature_validation_run(&Bytes::from(input.clone()), 100_000_000, 0) {
+        let result = match bls_signature_validation_run(&Bytes::from(input.clone()), 100_000_000, 0)
+        {
             Ok(o) => o.bytes,
             Err(e) => panic!("BLS signature validation failed, {e:?}"),
         };
@@ -127,7 +131,8 @@ mod tests {
         input.extend_from_slice(&pub_key);
 
         let excepted_output = Bytes::from(vec![]);
-        let result = match bls_signature_validation_run(&Bytes::from(input.clone()), 100_000_000, 0) {
+        let result = match bls_signature_validation_run(&Bytes::from(input.clone()), 100_000_000, 0)
+        {
             Ok(o) => o.bytes,
             Err(e) => panic!("BLS signature validation failed, {e:?}"),
         };
@@ -177,7 +182,8 @@ mod tests {
         input.extend_from_slice(&pub_key3);
 
         let excepted_output = Bytes::from(vec![1]);
-        let result = match bls_signature_validation_run(&Bytes::from(input.clone()), 100_000_000, 0) {
+        let result = match bls_signature_validation_run(&Bytes::from(input.clone()), 100_000_000, 0)
+        {
             Ok(o) => o.bytes,
             Err(e) => panic!("BLS signature validation failed, {e:?}"),
         };
@@ -196,7 +202,8 @@ mod tests {
         input.extend_from_slice(&pub_key2);
         input.extend_from_slice(&pub_key3);
         let excepted_output = Bytes::from(vec![]);
-        let result = match bls_signature_validation_run(&Bytes::from(input.clone()), 100_000_000, 0) {
+        let result = match bls_signature_validation_run(&Bytes::from(input.clone()), 100_000_000, 0)
+        {
             Ok(o) => o.bytes,
             Err(e) => panic!("BLS signature validation failed, {e:?}"),
         };
@@ -251,7 +258,8 @@ mod tests {
         input.extend_from_slice(&pub_key2);
         input.extend_from_slice(&pub_key3);
         let excepted_output = Bytes::from(vec![]);
-        let result = match bls_signature_validation_run(&Bytes::from(input.clone()), 100_000_000, 0) {
+        let result = match bls_signature_validation_run(&Bytes::from(input.clone()), 100_000_000, 0)
+        {
             Ok(o) => o.bytes,
             Err(e) => panic!("BLS signature validation failed, {e:?}"),
         };

@@ -5,15 +5,13 @@ use reth::{
     consensus::FullConsensus,
     version::{default_reth_version_metadata, try_init_version_metadata},
 };
-use reth_bsc::consensus::parlia::bls_signer;
-use reth_bsc::node::consensus::BscConsensus;
 use reth_bsc::{
     chainspec::{genesis_override, parser::BscChainSpecParser},
-    node::{evm::config::BscEvmConfig, BscNode},
+    consensus::parlia::bls_signer,
+    node::{consensus::BscConsensus, evm::config::BscEvmConfig, BscNode},
     BscPrimitives,
 };
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 // We use jemalloc for performance reasons
 #[cfg(all(feature = "jemalloc", unix))]
@@ -248,7 +246,7 @@ fn main() -> eyre::Result<()> {
                 tracing::info!(limit, "Prune delete limit override set");
             }
 
-            if builder.config().rpc.ipcdisable {    
+            if builder.config().rpc.ipcdisable {
                 panic!("IPC is disabled, please enable it by setting --ipc.enable to true");
             }
             let ipc_path = builder.config().rpc.ipcpath.clone();
@@ -258,6 +256,31 @@ fn main() -> eyre::Result<()> {
                 builder.config_mut().rpc.gas_price_oracle.ignore_price =
                     BSC_DEFAULT_GPO_IGNORE_PRICE;
             }
+
+            // v2.5 VALIDATION: parallel import sparse-trie state-root re-enabled.
+            //
+            // On reth v2.4.1 this was forced to `true` (serial import) because the sparse-trie
+            // task corrupted shared state on a *reorg* block whose parent is a historical
+            // (below-tip) in-memory block: `PreservedSparseTrie` reuse on an anchor mismatch
+            // produced a wrong reconstructed parent state root, the block's computed root
+            // mismatched its header, and the valid block was rejected — permanently stalling sync.
+            // BSC parlia hits that reorg path constantly via out-of-turn "slash" blocks.
+            //
+            // reth v2.5 reworked that subsystem (overlay-manager anchoring, `anchor_hash`,
+            // `into_trie_for -> Result<Option<..>>`). We set `false` here to exercise the parallel
+            // import path and confirm on the devnet that v2.5 no longer diverges on the reorg path.
+            // If a validator stalls with `mismatched block state root`, flip back to `true`.
+            // 2026-08-20: fallback=false wedges PRODUCING validators — reth mis-roots an incoming
+            // fork block during reorg (anchored to wrong parent state). Testing fallback=true.
+            // TEST-ONLY (uncommitted): allow overriding via env so one binary can exercise both
+            // the parallel sparse path (default false) and the serial path (true) — the latter is
+            // needed to test the v2.5.1 storage-wipe batched-persistence fix (#26750).
+            let state_root_fallback = std::env::var("STATE_ROOT_FALLBACK")
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            builder.config_mut().engine.state_root_fallback = state_root_fallback;
+            tracing::info!(target: "reth_bsc", state_root_fallback, "engine.state_root_fallback");
 
             // Map CLI args into a global MiningConfig override before launching services
             {
@@ -302,7 +325,7 @@ fn main() -> eyre::Result<()> {
                 } else {
                     None
                 };
-                
+
                 if let Some(gas_limit) = args.mining_gas_limit {
                     mining_config.gas_limit = Some(gas_limit);
                 }
@@ -441,13 +464,13 @@ fn main() -> eyre::Result<()> {
                     .unwrap_or_default();
                 let mut peer_ids_str = peers_from_env;
                 peer_ids_str.extend(args.proxyed_peer_ids.iter().cloned());
-                
+
                 let mut parsed_peer_ids = Vec::new();
                 for peer_id_str in peer_ids_str {
                     // Parse as 64-character hex PeerId (64 bytes total)
                     let peer_id_str = peer_id_str.trim();
                     if peer_id_str.is_empty() { continue; }
-                    
+
                     let hex = peer_id_str.strip_prefix("0x").unwrap_or(peer_id_str);
                     match alloy_primitives::hex::decode(hex) {
                         Ok(bytes) if bytes.len() == 64 => {
@@ -460,7 +483,7 @@ fn main() -> eyre::Result<()> {
                         Err(e) => tracing::warn!("Failed to parse proxyed peer ID '{}': {}", peer_id_str, e),
                     }
                 }
-                
+
                 if !parsed_peer_ids.is_empty() {
                     tracing::info!(target: "bsc::init", "Configured {} proxyed peer(s)", parsed_peer_ids.len());
                 }
@@ -516,14 +539,14 @@ fn main() -> eyre::Result<()> {
 
                         tracing::info!("Start to register Parlia RPC API...");
                         use reth_bsc::rpc::parlia::{ParliaApiImpl, ParliaApiServer, DynSnapshotProvider};
-                        
+
                         let snapshot_provider = if let Some(provider) = reth_bsc::shared::get_snapshot_provider() {
                             provider.clone()
                         } else {
                             tracing::error!("Failed to register Parlia RPC due to can not get snapshot provider");
                             return Err(eyre::eyre!("Failed to get snapshot provider"));
                         };
-                        
+
                         let wrapped_provider = Arc::new(DynSnapshotProvider::new(snapshot_provider));
                         let parlia_api = ParliaApiImpl::new(wrapped_provider, ctx.provider().clone());
                         // `parlia` stays unconditional: reth's CLI rejects module names outside its
@@ -656,7 +679,12 @@ fn main() -> eyre::Result<()> {
                         }
                         Ok(())
                     })
-                    .launch().await?;
+                    .launch_with_fn(|builder| {
+                        let launcher = builder.engine_api_launcher().with_backfill(
+                            reth_bsc::node::startup_recovery::BscRecoveryBackfill,
+                        );
+                        builder.launch_with(launcher)
+                    }).await?;
 
             // Send the engine handle to the network
             engine_handle_tx.send(node.beacon_engine_handle.clone()).unwrap();
@@ -673,6 +701,17 @@ fn main() -> eyre::Result<()> {
             // Set the IPC client. IPC is required (see the `--ipc.disable` check above), so a
             // failure here is a startup error rather than something to panic on.
             reth_bsc::shared::set_ipc_client(ipc_path).await?;
+
+            let recovery_provider = node.provider.clone();
+            let recovery_engine = node.beacon_engine_handle.clone();
+            node.task_executor.spawn_critical_task("bsc-startup-recovery", async move {
+                if let Err(error) = reth_bsc::node::startup_recovery::run(
+                    recovery_provider, recovery_engine,
+                ).await {
+                    tracing::error!(target: "bsc::startup_recovery", %error, "Startup finality recovery failed");
+                    panic!("Startup finality recovery failed: {error}");
+                }
+            });
 
             let grpc_handle = mev_grpc_handle.lock().unwrap().take();
             let exit_result = exit_future.await;

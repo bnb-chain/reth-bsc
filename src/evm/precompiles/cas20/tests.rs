@@ -238,13 +238,9 @@ fn addresses_route_by_prefix_and_singleton() {
     assert!(jenner.lookup(&asset).is_some() && jenner.lookup(&ALICE).is_none());
     assert!(jenner.lookup(&unknown).is_none());
     let pasteur = Cas20Lookup::new(crate::hardforks::bsc::BscHardfork::Pasteur);
-    for address in [
-        asset,
-        stable,
-        FACTORY_ADDRESS,
-        POLICY_REGISTRY_ADDRESS,
-        ACTIVATION_REGISTRY_ADDRESS,
-    ] {
+    for address in
+        [asset, stable, FACTORY_ADDRESS, POLICY_REGISTRY_ADDRESS, ACTIVATION_REGISTRY_ADDRESS]
+    {
         assert!(pasteur.lookup(&address).is_none());
     }
 }
@@ -345,8 +341,8 @@ fn factory_creates_a_token_that_transfers() {
     );
     assert_eq!(h.call(BOB, token, &call_data(SEL_SUPPLY_CAP, &[])).u256(), NO_SUPPLY_CAP);
     assert!(
-        h.call(BOB, token, &call_data(SEL_HAS_ROLE, &[ROLE_DEFAULT_ADMIN, a(ALICE)])).ret()
-            == enc_bool(true)
+        h.call(BOB, token, &call_data(SEL_HAS_ROLE, &[ROLE_DEFAULT_ADMIN, a(ALICE)])).ret() ==
+            enc_bool(true)
     );
 
     let out = h.call(ALICE, token, &call_data(SEL_TRANSFER, &[a(BOB), w(400)]));
@@ -1137,8 +1133,10 @@ fn seize_and_roles() {
 // --- through the EVM ------------------------------------------------------------------
 
 mod evm {
-    use super::super::{sigs::*, *};
-    use super::{a, call_data, encode_create, w, ADMIN, ALICE, BOB};
+    use super::{
+        super::{sigs::*, *},
+        a, call_data, encode_create, w, ADMIN, ALICE, BOB,
+    };
     use crate::{
         evm::{
             api::BscEvm,
@@ -1228,7 +1226,8 @@ mod evm {
     /// bubbles the returndata and status up.
     fn forwarder(target: Address, op: u8) -> Bytecode {
         let mut c = vec![0x36, 0x60, 0x00, 0x60, 0x00, 0x37]; // CALLDATACOPY(0, 0, CALLDATASIZE)
-        c.extend([0x60, 0x00, 0x60, 0x00, 0x36, 0x60, 0x00]); // retSize retOffset argsSize argsOffset
+        c.extend([0x60, 0x00, 0x60, 0x00, 0x36, 0x60, 0x00]); // retSize retOffset argsSize
+                                                              // argsOffset
         if op == 0xF1 {
             c.extend([0x60, 0x00]); // value
         }
@@ -1641,8 +1640,8 @@ mod golden {
             .map(|(i, (want, got))| format!("#{i}: pinned {want}, got {got}"))
             .collect();
         assert!(
-            drift.is_empty()
-                && pinned.as_array().unwrap().len() == footprint.as_array().unwrap().len(),
+            drift.is_empty() &&
+                pinned.as_array().unwrap().len() == footprint.as_array().unwrap().len(),
             "storage-access footprint drifted (regenerate with BLESS_GOLDEN=1 if intended):\n{}",
             drift.join("\n")
         );
@@ -1655,13 +1654,15 @@ mod golden {
 /// (go-bsc's TestCAS20TokenInfoMatchesTheSelectors), and read the same through a
 /// state provider as through the frame host.
 mod info {
-    use super::super::{
-        info::{token_info_at, InfoError, ProviderHost, RPC_MAX_STRING_LEN},
-        sigs::*,
-        storage::{slot_at, SLOT_CONTRACT_URI},
-        *,
+    use super::{
+        super::{
+            info::{token_info_at, InfoError, ProviderHost, RPC_MAX_STRING_LEN},
+            sigs::*,
+            storage::{slot_at, SLOT_CONTRACT_URI},
+            *,
+        },
+        a, call_data, w, Harness, ADMIN, ALICE, BOB, NOW,
     };
-    use super::{a, call_data, w, Harness, ADMIN, ALICE, BOB, NOW};
     use alloy_primitives::{Address, Bytes, B256, U256, U64};
     use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
 
@@ -1760,11 +1761,7 @@ mod info {
 
         // Not tokens: outside the space, the factory, an address never created.
         for addr in [ALICE, FACTORY_ADDRESS, factory::derive_address(VARIANT_ASSET, BOB, w(0xee))] {
-            assert_eq!(
-                token_info_at(&mut h.st, addr),
-                Err(InfoError::NotToken),
-                "{addr:?}"
-            );
+            assert_eq!(token_info_at(&mut h.st, addr), Err(InfoError::NotToken), "{addr:?}");
         }
         // A length word no transaction could have paid for is refused, not walked.
         h.st.set(token, slot_at(SLOT_CONTRACT_URI), U256::from(2 * (RPC_MAX_STRING_LEN + 32) + 1));
@@ -1834,10 +1831,7 @@ mod info {
         }
         let mut host = ProviderHost { state: &provider, time: NOW, chain_id: 714 };
         assert_eq!(token_info_at(&mut host, token).unwrap(), want);
-        assert_eq!(
-            token_info_at(&mut host, Address::repeat_byte(0x42)),
-            Err(InfoError::NotToken)
-        );
+        assert_eq!(token_info_at(&mut host, Address::repeat_byte(0x42)), Err(InfoError::NotToken));
     }
 }
 

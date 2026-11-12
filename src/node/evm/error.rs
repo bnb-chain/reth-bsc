@@ -1,10 +1,10 @@
 //! Error types for the Bsc EVM module.
 
-use alloy_primitives::{Address, BlockHash, BlockNumber, B256, U256};
 use crate::consensus::{parlia::error::ParliaConsensusError, payment_lane::LaneError};
+use alloy_primitives::{Address, BlockHash, BlockNumber, B256, U256};
 use reth_evm::execute::{BlockExecutionError, BlockValidationError};
-use reth_provider::ProviderError;
 use reth_primitives_traits::{GotExpected, GotExpectedBoxed};
+use reth_provider::ProviderError;
 
 /// A validation failure before Parlia has authenticated the imported block.
 /// Keep this typed across the engine boundary: it invalidates the block, but cannot be used
@@ -87,7 +87,7 @@ pub enum BscBlockValidationError {
         /// The block hash
         hash: B256,
     },
-    
+
     /// A payment lane rule the block breaks.
     #[error("{0}")]
     PaymentLane(String),
@@ -289,9 +289,10 @@ pub fn lane_reject(err: LaneError) -> BlockExecutionError {
 impl From<BscBlockExecutionError> for BlockExecutionError {
     fn from(err: BscBlockExecutionError) -> Self {
         // Update execution errors metric for all types of errors
-        use once_cell::sync::Lazy;
         use crate::metrics::{BscConsensusMetrics, BscExecutorMetrics};
-        static CONSENSUS_METRICS: Lazy<BscConsensusMetrics> = Lazy::new(BscConsensusMetrics::default);
+        use once_cell::sync::Lazy;
+        static CONSENSUS_METRICS: Lazy<BscConsensusMetrics> =
+            Lazy::new(BscConsensusMetrics::default);
         static EXECUTOR_METRICS: Lazy<BscExecutorMetrics> = Lazy::new(BscExecutorMetrics::default);
         EXECUTOR_METRICS.execution_errors_total.increment(1);
 
@@ -299,9 +300,9 @@ impl From<BscBlockExecutionError> for BlockExecutionError {
             // Transient validation error: the block proposer is in the backoff period
             // and the block will become valid after a short delay. Must NOT be cached
             // in engine-tree's invalid_headers to avoid poisoning the chain.
-            BscBlockExecutionError::Validation(
-                BscBlockValidationError::FutureBlock { .. }
-            ) => Self::other(err),
+            BscBlockExecutionError::Validation(BscBlockValidationError::FutureBlock { .. }) => {
+                Self::other(err)
+            }
 
             BscBlockExecutionError::Validation(validation_err) => {
                 // Permanent validation errors: the block genuinely violates consensus
@@ -309,11 +310,13 @@ impl From<BscBlockExecutionError> for BlockExecutionError {
                 CONSENSUS_METRICS.bad_blocks_total.increment(1);
 
                 // TODO: now use DepositRequestDecode as the validation error carrier,
-                // but we should refine it by rewrite some validation error types in reth engine-tree.
-                // Note: Validation errors will be identified in the engine-tree and treated as invalid blocks.
-                Self::Validation(BlockValidationError::DepositRequestDecode(
-                    format!("BSC validation error: {}", validation_err)
-                ))
+                // but we should refine it by rewrite some validation error types in reth
+                // engine-tree. Note: Validation errors will be identified in the
+                // engine-tree and treated as invalid blocks.
+                Self::Validation(BlockValidationError::DepositRequestDecode(format!(
+                    "BSC validation error: {}",
+                    validation_err
+                )))
             }
 
             BscBlockExecutionError::PaymentLaneStateUnavailable(_) |
