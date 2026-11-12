@@ -165,8 +165,7 @@ impl RangeFetcher for BscRangeFetcher {
         Box::pin(async move {
             let resp = crate::node::network::bsc_protocol::registry::request_blocks_by_range_with_failover(
                 peer,
-                start_num,
-                start_hash,
+                reth_eth_wire::BlockHashNumber { number: start_num, hash: start_hash },
                 count,
                 self.1.args.recovery_timeout,
                 usize::from(self.1.args.recovery_peer_attempts),
@@ -926,9 +925,9 @@ mod tests {
     use alloy_primitives::B256;
     use reth_primitives_traits::AlloyBlockHeader;
     use reth_provider::{BlockHashReader, HeaderProvider, ProviderError};
-    use std::future::Future;
     use std::{
         collections::HashMap,
+        future::Future,
         sync::{Arc, Mutex},
     };
 

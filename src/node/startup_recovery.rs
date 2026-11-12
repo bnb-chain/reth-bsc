@@ -4,13 +4,13 @@
 //! checkpoint awaiting its next persistence batch. The marker survives successful recovery:
 //! otherwise another restart could lose it before the Engine persists restored finality.
 
-use crate::hardforks::BscHardforks;
-use crate::node::engine_api::payload::BscPayloadTypes;
 use crate::{
     chainspec::BscChainSpec,
     consensus::parlia::{
         provider::DbSnapshotProvider, BscForkChoiceRule, HeaderForForkchoice, SnapshotProvider,
     },
+    hardforks::BscHardforks,
+    node::engine_api::payload::BscPayloadTypes,
 };
 use alloy_consensus::Header;
 use alloy_eips::BlockNumHash;
@@ -241,9 +241,9 @@ impl StartupRecovery {
 /// Shared signing gate. The launcher installs it before any BSC components can start.
 pub(crate) fn is_ready() -> bool {
     RECOVERY.get().is_none_or(|recovery| {
-        recovery.is_ready()
-            && recovery.head_resolved.load(Ordering::Acquire)
-            && NETWORK_READY.load(Ordering::Acquire)
+        recovery.is_ready() &&
+            recovery.head_resolved.load(Ordering::Acquire) &&
+            NETWORK_READY.load(Ordering::Acquire)
     })
 }
 
@@ -326,6 +326,109 @@ fn read_checkpoint(provider: &impl HeaderProvider, number: u64) -> eyre::Result<
         eyre::eyre!("BSC startup recovery: missing persisted finalized header #{number}")
     })?;
     Ok(BlockNumHash { number, hash: header.hash() })
+}
+
+/// Complete one successful network-head assessment before either signer can run.
+pub(crate) fn network_ready(head: alloy_eips::BlockNumHash) {
+    if !NETWORK_READY.swap(true, Ordering::AcqRel) {
+        tracing::info!(target: "bsc::startup_sync", number = head.number, hash = %head.hash,
+            "Network head assessed; startup network signing gate released");
+    }
+}
+
+/// The captured checkpoint remains a safety floor even before Engine restores its marker.
+pub(crate) fn finalized_checkpoint() -> Option<BlockNumHash> {
+    RECOVERY.get().and_then(|recovery| recovery.checkpoint)
+}
+
+/// Snapshot checkpoints are sparse and headers may live only in static files. The latest
+/// applicable attestation determines justified height; use the same parser/target rule as
+/// Snapshot::update_attestation while walking the already executed canonical history.
+fn capture_justified<P>(
+    provider: &P,
+    mut header: Header,
+    snapshots: &dyn SnapshotProvider,
+    spec: std::sync::Arc<BscChainSpec>,
+) -> eyre::Result<Option<u64>>
+where
+    P: HeaderProvider<Header = Header>,
+{
+    let parlia = crate::consensus::parlia::Parlia::new(spec.clone(), 200);
+    for _ in 0..crate::node::network::block_import::fork_recover::MAX_FORK_DEPTH {
+        if let Some(snapshot) = snapshots.snapshot_by_hash(&header.hash_slow()) {
+            return Ok(Some(if snapshot.vote_data.target_hash.is_zero() {
+                0
+            } else {
+                snapshot.vote_data.target_number
+            }));
+        }
+        if !spec.is_luban_active_at_block(header.number) || header.number == 0 {
+            return Ok(Some(0));
+        }
+        if let Some(attestation) =
+            parlia.get_vote_attestation_from_header(&header, parlia.get_epoch_length(&header))?
+        {
+            if spec.is_fermi_active_at_timestamp(header.number, header.timestamp) ||
+                (attestation.data.target_number.checked_add(1) == Some(header.number) &&
+                    attestation.data.target_hash == header.parent_hash)
+            {
+                return Ok(Some(if attestation.data.target_hash.is_zero() {
+                    0
+                } else {
+                    attestation.data.target_number
+                }));
+            }
+        }
+        let Some(parent) = provider.sealed_header(header.number - 1)? else { return Ok(None) };
+        eyre::ensure!(
+            parent.hash() == header.parent_hash,
+            "persisted executed head ancestry conflict"
+        );
+        header = parent.header().clone();
+    }
+    Ok(None)
+}
+
+struct PersistedHead {
+    header: Header,
+    td: Option<U256>,
+    justified: Option<u64>,
+}
+
+/// Only an executed head selected by the normal Parlia rule may supersede an unfinalized
+/// persisted tip. Coordinate this decision with restoration of the finalized checkpoint.
+pub(crate) async fn supersede_persisted_head(
+    header: &Header,
+    td: Option<U256>,
+    justified: u64,
+    spec: std::sync::Arc<BscChainSpec>,
+) -> eyre::Result<()> {
+    let Some(recovery) = RECOVERY.get() else { return Ok(()) };
+    recovery.supersede_head(header, td, justified, spec).await
+}
+
+/// An unfinalized durable head is a recovery candidate, never an Engine sync target by itself.
+pub(crate) fn unresolved_persisted_head() -> Option<BlockNumHash> {
+    RECOVERY
+        .get()
+        .filter(|recovery| !recovery.head_resolved.load(Ordering::Acquire))
+        .and_then(|recovery| recovery.head)
+}
+
+/// Executed canonical ancestry is sufficient to recover the durable tip without a peer claim.
+pub(crate) fn confirm_persisted_ancestor<P>(provider: &P) -> eyre::Result<()>
+where
+    P: reth_provider::BlockHashReader + BlockNumReader,
+{
+    let Some(recovery) = RECOVERY.get() else { return Ok(()) };
+    if let Some(saved) = recovery.head {
+        if provider.chain_info()?.best_number >= saved.number &&
+            provider.block_hash(saved.number)? == Some(saved.hash)
+        {
+            recovery.head_resolved.store(true, Ordering::Release);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -776,107 +879,4 @@ mod tests {
         assert!(recovery.is_ready());
         assert!(requests.try_recv().is_err());
     }
-}
-
-/// Complete one successful network-head assessment before either signer can run.
-pub(crate) fn network_ready(head: alloy_eips::BlockNumHash) {
-    if !NETWORK_READY.swap(true, Ordering::AcqRel) {
-        tracing::info!(target: "bsc::startup_sync", number = head.number, hash = %head.hash,
-            "Network head assessed; startup network signing gate released");
-    }
-}
-
-/// The captured checkpoint remains a safety floor even before Engine restores its marker.
-pub(crate) fn finalized_checkpoint() -> Option<BlockNumHash> {
-    RECOVERY.get().and_then(|recovery| recovery.checkpoint)
-}
-
-/// Snapshot checkpoints are sparse and headers may live only in static files. The latest
-/// applicable attestation determines justified height; use the same parser/target rule as
-/// Snapshot::update_attestation while walking the already executed canonical history.
-fn capture_justified<P>(
-    provider: &P,
-    mut header: Header,
-    snapshots: &dyn SnapshotProvider,
-    spec: std::sync::Arc<BscChainSpec>,
-) -> eyre::Result<Option<u64>>
-where
-    P: HeaderProvider<Header = Header>,
-{
-    let parlia = crate::consensus::parlia::Parlia::new(spec.clone(), 200);
-    for _ in 0..crate::node::network::block_import::fork_recover::MAX_FORK_DEPTH {
-        if let Some(snapshot) = snapshots.snapshot_by_hash(&header.hash_slow()) {
-            return Ok(Some(if snapshot.vote_data.target_hash.is_zero() {
-                0
-            } else {
-                snapshot.vote_data.target_number
-            }));
-        }
-        if !spec.is_luban_active_at_block(header.number) || header.number == 0 {
-            return Ok(Some(0));
-        }
-        if let Some(attestation) =
-            parlia.get_vote_attestation_from_header(&header, parlia.get_epoch_length(&header))?
-        {
-            if spec.is_fermi_active_at_timestamp(header.number, header.timestamp)
-                || (attestation.data.target_number.checked_add(1) == Some(header.number)
-                    && attestation.data.target_hash == header.parent_hash)
-            {
-                return Ok(Some(if attestation.data.target_hash.is_zero() {
-                    0
-                } else {
-                    attestation.data.target_number
-                }));
-            }
-        }
-        let Some(parent) = provider.sealed_header(header.number - 1)? else { return Ok(None) };
-        eyre::ensure!(
-            parent.hash() == header.parent_hash,
-            "persisted executed head ancestry conflict"
-        );
-        header = parent.header().clone();
-    }
-    Ok(None)
-}
-
-struct PersistedHead {
-    header: Header,
-    td: Option<U256>,
-    justified: Option<u64>,
-}
-
-/// Only an executed head selected by the normal Parlia rule may supersede an unfinalized
-/// persisted tip. Coordinate this decision with restoration of the finalized checkpoint.
-pub(crate) async fn supersede_persisted_head(
-    header: &Header,
-    td: Option<U256>,
-    justified: u64,
-    spec: std::sync::Arc<BscChainSpec>,
-) -> eyre::Result<()> {
-    let Some(recovery) = RECOVERY.get() else { return Ok(()) };
-    recovery.supersede_head(header, td, justified, spec).await
-}
-
-/// An unfinalized durable head is a recovery candidate, never an Engine sync target by itself.
-pub(crate) fn unresolved_persisted_head() -> Option<BlockNumHash> {
-    RECOVERY
-        .get()
-        .filter(|recovery| !recovery.head_resolved.load(Ordering::Acquire))
-        .and_then(|recovery| recovery.head)
-}
-
-/// Executed canonical ancestry is sufficient to recover the durable tip without a peer claim.
-pub(crate) fn confirm_persisted_ancestor<P>(provider: &P) -> eyre::Result<()>
-where
-    P: reth_provider::BlockHashReader + BlockNumReader,
-{
-    let Some(recovery) = RECOVERY.get() else { return Ok(()) };
-    if let Some(saved) = recovery.head {
-        if provider.chain_info()?.best_number >= saved.number
-            && provider.block_hash(saved.number)? == Some(saved.hash)
-        {
-            recovery.head_resolved.store(true, Ordering::Release);
-        }
-    }
-    Ok(())
 }
