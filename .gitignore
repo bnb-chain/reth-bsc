@@ -5,5 +5,5 @@ genesis_local.json
 test-datadir/
 .cargo/config.toml
 
-# static musl build cargo cache (see BUILD_MUSL.md)
+# static musl build cargo cache (see https://app.clickup.com/25652588/docs/revbc-65897/revbc-365597)
 .cargo-musl/
