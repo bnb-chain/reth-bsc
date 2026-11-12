@@ -204,6 +204,8 @@ gmp-mpfr-sys = { version = "1.7", features = ["force-cross"] }
 [features]
 default = ["jemalloc"]
 jemalloc = ["dep:tikv-jemallocator", "reth/jemalloc"]
+# Rust allocations use prefixed symbols without overriding the static musl libc allocator.
+jemalloc-prefixed = ["dep:tikv-jemallocator"]
 dev = ["reth-cli-commands/arbitrary", "reth/dev", "revm/dev"]
 asm-keccak = [
     "reth/asm-keccak",

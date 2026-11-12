@@ -61,8 +61,8 @@ no runtime dependencies to install.
 
 ## What `make maxperf-musl` runs
 
-It uses the same profile and CPU optimizations as `make maxperf`, but disables
-jemalloc for the static musl build. It runs inside the musl-cross image, adds a
+It uses the same profile and CPU optimizations as `make maxperf`, with prefixed
+jemalloc for Rust allocations. It runs inside the musl-cross image, adds a
 few build-time packages, and persists the crate/git cache under a repo-local
 `.cargo-musl/` so subsequent builds are incremental:
 
@@ -77,7 +77,7 @@ docker run --rm \
     export PERL_USE_UNSAFE_INC=1 &&
     RUSTFLAGS="-C target-cpu=native" \
       cargo build --bin reth-bsc --profile maxperf \
-        --no-default-features --features asm-keccak --target x86_64-unknown-linux-musl'
+        --no-default-features --features asm-keccak,jemalloc-prefixed --target x86_64-unknown-linux-musl'
 ```
 
 The added packages cover reth's C stack: `clang`/`libclang-dev` (bindgen for
@@ -89,7 +89,9 @@ autotools configure), `cmake` (rocksdb, aws-lc), `perl`+`golang` (aws-lc-sys).
 
 ## Allocator selection
 
-The static musl build uses the system allocator. Enabling jemalloc through
+The static musl build uses `jemalloc-prefixed` for Rust allocations, including
+Rust dependencies. Native C/C++ allocations retain their existing allocator.
+Enabling the regular `jemalloc` feature through
 Reth also enables allocator overrides and RocksDB's unprefixed jemalloc
 symbols. Those can collide with musl's `libc.a` during linking, producing
 `multiple definition` errors for `calloc`, `free`, `realloc`, `aligned_alloc`,
@@ -99,20 +101,23 @@ Removing `jemalloc` from `--features` alone does not disable it: both this
 package and Reth enable it by default. `Cargo.toml` therefore disables Reth's
 implicit defaults and explicitly preserves its other default features. This
 package's `jemalloc` feature still enables the allocator for normal builds;
-`maxperf-musl` uses `--no-default-features --features asm-keccak` to turn it off.
-The allocator change can affect runtime performance and memory usage, so
-benchmark the musl binary for your workload.
+`maxperf-musl` uses `--no-default-features --features asm-keccak,jemalloc-prefixed`
+to select only the prefixed Rust allocator. Keep default features disabled:
+Cargo features are additive, so `jemalloc-prefixed` cannot undo allocator
+overrides enabled by `jemalloc`. For a system-allocator comparison, omit
+`jemalloc-prefixed` while preserving the other build flags.
 
 You can inspect the resolved features inside the build container with:
 
 ```bash
 cargo tree -p reth_bsc --target x86_64-unknown-linux-musl \
-  --no-default-features --features asm-keccak -e features -i tikv-jemalloc-sys
+  --no-default-features --features asm-keccak,jemalloc-prefixed -e features -i tikv-jemalloc-sys
 ```
 
 The graph must not enable `unprefixed_malloc_on_supported_platforms` or
-`override_allocator_on_supported_platforms`. The `tikv-jemalloc-sys` crate can
-still appear through allocator-control dependencies without overriding libc.
+`override_allocator_on_supported_platforms`. The `tikv-jemalloc-sys` crate
+provides prefixed symbols for the Rust global allocator without overriding libc.
+The binary's `--version` output reports `jemalloc-prefixed` when selected.
 
 **Do not override `CARGO_HOME`.** The image ships `/root/.cargo/config.toml`
 that configures the musl cross compiler as the linker for the target. If you
@@ -147,9 +152,9 @@ Normal and CI (glibc) builds don't match that target, so they're unaffected.
   on different CPU classes, edit the Makefile target (or the raw command) to use
   e.g. `-C target-cpu=x86-64-v3` to avoid illegal-instruction crashes.
 
-- **jemalloc**: `maxperf-musl` disables it as described above. Normal
-  `make maxperf` builds retain jemalloc. Adding it back to the musl feature
-  list can reintroduce the duplicate-symbol link failure.
+- **jemalloc**: `maxperf-musl` selects `jemalloc-prefixed` as described above.
+  Normal `make maxperf` builds retain the regular `jemalloc` feature. Enabling
+  that regular feature for musl can reintroduce the duplicate-symbol link failure.
 
 - **Rust version**: the deps require a recent stable. If the image's toolchain
   is too old ("package X requires rustc 1.NN"), add `rustup update` before the
