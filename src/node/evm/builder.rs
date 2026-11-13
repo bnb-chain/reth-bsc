@@ -170,8 +170,8 @@ where
         stages.enter("system_transactions");
         let (evm, result) = self.executor.finish()?;
         let (db, evm_env) = evm.finish();
-        // These are advisory read hints only. BSC system transactions are deferred to finish;
-        // their BAL values/indexes must not be used by Ethereum's parallel transaction executor.
+        // The recorder uses BSC's deferred-system-transaction boundaries. Until consensus BAL
+        // activation is implemented, only its addresses and slots are published as read hints.
         let block_access_list =
             db.take_built_alloy_bal().and_then(crate::node::bal::encode_read_hint);
 

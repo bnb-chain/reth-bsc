@@ -45,7 +45,7 @@ use revm::{
     context::{BlockEnv, TxEnv},
     context_interface::block::Block,
     state::{Account as RevmAccount, EvmState},
-    Database as _, DatabaseCommit,
+    Database as _,
 };
 use std::collections::HashMap;
 use tracing::warn;
@@ -583,6 +583,7 @@ where
             cumulative_gas_used: self.gas_used,
         }));
         self.commit_state(state);
+        self.advance_bal_index()?;
 
         // Record system contract execution duration
         let duration = start_time.elapsed();
@@ -616,7 +617,7 @@ where
             system_account.info.balance = U256::ZERO;
             let mut changes: EvmState = Default::default();
             changes.insert(SYSTEM_ADDRESS, system_account);
-            self.evm.db_mut().commit(changes);
+            self.commit_state(changes);
         }
 
         // Credit validator with the block reward
@@ -633,7 +634,7 @@ where
                 validator_account.info.balance.saturating_add(U256::from(block_reward));
             let mut changes: EvmState = Default::default();
             changes.insert(validator, validator_account);
-            self.evm.db_mut().commit(changes);
+            self.commit_state(changes);
         }
 
         let system_reward_balance = self

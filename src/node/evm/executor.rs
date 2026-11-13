@@ -1,4 +1,5 @@
 use super::{
+    bal::BscBalRecorder,
     config::{revm_spec_by_timestamp_and_block_number, BscBlockExecutionCtx, BscExecutionMode},
     patch::HertzPatchManager,
 };
@@ -47,7 +48,6 @@ use reth_evm::{
     block::BlockValidationError,
     eth::receipt_builder::ReceiptBuilder,
     execute::{BlockExecutionError, BlockExecutor},
-    system_calls::SystemCaller,
     Evm, FromRecoveredTx, FromTxWithEncoded, IntoTxEnv,
 };
 use reth_primitives_traits::Recovered;
@@ -129,8 +129,8 @@ where
     hertz_patch_manager: HertzPatchManager,
     /// Context for block execution.
     pub(super) ctx: BscBlockExecutionCtx<'a>,
-    /// Utility to call system caller.
-    pub(super) system_caller: SystemCaller<Spec>,
+    /// BSC-specific BAL recorder; absent when BAL recording is disabled.
+    pub(super) bal_recorder: Option<BscBalRecorder<EVM>>,
     /// Snapshot provider for accessing Parlia validator snapshots.
     pub(super) snapshot_provider: Option<Arc<dyn SnapshotProvider + Send + Sync>>,
     /// Parlia consensus instance.
@@ -217,7 +217,7 @@ where
             hertz_patch_manager,
             ctx,
             shared_ctx,
-            system_caller: SystemCaller::new(spec_clone),
+            bal_recorder: None,
             snapshot_provider: crate::shared::get_snapshot_provider().cloned(),
             parlia,
             inner_ctx: InnerExecutionContext {
@@ -438,7 +438,7 @@ where
             changes.insert(address, account);
             // As for every other block-begin write, the DB-level state hook streams this
             // commit to the incremental state-root task.
-            db.commit(changes);
+            self.commit_state(changes);
             info!(target: "bsc::executor::cas20", block_number, ?address, "Seeded CAS20 registry sentinel (Jenner transition)");
         }
         Ok(())
@@ -499,6 +499,9 @@ where
     }
     /// Commits state, preserving lane metadata across read-only calls.
     pub(super) fn commit_state(&mut self, changes: EvmState) {
+        if let Some(recorder) = &mut self.bal_recorder {
+            recorder.record(&changes);
+        }
         self.db_at_parent_state = false;
         if let Some(account) = changes
             .get(&PAYMENT_LANE_CONTRACT)
@@ -515,6 +518,14 @@ where
                 };
         }
         self.evm.db_mut().commit(changes);
+    }
+
+    /// Advances only after pre-execution or an actually committed transaction.
+    pub(super) fn advance_bal_index(&mut self) -> Result<(), BlockExecutionError> {
+        if let Some(recorder) = &mut self.bal_recorder {
+            recorder.advance()?;
+        }
+        Ok(())
     }
 
     /// Remaining producer gas after Parlia's system reserve and executed transactions.
@@ -731,11 +742,29 @@ where
                 parent_hash = ?self.ctx.base.parent_hash,
                 "Calling apply_blockhashes_contract_call (Prague active)"
             );
-            self.system_caller
-                .apply_blockhashes_contract_call(self.ctx.base.parent_hash, &mut self.evm)?;
+            // Route the commit through the recorder so the protocol call is attributed to
+            // index zero. Genesis never executes the history-storage call.
+            if !self.evm.block().number().is_zero() &&
+                EthereumHardforks::is_prague_active_at_timestamp(
+                    &self.spec,
+                    self.evm.block().timestamp().saturating_to(),
+                )
+            {
+                let result = self
+                    .evm
+                    .transact_system_call(
+                        alloy_eips::eip4788::SYSTEM_ADDRESS,
+                        HISTORY_STORAGE_ADDRESS,
+                        self.ctx.base.parent_hash.0.into(),
+                    )
+                    .map_err(|err| BlockValidationError::BlockHashContractCall {
+                        message: err.to_string(),
+                    })?;
+                self.commit_state(result.state);
+            }
         }
 
-        Ok(())
+        self.advance_bal_index()
     }
 
     fn execute_transaction_without_commit(
@@ -929,6 +958,10 @@ where
         }
 
         self.execution_diagnostics.record(2, started);
+        if let Err(err) = self.advance_bal_index() {
+            self.deferred_error = Some(err);
+        }
+
         GasOutput::new(gas_used)
     }
 
@@ -1048,6 +1081,10 @@ where
         // - sync.execution.gas_used_histogram
         // - sync.execution.gas_per_second (can be converted to MGas/s)
         // - sync.execution.execution_duration
+
+        if let Some(recorder) = self.bal_recorder.take() {
+            recorder.finish(&mut self.evm);
+        }
 
         Ok((
             self.evm,
