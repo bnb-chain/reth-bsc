@@ -102,6 +102,9 @@ Live multi-node propagation and mixed-client correctness were also checked in th
 separate validation work.
 The subsequent [common suite](bal-common-suite-2026-11-13.md) also passed BEP-675,
 CAS20, ERC20, BNB transfer and Uniswap V2 scenarios on a mixed-client BAL cluster.
+The [bad-BAL suite](bal-negative-cluster-2026-11-13.md) passed 13 live fault cases,
+including forged values and oversized-frame disconnection/recovery, with matching
+state across 634 transactions and 534 consecutive blocks on all four clients.
 
 Validated locally with Rust 1.99.0 on 2026-11-13: all seven BSC BAL tests and all four
 engine read-hint tests passed. The full BSC library run had 781 passes, one ignored
