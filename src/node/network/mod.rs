@@ -419,6 +419,11 @@ impl BscNetworkBuilder {
             .add_rlpx_sub_protocol(bsc_protocol::protocol::handler::BscProtocolHandlerV2)
             .add_rlpx_sub_protocol(bsc_protocol::protocol::handler::BscProtocolHandlerV1);
 
+        if crate::node::bal::enabled() {
+            network_builder =
+                network_builder.add_rlpx_sub_protocol(crate::node::bal::BalProtocolHandler);
+        }
+
         // Apply proxyed peer IDs if configured
         if let Some(proxyed_peer_ids) = crate::shared::get_proxyed_peer_ids() {
             network_builder = network_builder.proxied_peers(proxyed_peer_ids.clone());

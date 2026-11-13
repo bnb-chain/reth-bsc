@@ -26,7 +26,7 @@ use reth_evm::{
     block::{BlockExecutorFactory, BlockExecutorFor},
     eth::{receipt_builder::ReceiptBuilder, EthBlockExecutionCtx},
     execute::BlockBuilder,
-    ConfigureEngineEvm, ConfigureEvm, Database, EvmEnv, EvmEnvFor, EvmFactory, EvmFor,
+    ConfigureEngineEvm, ConfigureEvm, Database, Evm, EvmEnv, EvmEnvFor, EvmFactory, EvmFor,
     ExecutableTxIterator, ExecutionCtxFor, FromRecoveredTx, FromTxWithEncoded, InspectorFor,
     IntoTxEnv, NextBlockEnvAttributes,
 };
@@ -670,7 +670,7 @@ where
     // payload builder use this method to create BscBlockBuilder.
     fn create_block_builder<'a, DB, I>(
         &'a self,
-        evm: EvmFor<Self, &'a mut State<DB>, I>,
+        mut evm: EvmFor<Self, &'a mut State<DB>, I>,
         parent: &'a SealedHeader<HeaderTy<Self::Primitives>>,
         ctx: <Self::BlockExecutorFactory as BlockExecutorFactory>::ExecutionCtx<'a>,
     ) -> impl BlockBuilder<
@@ -681,6 +681,10 @@ where
         DB: Database,
         I: InspectorFor<Self, &'a mut State<DB>> + 'a,
     {
+        if crate::node::bal::enabled() {
+            evm.db_mut().bal_state =
+                revm::database_interface::bal::BalState::new().with_bal_builder();
+        }
         // just init a default custom ctx for mining block.
         let shared_ctx = BscExecutionSharedCtx::default();
         let bsc_executor = BscBlockExecutor::new(

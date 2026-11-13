@@ -22,6 +22,9 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[derive(Debug, Clone, Args)]
 #[non_exhaustive]
 pub struct BscCliArgs {
+    /// Exchange optional block access hints and prefetch parent-state data in parallel.
+    #[arg(long = "bal.enabled", env = "BSC_BAL_ENABLED")]
+    pub bal_enabled: bool,
     /// Enable mining
     #[arg(long = "mining.enabled")]
     pub mining_enabled: bool,
@@ -259,6 +262,7 @@ fn main() -> eyre::Result<()> {
         },
         async move |mut builder, args| {
             let block_sync = args.block_sync.into_config()?;
+            reth_bsc::node::bal::set_enabled(args.bal_enabled);
             // Set genesis hash override if provided
             if let Err(e) = genesis_override::set_genesis_hash_override(args.genesis_hash) {
                 tracing::error!("Failed to set genesis hash override: {}", e);

@@ -821,6 +821,12 @@ where
             crate::shared::cache_full_block(block.clone());
         }
         let block_hash = block_msg.hash;
+        crate::node::bal::publish(
+            block_hash,
+            block.header.parent_hash,
+            block.header.number,
+            payload.bal_read_hint.clone(),
+        );
         // Clone header for FCU update
         let header_for_fcu = block.header.clone();
 

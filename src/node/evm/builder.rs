@@ -170,6 +170,10 @@ where
         stages.enter("system_transactions");
         let (evm, result) = self.executor.finish()?;
         let (db, evm_env) = evm.finish();
+        // These are advisory read hints only. BSC system transactions are deferred to finish;
+        // their BAL values/indexes must not be used by Ethereum's parallel transaction executor.
+        let block_access_list =
+            db.take_built_alloy_bal().and_then(crate::node::bal::encode_read_hint);
 
         // Finish the sparse-trie update stream. The hook lives on the DB (which outlives the
         // executor), so it is NOT dropped by `executor.finish()`; we must clear it explicitly.
@@ -460,7 +464,7 @@ where
             hashed_state,
             trie_updates,
             block,
-            block_access_list: None,
+            block_access_list,
         })
     }
 

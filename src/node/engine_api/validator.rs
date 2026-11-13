@@ -197,6 +197,13 @@ where
         ctx: TreeCtx<'_, BscPrimitives>,
     ) -> ValidationOutcome<BscPrimitives> {
         let local_fault = payload.local_fault.clone();
+        let hash = payload.block_hash_cached();
+        let hint = crate::node::bal::take(
+            hash,
+            payload.block.header.parent_hash,
+            payload.block.header.number,
+        );
+        self.inner.set_bal_read_hint(hash, payload.block.header.gas_limit, hint);
         let outcome = self.inner.validate_payload(payload, ctx);
         if let Some(local_fault) = local_fault {
             local_fault.store(payload_failed_locally(&outcome), Ordering::Release);
@@ -210,6 +217,8 @@ where
         block: SealedBlockWithAccessList<BscBlock>,
         ctx: TreeCtx<'_, BscPrimitives>,
     ) -> ValidationOutcome<BscPrimitives> {
+        let hint = crate::node::bal::take(block.hash(), block.parent_hash(), block.number());
+        self.inner.set_bal_read_hint(block.hash(), block.gas_limit(), hint);
         let outcome = self.inner.validate_block(block, ctx);
         self.report_invalid_block(&outcome);
         outcome

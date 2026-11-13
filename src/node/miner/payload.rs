@@ -1210,7 +1210,7 @@ where
             hashed_state,
             trie_updates,
             block,
-            block_access_list: _,
+            block_access_list,
         } = builder.finish(&state_provider, None)?;
 
         if let Some(control) = build_control.as_ref().filter(|control| control.allows_late_finish())
@@ -1318,6 +1318,7 @@ where
         let pending_turn_length = turn_length_sink.lock().unwrap().take();
 
         let payload = BscBuiltPayload {
+            bal_read_hint: block_access_list.map(|bal| bal.split().1),
             diagnostics: None,
             block: sealed_block.clone(),
             fees: total_fees,
@@ -1454,7 +1455,7 @@ where
             hashed_state,
             trie_updates,
             block,
-            block_access_list: _,
+            block_access_list,
         } = builder.finish(&state_provider, None)?;
         let finalize_elapsed = finalize_start.elapsed();
 
@@ -1496,6 +1497,7 @@ where
         let pending_turn_length = turn_length_sink.lock().unwrap().take();
 
         let payload = BscBuiltPayload {
+            bal_read_hint: block_access_list.map(|bal| bal.split().1),
             diagnostics: None,
             block: sealed_block.clone(),
             fees: total_fees,
@@ -4021,6 +4023,7 @@ mod tests {
             let mut executed_block = block.clone();
             executed_block.body.sidecars = None;
             let mut payload = super::BscBuiltPayload {
+                bal_read_hint: None,
                 diagnostics: None,
                 block: Arc::new(block.into()),
                 fees: U256::ZERO,

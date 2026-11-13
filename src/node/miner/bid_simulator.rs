@@ -868,7 +868,7 @@ where
             hashed_state,
             trie_updates,
             block,
-            block_access_list: _,
+            block_access_list,
         } = out;
         let mut sealed_block = Arc::new(block.sealed_block().clone());
 
@@ -918,6 +918,7 @@ where
         let pending_turn_length = bid_turn_length_sink.lock().unwrap().take();
 
         bid_runtime.bsc_payload = Some(BscBuiltPayload {
+            bal_read_hint: block_access_list.map(|bal| bal.split().1),
             diagnostics: None,
             block: sealed_block.clone(),
             fees: bid_runtime.gas_fee,
