@@ -28,7 +28,7 @@ use futures::{future::Either, stream::FuturesUnordered, FutureExt, StreamExt};
 use parking_lot::RwLock;
 use reth::{consensus::HeaderValidator, network::cache::LruCache};
 use reth_engine_primitives::{ConsensusEngineHandle, EngineTypes};
-use reth_engine_tree::engine::EngineApiRequest;
+use reth_engine_tree::engine::{EngineApiRequest, LocalBlockOutcome};
 use reth_eth_wire::{BlockHashNumber, GetBlockHeaders, NewBlock};
 use reth_eth_wire_types::broadcast::NewBlockHashes;
 use reth_network::{
@@ -39,7 +39,7 @@ use reth_network::{
 use reth_network_api::{PeerId, Peers, ReputationChangeKind};
 use reth_node_ethereum::EthEngineTypes;
 use reth_payload_builder_primitives::Events;
-use reth_payload_primitives::{BuiltPayload, PayloadTypes};
+use reth_payload_primitives::{BuiltPayload, BuiltPayloadExecutedBlock, PayloadTypes};
 use reth_primitives_traits::{AlloyBlockHeader, Block, NodePrimitives, SealedBlock, SealedHeader};
 use reth_provider::{
     BlockHashReader, BlockNumReader, BlockReaderIdExt, CanonStateNotification,
@@ -53,9 +53,14 @@ use std::{
         Arc,
     },
     task::{Context, Poll},
+    time::Duration,
 };
-use tokio::sync::mpsc::{self, OwnedPermit, Receiver};
+use tokio::sync::{
+    mpsc::{self, OwnedPermit, Receiver},
+    oneshot,
+};
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
+use tracing::Instrument;
 
 /// Network message containing a new block
 pub(crate) type BlockMsg = NewBlockMessage<BscNewBlock>;
@@ -112,6 +117,9 @@ const MAX_PENDING_IMPORTS: usize = 32;
 /// For example, 100 queued network messages get at most 32 turns before local/hash work.
 /// This is per source, not a total concurrency cap; one hashes message may contain many hashes.
 const POLL_BATCH: usize = 32;
+/// Bound the entire local handoff, including stale-head re-evaluation; not a fixed delay.
+const LOCAL_IMPORT_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_LOCAL_FORKCHOICE_ATTEMPTS: usize = 3;
 /// Geth's default backward window, retained for default-policy regression assertions.
 #[cfg(test)]
 const MAX_UNCLE_DISTANCE: u64 = 11;
@@ -758,81 +766,23 @@ where
             propagation.send(block_msg);
         }
 
-        // Insert the executed block into the engine tree, then update fork choice.
-        //
-        // Ordering guarantee: InsertExecutedBlock MUST be processed by the engine before FCU.
-        // Both messages travel through separate channels (engine_api_tx vs consensus_engine_tx)
-        // that feed into the same engine service via a tokio::select! loop. Without explicit
-        // ordering, the engine may process FCU before the block is indexed, causing it to be
-        // rejected or ignored.
-        //
-        // Fix: run both in a single spawned task. After sending InsertExecutedBlock, call
-        // yield_now() so the engine service task can pick up and process the insert from
-        // engine_api_rx before we send FCU through the separate consensus channel.
-        {
-            let engine_tx_opt = crate::shared::get_engine_api_tx();
-            let executed_block = payload.executed_block.clone();
-            let forkchoice_engine = self.forkchoice_engine.clone();
-            let submitted = std::time::Instant::now();
-            tokio::spawn(async move {
-                metrics::histogram!("bsc.block_handoff.stage_seconds", "phase" => "submit_task_schedule", "source" => "local").record(submitted.elapsed().as_secs_f64());
-                if let Some(engine_tx) = engine_tx_opt {
-                    tracing::debug!(
-                        target: "bsc::block_import",
-                        block_number = %header_for_fcu.number,
-                        block_hash = %block_hash,
-                        "Inserting mined block into engine tree"
-                    );
-                    if let Err(e) =
-                        engine_tx.send(EngineApiRequest::InsertExecutedBlock(executed_block))
-                    {
-                        tracing::warn!(
-                            target: "bsc::block_import",
-                            block_number = %header_for_fcu.number,
-                            block_hash = %block_hash,
-                            error = %e,
-                            "Failed to insert executed block into engine tree, block will be dropped"
-                        );
-                        return;
-                    }
-                    // Yield to the tokio runtime so the engine service loop processes
-                    // InsertExecutedBlock from engine_api_rx before FCU is enqueued in
-                    // the separate consensus_engine channel. This closes the race window
-                    // where FCU could arrive at the engine tree before the block is indexed.
-                    tokio::task::yield_now().await;
-                } else {
-                    tracing::warn!(
-                        target: "bsc::block_import",
-                        block_number = %header_for_fcu.number,
-                        block_hash = %block_hash,
-                        "engine_api_tx not initialized, skipping InsertExecutedBlock"
-                    );
-                }
-
-                tracing::debug!(
-                    target: "bsc::block_import",
-                    block_number = %header_for_fcu.number,
-                    block_hash = %block_hash,
-                    "Updating fork choice for mined block"
-                );
-                if let Err(e) = forkchoice_engine.update_forkchoice(&header_for_fcu).await {
-                    tracing::warn!(
-                        target: "bsc::block_import",
-                        block_number = %header_for_fcu.number,
-                        block_hash = %block_hash,
-                        error = %e,
-                        "Failed to update fork choice for mined block"
-                    );
-                } else {
-                    tracing::debug!(
-                        target: "bsc::block_import",
-                        block_number = %header_for_fcu.number,
-                        block_hash = %block_hash,
-                        "Succeeded to update fork choice for mined block"
-                    );
-                }
-            });
-        }
+        // One request orders indexing and FCU on the Engine thread. Parlia selection stays
+        // in BSC; a stale expected head is re-evaluated rather than applied unconditionally.
+        let engine_tx = crate::shared::get_engine_api_tx();
+        let executed_block = payload.executed_block.clone();
+        let forkchoice_engine = self.forkchoice_engine.clone();
+        let submitted = std::time::Instant::now();
+        tokio::spawn(async move {
+            metrics::histogram!("bsc.block_handoff.stage_seconds", "phase" => "submit_task_schedule", "source" => "local").record(submitted.elapsed().as_secs_f64());
+            let Some(engine_tx) = engine_tx else {
+                tracing::error!(target: "bsc::block_import", %block_hash, "Engine local-import queue not initialized");
+                return;
+            };
+            match submit_mined_block(&forkchoice_engine, &engine_tx, executed_block, &header_for_fcu).await {
+                Ok(status) => tracing::debug!(target: "bsc::block_import", %block_hash, ?status, "Local combined import completed"),
+                Err(error) => tracing::error!(target: "bsc::block_import", %block_hash, %error, "Local combined import not confirmed; a timed-out request may still execute"),
+            }
+        }.in_current_span());
         // Cache the block hash to avoid re-processing the same block.
         self.processed_blocks.insert(block_hash);
         self.head_fetches.cancel(&block_hash);
@@ -1950,6 +1900,126 @@ where
     Ok(Some(U128::from(total.to::<u128>())))
 }
 
+/// Completion is about the local block, not merely a VALID response for some other head.
+#[derive(Debug, PartialEq, Eq)]
+enum LocalImportStatus {
+    Canonical,
+    SideBranch,
+    Deferred,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum LocalImportError {
+    #[error("Engine local-import queue closed")]
+    QueueClosed,
+    #[error("forkchoice preparation failed: {0}")]
+    Preparation(#[from] ParliaConsensusErr),
+    #[error("Engine insertion failed: {0}")]
+    Provider(#[from] reth_provider::ProviderError),
+    #[error("Engine local-import reply dropped; outcome unknown")]
+    ReplyDropped(#[from] oneshot::error::RecvError),
+    #[error("Engine local-import timed out; outcome unknown")]
+    Timeout(#[from] tokio::time::error::Elapsed),
+    #[error("Engine skipped insertion and does not know the local block")]
+    NotRetained,
+    #[error("local forkchoice conflicts with confirmed finality")]
+    FinalityConflict,
+    #[error("canonical head kept changing during local forkchoice preparation")]
+    StaleHead,
+    #[error("forkchoice failed: {0}")]
+    Forkchoice(#[from] reth_engine_primitives::BeaconForkChoiceUpdateError),
+    #[error("local forkchoice rejected: {0}")]
+    Invalid(String),
+}
+
+async fn submit_mined_block<P>(
+    forkchoice: &BscForkChoiceEngine<P>,
+    engine_tx: &crate::shared::BscEngineApiTx,
+    payload: BuiltPayloadExecutedBlock<BscPrimitives>,
+    header: &Header,
+) -> Result<LocalImportStatus, LocalImportError>
+where
+    P: BlockNumReader + HeaderProvider<Header = Header> + Clone + Send + Sync,
+{
+    tokio::time::timeout(LOCAL_IMPORT_TIMEOUT, async {
+        let mut current_hash = match forkchoice.provider.chain_info() {
+            Ok(info) => Some(info.best_hash),
+            Err(error) => {
+                engine_tx
+                    .send(EngineApiRequest::InsertExecutedBlock(payload.clone()))
+                    .map_err(|_| LocalImportError::QueueClosed)?;
+                return Err(error.into());
+            }
+        };
+        for _ in 0..MAX_LOCAL_FORKCHOICE_ATTEMPTS {
+            let prepared = match forkchoice.prepare_forkchoice(header, current_hash).await {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    // Retain valid execution data even when Parlia preparation cannot finish.
+                    engine_tx
+                        .send(EngineApiRequest::InsertExecutedBlock(payload.clone()))
+                        .map_err(|_| LocalImportError::QueueClosed)?;
+                    return Err(error.into());
+                }
+            };
+            let (tx, rx) = oneshot::channel();
+            engine_tx
+                .send(EngineApiRequest::InsertExecutedBlockAndForkchoice {
+                    payload: payload.clone(),
+                    state: prepared.state,
+                    expected_head: prepared.expected_head,
+                    cause: tracing::Span::current(),
+                    tx,
+                })
+                .map_err(|_| LocalImportError::QueueClosed)?;
+            let stage = startup_diagnostics::HandoffStage::new("local_combined_roundtrip", "local");
+            let result = rx.await??;
+            drop(stage);
+            match result {
+                LocalBlockOutcome::NotRetained => return Err(LocalImportError::NotRetained),
+                LocalBlockOutcome::FinalityConflict => {
+                    return Err(LocalImportError::FinalityConflict)
+                }
+                LocalBlockOutcome::StaleHead { actual_head } => {
+                    metrics::counter!("bsc.block_handoff.local_stale_retries_total").increment(1);
+                    current_hash = Some(actual_head.hash);
+                }
+                LocalBlockOutcome::Forkchoice {
+                    outcome,
+                    state,
+                    canonical_head,
+                    finalized,
+                    safe,
+                } => {
+                    let response = outcome.await?;
+                    return match response.payload_status.status {
+                        PayloadStatusEnum::Valid
+                            if canonical_head.hash == state.head_block_hash &&
+                                state.head_block_hash == prepared.state.head_block_hash =>
+                        {
+                            forkchoice.complete_local_forkchoice(canonical_head, safe, finalized);
+                            Ok(if canonical_head.hash == header.hash_slow() {
+                                LocalImportStatus::Canonical
+                            } else {
+                                LocalImportStatus::SideBranch
+                            })
+                        }
+                        PayloadStatusEnum::Valid => Ok(LocalImportStatus::SideBranch),
+                        PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted => {
+                            Ok(LocalImportStatus::Deferred)
+                        }
+                        PayloadStatusEnum::Invalid { validation_error } => {
+                            Err(LocalImportError::Invalid(validation_error))
+                        }
+                    };
+                }
+            }
+        }
+        Err(LocalImportError::StaleHead)
+    })
+    .await?
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
@@ -1965,7 +2035,7 @@ mod tests {
     use reth_eth_wire::NewBlock;
     use reth_ethereum_primitives::{Block, Receipt};
     use reth_node_ethereum::EthEngineTypes;
-    use reth_primitives_traits::SealedHeader;
+    use reth_primitives_traits::{RecoveredBlock, SealedHeader};
     use reth_provider::ProviderError;
     use schnellru::{ByLength, LruMap};
     use std::{
@@ -1974,6 +2044,249 @@ mod tests {
         task::{Context, Poll},
         time::Duration,
     };
+
+    fn local_combined_fixture(
+    ) -> (BscForkChoiceEngine<MockProvider>, BuiltPayloadExecutedBlock<BscPrimitives>, Header) {
+        let mut provider = MockProvider::new();
+        provider.insert(Header { number: 9, ..Default::default() }, U256::from(98));
+        let parent = propagation_test_parent();
+        provider.insert(parent.clone(), U256::from(100));
+        let header = propagation_test_child(&parent).block.0.block.header.clone();
+        let block = BscBlock { header: header.clone(), ..Default::default() };
+        let payload = BuiltPayloadExecutedBlock {
+            recovered_block: Arc::new(RecoveredBlock::new_unhashed(block, vec![])),
+            execution_output: Arc::default(),
+            hashed_state: Arc::default(),
+            trie_updates: Arc::default(),
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        (
+            BscForkChoiceEngine::new(
+                provider,
+                ConsensusEngineHandle::new(tx),
+                Arc::new(BscChainSpec::from(bsc_mainnet())),
+            ),
+            payload,
+            header,
+        )
+    }
+
+    fn local_combined_reply(
+        state: ForkchoiceState,
+        status: PayloadStatusEnum,
+        head_hash: B256,
+        head_number: u64,
+    ) -> LocalBlockOutcome {
+        LocalBlockOutcome::Forkchoice {
+            outcome: OnForkChoiceUpdated::valid(PayloadStatus::new(status, None)),
+            state,
+            canonical_head: alloy_eips::BlockNumHash::new(head_number, head_hash),
+            safe: None,
+            finalized: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn local_combined_uses_one_request_and_confirms_actual_head() {
+        let (forkchoice, payload, header) = local_combined_fixture();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut pending = Box::pin(submit_mined_block(&forkchoice, &tx, payload, &header));
+        assert!(futures::poll!(&mut pending).is_pending());
+        let EngineApiRequest::InsertExecutedBlockAndForkchoice {
+            payload,
+            state,
+            expected_head,
+            tx,
+            ..
+        } = rx.try_recv().unwrap()
+        else {
+            panic!("one combined request expected")
+        };
+        assert_eq!(payload.recovered_block.hash(), header.hash_slow());
+        assert_eq!(expected_head, header.parent_hash);
+        assert_eq!(state.head_block_hash, header.hash_slow());
+        assert!(futures::poll!(&mut pending).is_pending());
+        tx.send(Ok(local_combined_reply(
+            state,
+            PayloadStatusEnum::Valid,
+            header.hash_slow(),
+            header.number,
+        )))
+        .unwrap();
+        assert_eq!(pending.await.unwrap(), LocalImportStatus::Canonical);
+        assert!(rx.try_recv().is_err(), "no insertion query or second FCU should be sent");
+    }
+
+    #[tokio::test]
+    async fn local_combined_stale_reprepares_against_engine_hash_and_is_bounded() {
+        for exhaust in [false, true] {
+            let (forkchoice, payload, header) = local_combined_fixture();
+            let older = forkchoice.provider.headers_by_number[&9].hash_slow();
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let mut pending = Box::pin(submit_mined_block(&forkchoice, &tx, payload, &header));
+            for attempt in 0..if exhaust { MAX_LOCAL_FORKCHOICE_ATTEMPTS } else { 2 } {
+                assert!(futures::poll!(&mut pending).is_pending());
+                let EngineApiRequest::InsertExecutedBlockAndForkchoice {
+                    state,
+                    expected_head,
+                    tx,
+                    ..
+                } = rx.try_recv().unwrap()
+                else {
+                    panic!("combined request expected")
+                };
+                assert_eq!(
+                    expected_head,
+                    if attempt % 2 == 0 { header.parent_hash } else { older }
+                );
+                if !exhaust && attempt == 1 {
+                    tx.send(Ok(local_combined_reply(
+                        state,
+                        PayloadStatusEnum::Valid,
+                        header.hash_slow(),
+                        header.number,
+                    )))
+                    .unwrap();
+                } else {
+                    tx.send(Ok(LocalBlockOutcome::StaleHead {
+                        actual_head: alloy_eips::BlockNumHash::new(
+                            if attempt % 2 == 0 { 9 } else { 10 },
+                            if attempt % 2 == 0 { older } else { header.parent_hash },
+                        ),
+                    }))
+                    .unwrap();
+                }
+            }
+            if exhaust {
+                assert!(matches!(pending.await, Err(LocalImportError::StaleHead)));
+            } else {
+                assert_eq!(pending.await.unwrap(), LocalImportStatus::Canonical);
+            }
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn local_combined_nonvalid_and_nonselected_results_are_not_commits() {
+        for case in 0..7 {
+            let (forkchoice, payload, header) = local_combined_fixture();
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let mut pending = Box::pin(submit_mined_block(&forkchoice, &tx, payload, &header));
+            assert!(futures::poll!(&mut pending).is_pending());
+            let EngineApiRequest::InsertExecutedBlockAndForkchoice { state, tx, .. } =
+                rx.try_recv().unwrap()
+            else {
+                panic!("combined request expected")
+            };
+            let result = match case {
+                0 => LocalBlockOutcome::NotRetained,
+                1 => LocalBlockOutcome::FinalityConflict,
+                2 => local_combined_reply(
+                    state,
+                    PayloadStatusEnum::Syncing,
+                    header.parent_hash,
+                    header.number - 1,
+                ),
+                3 => local_combined_reply(
+                    state,
+                    PayloadStatusEnum::Invalid { validation_error: "invalid test block".into() },
+                    header.parent_hash,
+                    header.number - 1,
+                ),
+                4 => local_combined_reply(
+                    state,
+                    PayloadStatusEnum::Valid,
+                    header.parent_hash,
+                    header.number - 1,
+                ),
+                _ => LocalBlockOutcome::Forkchoice {
+                    outcome: OnForkChoiceUpdated::invalid_state(),
+                    state,
+                    canonical_head: alloy_eips::BlockNumHash::new(
+                        header.number - 1,
+                        header.parent_hash,
+                    ),
+                    finalized: None,
+                    safe: None,
+                },
+            };
+            if case == 6 {
+                tx.send(Err(reth_provider::ProviderError::HeaderNotFound(
+                    header.hash_slow().into(),
+                )))
+                .unwrap();
+            } else {
+                tx.send(Ok(result)).unwrap();
+            }
+            let result = pending.await;
+            match case {
+                0 => assert!(matches!(result, Err(LocalImportError::NotRetained))),
+                1 => assert!(matches!(result, Err(LocalImportError::FinalityConflict))),
+                2 => assert_eq!(result.unwrap(), LocalImportStatus::Deferred),
+                3 => assert!(
+                    matches!(result, Err(LocalImportError::Invalid(error)) if error == "invalid test block")
+                ),
+                4 => assert_eq!(result.unwrap(), LocalImportStatus::SideBranch),
+                5 => assert!(matches!(result, Err(LocalImportError::Forkchoice(_)))),
+                _ => assert!(matches!(
+                    result,
+                    Err(LocalImportError::Provider(reth_provider::ProviderError::HeaderNotFound(
+                        _
+                    )))
+                )),
+            }
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn local_combined_preparation_failure_retains_execution_without_fcu() {
+        let (mut forkchoice, payload, header) = local_combined_fixture();
+        forkchoice.provider.headers_by_hash.clear();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        assert!(matches!(
+            submit_mined_block(&forkchoice, &tx, payload, &header).await,
+            Err(LocalImportError::Preparation(ParliaConsensusErr::HeadHashNotFound))
+        ));
+        assert_matches_local_insert(rx.try_recv().unwrap(), header.hash_slow());
+        assert!(rx.try_recv().is_err());
+    }
+
+    fn assert_matches_local_insert(
+        request: EngineApiRequest<BscPayloadTypes, BscPrimitives>,
+        hash: B256,
+    ) {
+        let EngineApiRequest::InsertExecutedBlock(payload) = request else {
+            panic!("insertion-only fallback expected")
+        };
+        assert_eq!(payload.recovered_block.hash(), hash);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn local_combined_timeout_and_transport_errors_do_not_mean_no_mutation() {
+        for timeout in [false, true] {
+            let (forkchoice, payload, header) = local_combined_fixture();
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let mut pending = Box::pin(submit_mined_block(&forkchoice, &tx, payload, &header));
+            assert!(futures::poll!(&mut pending).is_pending());
+            let request = rx.try_recv().unwrap();
+            if timeout {
+                tokio::time::advance(LOCAL_IMPORT_TIMEOUT).await;
+                assert!(matches!(pending.await, Err(LocalImportError::Timeout(_))));
+                drop(request);
+            } else {
+                drop(request);
+                assert!(matches!(pending.await, Err(LocalImportError::ReplyDropped(_))));
+            }
+        }
+        let (forkchoice, payload, header) = local_combined_fixture();
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        assert!(matches!(
+            submit_mined_block(&forkchoice, &tx, payload, &header).await,
+            Err(LocalImportError::QueueClosed)
+        ));
+    }
 
     #[tokio::test]
     async fn can_handle_valid_block() {

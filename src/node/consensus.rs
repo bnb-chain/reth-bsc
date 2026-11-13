@@ -14,7 +14,7 @@ use crate::{
     shared, BscBlock, BscBlockBody, BscPrimitives,
 };
 use alloy_consensus::{Header, TxReceipt};
-use alloy_eips::Encodable2718;
+use alloy_eips::{BlockNumHash, Encodable2718};
 use alloy_primitives::{Bytes, B256};
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
 use reth::{
@@ -1147,6 +1147,15 @@ pub struct BscForkChoiceEngine<P> {
     consensus_metrics: crate::metrics::BscConsensusMetrics,
 }
 
+/// A Parlia decision prepared against one exact canonical hash, not an Engine mutation.
+pub(crate) struct PreparedForkchoice {
+    pub(crate) expected_head: B256,
+    pub(crate) state: ForkchoiceState,
+    head_number: u64,
+    safe_number: u64,
+    finalized_number: u64,
+}
+
 impl<P> BscForkChoiceEngine<P>
 where
     P: BlockNumReader + HeaderProvider<Header = Header> + Clone + Send + Sync,
@@ -1212,66 +1221,13 @@ where
             "Updating fork choice with incoming header"
         );
 
+        let prepared = self.prepare_forkchoice(incoming_header, None).await?;
+        let state = prepared.state;
         let source =
             crate::node::miner::startup_diagnostics::handoff_source(incoming_header.hash_slow());
-        let preparation = crate::node::miner::startup_diagnostics::HandoffStage::new(
-            "forkchoice_prepare",
-            source,
-        );
-        let current_number = self.provider.chain_info()?.best_number;
-        tracing::trace!(target: "bsc::forkchoice", "Best canonical number: {:?}, new_header = {:?}", current_number, incoming_header);
-
-        let current_head = self
-            .provider
-            .header_by_number(current_number)?
-            .ok_or(ParliaConsensusErr::HeadHashNotFound)?;
-
-        // Determine if we need to reorg using fork choice rules
-        let need_reorg = match self.is_need_reorg(incoming_header, &current_head).await {
-            Ok(need_reorg) => need_reorg,
-            Err(e) => {
-                // Bailing here means no forkchoice update is sent and the canonical head stays
-                // put, so this must be visible in metrics — callers only log it at warn.
-                self.consensus_metrics.forkchoice_update_errors_total.increment(1);
-                return Err(e);
-            }
-        };
-
-        // A preferred head may simply extend the current chain by several blocks.
-        // Reorg metrics are recorded from the engine's canonical notifications instead.
-        let new_canonical_head = if need_reorg { incoming_header } else { &current_head };
-
-        // Get safe block and finalized block with new canonical head
-        // ref: https://github.com/bnb-chain/bsc/blob/f70aaa8399ccee429804eecf3fc4c6fd8d9e6cab/eth/api_backend.go#L72
-        let (safe_block_number, safe_block_hash) =
-            self.get_justified_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
-        let (finalized_block_number, finalized_block_hash) =
-            self.get_finalized_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
-
-        // Update finality metrics
-        self.finality_metrics.justified_block_height.set(safe_block_number as f64);
-        self.finality_metrics.safe_block_height.set(safe_block_number as f64);
-        self.finality_metrics.finalized_block_height.set(finalized_block_number as f64);
-
-        let state = ForkchoiceState {
-            head_block_hash: new_canonical_head.hash_slow(),
-            safe_block_hash,
-            finalized_block_hash,
-        };
-
-        tracing::debug!(
-            target: "bsc::forkchoice",
-            ?state,
-            new_canonical_head_number = new_canonical_head.number,
-            new_canonical_head_hash = ?new_canonical_head.hash_slow(),
-            incoming_header_number = incoming_header.number,
-            incoming_header_hash = ?incoming_header.hash_slow(),
-            safe_block_number,
-            finalized_block_number,
-            "Fork choice updated"
-        );
-
-        drop(preparation);
+        self.finality_metrics.justified_block_height.set(prepared.safe_number as f64);
+        self.finality_metrics.safe_block_height.set(prepared.safe_number as f64);
+        self.finality_metrics.finalized_block_height.set(prepared.finalized_number as f64);
         let fcu_roundtrip =
             crate::node::miner::startup_diagnostics::HandoffStage::new("fcu_roundtrip", source);
         let outcome = match self.engine_handle.fork_choice_updated(state, None).await {
@@ -1301,10 +1257,99 @@ where
         // A failed update means the block did not become canonical, so there is
         // nothing to promote against.
         if outcome.is_ok() {
-            crate::consensus::parlia::vote_pool::promote_future_votes(new_canonical_head.number);
+            crate::consensus::parlia::vote_pool::promote_future_votes(prepared.head_number);
         }
 
         outcome
+    }
+
+    /// Prepare without mutating Engine state or reporting applied finality. A stale combined
+    /// result supplies the exact current hash for a bounded re-evaluation.
+    pub(crate) async fn prepare_forkchoice(
+        &self,
+        incoming_header: &Header,
+        current_hash: Option<B256>,
+    ) -> Result<PreparedForkchoice, ParliaConsensusErr> {
+        let source =
+            crate::node::miner::startup_diagnostics::handoff_source(incoming_header.hash_slow());
+        let preparation = crate::node::miner::startup_diagnostics::HandoffStage::new(
+            "forkchoice_prepare",
+            source,
+        );
+        // Ordinary imports retain their original number-based lookup. The local combined
+        // path supplies an exact hash, which the Engine validates before applying the choice.
+        let current_head = match current_hash {
+            Some(hash) => self.provider.header(hash)?,
+            None => self.provider.header_by_number(self.provider.chain_info()?.best_number)?,
+        }
+        .ok_or(ParliaConsensusErr::HeadHashNotFound)?;
+        let current_hash = current_head.hash_slow();
+
+        // Determine if we need to reorg using fork choice rules
+        let need_reorg = match self.is_need_reorg(incoming_header, &current_head).await {
+            Ok(need_reorg) => need_reorg,
+            Err(e) => {
+                // Bailing here means no forkchoice update is sent and the canonical head stays
+                // put, so this must be visible in metrics — callers only log it at warn.
+                self.consensus_metrics.forkchoice_update_errors_total.increment(1);
+                return Err(e);
+            }
+        };
+
+        // A preferred head may simply extend the current chain by several blocks.
+        // Reorg metrics are recorded from the engine's canonical notifications instead.
+        let new_canonical_head = if need_reorg { incoming_header } else { &current_head };
+
+        // Get safe block and finalized block with new canonical head
+        // ref: https://github.com/bnb-chain/bsc/blob/f70aaa8399ccee429804eecf3fc4c6fd8d9e6cab/eth/api_backend.go#L72
+        let (safe_block_number, safe_block_hash) =
+            self.get_justified_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
+        let (finalized_block_number, finalized_block_hash) =
+            self.get_finalized_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
+
+        let state = ForkchoiceState {
+            head_block_hash: new_canonical_head.hash_slow(),
+            safe_block_hash,
+            finalized_block_hash,
+        };
+
+        tracing::debug!(
+            target: "bsc::forkchoice",
+            ?state,
+            new_canonical_head_number = new_canonical_head.number,
+            new_canonical_head_hash = ?new_canonical_head.hash_slow(),
+            incoming_header_number = incoming_header.number,
+            incoming_header_hash = ?incoming_header.hash_slow(),
+            safe_block_number,
+            finalized_block_number,
+            "Prepared fork choice"
+        );
+
+        drop(preparation);
+        Ok(PreparedForkchoice {
+            expected_head: current_hash,
+            state,
+            head_number: new_canonical_head.number,
+            safe_number: safe_block_number,
+            finalized_number: finalized_block_number,
+        })
+    }
+
+    /// Called only after a combined request returned VALID and the selected head is canonical.
+    pub(crate) fn complete_local_forkchoice(
+        &self,
+        head: BlockNumHash,
+        safe: Option<BlockNumHash>,
+        finalized: Option<BlockNumHash>,
+    ) {
+        self.finality_metrics
+            .justified_block_height
+            .set(safe.map_or(0, |block| block.number) as f64);
+        self.finality_metrics.safe_block_height.set(safe.map_or(0, |block| block.number) as f64);
+        self.finality_metrics
+            .finalized_block_height
+            .set(finalized.map_or(0, |block| block.number) as f64);
+        crate::consensus::parlia::vote_pool::promote_future_votes(head.number);
     }
 
     /// Determines if a chain reorganization is needed based on fork choice rules.
