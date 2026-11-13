@@ -2,7 +2,7 @@ use super::*;
 use alloy_consensus::{
     transaction::Recovered, TxEip1559, TxEip2930, TxEip4844, TxEip7702, TxLegacy,
 };
-use alloy_eips::eip7702::{Authorization, RecoveredAuthority, RecoveredAuthorization};
+use alloy_eips::eip7702::{Authorization, SignedAuthorization};
 use alloy_primitives::{Bytes, TxKind, B256};
 use evm2::{
     env::BlockEnv,
@@ -127,8 +127,8 @@ fn authorization_tx(authority: Address, nonce: u64, clears: bool) -> TxEnvelope 
         address: if clears { Address::ZERO } else { RECIPIENT },
         nonce,
     };
-    let recovered =
-        RecoveredAuthorization::new_unchecked(auth, RecoveredAuthority::Valid(authority));
+    // Recovery is supplied by the fixture so blacklist addresses need no private keys.
+    let signed = SignedAuthorization::new_unchecked(auth, 0, U256::ONE, U256::ONE);
     let tx = TxEip7702 {
         chain_id: 56,
         gas_limit: 100_000,
@@ -136,9 +136,13 @@ fn authorization_tx(authority: Address, nonce: u64, clears: bool) -> TxEnvelope 
         max_priority_fee_per_gas: 3,
         to: RECIPIENT,
         value: U256::from(7),
+        authorization_list: vec![signed],
         ..Default::default()
     };
-    TxEnvelope::Eip7702(LazyTxEip7702::from_cached_recovered_authorizations(tx, vec![recovered]))
+    TxEnvelope::Eip7702(LazyTxEip7702::from_cached_recovered_authorizations(
+        tx,
+        vec![Some(authority)],
+    ))
 }
 
 #[test]
@@ -234,14 +238,30 @@ fn blacklisted_authority_remains_cold_during_execution() {
 #[test]
 fn mixed_authorizations_preserve_order_and_charge_for_rejected_entries() {
     let authority = Address::with_last_byte(0xab);
-    let mut tx = authorization_tx(authority, 0, false);
-    let TxEnvelope::Eip7702(ref mut inner) = tx else { unreachable!() };
+    let TxEnvelope::Eip7702(inner) = authorization_tx(authority, 0, false) else { unreachable!() };
     let TxEnvelope::Eip7702(blocked) = authorization_tx(NANO_BLACKLIST[0], 0, false) else {
         unreachable!()
     };
     let TxEnvelope::Eip7702(clear) = authorization_tx(authority, 1, true) else { unreachable!() };
-    inner.authorization_list.splice(0..0, blocked.authorization_list);
-    inner.authorization_list.extend(clear.authorization_list);
+    let authorization_list = [blocked, inner.clone(), clear]
+        .iter()
+        .flat_map(|tx| tx.authorization_list().unwrap().iter().cloned())
+        .collect();
+    let tx = TxEnvelope::Eip7702(LazyTxEip7702::from_cached_recovered_authorizations(
+        TxEip7702 {
+            chain_id: inner.chain_id,
+            nonce: inner.nonce,
+            gas_limit: inner.gas_limit,
+            max_fee_per_gas: inner.max_fee_per_gas,
+            max_priority_fee_per_gas: inner.max_priority_fee_per_gas,
+            to: inner.to,
+            value: inner.value,
+            access_list: inner.access_list,
+            input: inner.input,
+            authorization_list,
+        },
+        vec![Some(NANO_BLACKLIST[0]), Some(authority), Some(authority)],
+    ));
     let original = tx.clone();
     let mut evm = evm(SpecId::PRAGUE, database());
     let tx = Recovered::new_unchecked(tx, CALLER);

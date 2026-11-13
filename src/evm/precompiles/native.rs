@@ -121,7 +121,7 @@ impl PrecompileProvider<BscEvmTypes> for BscNativePrecompiles {
         let entry = self.entry(&message.call_target)?;
         Some(match entry {
             Entry::Pure(precompile) => convert_output(
-                precompile.execute(&message.input, gas.remaining(), gas.reservoir()),
+                precompile.execute(evm.message_input(message), gas.remaining(), gas.reservoir()),
                 gas,
             ),
             Entry::MilliTimestamp => {

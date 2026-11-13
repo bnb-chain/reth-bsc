@@ -68,6 +68,10 @@ impl BlockTransactionResult<BscEvmTypes> for BscTxResult {
     fn result(&self) -> &TxResultWithState<BscEvmTypes> {
         &self.inner
     }
+
+    fn into_result(self) -> TxResultWithState<BscEvmTypes> {
+        self.inner
+    }
 }
 
 /// Helper type for the input of post execution.

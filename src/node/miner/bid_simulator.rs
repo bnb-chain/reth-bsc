@@ -1529,6 +1529,7 @@ mod tests {
                     &evm2::TxResult<
                         <<Self::Executor as BlockExecutor>::Evm as reth_evm::Evm>::EvmTypes,
                     >,
+                    evm2::TxStateChanges<'_>,
                 ) -> CommitChanges,
             ) -> Result<Option<GasOutput>, BlockExecutionError> {
                 self.attempts += 1;

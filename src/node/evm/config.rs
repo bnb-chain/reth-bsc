@@ -289,7 +289,6 @@ impl BscEvmConfig {
         if env.version.max_initcode_size != old_defaults.max_initcode_size {
             version.max_initcode_size = env.version.max_initcode_size;
         }
-        version.initial_call_depth = env.version.initial_call_depth;
         version.memory_limit = env.version.memory_limit;
         if env.version.tx_gas_limit_cap != old_defaults.tx_gas_limit_cap ||
             !env.version.feature(evm2::EvmFeatures::BLOCK_GAS_LIMIT_CHECK)

@@ -26,6 +26,7 @@ pub struct BscEvm<'a> {
     pub env: BscEvmEnv,
     /// Native execution state. Install inspectors through this wrapper's [`Evm`] implementation.
     pub inner: evm2::Evm<'a, BscEvmTypes>,
+    installed_inspector: Option<InstalledInspector>,
 }
 
 impl<'a> BscEvm<'a> {
@@ -46,7 +47,7 @@ impl<'a> BscEvm<'a> {
             BscRuntime { is_system_contract, ..Default::default() },
         );
         inner.set_interpreter_runner(CoinbaseGuard);
-        Self { inner, env }
+        Self { inner, env, installed_inspector: None }
     }
 
     /// Returns the opcode-visible block environment.
@@ -99,8 +100,36 @@ impl Evm for BscEvm<'_> {
         result.map(|(GuardedInspector(inspector), result)| (inspector, result))
     }
     fn set_inspector<I: Inspector<BscEvmTypes> + 'static>(&mut self, inspector: I) {
+        let previous_trace_replay = self
+            .installed_inspector
+            .as_ref()
+            .map_or(self.inner.ext().trace_replay, |installed| installed.previous_trace_replay);
+        self.installed_inspector = Some(InstalledInspector {
+            previous_trace_replay,
+            unwrap: GuardedInspector::<I>::unwrap,
+        });
         self.inner.ext_mut().trace_replay = true;
         self.inner.set_inspector(GuardedInspector(inspector));
+    }
+    unsafe fn with_inspector<I, R>(&mut self, f: impl FnOnce(&mut I) -> R) -> Option<R>
+    where
+        I: Inspector<BscEvmTypes> + 'static,
+    {
+        // SAFETY: the caller guarantees I has no lifetime parameters; the guard adds none.
+        unsafe {
+            Evm::with_inspector::<GuardedInspector<I>, R>(&mut self.inner, |guard| f(&mut guard.0))
+        }
+    }
+    fn take_inspector(&mut self) -> Option<Box<dyn Inspector<BscEvmTypes> + '_>> {
+        let installed = self.installed_inspector.take();
+        if let Some(installed) = &installed {
+            self.inner.ext_mut().trace_replay = installed.previous_trace_replay;
+        }
+        let inspector = self.inner.clear_inspector()?;
+        Some(match installed {
+            Some(installed) => (installed.unwrap)(inspector),
+            None => inspector,
+        })
     }
     fn state_db_mut(&mut self) -> &mut dyn DynDatabase {
         Evm::state_db_mut(&mut self.inner)
@@ -155,9 +184,35 @@ impl InterpreterRunner<BscEvmTypes> for CoinbaseGuard {
     }
 }
 
+#[derive(Debug)]
+struct InstalledInspector {
+    previous_trace_replay: bool,
+    unwrap: UnwrapInspector,
+}
+
+type UnwrapInspector =
+    for<'a> fn(Box<dyn Inspector<BscEvmTypes> + 'a>) -> Box<dyn Inspector<BscEvmTypes> + 'a>;
+
 struct GuardedInspector<I>(I);
 
+impl<I: Inspector<BscEvmTypes> + 'static> GuardedInspector<I> {
+    fn unwrap(
+        inspector: Box<dyn Inspector<BscEvmTypes> + '_>,
+    ) -> Box<dyn Inspector<BscEvmTypes> + '_> {
+        if evm2::evm::NonStaticAny::type_id(&*inspector) != core::any::TypeId::of::<Self>() {
+            return inspector;
+        }
+        // SAFETY: the type ID matches the guard, which only wraps a 'static inspector.
+        let guarded = unsafe { Box::from_raw(Box::into_raw(inspector).cast::<Self>()) };
+        Box::new(guarded.0)
+    }
+}
+
 impl<I: Inspector<BscEvmTypes>> Inspector<BscEvmTypes> for GuardedInspector<I> {
+    fn inspector_config(&self) -> evm2::InspectorConfig {
+        self.0.inspector_config()
+    }
+
     fn initialize_interp(&mut self, interp: &mut Interpreter<'_, '_, BscEvmTypes>) {
         self.0.initialize_interp(interp);
         if interp.message().destination == interp.host().block().beneficiary {
@@ -271,7 +326,11 @@ mod tests {
 
     #[derive(Default)]
     struct Noop;
-    impl Inspector<BscEvmTypes> for Noop {}
+    impl Inspector<BscEvmTypes> for Noop {
+        fn inspector_config(&self) -> evm2::InspectorConfig {
+            evm2::InspectorConfig::without_steps()
+        }
+    }
 
     #[test]
     fn parlia_transfer_bypasses_tx_checks_but_increments_actual_nonce() {
@@ -377,6 +436,29 @@ mod tests {
                 evm.inner.overlay_db_mut().get_storage(&VALIDATOR, &U256::ZERO).unwrap(),
                 U256::ZERO
             );
+        }
+    }
+
+    #[test]
+    fn inspector_lifecycle_restores_trace_mode_and_exposes_original_type() {
+        assert_eq!(GuardedInspector(Noop).inspector_config(), Noop.inspector_config());
+        for trace_replay in [false, true] {
+            let mut evm = evm(db());
+            evm.inner.ext_mut().trace_replay = trace_replay;
+            evm.set_inspector(Noop);
+            evm.set_inspector(Noop);
+            // SAFETY: Noop has no lifetime parameters.
+            assert_eq!(unsafe { evm.with_inspector::<Noop, _>(|_| 7) }, Some(7));
+            // SAFETY: GuardedInspector<Noop> has no lifetime parameters.
+            assert_eq!(unsafe { evm.with_inspector::<GuardedInspector<Noop>, _>(|_| 7) }, None);
+            let inspector = evm.take_inspector().unwrap();
+            assert_eq!(
+                evm2::evm::NonStaticAny::type_id(&*inspector),
+                core::any::TypeId::of::<Noop>()
+            );
+            drop(inspector);
+            assert_eq!(evm.inner.ext().trace_replay, trace_replay);
+            assert!(evm.take_inspector().is_none());
         }
     }
 }

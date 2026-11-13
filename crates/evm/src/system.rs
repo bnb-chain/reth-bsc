@@ -52,8 +52,7 @@ impl TxHandler<BscEvmTypes, TxEnvelope, TxResult<BscEvmTypes>> for BscHandler {
             eip7702::apply_auth_list(
                 req.host,
                 chain_id,
-                tx.authorization_list
-                    .iter()
+                tx.authorizations()
                     .filter(|auth| !auth.authority().is_some_and(|a| NANO_BLACKLIST.contains(&a))),
                 &mut refunds,
             )?;
@@ -61,7 +60,7 @@ impl TxHandler<BscEvmTypes, TxEnvelope, TxResult<BscEvmTypes>> for BscHandler {
         }
         let gas_limit = tx.gas_limit();
         let mut gas = GasTracker::new_with_execution_gas_and_reservoir(gas_limit, 0);
-        let env = TxEnvExt {
+        *req.host.tx_env_mut() = TxEnvExt {
             origin: caller,
             gas_price: U256::ZERO,
             chain_id: U256::from(req.host.version().chain_id),
@@ -82,8 +81,7 @@ impl TxHandler<BscEvmTypes, TxEnvelope, TxResult<BscEvmTypes>> for BscHandler {
             tx.value(),
             &mut gas,
         )?;
-        let result =
-            ethereum::execute_initial_frame(req.host, &env, frame, &mut gas, gas_limit, 0)?;
+        let result = ethereum::execute_initial_frame(req.host, frame, &mut gas, gas_limit, 0)?;
         Ok(TxResult::<BscEvmTypes> {
             status: result.stop.is_success(),
             total_gas_spent: gas_limit.saturating_sub(result.gas.remaining()),

@@ -113,8 +113,7 @@ fn execute_authorizations<T: EvmTypes<Tx = TxEnvelope>>(
 ) -> HandlerResult<TxResult<T>> {
     if !req
         .tx
-        .authorization_list
-        .iter()
+        .authorizations()
         .any(|auth| auth.authority().is_some_and(|a| NANO_BLACKLIST.contains(&a)))
     {
         return eip7702::execute_prepared::<T, BscHooks>(req, prepared);
@@ -123,10 +122,33 @@ fn execute_authorizations<T: EvmTypes<Tx = TxEnvelope>>(
     // Preparation charges intrinsic gas for the original list. Filter only the application
     // phase so rejected authorities neither warm state nor receive a nonce, code, or refund.
     // Preserve the original envelope for inspectors and settlement.
-    let mut filtered = (*req.tx.inner()).clone();
-    filtered
-        .authorization_list
-        .retain(|auth| !auth.authority().is_some_and(|a| NANO_BLACKLIST.contains(&a)));
+    let original = *req.tx.inner();
+    let (authorization_list, authorities) = original
+        .authorization_list()
+        .unwrap_or_default()
+        .iter()
+        .zip(original.authorizations())
+        .filter_map(|(signed, auth)| {
+            let authority = auth.authority();
+            (!authority.is_some_and(|a| NANO_BLACKLIST.contains(&a)))
+                .then(|| (signed.clone(), authority))
+        })
+        .unzip();
+    let filtered = LazyTxEip7702::from_cached_recovered_authorizations(
+        alloy_consensus::TxEip7702 {
+            chain_id: original.chain_id,
+            nonce: original.nonce,
+            gas_limit: original.gas_limit,
+            max_fee_per_gas: original.max_fee_per_gas,
+            max_priority_fee_per_gas: original.max_priority_fee_per_gas,
+            to: original.to,
+            value: original.value,
+            access_list: original.access_list.clone(),
+            input: original.input.clone(),
+            authorization_list,
+        },
+        authorities,
+    );
     let tx = alloy_consensus::transaction::Recovered::new_unchecked(&filtered, req.tx.signer());
     eip7702::execute_prepared::<T, BscHooks>(TxRequest { tx, ..req }, prepared)
 }

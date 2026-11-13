@@ -123,7 +123,7 @@ where
     fn execute_transaction_with_commit_condition(
         &mut self,
         tx: impl ExecutorTx<Self::Executor>,
-        f: impl FnOnce(&evm2::TxResult<BscEvmTypes>) -> CommitChanges,
+        f: impl FnOnce(&evm2::TxResult<BscEvmTypes>, evm2::TxStateChanges<'_>) -> CommitChanges,
     ) -> Result<Option<GasOutput>, BlockExecutionError> {
         let (tx_env, recovered) = tx.into_parts();
         if let Some(gas_output) =

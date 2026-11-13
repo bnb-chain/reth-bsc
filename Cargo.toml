@@ -21,7 +21,7 @@ reth-bsc-evm = { path = "crates/evm" }
 # Keep Reth's non-allocator defaults explicit so `--no-default-features` can
 # disable jemalloc throughout the dependency graph for static musl builds.
 # The local `jemalloc` feature below enables Reth's allocator for normal builds.
-reth = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff", default-features = false, features = [
+reth = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156", default-features = false, features = [
     "otlp",
     "otlp-logs",
     "js-tracer",
@@ -31,55 +31,55 @@ reth = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f0
     "min-trace-logs",
     "portable",
 ] }
-reth-cli = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-cli-commands = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-basic-payload-builder = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-db = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-engine-local = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-engine-tree = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-node-builder = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-cli-util = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-discv4 = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff", features = ["test-utils"] }
-reth-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff", features = ["serde"] }
-reth-ethereum-payload-builder = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-payload-builder-primitives = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-chain-state = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-eth-wire = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-eth-wire-types = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-errors = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-evm = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-execution-types = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-ipc = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-metrics = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-node-core = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-network = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff", features = ["test-utils"] }
-reth-network-p2p = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-network-api = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-node-ethereum = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff", features = ["test-utils"] }
-reth-network-peers = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-payload-primitives = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-ethereum-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
+reth-cli = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-cli-commands = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-basic-payload-builder = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-db = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-engine-local = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-engine-tree = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-node-builder = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-chainspec = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-cli-util = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-discv4 = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156", features = ["test-utils"] }
+reth-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-ethereum-forks = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156", features = ["serde"] }
+reth-ethereum-payload-builder = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-payload-builder-primitives = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-chain-state = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-ethereum-primitives = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-eth-wire = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-eth-wire-types = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-errors = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-evm = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-evm-ethereum = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-execution-types = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-ipc = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-metrics = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-node-core = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-network = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156", features = ["test-utils"] }
+reth-network-p2p = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-network-api = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-node-ethereum = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156", features = ["test-utils"] }
+reth-network-peers = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-payload-primitives = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-ethereum-engine-primitives = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
 reth-primitives-traits = { version = "0.8.2", default-features = false }
 reth-codecs = { version = "0.8.2" }
-reth-provider = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff", features = ["test-utils"] }
-reth-storage-overlay = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-rpc-eth-api = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-rpc-eth-types = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-rpc-convert = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-rpc-engine-api = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-rpc-server-types = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-tasks = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
-reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
+reth-provider = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156", features = ["test-utils"] }
+reth-storage-overlay = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-rpc-eth-api = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-rpc-eth-types = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-rpc-convert = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-rpc-engine-api = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-rpc-server-types = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-trie-common = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-trie-db = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-tasks = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
+reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
 # Used by BSC pure precompile implementations and the reference EVM test fixtures.
 revm = { version = "43.0.3", features = ["optional_balance_check"] }
-evm2 = { git = "https://github.com/alloy-rs/evm2", rev = "f93318f120f6300599b21170d6c7bef81ed63d87", default-features = false }
-evm2-inspectors = { git = "https://github.com/alloy-rs/evm2", rev = "f93318f120f6300599b21170d6c7bef81ed63d87", default-features = false }
+evm2 = { git = "https://github.com/alloy-rs/evm2", rev = "66687c18b34d3bdbb899f5eb7605070615c03475", default-features = false }
+evm2-inspectors = { git = "https://github.com/alloy-rs/evm2", rev = "66687c18b34d3bdbb899f5eb7605070615c03475", default-features = false }
 revm-database = "43.0.0"
 revm-bytecode = "43.0.0"
 revm-state = "43.0.0"
@@ -278,12 +278,12 @@ debug = "line-tables-only"
 strip = false
 
 [dev-dependencies]
-reth-db-common = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
+reth-db-common = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
-reth-rpc = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff" }
+reth-rpc = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156" }
 criterion = "0.5"
 uuid = { version = "1", features = ["v4"] }
-reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", rev = "664f9c1685d2376f030a62adb83ee0a463a29eff", features = ["test-utils"] }
+reth-transaction-pool = { git = "https://github.com/bnb-chain/reth.git", rev = "d0080ff8a8d2262d96ed67aef3d9c0aeedbc8156", features = ["test-utils"] }
 # `test-util` gives tests a paused clock (`start_paused`, `time::advance`), so timing invariants
 # can be asserted by ordering instead of racing a wall clock.
 tokio = { version = "1.44", features = ["full", "test-util"] }
@@ -295,10 +295,13 @@ required-features = ["bench-test"]
 
 # Preserve BSC header conversion and sealed-header replacement with reth-core 0.8.2.
 [patch.crates-io]
-# Required by Reth v2.9's optional LLVM 23 JIT dependency.
-inkwell = { git = "https://github.com/TheDan64/inkwell", rev = "c9d9734ae17dbaf1d9902dab3b8ee9d2041781ff" }
 reth-rpc-traits = { git = "https://github.com/bnb-chain/reth-core", rev = "ecc69684cb678c261156ca21977cb89614a768d0" }
 reth-primitives-traits = { git = "https://github.com/bnb-chain/reth-core", rev = "ecc69684cb678c261156ca21977cb89614a768d0" }
 reth-codecs = { git = "https://github.com/bnb-chain/reth-core", rev = "ecc69684cb678c261156ca21977cb89614a768d0" }
 reth-codecs-derive = { git = "https://github.com/bnb-chain/reth-core", rev = "ecc69684cb678c261156ca21977cb89614a768d0" }
 reth-zstd-compressors = { git = "https://github.com/bnb-chain/reth-core", rev = "ecc69684cb678c261156ca21977cb89614a768d0" }
+
+[patch."https://github.com/alloy-rs/evm2"]
+evm2 = { git = "https://github.com/DaniPopes/evm2", rev = "66687c18b34d3bdbb899f5eb7605070615c03475" }
+evm2-inspectors = { git = "https://github.com/DaniPopes/evm2", rev = "66687c18b34d3bdbb899f5eb7605070615c03475" }
+evm2-jit = { git = "https://github.com/DaniPopes/evm2", rev = "66687c18b34d3bdbb899f5eb7605070615c03475" }

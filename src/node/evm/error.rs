@@ -16,7 +16,7 @@ pub(crate) struct PreExecutionValidationError(BlockValidationError);
 pub(crate) fn mark_pre_execution_error(error: BlockExecutionError) -> BlockExecutionError {
     match error {
         BlockExecutionError::Validation(error) => BlockExecutionError::Validation(
-            BlockValidationError::Other(Box::new(PreExecutionValidationError(error))),
+            BlockValidationError::other(PreExecutionValidationError(error)),
         ),
         internal => internal,
     }
@@ -25,7 +25,7 @@ pub(crate) fn mark_pre_execution_error(error: BlockExecutionError) -> BlockExecu
 pub(crate) fn is_execution_evidence(error: &BlockExecutionError) -> bool {
     match error {
         BlockExecutionError::Validation(BlockValidationError::Other(error)) => {
-            !error.is::<PreExecutionValidationError>()
+            error.downcast_ref::<PreExecutionValidationError>().is_none()
         }
         BlockExecutionError::Validation(_) => true,
         BlockExecutionError::Internal(_) => false,
@@ -397,13 +397,13 @@ impl InvalidTxError for InvalidNativeTransaction {
 pub(super) fn with_transaction_hash(error: BlockExecutionError, hash: B256) -> BlockExecutionError {
     match error {
         BlockExecutionError::Validation(BlockValidationError::Other(error)) => {
-            match error.downcast::<HandlerError>() {
-                Ok(error) => BlockValidationError::InvalidTx {
+            match error.downcast_ref::<HandlerError>() {
+                Some(native) => BlockValidationError::InvalidTx {
                     hash,
-                    error: Box::new(InvalidNativeTransaction(*error)),
+                    error: Box::new(InvalidNativeTransaction(native.clone())),
                 }
                 .into(),
-                Err(error) => BlockValidationError::Other(error).into(),
+                None => BlockValidationError::Other(error).into(),
             }
         }
         error => error,
@@ -443,8 +443,7 @@ mod native_transaction_error_tests {
             ),
         ];
         for (error, nonce_low, gas_high, gas_low) in cases {
-            let error =
-                with_transaction_hash(BlockValidationError::Other(Box::new(error)).into(), hash);
+            let error = with_transaction_hash(BlockValidationError::other(error).into(), hash);
             let BlockExecutionError::Validation(BlockValidationError::InvalidTx {
                 hash: actual,
                 error,
@@ -467,8 +466,7 @@ mod native_transaction_error_tests {
         );
         assert!(error.as_internal().is_some());
         assert!(error.to_string().contains("state provider unavailable"));
-        let other =
-            BlockValidationError::Other(Box::new(std::io::Error::other("non-native error")));
+        let other = BlockValidationError::other(std::io::Error::other("non-native error"));
         let error = with_transaction_hash(other.into(), B256::ZERO);
         assert!(matches!(error, BlockExecutionError::Validation(BlockValidationError::Other(_))));
     }

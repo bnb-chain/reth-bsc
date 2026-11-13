@@ -313,6 +313,11 @@ pub(super) fn run_native(
     let kind = resolve(address).expect("CAS20 route was resolved");
     let observer = NodeObserver;
     let started = observer.enabled().then(Instant::now);
+    // Nested execution can mutate caller memory, so borrowed calldata must be copied first.
+    let input = match message.input.as_owned() {
+        Some(input) => std::borrow::Cow::Borrowed(input.as_ref()),
+        None => std::borrow::Cow::Owned(evm.message_input(message).to_vec()),
+    };
     let mut frame = Frame::new(evm, gas.remaining());
     let ctx = Ctx {
         frame: &mut frame,
@@ -323,12 +328,12 @@ pub(super) fn run_native(
         value: message.value,
         admin_renounced: false,
     };
-    let result = execute(kind, ctx, &message.input);
+    let result = execute(kind, ctx, &input);
     let (outcome, used, refund) = complete(&mut frame, result);
     if let Some(started) = started {
         observer.record_call(&CallRecord {
             kind,
-            selector: sigs::selector_index(&message.input),
+            selector: sigs::selector_index(&input),
             status: outcome.status(),
             gas_used: used,
             elapsed: started.elapsed(),
