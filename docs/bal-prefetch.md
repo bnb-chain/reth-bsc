@@ -76,10 +76,11 @@ remain unchanged. Peers without `bsc-bal/1` remain connected normally.
 
 ## Metrics and validation
 
-`bsc_bal_hints_sent_total` and `bsc_bal_hints_received_total` count hint frames.
-`bsc_bal_hint_lookup_total{result="hit"|"miss"}` reports arrival before validation;
+`reth_bsc_bal_hints_sent_total` and `reth_bsc_bal_hints_received_total` count hint frames
+in the node's Prometheus endpoint.
+`reth_bsc_bal_hint_lookup_total{result="hit"|"miss"}` reports arrival before validation;
 a hit can still be rejected by the engine's decoder or resource limits.
-`bsc_bal_hints_lagged_total` counts outgoing subscriber lag. Existing engine cache
+`reth_bsc_bal_hints_lagged_total` counts outgoing subscriber lag. Existing engine cache
 and BAL-prefetch metrics measure cache activity.
 
 Focused checks:
@@ -96,7 +97,9 @@ The regression tests cover frame bounds, cache eviction/expiry and block binding
 unsupported peers, stripping advertised values, malformed-hint fallback, resource
 limits, local-state cache contents, disable flags, and transaction ordering.
 They also compare BSC transaction results and state with collection enabled and disabled.
-Live multi-node propagation and performance benchmarks are separate validation work.
+Live multi-node propagation and mixed-client correctness were also checked in the
+[local cluster run](bal-local-cluster-2026-11-13.md). Performance benchmarks remain
+separate validation work.
 
 Validated locally with Rust 1.99.0 on 2026-11-13: all seven BSC BAL tests and all four
 engine read-hint tests passed. The full BSC library run had 781 passes, one ignored

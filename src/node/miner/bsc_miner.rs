@@ -1068,6 +1068,14 @@ where
             BscNewBlock(reth_eth_wire::NewBlock { block: sealed_block.clone_block(), td });
         let msg = NewBlockMessage { hash: block_hash, block: Arc::new(new_block) };
 
+        // Both import paths below must publish hints before scheduling block diffusion.
+        crate::node::bal::publish(
+            block_hash,
+            parent_hash,
+            block_number,
+            payload.bal_read_hint.clone(),
+        );
+
         let incoming = if self.submit_built_payload {
             IncomingLocalBlock::Mined(Box::new((payload, msg)))
         } else {
