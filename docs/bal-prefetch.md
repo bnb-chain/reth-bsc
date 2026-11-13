@@ -100,6 +100,8 @@ They also compare BSC transaction results and state with collection enabled and 
 Live multi-node propagation and mixed-client correctness were also checked in the
 [local cluster run](bal-local-cluster-2026-11-13.md). Performance benchmarks remain
 separate validation work.
+The subsequent [common suite](bal-common-suite-2026-11-13.md) also passed BEP-675,
+CAS20, ERC20, BNB transfer and Uniswap V2 scenarios on a mixed-client BAL cluster.
 
 Validated locally with Rust 1.99.0 on 2026-11-13: all seven BSC BAL tests and all four
 engine read-hint tests passed. The full BSC library run had 781 passes, one ignored
