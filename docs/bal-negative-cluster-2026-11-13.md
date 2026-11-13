@@ -114,3 +114,43 @@ Use a fresh output directory or archive prior reports before repeating.
 All four owned processes were stopped. The regular target binary was restored and
 its hash verified against the stock binary. No fault hook was added to the feature
 branch. The reusable local-cluster skill now includes the negative-BAL procedure.
+
+## Local rerun
+
+Repeated on 2026-11-13 from branch HEAD `0831b7c66d5c2d1f502bc3fd0a590289def0e73e`.
+The Rust source and companion Reth revision were unchanged; both reused binaries
+were checked against their recorded SHA-256 hashes. An isolated copy of the stopped
+negative-test chain used HTTP ports 28480–28483 and P2P ports 32680–32683.
+
+All **13 fault cases passed again**, with **830 successful workload transactions**
+(one deployment and 829 storage writes). All **694 blocks from 1835 through 2528**
+matched across the four clients, as did every workload receipt and the final
+contract state. Irrelevant-access and forged-value hints each invoked BAL prewarm
+ten times without affecting correctness. The 64-frame burst caused no observed
+disconnect; the oversized transport frame disconnected the producer and incremented
+the receiver's oversize counter once. Reconnection and resumed normal hint hits
+were verified before all owned processes were stopped.
+
+```text
+block:     2528
+hash:      0xf11e40c5472d089b64e2343fc920c5a8618216e70d39ac94a08cf9b24e8328a1
+stateRoot: 0x6b9e8a5f64c52ba2ed78fbbbf6513e02186839793d9b7e8d54727d7312f20ac0
+```
+
+The first rerun attempt stopped during deployment receipt comparison, before any
+fault injection. Logs showed startup reorganizations after the copied validators
+connected. The harness previously treated peer connectivity as sufficient readiness
+and compared receipts before settlement. It now requires 24 new blocks and matching
+settled roots before deploying, waits 12 blocks before comparing receipts, and
+fetches those receipts again after the wait. The original setup transaction was
+also verified successfully with identical receipts on all four clients after
+convergence. No client Rust changes were needed.
+
+Artifacts are retained in
+`/Users/chee/Documents/repo/bal-negative-cluster-2026-11-13-rerun/`:
+`results/negative-report.json`, `verification.json`, `verified-blocks.json`,
+`provenance.json`, `run-status.json`, node logs and metrics. The initial failure
+and its unmodified harness are preserved under `startup-attempt-1/`.
+`results/harness-settlement.patch` records the scoped harness correction;
+`run_once.py` bounds each phase and stops owned processes on success or failure.
+The reusable skill now documents the startup/receipt-settlement requirement.
