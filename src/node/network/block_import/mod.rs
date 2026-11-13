@@ -2,6 +2,7 @@
 pub(crate) mod metrics;
 pub(crate) mod pipeline_targets;
 pub(crate) mod propagation;
+pub(crate) mod publication;
 use handle::ImportHandle;
 use reth_engine_primitives::EngineTypes;
 use reth_eth_wire_types::DisconnectReason;
@@ -18,8 +19,10 @@ use std::{
 
 use crate::node::network::BscNewBlock;
 
+pub mod config;
 pub(crate) mod fork_recover;
 pub mod handle;
+pub(crate) mod head_fetch;
 pub mod service;
 
 const MAX_NEW_BLOCK_HASHES: usize = 1024;
@@ -32,11 +35,17 @@ pub(crate) const IMPORT_QUEUE_CAPACITY: usize = 128;
 #[derive(Debug)]
 pub struct BscBlockImport {
     handle: ImportHandle,
+    publication: Option<publication::Publication>,
 }
 
 impl BscBlockImport {
     pub fn new(handle: ImportHandle) -> Self {
-        Self { handle }
+        Self { handle, publication: None }
+    }
+
+    pub(crate) fn with_publication(mut self, publication: publication::Publication) -> Self {
+        self.publication = Some(publication);
+        self
     }
 }
 
@@ -66,10 +75,15 @@ impl BlockImport<BscNewBlock> for BscBlockImport {
     }
 
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<ImportEvent> {
-        match ready!(self.handle.poll_outcome(cx)) {
-            Some(outcome) => Poll::Ready(outcome),
-            None => Poll::Pending,
+        for _ in 0..32 {
+            let Some(outcome) = ready!(self.handle.poll_outcome(cx)) else { return Poll::Pending };
+            let Some(publication) = &self.publication else { return Poll::Ready(outcome) };
+            if let Some(outcome) = publication.filter_event(outcome) {
+                return Poll::Ready(outcome);
+            }
         }
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 }
 

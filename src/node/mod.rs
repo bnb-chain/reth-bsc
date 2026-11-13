@@ -15,7 +15,7 @@ use crate::{
 use consensus::BscConsensusBuilder;
 use engine::BscPayloadServiceBuilder;
 use evm::BscExecutorBuilder;
-use network::BscNetworkBuilder;
+use network::{block_import::config::BlockSyncConfig, BscNetworkBuilder};
 use reth::{
     api::{FullNodeComponents, FullNodeTypes, NodeTypes, PrimitivesTy},
     builder::{
@@ -45,6 +45,7 @@ pub mod pool;
 pub mod primitives;
 mod reorg_metrics;
 pub mod startup_recovery;
+pub mod startup_sync;
 pub mod storage;
 pub mod vote_journal;
 pub mod vote_producer;
@@ -110,13 +111,22 @@ where
 /// Type configuration for a regular BSC node.
 #[derive(Debug, Clone)]
 pub struct BscNode {
+    block_sync: Arc<BlockSyncConfig>,
     engine_handle_rx: Arc<Mutex<Option<oneshot::Receiver<ConsensusEngineHandle<BscPayloadTypes>>>>>,
+    disable_proactive_tx_broadcast: bool,
 }
 
 impl BscNode {
     pub fn new() -> (Self, oneshot::Sender<ConsensusEngineHandle<BscPayloadTypes>>) {
         let (tx, rx) = oneshot::channel();
-        (Self { engine_handle_rx: Arc::new(Mutex::new(Some(rx))) }, tx)
+        (
+            Self {
+                block_sync: Arc::new(BlockSyncConfig::default()),
+                engine_handle_rx: Arc::new(Mutex::new(Some(rx))),
+                disable_proactive_tx_broadcast: false,
+            },
+            tx,
+        )
     }
 }
 
@@ -128,6 +138,19 @@ impl Default for BscNode {
 }
 
 impl BscNode {
+    /// Configure block retrieval and share its recovery gate with startup catch-up.
+    pub fn with_block_sync(mut self, config: Arc<BlockSyncConfig>) -> Self {
+        self.block_sync = config;
+        self
+    }
+
+    /// Configure outbound-only transaction broadcast suppression before building the node.
+    /// Defaults to false and does not restrict receiving or serving transaction requests.
+    pub fn with_disable_proactive_tx_broadcast(mut self, disabled: bool) -> Self {
+        self.disable_proactive_tx_broadcast = disabled;
+        self
+    }
+
     /// Returns a [`ComponentsBuilder`] configured for a regular BSC node.
     pub fn components<Node>(
         &self,
@@ -147,7 +170,11 @@ impl BscNode {
             .pool(BscPoolBuilder::default())
             .executor(BscExecutorBuilder::default())
             .payload(BscPayloadServiceBuilder::default())
-            .network(BscNetworkBuilder::new(self.engine_handle_rx.clone()))
+            .network(
+                BscNetworkBuilder::new(self.engine_handle_rx.clone())
+                    .with_sync_config(self.block_sync.clone())
+                    .with_disable_proactive_tx_broadcast(self.disable_proactive_tx_broadcast),
+            )
             .consensus(BscConsensusBuilder::default())
     }
 }

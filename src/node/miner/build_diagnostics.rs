@@ -110,7 +110,7 @@ impl BuildWorkObservation {
             // Rebuilds share the job's deadline, so they may enter with a smaller window.
             metrics::histogram!("bsc.build_diagnostics.attempt_transaction_window_seconds", "kind" => kind.label(),
                 "turn" => if inturn { "inturn" } else { "outofturn" })
-                .record(control.transactions_until.saturating_duration_since(started).as_secs_f64());
+                .record(control.transactions_until().saturating_duration_since(started).as_secs_f64());
         }
         Self {
             kind: kind.label(),
@@ -121,8 +121,8 @@ impl BuildWorkObservation {
             acquired: None,
             executing: None,
             stopped: None,
-            transaction_deadline: control.map(|c| c.transactions_until),
-            finish_deadline: control.map(|c| c.finish_until),
+            transaction_deadline: control.map(|c| c.transactions_until()),
+            finish_deadline: control.map(|c| c.finish_until()),
             reason: "incomplete",
             completed: false,
             scanned: 0,
@@ -141,7 +141,15 @@ impl BuildWorkObservation {
         metrics::gauge!("bsc.build_diagnostics.permit_waiters", "kind" => self.kind, "turn" => self.turn).decrement(1.0);
     }
 
-    pub(crate) fn execution_started(&mut self, now: Instant) {
+    pub(crate) fn execution_started(
+        &mut self,
+        now: Instant,
+        control: Option<&super::build_control::BuildControl>,
+    ) {
+        if let Some(control) = control {
+            self.transaction_deadline = Some(control.transactions_until());
+            self.finish_deadline = Some(control.finish_until());
+        }
         self.executing = Some(now);
         self.selection_phase = Some((SelectionStage::Control, now));
         if let Some(deadline) = self.transaction_deadline {
@@ -404,7 +412,7 @@ impl Drop for AttemptObservation {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{super::build_control::BuildControl, *};
     use metrics_exporter_prometheus::PrometheusBuilder;
 
     #[test]
@@ -414,7 +422,7 @@ mod tests {
         metrics::with_local_recorder(&recorder, || {
             let mut limited = BuildWorkObservation::new(AttemptKind::Regular, true, 1, 1, None);
             limited.permit_acquired();
-            limited.execution_started(Instant::now());
+            limited.execution_started(Instant::now(), None);
             limited.scanned = 7_500;
             limited.executed = 2_500;
             limited.gas_limit_skip_peak = 5_000;
@@ -465,7 +473,7 @@ mod tests {
             let mut work = BuildWorkObservation::new(AttemptKind::Regular, true, 1, 1, None);
             work.permit_acquired();
             let start = Instant::now() - Duration::from_millis(20);
-            work.execution_started(start);
+            work.execution_started(start, None);
             work.close_selection_phase(start + Duration::from_millis(2));
             work.selection_phase =
                 Some((SelectionStage::Iterator, start + Duration::from_millis(2)));
@@ -511,7 +519,7 @@ mod tests {
             drop(BuildWorkObservation::new(AttemptKind::Speculative, false, 1, 1, None));
             let mut failed = BuildWorkObservation::new(AttemptKind::Regular, true, 2, 1, None);
             failed.permit_acquired();
-            failed.execution_started(Instant::now());
+            failed.execution_started(Instant::now(), None);
             failed.scanned = 3;
             failed.executed = 1;
             failed.skip(SkipReason::NonceTooLow, Instant::now());
@@ -569,7 +577,6 @@ mod tests {
 
     #[test]
     fn execution_window_excludes_time_spent_waiting_and_expired_windows_are_zero() {
-        use super::super::build_control::BuildControl;
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, || {
@@ -584,7 +591,10 @@ mod tests {
             let mut work =
                 BuildWorkObservation::new(AttemptKind::Regular, true, 1, 1, Some(&control));
             work.permit_acquired();
-            work.execution_started(control.transactions_until - Duration::from_millis(80));
+            work.execution_started(
+                control.transactions_until() - Duration::from_millis(80),
+                Some(&control),
+            );
             // Only the observation boundary is synthetic; reset before Drop's elapsed timing.
             work.executing = Some(Instant::now());
             work.selection_stopped("transaction_deadline");
@@ -593,7 +603,10 @@ mod tests {
             let mut expired =
                 BuildWorkObservation::new(AttemptKind::Rebuild, true, 1, 1, Some(&control));
             expired.permit_acquired();
-            expired.execution_started(control.transactions_until + Duration::from_millis(1));
+            expired.execution_started(
+                control.transactions_until() + Duration::from_millis(1),
+                Some(&control),
+            );
             expired.executing = Some(Instant::now());
         });
         let rendered = handle.render();
@@ -606,6 +619,39 @@ mod tests {
             l.starts_with("bsc_build_diagnostics_execution_window_seconds_sum") &&
                 l.contains("rebuild") &&
                 l.ends_with(" 0")
+        }));
+    }
+
+    #[test]
+    fn execution_window_uses_the_selection_entry_floor_not_the_initial_job_deadline() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let start = Instant::now();
+            let reserve = Duration::from_millis(30);
+            let control = BuildControl::new(
+                start,
+                Duration::from_millis(450),
+                reserve,
+                Duration::ZERO,
+                Default::default(),
+            )
+            .with_late_finish(true, start, reserve)
+            .with_first_transaction_window(true);
+            let mut work =
+                BuildWorkObservation::new(AttemptKind::Regular, true, 1, 1, Some(&control));
+            work.permit_acquired();
+            let entry = start + Duration::from_millis(200);
+            control.start_transaction_selection(entry).unwrap();
+            work.execution_started(entry, Some(&control));
+            assert_eq!(work.transaction_deadline, Some(entry + Duration::from_millis(50)));
+            assert_eq!(work.finish_deadline, Some(entry + Duration::from_millis(80)));
+            work.executing = Some(Instant::now());
+        });
+        assert!(handle.render().lines().any(|line| {
+            line.starts_with("bsc_build_diagnostics_execution_window_seconds_sum") &&
+                line.contains("regular") &&
+                line.ends_with(" 0.05")
         }));
     }
 

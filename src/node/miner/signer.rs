@@ -112,7 +112,7 @@ impl MinerSigner {
         // Also protect callers outside the ordinary mining work scheduler.
         if !crate::node::startup_recovery::is_ready() {
             return Err(SignerError::SigningFailed(
-                "Persisted finalized history is not restored".to_string(),
+                "Startup history recovery and network head assessment are not complete".to_string(),
             ));
         }
         let hash_data = hash_with_chain_id(header, chain_id);

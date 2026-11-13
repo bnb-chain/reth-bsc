@@ -186,7 +186,8 @@ mod tests {
     use alloy_eips::BlockNumHash;
     use reth_primitives_traits::{Account, RecoveredBlock};
     use reth_provider::{
-        providers::LatestStateProvider, test_utils::create_test_provider_factory, StateRootProvider,
+        providers::LatestStateProvider, test_utils::create_test_provider_factory, BlockWriter,
+        StageCheckpointWriter, StateRootProvider,
     };
     use reth_storage_overlay::StateTrieOverlay;
     use reth_trie_common::{HashedPostState, HashedStorage, SortedTrieData};
@@ -221,12 +222,42 @@ mod tests {
         )
     }
 
+    fn genesis_anchor() -> BlockNumHash {
+        BlockNumHash::new(0, Header::default().hash_slow())
+    }
+
     fn overlay(
         manager: &OverlayManager<BscPrimitives>,
         tip: B256,
         anchor: BlockNumHash,
     ) -> StateTrieOverlay {
         let factory = create_test_provider_factory();
+        let writer = factory.provider_rw().unwrap();
+        // Cache fixtures use an empty genesis and a canonical prefix with timestamp = height.
+        // Persist that exact prefix: capture validates the supplied frontier against this RO.
+        let mut header = Header::default();
+        for number in 0..=anchor.number {
+            if number > 0 {
+                header = Header {
+                    number,
+                    parent_hash: header.hash_slow(),
+                    timestamp: number,
+                    ..Default::default()
+                };
+            }
+            writer
+                .insert_block(&RecoveredBlock::new_unhashed(
+                    reth_ethereum_primitives::Block {
+                        header: header.clone(),
+                        body: Default::default(),
+                    },
+                    Vec::new(),
+                ))
+                .unwrap();
+        }
+        assert_eq!(header.hash_slow(), anchor.hash);
+        writer.update_pipeline_stages(anchor.number, true).unwrap();
+        writer.commit().unwrap();
         manager
             .overlay_builder(tip)
             .build_state_trie_overlay_at_frontiers(
@@ -509,7 +540,7 @@ mod tests {
 
     #[test]
     fn retries_share_computed_overlay_and_extension_matches_fresh_root() {
-        let anchor = BlockNumHash::new(0, B256::ZERO);
+        let anchor = genesis_anchor();
         let a = block(1, anchor.hash, 1);
         let b = block(2, a.recovered_block().hash(), 2);
         let mut cache = MinerOverlayCache::default();
@@ -534,7 +565,7 @@ mod tests {
 
     #[test]
     fn reorg_and_rollback_leave_inflight_parent_intact() {
-        let anchor = BlockNumHash::new(0, B256::ZERO);
+        let anchor = genesis_anchor();
         let a = block(1, anchor.hash, 1);
         let b = block(2, a.recovered_block().hash(), 2);
         let fork = block(2, a.recovered_block().hash(), 99);
@@ -563,7 +594,7 @@ mod tests {
 
     #[test]
     fn persistence_frontier_change_rotates_without_pruning_old_task() {
-        let anchor = BlockNumHash::new(0, B256::ZERO);
+        let anchor = genesis_anchor();
         let a = block(1, anchor.hash, 1);
         let b = block(2, a.recovered_block().hash(), 2);
         let mut cache = MinerOverlayCache::default();
@@ -586,7 +617,7 @@ mod tests {
     fn stalled_persistence_bounds_generation_lifetime() {
         let mut cache = MinerOverlayCache::default();
         let mut chain = Vec::new();
-        let mut tip = B256::ZERO;
+        let mut tip = genesis_anchor().hash;
         let mut created = 0;
         let mut old = None;
         for number in 1..=MAX_PARENTS_PER_GENERATION + 1 {
@@ -606,7 +637,7 @@ mod tests {
         assert_eq!(created, 2);
         assert_eq!(cache.generations.front().unwrap().views.len(), 1);
         let first = chain.last().unwrap();
-        let anchor = BlockNumHash::new(0, B256::ZERO);
+        let anchor = genesis_anchor();
         let retained = overlay(&old.unwrap(), first.recovered_block().hash(), anchor);
         assert_eq!(
             root(&retained),
@@ -620,7 +651,7 @@ mod tests {
 
     #[test]
     fn skipped_heads_and_changed_database_frontier_match_fresh_overlay() {
-        let anchor = BlockNumHash::new(0, B256::ZERO);
+        let anchor = genesis_anchor();
         let a = block(1, anchor.hash, 1);
         let b = block(2, a.recovered_block().hash(), 2);
         let c = block(3, b.recovered_block().hash(), 3);
@@ -642,7 +673,7 @@ mod tests {
 
     #[test]
     fn old_worker_can_finish_after_concurrent_generation_replacement() {
-        let anchor = BlockNumHash::new(0, B256::ZERO);
+        let anchor = genesis_anchor();
         let a = block(1, anchor.hash, 1);
         let b = block(2, a.recovered_block().hash(), 2);
         let fork = block(2, a.recovered_block().hash(), 99);
@@ -666,7 +697,7 @@ mod tests {
     }
     #[test]
     fn frontier_progress_reuses_manager_but_not_wrong_anchor_overlay() {
-        let anchor = BlockNumHash::new(0, B256::ZERO);
+        let anchor = genesis_anchor();
         let a = block(1, anchor.hash, 1);
         let b = block(2, a.recovered_block().hash(), 2);
         let c = block(3, b.recovered_block().hash(), 3);
@@ -694,7 +725,7 @@ mod tests {
 
     #[test]
     fn returning_to_retained_fork_reuses_completed_overlay() {
-        let anchor = BlockNumHash::new(0, B256::ZERO);
+        let anchor = genesis_anchor();
         let a = block(1, anchor.hash, 1);
         let b = block(2, a.recovered_block().hash(), 2);
         let fork = block(2, a.recovered_block().hash(), 99);
@@ -711,7 +742,7 @@ mod tests {
 
     #[test]
     fn eviction_bounds_owners_without_invalidating_old_readers() {
-        let anchor = BlockNumHash::new(0, B256::ZERO);
+        let anchor = genesis_anchor();
         let a = block(1, anchor.hash, 1);
         let mut cache = MinerOverlayCache::default();
         let old = cache.for_parent(std::slice::from_ref(&a), OverlayManager::default).0;

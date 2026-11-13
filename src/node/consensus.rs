@@ -14,7 +14,7 @@ use crate::{
     shared, BscBlock, BscBlockBody, BscPrimitives,
 };
 use alloy_consensus::{Header, TxReceipt};
-use alloy_eips::Encodable2718;
+use alloy_eips::{BlockNumHash, Encodable2718};
 use alloy_primitives::{Bytes, B256};
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
 use reth::{
@@ -1147,6 +1147,15 @@ pub struct BscForkChoiceEngine<P> {
     consensus_metrics: crate::metrics::BscConsensusMetrics,
 }
 
+/// A Parlia decision prepared against one exact canonical hash, not an Engine mutation.
+pub(crate) struct PreparedForkchoice {
+    pub(crate) expected_head: B256,
+    pub(crate) state: ForkchoiceState,
+    head_number: u64,
+    safe_number: u64,
+    finalized_number: u64,
+}
+
 impl<P> BscForkChoiceEngine<P>
 where
     P: BlockNumReader + HeaderProvider<Header = Header> + Clone + Send + Sync,
@@ -1175,6 +1184,19 @@ where
         &self.chain_spec
     }
 
+    /// Returns Parlia finality for a locally known canonical head, not a remote sync target.
+    /// `None` means fast finality or the head snapshot is not available.
+    pub(crate) fn finalized_number_at_head(
+        &self,
+        head_number: u64,
+    ) -> Result<Option<u64>, reth_provider::ProviderError> {
+        Ok(self
+            .provider
+            .header_by_number(head_number)?
+            .and_then(|head| self.get_finalized_number_and_hash(&head))
+            .map(|(number, _)| number))
+    }
+
     /// Updates the fork choice based on the incoming header.
     ///
     /// This function evaluates whether the incoming header should become the new canonical head
@@ -1199,66 +1221,13 @@ where
             "Updating fork choice with incoming header"
         );
 
+        let prepared = self.prepare_forkchoice(incoming_header, None).await?;
+        let state = prepared.state;
         let source =
             crate::node::miner::startup_diagnostics::handoff_source(incoming_header.hash_slow());
-        let preparation = crate::node::miner::startup_diagnostics::HandoffStage::new(
-            "forkchoice_prepare",
-            source,
-        );
-        let current_number = self.provider.chain_info()?.best_number;
-        tracing::trace!(target: "bsc::forkchoice", "Best canonical number: {:?}, new_header = {:?}", current_number, incoming_header);
-
-        let current_head = self
-            .provider
-            .header_by_number(current_number)?
-            .ok_or(ParliaConsensusErr::HeadHashNotFound)?;
-
-        // Determine if we need to reorg using fork choice rules
-        let need_reorg = match self.is_need_reorg(incoming_header, &current_head).await {
-            Ok(need_reorg) => need_reorg,
-            Err(e) => {
-                // Bailing here means no forkchoice update is sent and the canonical head stays
-                // put, so this must be visible in metrics — callers only log it at warn.
-                self.consensus_metrics.forkchoice_update_errors_total.increment(1);
-                return Err(e);
-            }
-        };
-
-        // A preferred head may simply extend the current chain by several blocks.
-        // Reorg metrics are recorded from the engine's canonical notifications instead.
-        let new_canonical_head = if need_reorg { incoming_header } else { &current_head };
-
-        // Get safe block and finalized block with new canonical head
-        // ref: https://github.com/bnb-chain/bsc/blob/f70aaa8399ccee429804eecf3fc4c6fd8d9e6cab/eth/api_backend.go#L72
-        let (safe_block_number, safe_block_hash) =
-            self.get_justified_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
-        let (finalized_block_number, finalized_block_hash) =
-            self.get_finalized_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
-
-        // Update finality metrics
-        self.finality_metrics.justified_block_height.set(safe_block_number as f64);
-        self.finality_metrics.safe_block_height.set(safe_block_number as f64);
-        self.finality_metrics.finalized_block_height.set(finalized_block_number as f64);
-
-        let state = ForkchoiceState {
-            head_block_hash: new_canonical_head.hash_slow(),
-            safe_block_hash,
-            finalized_block_hash,
-        };
-
-        tracing::debug!(
-            target: "bsc::forkchoice",
-            ?state,
-            new_canonical_head_number = new_canonical_head.number,
-            new_canonical_head_hash = ?new_canonical_head.hash_slow(),
-            incoming_header_number = incoming_header.number,
-            incoming_header_hash = ?incoming_header.hash_slow(),
-            safe_block_number,
-            finalized_block_number,
-            "Fork choice updated"
-        );
-
-        drop(preparation);
+        self.finality_metrics.justified_block_height.set(prepared.safe_number as f64);
+        self.finality_metrics.safe_block_height.set(prepared.safe_number as f64);
+        self.finality_metrics.finalized_block_height.set(prepared.finalized_number as f64);
         let fcu_roundtrip =
             crate::node::miner::startup_diagnostics::HandoffStage::new("fcu_roundtrip", source);
         let outcome = match self.engine_handle.fork_choice_updated(state, None).await {
@@ -1288,10 +1257,99 @@ where
         // A failed update means the block did not become canonical, so there is
         // nothing to promote against.
         if outcome.is_ok() {
-            crate::consensus::parlia::vote_pool::promote_future_votes(new_canonical_head.number);
+            crate::consensus::parlia::vote_pool::promote_future_votes(prepared.head_number);
         }
 
         outcome
+    }
+
+    /// Prepare without mutating Engine state or reporting applied finality. A stale combined
+    /// result supplies the exact current hash for a bounded re-evaluation.
+    pub(crate) async fn prepare_forkchoice(
+        &self,
+        incoming_header: &Header,
+        current_hash: Option<B256>,
+    ) -> Result<PreparedForkchoice, ParliaConsensusErr> {
+        let source =
+            crate::node::miner::startup_diagnostics::handoff_source(incoming_header.hash_slow());
+        let preparation = crate::node::miner::startup_diagnostics::HandoffStage::new(
+            "forkchoice_prepare",
+            source,
+        );
+        // Ordinary imports retain their original number-based lookup. The local combined
+        // path supplies an exact hash, which the Engine validates before applying the choice.
+        let current_head = match current_hash {
+            Some(hash) => self.provider.header(hash)?,
+            None => self.provider.header_by_number(self.provider.chain_info()?.best_number)?,
+        }
+        .ok_or(ParliaConsensusErr::HeadHashNotFound)?;
+        let current_hash = current_head.hash_slow();
+
+        // Determine if we need to reorg using fork choice rules
+        let need_reorg = match self.is_need_reorg(incoming_header, &current_head).await {
+            Ok(need_reorg) => need_reorg,
+            Err(e) => {
+                // Bailing here means no forkchoice update is sent and the canonical head stays
+                // put, so this must be visible in metrics — callers only log it at warn.
+                self.consensus_metrics.forkchoice_update_errors_total.increment(1);
+                return Err(e);
+            }
+        };
+
+        // A preferred head may simply extend the current chain by several blocks.
+        // Reorg metrics are recorded from the engine's canonical notifications instead.
+        let new_canonical_head = if need_reorg { incoming_header } else { &current_head };
+
+        // Get safe block and finalized block with new canonical head
+        // ref: https://github.com/bnb-chain/bsc/blob/f70aaa8399ccee429804eecf3fc4c6fd8d9e6cab/eth/api_backend.go#L72
+        let (safe_block_number, safe_block_hash) =
+            self.get_justified_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
+        let (finalized_block_number, finalized_block_hash) =
+            self.get_finalized_number_and_hash(new_canonical_head).unwrap_or((0, B256::ZERO));
+
+        let state = ForkchoiceState {
+            head_block_hash: new_canonical_head.hash_slow(),
+            safe_block_hash,
+            finalized_block_hash,
+        };
+
+        tracing::debug!(
+            target: "bsc::forkchoice",
+            ?state,
+            new_canonical_head_number = new_canonical_head.number,
+            new_canonical_head_hash = ?new_canonical_head.hash_slow(),
+            incoming_header_number = incoming_header.number,
+            incoming_header_hash = ?incoming_header.hash_slow(),
+            safe_block_number,
+            finalized_block_number,
+            "Prepared fork choice"
+        );
+
+        drop(preparation);
+        Ok(PreparedForkchoice {
+            expected_head: current_hash,
+            state,
+            head_number: new_canonical_head.number,
+            safe_number: safe_block_number,
+            finalized_number: finalized_block_number,
+        })
+    }
+
+    /// Called only after a combined request returned VALID and the selected head is canonical.
+    pub(crate) fn complete_local_forkchoice(
+        &self,
+        head: BlockNumHash,
+        safe: Option<BlockNumHash>,
+        finalized: Option<BlockNumHash>,
+    ) {
+        self.finality_metrics
+            .justified_block_height
+            .set(safe.map_or(0, |block| block.number) as f64);
+        self.finality_metrics.safe_block_height.set(safe.map_or(0, |block| block.number) as f64);
+        self.finality_metrics
+            .finalized_block_height
+            .set(finalized.map_or(0, |block| block.number) as f64);
+        crate::consensus::parlia::vote_pool::promote_future_votes(head.number);
     }
 
     /// Determines if a chain reorganization is needed based on fork choice rules.
@@ -1366,7 +1424,7 @@ where
     }
 
     /// Gets the finalized number and hash from the header's snapshot.
-    fn get_finalized_number_and_hash(&self, header: &Header) -> Option<(u64, B256)> {
+    pub(crate) fn get_finalized_number_and_hash(&self, header: &Header) -> Option<(u64, B256)> {
         if !self.chain_spec.is_plato_active_at_block(header.number) {
             return None;
         }
@@ -1455,23 +1513,41 @@ where
 
     /// Gets the total difficulty for a specific header, keyed by hash.
     ///
-    /// Reads the TD from the provider's `header_td` hook, which serves the persisted per-block TD
-    /// from the `HeaderTerminalDifficulties` table (written in `save_blocks`) and extends it over
-    /// any not-yet-persisted in-memory tail. Results are cached here for the sequential queries
-    /// fork choice makes.
+    /// Recovered fork TDs come from the hash-keyed cache. Provider fallback is allowed only
+    /// after confirming the hash identifies its canonical block number, since the provider's
+    /// TD lookup may otherwise return the canonical chain's TD for a side-branch hash.
     async fn header_td(
         &self,
         _engine: &ConsensusEngineHandle<BscPayloadTypes>,
         _number: u64,
         hash: B256,
     ) -> Result<Option<alloy_primitives::U256>, ParliaConsensusErr> {
+        self.header_td_by_hash(hash)
+    }
+
+    /// Resolve exact-hash TD from the fork cache or a confirmed canonical provider block.
+    /// Provider TD APIs may resolve a noncanonical hash through its canonical block number.
+    pub(crate) fn header_td_by_hash(
+        &self,
+        hash: B256,
+    ) -> Result<Option<alloy_primitives::U256>, ParliaConsensusErr> {
         if let Some(td) = self.header_td_cache.write().get(&hash) {
             return Ok(*td);
         }
+        let canonical =
+            match self.provider.block_number(hash).map_err(ParliaConsensusErr::internal)? {
+                Some(number) => self
+                    .provider
+                    .header_by_number(number)
+                    .map_err(ParliaConsensusErr::internal)?
+                    .is_some_and(|header| header.hash_slow() == hash),
+                None => false,
+            };
+        if !canonical {
+            return Ok(None);
+        }
         let td = self.provider.header_td(&hash).map_err(ParliaConsensusErr::internal)?;
-        // Only memoize resolved values. Caching a `None` makes a transient failure permanent for
-        // that hash: TD becomes resolvable once the block is persisted or a common ancestor
-        // appears, but a cached `None` means we would never ask again.
+        // Only memoize resolved values; a missing hash may become available later.
         if td.is_some() {
             self.header_td_cache.write().insert(hash, td);
         }
@@ -1498,9 +1574,7 @@ where
     {
         let mut iter = headers.into_iter().peekable();
         let Some(first) = iter.peek() else { return Ok(()) };
-        let Some(mut running) =
-            self.provider.header_td(&first.parent_hash).map_err(ParliaConsensusErr::internal)?
-        else {
+        let Some(mut running) = self.header_td_by_hash(first.parent_hash)? else {
             // Fork point TD unknown; leave resolution to the header_td fallback.
             return Ok(());
         };

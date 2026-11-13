@@ -25,6 +25,12 @@ static EVN_PEERS: Lazy<RwLock<HashMap<PeerId, EvnPeerInfo>>> =
 /// Global on-chain NodeIDs set (normalized hex strings without 0x)
 static ONCHAIN_NODEIDS: Lazy<RwLock<HashSet<String>>> = Lazy::new(|| RwLock::new(HashSet::new()));
 
+/// Latest advisory pre-execution membership, used only for proactive transaction filtering.
+/// Unlike the legacy union above, this snapshot removes departed validators. It is not a
+/// canonical/reorg-consistent validator registry and must not drive votes or trust decisions.
+static TX_ONCHAIN_NODEIDS: Lazy<RwLock<HashSet<[u8; 32]>>> =
+    Lazy::new(|| RwLock::new(HashSet::new()));
+
 pub fn peer_id_to_node_id(peer: PeerId) -> String {
     alloy_primitives::hex::encode(keccak256(peer.as_slice()))
 }
@@ -91,11 +97,12 @@ pub fn snapshot() -> Vec<(PeerId, EvnPeerInfo)> {
 /// Update the on-chain NodeIDs cache with the provided list
 pub fn update_onchain_nodeids(ids: Vec<[u8; 32]>) {
     if let Ok(mut set) = ONCHAIN_NODEIDS.write() {
-        for id in ids {
+        for id in &ids {
             let hex = alloy_primitives::hex::encode(id);
             set.insert(hex);
         }
     }
+    replace_tx_nodeids(&TX_ONCHAIN_NODEIDS, &ids);
 }
 
 /// Get a snapshot of on-chain NodeIDs as normalized hex strings
@@ -104,5 +111,96 @@ pub fn get_onchain_nodeids_set() -> HashSet<String> {
         set.clone()
     } else {
         HashSet::new()
+    }
+}
+
+fn replace_tx_nodeids(cache: &RwLock<HashSet<[u8; 32]>>, ids: &[[u8; 32]]) {
+    let snapshot = ids.iter().copied().collect();
+    if let Ok(mut current) = cache.write() {
+        *current = snapshot;
+    }
+}
+
+/// Evaluates current configuration/membership, not the insert-only peer marks. This also works
+/// before the BSC subprotocol has registered the session and after membership removal/reconnect.
+pub(crate) fn is_evn_for_proactive_transactions(peer: PeerId) -> bool {
+    let cfg = super::evn::get_global_evn_config();
+    let whitelist = cfg.map_or(&[][..], |cfg| cfg.whitelist_nodeids.as_slice());
+    is_evn_for_transactions(peer, super::evn::is_evn_enabled(), whitelist, &TX_ONCHAIN_NODEIDS)
+}
+
+fn is_evn_for_transactions(
+    peer: PeerId,
+    enabled: bool,
+    whitelist: &[String],
+    current: &RwLock<HashSet<[u8; 32]>>,
+) -> bool {
+    if !enabled {
+        return false;
+    }
+    let node_id = keccak256(peer.as_slice()).0;
+    if is_whitelisted_node_id(&node_id, whitelist) {
+        return true;
+    }
+    current.read().is_ok_and(|current| current.contains(&node_id))
+}
+
+fn is_whitelisted_node_id(node_id: &[u8; 32], whitelist: &[String]) -> bool {
+    !whitelist.is_empty() && whitelist.contains(&alloy_primitives::hex::encode(node_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transaction_membership_snapshot_removes_departed_validators() {
+        let current = RwLock::new(HashSet::new());
+        let old = keccak256(PeerId::repeat_byte(1)).0;
+        let new = keccak256(PeerId::repeat_byte(2)).0;
+        replace_tx_nodeids(&current, &[old, old]);
+        assert_eq!(current.read().unwrap().len(), 1);
+        replace_tx_nodeids(&current, &[new]);
+        assert!(!current.read().unwrap().contains(&old));
+        assert!(current.read().unwrap().contains(&new));
+        replace_tx_nodeids(&current, &[]);
+        assert!(current.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn transaction_whitelist_uses_the_existing_node_id_encoding() {
+        let peer = PeerId::repeat_byte(3);
+        let node_id = keccak256(peer.as_slice()).0;
+        let whitelist = vec![peer_id_to_node_id(peer)];
+        assert!(is_whitelisted_node_id(&node_id, &whitelist));
+        assert!(!is_whitelisted_node_id(&keccak256(PeerId::repeat_byte(4)).0, &whitelist));
+        assert!(!is_whitelisted_node_id(&node_id, &[]));
+    }
+
+    #[test]
+    fn proactive_membership_checks_config_and_current_snapshot_without_session_marks() {
+        let peer = PeerId::repeat_byte(5);
+        let ordinary = PeerId::repeat_byte(6);
+        let current = RwLock::new(HashSet::new());
+        let whitelist = vec![peer_id_to_node_id(peer)];
+        assert!(!is_evn_for_transactions(peer, false, &whitelist, &current));
+        assert!(
+            is_evn_for_transactions(peer, true, &whitelist, &current),
+            "whitelist applies before subprotocol session registration"
+        );
+        assert!(!is_evn_for_transactions(ordinary, true, &whitelist, &current));
+        replace_tx_nodeids(&current, &[keccak256(peer.as_slice()).0]);
+        assert!(is_evn_for_transactions(peer, true, &[], &current));
+        assert!(!is_evn_for_transactions(peer, false, &[], &current));
+        replace_tx_nodeids(&current, &[keccak256(ordinary.as_slice()).0]);
+        assert!(
+            !is_evn_for_transactions(peer, true, &[], &current),
+            "departed peer is eligible immediately and after reconnect"
+        );
+        assert!(is_evn_for_transactions(ordinary, true, &[], &current));
+        assert!(
+            is_evn_for_transactions(peer, true, &whitelist, &current),
+            "static whitelist remains independent of dynamic membership"
+        );
     }
 }

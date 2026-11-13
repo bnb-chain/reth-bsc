@@ -1,4 +1,4 @@
-use clap::{Args, Parser};
+use clap::{Args, CommandFactory, FromArgMatches};
 use reth::{
     builder::NodeHandle,
     cli::Cli,
@@ -149,6 +149,17 @@ pub struct BscCliArgs {
     /// Disable TX broadcast forbidden for EVN peers.
     #[arg(long = "evn.disable-tx-broadcast-forbidden")]
     pub evn_disable_tx_broadcast_forbidden: bool,
+
+    /// Block download, ancestor recovery, and active startup catch-up tuning.
+    #[command(flatten)]
+    pub block_sync: reth_bsc::node::network::block_import::config::BlockSyncArgs,
+
+    /// Disable unsolicited transaction bodies and hash announcements to all peers.
+    /// Receiving transactions, fetching them, and serving explicit requests remain enabled
+    /// under the existing ingress and propagation policies. Intended for validators fed by
+    /// fullnodes in controlled topologies; disabled by default.
+    #[arg(long = "bsc.disable-proactive-tx-broadcast")]
+    pub disable_proactive_tx_broadcast: bool,
 }
 
 /// BSC default for `--gpo.ignoreprice` (wei), matching geth and pre-v2.2 reth-bsc.
@@ -164,7 +175,21 @@ fn user_set_gpo_ignore_price(mut args: impl Iterator<Item = String>) -> bool {
     args.any(|arg| arg == "--gpo.ignoreprice" || arg.starts_with("--gpo.ignoreprice="))
 }
 
+fn bsc_cli_command() -> clap::Command {
+    Cli::<BscChainSpecParser, BscCliArgs>::command().mut_subcommand("node", |node| {
+        node.mut_arg("max_seen_tx_history", |arg| {
+            // Upstream's derived long help hardcodes its own 320-entry default.
+            arg.help("Max number of seen transactions to remember per peer; BSC defaults to Geth's 32768-entry history.")
+                .long_help(None)
+        })
+    })
+}
+
 fn main() -> eyre::Result<()> {
+    reth_bsc::node::network::bsc_network_args()
+        .try_init()
+        .map_err(|_| eyre::eyre!("network defaults initialized before BSC defaults"))?;
+
     // Override reth's global version metadata so startup/P2P logs identify
     // this binary as Reth-BSC with its own version + commit.
     {
@@ -223,7 +248,8 @@ fn main() -> eyre::Result<()> {
     // Initialize bid package queue at startup
     reth_bsc::shared::init_bid_package_queue();
 
-    Cli::<BscChainSpecParser, BscCliArgs>::parse().run_with_components::<BscNode>(
+    let matches = bsc_cli_command().get_matches();
+    Cli::<BscChainSpecParser, BscCliArgs>::from_arg_matches(&matches)?.run_with_components::<BscNode>(
         |spec| {
             (
                 BscEvmConfig::new(spec.clone()),
@@ -232,6 +258,7 @@ fn main() -> eyre::Result<()> {
             )
         },
         async move |mut builder, args| {
+            let block_sync = args.block_sync.into_config()?;
             // Set genesis hash override if provided
             if let Err(e) = genesis_override::set_genesis_hash_override(args.genesis_hash) {
                 tracing::error!("Failed to set genesis hash override: {}", e);
@@ -520,6 +547,9 @@ fn main() -> eyre::Result<()> {
             let mev_grpc_handle_for_rpc = Arc::clone(&mev_grpc_handle);
 
             let (node, engine_handle_tx) = BscNode::new();
+            let node = node
+                .with_block_sync(block_sync.clone())
+                .with_disable_proactive_tx_broadcast(args.disable_proactive_tx_broadcast);
             let NodeHandle { node, node_exit_future: exit_future } =
                 builder.node(node)
                     .extend_rpc_modules(move |ctx| {
@@ -704,6 +734,8 @@ fn main() -> eyre::Result<()> {
 
             let recovery_provider = node.provider.clone();
             let recovery_engine = node.beacon_engine_handle.clone();
+            let recovery_network = node.network.clone();
+            let recovery_chain_spec = node.chain_spec();
             node.task_executor.spawn_critical_task("bsc-startup-recovery", async move {
                 if let Err(error) = reth_bsc::node::startup_recovery::run(
                     recovery_provider, recovery_engine,
@@ -711,6 +743,13 @@ fn main() -> eyre::Result<()> {
                     tracing::error!(target: "bsc::startup_recovery", %error, "Startup finality recovery failed");
                     panic!("Startup finality recovery failed: {error}");
                 }
+            });
+            let sync_provider = node.provider.clone();
+            let sync_engine = node.beacon_engine_handle.clone();
+            node.task_executor.spawn_critical_task("bsc-startup-sync", async move {
+                reth_bsc::node::startup_sync::run_with_config(
+                    sync_provider, sync_engine, recovery_network, recovery_chain_spec, block_sync,
+                ).await;
             });
 
             let grpc_handle = mev_grpc_handle.lock().unwrap().take();
@@ -726,7 +765,8 @@ fn main() -> eyre::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::user_set_gpo_ignore_price;
+    use super::*;
+    use clap::Parser;
 
     fn args(v: &[&str]) -> std::vec::IntoIter<String> {
         v.iter().map(|s| s.to_string()).collect::<Vec<_>>().into_iter()
@@ -738,5 +778,71 @@ mod tests {
         assert!(user_set_gpo_ignore_price(args(&["reth-bsc", "node", "--gpo.ignoreprice=7"])));
         assert!(!user_set_gpo_ignore_price(args(&["reth-bsc", "node", "--chain", "bsc"])));
         assert!(!user_set_gpo_ignore_price(args(&["reth-bsc", "node", "--gpo.blocks", "20"])));
+    }
+
+    #[test]
+    fn real_node_cli_exposes_and_parses_block_sync_tuning() {
+        let help =
+            Cli::<BscChainSpecParser, BscCliArgs>::try_parse_from(["reth-bsc", "node", "--help"])
+                .unwrap_err();
+        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert!(help.to_string().contains("--bsc.block-sync.quick-timeout"));
+        let cli = Cli::<BscChainSpecParser, BscCliArgs>::try_parse_from([
+            "reth-bsc",
+            "node",
+            "--bsc.block-sync.max-head-fetches",
+            "48",
+            "--bsc.block-sync.quick-timeout",
+            "80ms",
+        ])
+        .unwrap();
+        let reth::cli::Commands::Node(node) = cli.command else { panic!("node command expected") };
+        assert_eq!(node.ext.block_sync.max_head_fetches, 48);
+        assert_eq!(node.ext.block_sync.quick_timeout, std::time::Duration::from_millis(80));
+        node.ext.block_sync.into_config().unwrap();
+    }
+
+    #[test]
+    fn explicit_transaction_history_overrides_network_default() {
+        let matches = bsc_cli_command()
+            .try_get_matches_from(["reth-bsc", "node", "--max-seen-tx-history", "64000"])
+            .unwrap();
+        let cli = Cli::<BscChainSpecParser, BscCliArgs>::from_arg_matches(&matches).unwrap();
+        let reth::cli::Commands::Node(node) = cli.command else { panic!("node command expected") };
+        assert_eq!(
+            node.network.transactions_manager_config().max_transactions_seen_by_peer_history,
+            64000
+        );
+    }
+
+    #[test]
+    fn transaction_history_help_describes_bsc_default() {
+        let help =
+            bsc_cli_command().try_get_matches_from(["reth-bsc", "node", "--help"]).unwrap_err();
+        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+        let text = help.to_string();
+        assert!(text.contains("BSC defaults to Geth's 32768-entry history"));
+        assert!(!text.contains("Default is 320 transaction hashes"));
+    }
+
+    #[test]
+    fn proactive_transaction_broadcast_switch_is_opt_in() {
+        for disabled in [false, true] {
+            let mut argv = vec!["reth-bsc", "node"];
+            if disabled {
+                argv.push("--bsc.disable-proactive-tx-broadcast");
+            }
+            let matches = bsc_cli_command().try_get_matches_from(argv).unwrap();
+            let cli = Cli::<BscChainSpecParser, BscCliArgs>::from_arg_matches(&matches).unwrap();
+            let reth::cli::Commands::Node(node) = cli.command else {
+                panic!("node command expected")
+            };
+            assert_eq!(node.ext.disable_proactive_tx_broadcast, disabled);
+            assert!(!node.network.disable_tx_gossip);
+            assert_eq!(
+                node.network.tx_propagation_policy,
+                reth_network::transactions::config::TransactionPropagationKind::All
+            );
+        }
     }
 }

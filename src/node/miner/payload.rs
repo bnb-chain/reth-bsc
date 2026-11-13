@@ -234,7 +234,7 @@ fn late_finish_experiment(is_inturn: bool) -> bool {
             .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "on"));
         if enabled {
             warn!(target: "bsc::miner::payload",
-                "QA late-finish experiment enabled: in-turn jobs retain at least 50ms for transactions and completion may overrun the slot; cancellation remains active");
+                "QA late-finish experiment enabled: in-turn jobs retain a 50ms job window, first-in-turn jobs retain 50ms from selection entry, and completion may overrun the slot; cancellation remains active");
         }
         enabled
     });
@@ -819,11 +819,14 @@ where
         let exec_start = std::time::Instant::now();
         // Everything before `exec_start` is treated as "prepare" time for this payload attempt.
         let prepare_duration = exec_start.duration_since(build_start);
+        if let Some(control) = &build_control {
+            control.start_transaction_selection(exec_start).map_err(std::io::Error::other)?;
+        }
         read_phase.selection();
         if let Some(cache) = &prewarm_cache {
             cache.execution_started();
         }
-        work.execution_started(exec_start);
+        work.execution_started(exec_start, build_control.as_ref());
         let mut gas_limit_skips = super::perf_tuning::GasLimitSkips::configured();
         let mut gas_skip_limit_reached = false;
         loop {
@@ -1155,9 +1158,9 @@ where
                 "cancelled"
             } else if gas_skip_limit_reached {
                 "gas_skip_limit"
-            } else if !control.allows_late_finish() && now >= control.finish_until {
+            } else if !control.allows_late_finish() && now >= control.finish_until() {
                 "completion_deadline"
-            } else if now >= control.transactions_until {
+            } else if now >= control.transactions_until() {
                 "transaction_deadline"
             } else {
                 "pool_or_gas_limit"
@@ -1167,7 +1170,7 @@ where
             metrics::counter!("bsc_miner_build_stop_total", "turn" => turn, "reason" => reason)
                 .increment(1);
             metrics::histogram!("bsc_miner_execution_budget_overrun_seconds", "turn" => turn)
-                .record(now.saturating_duration_since(control.transactions_until).as_secs_f64());
+                .record(now.saturating_duration_since(control.transactions_until()).as_secs_f64());
             debug!(target: "payload_builder", trace_id, reason, cumulative_gas_used,
                 exec_duration_ms = exec_duration.as_millis(), "Stopped selecting payload transactions");
         } else {
@@ -1212,7 +1215,8 @@ where
 
         if let Some(control) = build_control.as_ref().filter(|control| control.allows_late_finish())
         {
-            let overrun = std::time::Instant::now().saturating_duration_since(control.finish_until);
+            let overrun =
+                std::time::Instant::now().saturating_duration_since(control.finish_until());
             if !overrun.is_zero() {
                 // Completed local candidates, not canonical blocks or accepted submissions.
                 metrics::counter!("bsc_miner_late_finish_completed_total").increment(1);
@@ -1727,6 +1731,11 @@ where
             late_finish_experiment(self.mining_ctx.is_inturn),
             start_time,
             self.root_reserve,
+        )
+        .with_first_transaction_window(
+            self.mining_ctx
+                .parent_snapshot
+                .first_block_in_one_turn(self.mining_ctx.parent_header.number() + 1),
         );
         if let Some(timing) = &self.mining_ctx.startup_timing {
             timing.report(
@@ -1742,18 +1751,20 @@ where
                 std::time::Duration::from_millis(STATE_ROOT_WAIT_MARGIN_MS),
                 self.root_reserve,
                 total_budget,
-                control.transactions_until.saturating_duration_since(start_time),
+                control.transactions_until().saturating_duration_since(start_time),
             );
         }
         // One sample per job (not per retry): slot_remaining is the original slot budget;
-        // job_transaction_window is the resulting budget after applying BuildControl.
+        // job_transaction_window is the initial budget, before the first-in-turn selection floor.
         // Both are seconds and use only consensus turn as a label, not block/trace IDs.
         let turn = if self.mining_ctx.is_inturn { "inturn" } else { "outofturn" };
         metrics::histogram!("bsc.build_diagnostics.job_slot_remaining_seconds", "turn" => turn)
             .record(slot_remaining.as_secs_f64());
         metrics::histogram!("bsc.build_diagnostics.job_transaction_window_seconds", "turn" => turn)
-            .record(control.transactions_until.saturating_duration_since(start_time).as_secs_f64());
-        self.timeout = control.transactions_until.saturating_duration_since(start_time);
+            .record(
+                control.transactions_until().saturating_duration_since(start_time).as_secs_f64(),
+            );
+        self.timeout = control.transactions_until().saturating_duration_since(start_time);
         self.build_args.build_control = Some(control);
         let initial_wait = initial_out_of_turn_build_wait(&self.parlia, &self.mining_ctx);
         if !initial_wait.is_zero() {
@@ -1821,8 +1832,8 @@ where
         loop {
             // Calculate remaining time from job start for outer loop
             let job_elapsed = self.job_start_time.elapsed();
-            let remaining_duration = if job_elapsed < self.timeout {
-                self.timeout - job_elapsed
+            let remaining_duration = if job_elapsed < self.transaction_timeout() {
+                self.transaction_timeout() - job_elapsed
             } else {
                 // Already timeout, return immediately
                 info!(
@@ -1831,7 +1842,7 @@ where
                     block_number = self.build_args.config.parent_header.number() + 1,
                     is_inturn = self.mining_ctx.is_inturn,
                     job_elapsed_ms = job_elapsed.as_millis(),
-                    timeout_ms = self.timeout.as_millis(),
+                    timeout_ms = self.transaction_timeout().as_millis(),
                     "Outer loop: Job already timeout, returning best payload"
                 );
                 return self.try_return_best_payload();
@@ -1906,8 +1917,8 @@ where
                             loop {
                                 // Calculate remaining time from job start
                                 let job_elapsed = self.job_start_time.elapsed();
-                                let remaining_duration = if job_elapsed < self.timeout {
-                                    self.timeout - job_elapsed
+                                let remaining_duration = if job_elapsed < self.transaction_timeout() {
+                                    self.transaction_timeout() - job_elapsed
                                 } else {
                                     // Already timeout, return immediately
                                     info!(
@@ -1916,7 +1927,7 @@ where
                                         block_number = self.build_args.config.parent_header.number() + 1,
                                         is_inturn = self.mining_ctx.is_inturn,
                                         job_elapsed_ms = job_elapsed.as_millis(),
-                                        timeout_ms = self.timeout.as_millis(),
+                                        timeout_ms = self.transaction_timeout().as_millis(),
                                         retries = self.retries,
                                         "Job already timeout, returning best payload immediately"
                                     );
@@ -1947,8 +1958,8 @@ where
                                         wait_for_more_txs = None;
 
                                         let fresh_job_elapsed = self.job_start_time.elapsed();
-                                        let fresh_remaining_duration = if fresh_job_elapsed < self.timeout {
-                                            self.timeout - fresh_job_elapsed
+                                        let fresh_remaining_duration = if fresh_job_elapsed < self.transaction_timeout() {
+                                            self.transaction_timeout() - fresh_job_elapsed
                                         } else {
                                             std::time::Duration::ZERO
                                         };
@@ -2039,8 +2050,8 @@ where
                                         }
 
                                         let fresh_job_elapsed = self.job_start_time.elapsed();
-                                        let fresh_remaining_duration = if fresh_job_elapsed < self.timeout {
-                                            self.timeout - fresh_job_elapsed
+                                        let fresh_remaining_duration = if fresh_job_elapsed < self.transaction_timeout() {
+                                            self.transaction_timeout() - fresh_job_elapsed
                                         } else {
                                             std::time::Duration::ZERO
                                         };
@@ -2148,6 +2159,10 @@ where
 
                 // Finish timeout by timer using remaining duration
                 _ = tokio::time::sleep(remaining_duration) => {
+                    // Preparation can move the first-in-turn deadline after this timer was armed.
+                    if self.job_start_time.elapsed() < self.transaction_timeout() {
+                        continue;
+                    }
                     let elapsed = start_time.elapsed();
                     info!(
                         target: "bsc::miner::payload",
@@ -2157,7 +2172,7 @@ where
                         cost_time = ?elapsed,
                         retries = self.retries,
                         job_elapsed_ms = self.job_start_time.elapsed().as_millis(),
-                        timeout_ms = self.timeout.as_millis(),
+                        timeout_ms = self.transaction_timeout().as_millis(),
                         "Try return best payload due to has no time"
                     );
                     return self.try_return_best_payload();
@@ -2207,6 +2222,13 @@ where
 
         U256::from(effective_tip)
             .saturating_mul(U256::from(pool_tx.gas_limit().min(ESTIMATED_FEE_GAS_CAP)))
+    }
+
+    /// Read the shared deadline because the first selection entry may extend the initial timer.
+    fn transaction_timeout(&self) -> std::time::Duration {
+        self.build_args.build_control.as_ref().map_or(self.timeout, |control| {
+            control.transactions_until().saturating_duration_since(self.job_start_time)
+        })
     }
 
     fn evaluate_local_rebuild_action(
