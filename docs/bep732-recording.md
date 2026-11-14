@@ -3,12 +3,15 @@
 The `feat/bep732-v2.8` branch is based on `feat/bal-v2.8` at
 `fad0ff89b448d7ef1acf35e2a0fa6e842264f63e`. It implements a sequential,
 custom-chain BEP-732 prototype. Named BSC networks remain unscheduled.
-Speculative block production and full-BAL network attachments remain unimplemented.
+Speculative block production and eth/71 retrieval remain unimplemented.
+Negotiated full-BAL attachments and bounded memory retention are implemented as a
+prototype; see the transport increment below.
 The recording and commitment milestones below describe their historical validation.
 
 The companion worktree is `../reth-bep732-v2.8`, also on `feat/bep732-v2.8`,
-at `9278c0cddbd86dc9c85ee0b8a2d530eb037faaae`. This increment makes no Rust
-changes in that companion. Cargo's existing local Reth patches now point to it.
+based at `9278c0cddbd86dc9c85ee0b8a2d530eb037faaae`. The recording and activation
+increments made no Rust changes there. The transport increment adds the per-peer
+payload hook described below. Cargo's local Reth patches point to that worktree.
 
 The design follows the recording section of the
 [BEP-732 draft](https://raw.githubusercontent.com/flywukong/BEPs/bal-mev-bep/BEPs/BEP-732.md),
@@ -197,6 +200,89 @@ before activation because the inherited harness passed `67108864` to a cache
 setting measured in MiB. The fresh rerun corrected it to `64` MiB. No production
 code change was required for that harness failure.
 
+## Negotiated full-BAL transport — 2026-11-14
+
+Local and SendBid payloads now retain the full BAL separately from advisory read
+hints. BidBlock tasks preserve the submitted attachment through system-transaction
+signing and the delayed import queue; broadcast does not depend on a cache lookup.
+After sealing, the full bytes accompany `NewBlockPacket`; retained bytes
+also accompany each block in negotiated `BlocksByRange` responses. Canonical block
+and body types are unchanged.
+
+The draft does not assign an exact handshake extension encoding. This prototype
+puts the RLP byte string `bep732-bal/1` in the existing BSC capability packet's
+opaque `extra` field. A matching negotiated BSC version and exact marker enable
+attachments; missing, legacy, malformed, and unknown extensions leave them off.
+Connections do not wait for the marker before processing ordinary votes/blocks.
+Reconnection resets support, and closed registry channels cannot authorize it.
+This format requires cross-client agreement before production interoperability.
+
+A default no-op `NewBlockPayload::for_peer` hook in the companion Reth active
+session removes attachments for unsupported destinations, including ordinary
+broadcasts and EVN/proxy sends. Unchanged payloads retain their shared allocation.
+The optional read-hint flag does not control this consensus attachment capability.
+
+Receivers check the attachment commitment, canonical RLP, ordering, indices, and
+gas-derived item limit before retaining bytes. A bad attachment is discarded while
+the block continues through sequential verification. This fallback covers invalid
+BAL bytes inside a valid packet envelope; malformed outer RLP remains a packet
+decode error. A commitment match alone never marks execution valid. Retention is keyed by exact block hash, including
+forks, and bounded to 128 entries / 128 MiB with oldest-first eviction. Range
+attachments have an 8 MiB aggregate soft limit and must fit remaining frame space;
+new-block attachments are omitted if they would exceed the frame limit. These are
+local transport/cache limits, not additional block validity rules.
+
+The cache is in memory only. It does not yet persist historical BALs, retain every
+execution-rebuilt BAL from attachment-free imports, or fetch missing BALs over
+eth/71. This branch deliberately restricts Ethereum protocol negotiation to
+eth/68 because BSC's newer status handshake differs; enabling eth/71 requires
+integrating and validating that compatibility layer. Existing BSC work at
+`f19020cd0` and `6ad8a1bb9` is a candidate for reuse, not yet incorporated here.
+Missing/evicted attachments currently fall back to sequential execution.
+
+### Transport validation
+
+The initial transport binaries completed two three-validator runs. Nodes 0/1
+negotiated attachments; node 1 had advisory hints disabled. Node 2 used the prior
+activation-only binary, enforcing the same commitment rules without recognizing
+attachments. Both runs passed all five scenario groups: 36 functional assertions,
+67 transactions (48 successful and 19 intentional reverts), and seven BEP-675
+cases. The normal run compared 288 canonical blocks through height 287. The fault
+run compared 329 through height 328.
+
+In the fault run, only node 0's test binary replaced outgoing attachment bytes
+with `0x80`, keeping the sealed block unchanged. The unmodified node 1 counted
+59 invalid attachments and continued in consensus. It also received valid
+attachments; node 2 continued without attachments. This tests attachment fallback,
+not acceptance of an invalid header commitment. The bid suite separately rejects
+a commitment inconsistent with execution and checks the permission lifecycle.
+
+Initial evidence is preserved under `results-initial/` in
+`../bep732-transport-cluster-2026-11-14/` and
+`../bep732-transport-fault-cluster-2026-11-14/`. Range attachment codec/fallback is
+unit-tested; these runs do not establish live range attachment delivery or
+cross-client BEP-732 interoperability. The companion Reth active-session suite
+passed 20 tests. The transport hook is committed in companion Reth at
+`a3c7bbd07f`.
+
+The final direct-queue revision passed 806 library tests (one ignored). A restricted
+run first hit four localhost bind denials; the full rerun with socket access passed.
+The final normal binary then reopened the existing database, passed all seven bid
+cases again, and verified 377 canonical blocks through height 376 plus all 67 prior
+workload receipts. It exchanged full attachments with advisory hints disabled on
+node 1 and retained legacy fallback for node 2. Its only two error-level log entries
+were the expected false-commitment and underpriced-bid revocations. Final restart
+evidence is in each cluster directory's `results/`; the functional workload was not
+resubmitted on restart.
+
+The final fault binary also reopened the database and passed all seven bid cases.
+The unmodified receiver counted 33 corrupted attachments, all three nodes agreed
+on 425 canonical blocks through height 424, and all 67 prior workload receipts
+remained canonical. Its only error-level entries were the same two intentional
+bid rejections. Both clusters were stopped, and the shared target's original
+advisory binary was restored. Fault injection exists only in the detached test
+worktree and artifact binary, not in the implementation commits.
+
 ## Remaining BEP-732 implementation
 
 1. Complete EIP-7928 conformance and differential vectors, including access-list
@@ -207,8 +293,10 @@ code change was required for that harness failure.
    regular transaction-list SendBid path and cross-client consensus vectors.
 3. Broaden BidBlock adversarial transport coverage and signed-system-transaction
    differential vectors; HTTP permission lifecycle is covered by the run above.
-4. Add negotiated block attachments, retention/forwarding, and eth/71 retrieval.
-   Missing or damaged attachments must remain recoverable through execution.
+4. Agree the handshake extension wire format with a reference client; add durable
+   BAL retention, capture execution-rebuilt BALs from attachment-free imports, and
+   implement BSC-compatible eth/71 retrieval. Negotiated push/range attachments
+   and bounded in-memory retention are implemented above.
 5. Implement isolated candidate-parent and child state views, branch-aware Parlia
    queries, and construction overlap. Sealing must wait for successful parent
    import and matching canonical state; reorgs or failures cancel dependent work.

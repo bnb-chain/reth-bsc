@@ -918,6 +918,10 @@ where
         let pending_turn_length = bid_turn_length_sink.lock().unwrap().take();
 
         bid_runtime.bsc_payload = Some(BscBuiltPayload {
+            block_access_list: block_access_list
+                .as_ref()
+                .filter(|_| sealed_block.header().block_access_list_hash.is_some())
+                .map(|bal| bal.as_raw().clone()),
             bal_read_hint: block_access_list.and_then(crate::node::bal::built_bal_read_hint),
             diagnostics: None,
             block: sealed_block.clone(),
@@ -1561,6 +1565,7 @@ mod tests {
             sidecars: None,
         };
         BidBlockTask {
+            block_access_list: None,
             block: RecoveredBlock::new_unhashed(BscBlock { header, body }, Vec::new()),
             gas_fee: U256::from(1),
             system_tx_start: 0,

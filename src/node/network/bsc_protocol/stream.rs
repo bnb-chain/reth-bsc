@@ -134,10 +134,10 @@ impl BscProtocolConnection {
         // bsc#3483 block on reading it before they will talk to us. Peers on
         // bsc#3737 and later no longer send one, and drop ours in their no-op
         // `handleBscCap`, so sending it stays safe across every peer generation.
-        // BSC sends []byte{00} which in RLP is encoded as a single byte 0x00
+        // The opaque extension advertises the prototype BAL attachment format.
         let initial_capability = Some(BscCommand::Capability {
             protocol_version: proto_version,
-            extra: Bytes::from_static(&[0x00u8]), // Raw RLP: single 0x00 byte represents []byte{00}
+            extra: alloy_rlp::encode(crate::node::network::consensus_bal::CAPABILITY).into(),
         });
 
         Self {
@@ -306,8 +306,8 @@ impl BscProtocolConnection {
     /// removed the blocking read and bsc#3737 stops sending the packet
     /// altogether, so a peer's first frame is normally `Votes`. Rejecting that
     /// tore down the whole RLPx session — a satellite stream ending drops the
-    /// `eth` primary with it — so 0x00 is now ignored exactly like geth's
-    /// no-op `handleBscCap`.
+    /// `eth` primary with it. Only a recognized BAL extension is consumed from
+    /// 0x00; legacy and unknown capability extensions remain harmless.
     fn dispatch(
         frame: &BytesMut,
         pending_range_reqs: &mut PendingRangeReqs,
@@ -321,10 +321,18 @@ impl BscProtocolConnection {
         tracing::trace!(target: "bsc_protocol", msg_id = format_args!("{msg_id:#04x}"), "Processing message");
         match msg_id {
             x if x == BscProtoMessageId::Capability as u8 => {
-                // Legacy handshake packet. Peers older than bsc#3737 still send
-                // it; the version it carries was only ever a restatement of the
-                // devp2p-negotiated version we already hold, so drop it.
-                tracing::trace!(target: "bsc_protocol", peer = ?peer_id, "Ignoring legacy BSC capability message");
+                if let (Some(peer), Ok(packet)) = (peer_id, BscCapPacket::decode(&mut &slice[..])) {
+                    if packet.protocol_version == proto_version &&
+                        alloy_rlp::decode_exact::<Bytes>(&packet.extra).is_ok_and(|extra| {
+                            extra.as_ref() == crate::node::network::consensus_bal::CAPABILITY
+                        })
+                    {
+                        crate::node::network::bsc_protocol::registry::set_bal_support(
+                            peer,
+                            proto_version,
+                        );
+                    }
+                }
                 None
             }
             x if x == BscProtoMessageId::Votes as u8 => {
@@ -366,7 +374,15 @@ impl BscProtocolConnection {
                         }
 
                         let resp = build_blocks_by_range_response(&req);
-                        let encoded = Self::encode_command(BscCommand::BlocksByRange(resp));
+                        let encoded = if peer_id
+                            .is_some_and(crate::node::network::bsc_protocol::registry::supports_bal)
+                        {
+                            let mut encoded = BytesMut::new();
+                            resp.encode_with_bal(&mut encoded);
+                            encoded
+                        } else {
+                            Self::encode_command(BscCommand::BlocksByRange(resp))
+                        };
                         tracing::debug!(
                             target: "bsc_protocol",
                             peer = ?peer_id,

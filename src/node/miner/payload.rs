@@ -1318,6 +1318,10 @@ where
         let pending_turn_length = turn_length_sink.lock().unwrap().take();
 
         let payload = BscBuiltPayload {
+            block_access_list: block_access_list
+                .as_ref()
+                .filter(|_| sealed_block.header().block_access_list_hash.is_some())
+                .map(|bal| bal.as_raw().clone()),
             bal_read_hint: block_access_list.and_then(crate::node::bal::built_bal_read_hint),
             diagnostics: None,
             block: sealed_block.clone(),
@@ -1497,6 +1501,10 @@ where
         let pending_turn_length = turn_length_sink.lock().unwrap().take();
 
         let payload = BscBuiltPayload {
+            block_access_list: block_access_list
+                .as_ref()
+                .filter(|_| sealed_block.header().block_access_list_hash.is_some())
+                .map(|bal| bal.as_raw().clone()),
             bal_read_hint: block_access_list.and_then(crate::node::bal::built_bal_read_hint),
             diagnostics: None,
             block: sealed_block.clone(),
@@ -2923,6 +2931,7 @@ where
         // on the sync path would reject it. Mirror that timing with a delayed background send,
         // the same pattern `submit_payload` uses for the local path.
         let delay = bid_block_broadcast_delay(sealed.header(), now_unix_ms());
+        let block_access_list = bid.block_access_list.clone();
 
         let trace_id = self.trace_id;
         let (builder_addr, bid_hash, gas_fee, system_tx_start) =
@@ -2936,6 +2945,7 @@ where
                     bid_hash,
                     gas_fee,
                     system_tx_start,
+                    block_access_list,
                 ))),
                 delay,
             )
@@ -4023,6 +4033,7 @@ mod tests {
             let mut executed_block = block.clone();
             executed_block.body.sidecars = None;
             let mut payload = super::BscBuiltPayload {
+                block_access_list: None,
                 bal_read_hint: None,
                 diagnostics: None,
                 block: Arc::new(block.into()),

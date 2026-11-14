@@ -983,6 +983,8 @@ pub fn bid_block_env_attributes(header: &Header) -> EthPayloadAttributes {
 /// execution is deferred.)
 #[derive(Clone)]
 pub struct BidBlockTask {
+    /// Full attachment retained through system-transaction signing.
+    pub block_access_list: Option<Bytes>,
     /// Sealed block with the validator's extra/seal and the bind-signed system txs.
     pub block: RecoveredBlock<BscBlock>,
     /// Deposit (gas-fee) value located during payload verification.
@@ -1116,6 +1118,7 @@ pub fn simulate_bid_block(
     let block = RecoveredBlock::new_unhashed(BscBlock { header, body }, senders);
 
     Ok(BidBlockTask {
+        block_access_list: decoded.block_access_list.clone(),
         block,
         gas_fee,
         system_tx_start,

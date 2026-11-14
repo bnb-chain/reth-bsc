@@ -64,7 +64,9 @@ pub(crate) mod bsc_protocol {
 }
 /// BSC `NewBlock` message value.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BscNewBlock(pub NewBlock<BscBlock>);
+pub struct BscNewBlock(pub NewBlock<BscBlock>, pub Option<alloy_primitives::Bytes>);
+
+pub(crate) mod consensus_bal;
 
 mod rlp {
     use super::*;
@@ -91,22 +93,26 @@ mod rlp {
         block: BlockHelper<'a>,
         td: U128,
         sidecars: Option<Cow<'a, Vec<BscBlobTransactionSidecar>>>,
+        block_access_list: Option<alloy_primitives::Bytes>,
     }
 
     impl<'a> From<&'a BscNewBlock> for BscNewBlockHelper<'a> {
         fn from(value: &'a BscNewBlock) -> Self {
-            let BscNewBlock(NewBlock {
-                block:
-                    BscBlock {
-                        header,
-                        body:
-                            BscBlockBody {
-                                inner: BlockBody { transactions, ommers, withdrawals },
-                                sidecars,
-                            },
-                    },
-                td,
-            }) = value;
+            let BscNewBlock(
+                NewBlock {
+                    block:
+                        BscBlock {
+                            header,
+                            body:
+                                BscBlockBody {
+                                    inner: BlockBody { transactions, ommers, withdrawals },
+                                    sidecars,
+                                },
+                        },
+                    td,
+                },
+                block_access_list,
+            ) = value;
 
             Self {
                 block: BlockHelper {
@@ -116,7 +122,12 @@ mod rlp {
                     withdrawals: withdrawals.as_ref().map(Cow::Borrowed),
                 },
                 td: *td,
-                sidecars: sidecars.as_ref().map(Cow::Borrowed),
+                sidecars: if block_access_list.is_some() {
+                    Some(sidecars.as_ref().map(Cow::Borrowed).unwrap_or_default())
+                } else {
+                    sidecars.as_ref().map(Cow::Borrowed)
+                },
+                block_access_list: block_access_list.clone(),
             }
         }
     }
@@ -137,22 +148,26 @@ mod rlp {
                 block: BlockHelper { header, transactions, ommers, withdrawals },
                 td,
                 sidecars,
+                block_access_list,
             } = BscNewBlockHelper::decode(buf)?;
 
-            Ok(BscNewBlock(NewBlock {
-                block: BscBlock {
-                    header: header.into_owned(),
-                    body: BscBlockBody {
-                        inner: BlockBody {
-                            transactions: transactions.into_owned(),
-                            ommers: ommers.into_owned(),
-                            withdrawals: withdrawals.map(|w| w.into_owned()),
+            Ok(BscNewBlock(
+                NewBlock {
+                    block: BscBlock {
+                        header: header.into_owned(),
+                        body: BscBlockBody {
+                            inner: BlockBody {
+                                transactions: transactions.into_owned(),
+                                ommers: ommers.into_owned(),
+                                withdrawals: withdrawals.map(|w| w.into_owned()),
+                            },
+                            sidecars: sidecars.map(|s| s.into_owned()),
                         },
-                        sidecars: sidecars.map(|s| s.into_owned()),
                     },
+                    td,
                 },
-                td,
-            }))
+                block_access_list,
+            ))
         }
     }
 }
@@ -162,6 +177,19 @@ impl NewBlockPayload for BscNewBlock {
 
     fn block(&self) -> &Self::Block {
         &self.0.block
+    }
+
+    fn for_peer(&self, peer: &alloy_primitives::B512) -> Option<Self> {
+        if bsc_protocol::registry::supports_bal(*peer) && self.length() < 16 * 1024 * 1024 - 1024 {
+            if self.1.is_some() {
+                metrics::counter!("bsc_consensus_bal_new_block_sent_total").increment(1);
+            }
+            None
+        } else if self.1.is_some() {
+            Some(Self(self.0.clone(), None))
+        } else {
+            None
+        }
     }
 
     fn td(&self) -> Option<U256> {
@@ -720,10 +748,7 @@ async fn register_nodeids_actions<P: StateProviderFactory>(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        apply_bsc_discv4_overrides, apply_bsc_eth_protocol_overrides,
-        apply_bsc_peer_stability_overrides,
-    };
+    use super::*;
     use reth_discv4::{Discv4Config, NatResolver};
     use reth_network::{PeersConfig, SessionsConfig};
     use reth_network_peers::NodeRecord;
@@ -731,6 +756,34 @@ mod tests {
         net::{IpAddr, Ipv4Addr},
         time::Duration,
     };
+
+    #[test]
+    fn bal_attachment_roundtrip_and_peer_negotiation() {
+        let mut block = BscBlock::default();
+        block.body.sidecars = Some(Vec::new());
+        block.header.base_fee_per_gas = Some(0);
+        block.header.withdrawals_root = Some(alloy_primitives::B256::ZERO);
+        block.header.blob_gas_used = Some(0);
+        block.header.excess_blob_gas = Some(0);
+        block.header.parent_beacon_block_root = Some(alloy_primitives::B256::ZERO);
+        block.header.requests_hash = Some(alloy_primitives::B256::ZERO);
+        block.header.block_access_list_hash = Some(alloy_primitives::keccak256([0xc0]));
+        let packet = BscNewBlock(
+            NewBlock { block, td: alloy_primitives::U128::ZERO },
+            Some(alloy_primitives::Bytes::from_static(&[0xc0])),
+        );
+        let raw = alloy_rlp::encode(&packet);
+        assert_eq!(raw.len(), packet.length());
+        assert_eq!(alloy_rlp::decode_exact::<BscNewBlock>(&raw).unwrap(), packet);
+        let peer = alloy_primitives::B512::repeat_byte(73);
+        let legacy = packet.for_peer(&peer).unwrap();
+        assert!(legacy.1.is_none());
+        assert_eq!(legacy.0, packet.0);
+        assert_eq!(
+            alloy_rlp::decode_exact::<BscNewBlock>(&alloy_rlp::encode(&legacy)).unwrap(),
+            legacy
+        );
+    }
 
     #[test]
     fn negotiates_eth68_with_go_bsc_eth70_peer() {

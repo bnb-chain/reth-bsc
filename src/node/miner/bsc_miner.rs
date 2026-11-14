@@ -1064,10 +1064,19 @@ where
         let new_td = parent_td + current_difficulty;
 
         let td = U128::from(new_td.to::<u128>());
-        let new_block =
-            BscNewBlock(reth_eth_wire::NewBlock { block: sealed_block.clone_block(), td });
+        let new_block = BscNewBlock(
+            reth_eth_wire::NewBlock { block: sealed_block.clone_block(), td },
+            payload.block_access_list.clone(),
+        );
         let msg = NewBlockMessage { hash: block_hash, block: Arc::new(new_block) };
 
+        if let Some(raw) = &payload.block_access_list {
+            crate::node::network::consensus_bal::retain(
+                sealed_block.header(),
+                sealed_block.body().inner.transactions.len(),
+                raw.clone(),
+            );
+        }
         // Both import paths below must publish hints before scheduling block diffusion.
         crate::node::bal::publish(
             block_hash,

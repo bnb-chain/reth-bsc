@@ -61,6 +61,53 @@ impl Encodable for BlocksByRangePacket {
     }
 }
 
+impl BlocksByRangePacket {
+    /// Encode negotiated BAL attachments without changing the canonical block-body encoding.
+    pub(crate) fn encode_with_bal(&self, out: &mut dyn BufMut) {
+        let mut blocks = Vec::new();
+        let mut attachment_budget =
+            (16usize * 1024 * 1024 - 1024).saturating_sub(self.length()).min(8 * 1024 * 1024);
+        for original in &self.blocks {
+            let mut block = original.clone();
+            let raw = super::consensus_bal::get(block.header.hash_slow()).filter(|raw| {
+                if raw.length() > attachment_budget {
+                    return false;
+                }
+                attachment_budget -= raw.length();
+                true
+            });
+            if raw.is_some() || block.body.sidecars.is_some() {
+                block.body.inner.withdrawals.get_or_insert_with(Default::default);
+            }
+            if raw.is_some() {
+                block.body.sidecars.get_or_insert_with(Vec::new);
+            }
+            let encoded = alloy_rlp::encode(&block);
+            let mut fields = encoded.as_slice();
+            let prefix =
+                alloy_rlp::Header::decode(&mut fields).expect("locally encoded block list");
+            let extra = raw.as_ref().map_or(0, Encodable::length);
+            alloy_rlp::Header { list: true, payload_length: prefix.payload_length + extra }
+                .encode(&mut blocks);
+            blocks.extend_from_slice(fields);
+            if let Some(raw) = raw {
+                raw.encode(&mut blocks);
+                metrics::counter!("bsc_consensus_bal_range_sent_total").increment(1);
+            }
+        }
+        let blocks_prefix = alloy_rlp::Header { list: true, payload_length: blocks.len() };
+        out.put_u8(BscProtoMessageId::BlocksByRange as u8);
+        alloy_rlp::Header {
+            list: true,
+            payload_length: self.request_id.length() + blocks_prefix.length() + blocks.len(),
+        }
+        .encode(out);
+        self.request_id.encode(out);
+        blocks_prefix.encode(out);
+        out.put_slice(&blocks);
+    }
+}
+
 impl Decodable for BlocksByRangePacket {
     fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
         decode_blocks_by_range(buf).map_err(|e| e.error)
@@ -167,12 +214,28 @@ fn decode_wire_block_data(buf: &mut &[u8]) -> alloy_rlp::Result<BscBlock> {
     // `sidecars`. It reaches this point as unconsumed trailing bytes of the
     // block's list and is skipped, so the five known fields above decode the
     // block exactly as if the BAL were absent. Any future trailing extension
-    // takes the same path.
+    // takes the same path, except the negotiated BEP-732 byte string below.
+    let remaining = head.payload_length.saturating_sub(started - buf.len());
+    let attachment =
+        if header.block_access_list_hash.is_some() && remaining > 0 && remaining <= buf.len() {
+            // Legacy BEP-592 lists and malformed attachments are ignored, preserving block
+            // fallback.
+            match alloy_rlp::decode_exact::<alloy_primitives::Bytes>(&buf[..remaining]) {
+                Ok(raw) => Some(raw),
+                Err(_) => None, // Attachment decoding must not reject an otherwise decodable block.
+            }
+        } else {
+            None
+        };
     skip_unknown_trailing(buf, head.payload_length, started, "BlockData")?;
-    Ok(BscBlock {
+    let block = BscBlock {
         header,
         body: BscBlockBody { inner: BlockBody { transactions, ommers, withdrawals }, sidecars },
-    })
+    };
+    if let Some(raw) = attachment {
+        super::consensus_bal::retain(&block.header, block.body.inner.transactions.len(), raw);
+    }
+    Ok(block)
 }
 
 /// Advance `buf` past any bytes left in the enclosing list after the known
@@ -340,6 +403,36 @@ mod tests {
     use bytes::BytesMut;
     use reth_ethereum_primitives::TransactionSigned;
     use std::collections::HashMap;
+
+    #[test]
+    fn negotiated_range_attachment_preserves_block_and_legacy_encoding() {
+        let mut block = BscBlock::default();
+        block.header.number = 73201;
+        block.header.base_fee_per_gas = Some(0);
+        block.header.withdrawals_root = Some(alloy_primitives::B256::ZERO);
+        block.header.blob_gas_used = Some(0);
+        block.header.excess_blob_gas = Some(0);
+        block.header.parent_beacon_block_root = Some(alloy_primitives::B256::ZERO);
+        block.header.requests_hash = Some(alloy_primitives::B256::ZERO);
+        block.header.block_access_list_hash = Some(alloy_primitives::keccak256([0xc0]));
+        block.body.inner.withdrawals = Some(Default::default());
+        block.body.sidecars = Some(Vec::new());
+        assert!(super::super::consensus_bal::retain(
+            &block.header,
+            0,
+            alloy_primitives::Bytes::from_static(&[0xc0])
+        ));
+        let packet = BlocksByRangePacket { request_id: 732, blocks: vec![block.clone()] };
+        let legacy = alloy_rlp::encode(&packet);
+        let mut extended = Vec::new();
+        packet.encode_with_bal(&mut extended);
+        assert_ne!(legacy, extended);
+        assert_eq!(BlocksByRangePacket::decode(&mut extended.as_slice()).unwrap(), packet);
+        assert_eq!(BlocksByRangePacket::decode(&mut legacy.as_slice()).unwrap(), packet);
+        // Alter attachment bytes while preserving the RLP envelope: block decoding still works.
+        *extended.last_mut().unwrap() = 0x80;
+        assert_eq!(BlocksByRangePacket::decode(&mut extended.as_slice()).unwrap(), packet);
+    }
 
     #[test]
     fn test_get_blocks_by_range_codec_roundtrip() {
