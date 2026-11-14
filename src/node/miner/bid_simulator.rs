@@ -918,7 +918,7 @@ where
         let pending_turn_length = bid_turn_length_sink.lock().unwrap().take();
 
         bid_runtime.bsc_payload = Some(BscBuiltPayload {
-            bal_read_hint: block_access_list.map(|bal| bal.split().1),
+            bal_read_hint: block_access_list.and_then(crate::node::bal::built_bal_read_hint),
             diagnostics: None,
             block: sealed_block.clone(),
             fees: bid_runtime.gas_fee,

@@ -98,7 +98,9 @@ where
             Arc::new(ctx.node.consensus().clone()),
             ctx.node.evm_config().clone(),
             validator,
-            tree_config,
+            // BSC defers system transactions; the Ethereum BAL parallel executor cannot
+            // execute those transactions independently of Parlia finalization.
+            tree_config.without_bal_parallel_execution(true),
             Box::new(invalid_block_hook),
             overlay_manager,
             ctx.node.task_executor().clone(),

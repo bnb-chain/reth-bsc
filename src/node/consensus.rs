@@ -278,6 +278,12 @@ impl<ChainSpec: EthChainSpec<Header = Header> + BscHardforks + 'static> FullCons
         let receipts = &result.receipts;
         let chain_spec = &self.chain_spec;
 
+        if chain_spec.is_bep732_active_at_timestamp(block.header().number, block.header().timestamp) &&
+            block.header().block_access_list_hash.is_none()
+        {
+            return Err(ConsensusError::BlockAccessListHashMissing);
+        }
+
         // A supplied sidecar is not evidence of correctness. This hash must come from the
         // independently executed block, including Parlia's deferred system transactions.
         match (block.header().block_access_list_hash, block_access_list_hash) {

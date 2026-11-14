@@ -1,9 +1,10 @@
-# BEP-732 recording foundation
+# BEP-732 sequential consensus prototype
 
-This is the first implementation increment on `feat/bep732-v2.8`, based on
-`feat/bal-v2.8` at `fad0ff89b448d7ef1acf35e2a0fa6e842264f63e`. It implements
-BSC recording boundaries; it does **not** activate BEP-732 consensus or
-speculative block production.
+The `feat/bep732-v2.8` branch is based on `feat/bal-v2.8` at
+`fad0ff89b448d7ef1acf35e2a0fa6e842264f63e`. It implements a sequential,
+custom-chain BEP-732 prototype. Named BSC networks remain unscheduled.
+Speculative block production and full-BAL network attachments remain unimplemented.
+The recording and commitment milestones below describe their historical validation.
 
 The companion worktree is `../reth-bep732-v2.8`, also on `feat/bep732-v2.8`,
 at `9278c0cddbd86dc9c85ee0b8a2d530eb037faaae`. This increment makes no Rust
@@ -127,27 +128,92 @@ serially with localhost socket access: **793 passed, 0 failed, 1 ignored**.
 Logs are retained in `../bep732-commitment-2026-11-14/`. The cluster results above
 belong to the recording increment; the cluster was not rerun for this change.
 
+## Custom-chain activation and signing — 2026-11-14
+
+An explicit genesis `config.bep732Time` enables the prototype. The parser requires
+unsigned timestamps for that setting and explicit Jenner, Prague, and Bohr times
+at or before it. Named networks have no BEP-732 schedule. Execution still uses
+BSC's Osaka rules; Ethereum Amsterdam is not activated.
+
+Before activation, headers cannot carry a BAL commitment. After activation they
+must carry one, regardless of `--bal.enabled`. Local and simulated-bid builders
+record the full BAL through finalization, validate its structure and gas-derived
+item limit, and commit its hash in the header. Parlia signs that hash after the
+requests hash. The activated double-sign evidence precompile verifies the extended
+seal for BAL-bearing headers and continues to accept legacy evidence. Import
+rebuilds the BAL sequentially and checks the commitment. The Ethereum parallel
+BAL executor is disabled because it does not implement deferred BSC system transactions.
+
+BidBlock JSON adds optional `blockAccessList`; RLP adds an optional final byte
+string. Existing three-field encodings are unchanged. After activation the
+attachment is mandatory, including the `0xc0` encoding for an empty BAL. Admission
+checks the raw hash, exact RLP, canonical order and indices, and gas-derived item
+limit before sealing. Attachment errors do not revoke builder permission; actual
+execution failures use the existing invalid-block evidence and permission path.
+The local debug builder returns the full attachment for activated blocks.
+
+The separate `bsc-bal/1` advisory protocol continues to send only read hints,
+stripping all values and indices from full BALs. Missing hints cannot disable
+consensus recording or validation. Full attachments are not yet retained or
+forwarded in the network block protocols; receivers rebuild them by execution.
+
+The final full serial library run passed **799 tests, 0 failed, 1 ignored**.
+Tests cover activation boundaries, legacy and extended seal verification, header
+presence, optional BidBlock wire encoding, missing/incorrect/undecodable BALs,
+duplicate/out-of-order accounts, out-of-range indices, the exact gas-item boundary,
+and full-BAL-to-advisory conversion. The binary built with Rust 1.99.0; existing
+dependency warnings and the macOS large-unwind-section linker warning remain.
+
+Local results are in `../bep732-activation-cluster-2026-11-14-r2/results/`.
+Three Reth validators crossed activation at block **169**. Two had advisory BAL
+enabled and one disabled. All three produced activated blocks. A dedicated check
+verified BAL absence/presence and equal hashes through block 212. The final
+canonical comparison covered **329 blocks (0–328)** across all three validators,
+including every workload receipt and log. No Geth interoperability is claimed:
+the installed Geth binary does not implement the activated rules.
+
+BNB, ERC20, CAS20, and Uniswap V2 passed **36 checks / 67 transactions** (48 successes,
+19 intentional reverts). The adapted local BidBlock driver passed **7/7** cases:
+
+- Missing attachment, hash mismatch, and undecodable bytes were rejected before
+  sealing without revoking permission.
+- A structurally valid empty BAL with a matching header commitment, but incorrect
+  for the actual execution, passed admission and failed import at height 323 with
+  `BlockAccessListHashMismatch`. Its transaction was excluded and permission revoked.
+- After permission recovery, a valid bid became canonical at 324; competing bids
+  selected one winner at 325; an underpriced bid became canonical at 328 and
+  triggered the existing fee-floor revocation. Permission was restored afterward.
+
+This run exercised the real BidBlock scenarios and four new BAL negatives; it did
+not rerun the older 15-case synthetic admission suite or the transaction-list
+SendBid path. The only error-level node logs were the intentional false-commitment
+and fee-floor revocations. Advisory nodes exchanged and used hints; the disabled
+node had no hint metrics. All owned processes stopped and the original advisory
+binary was restored. Build patch, binary hashes, test logs, and driver source are
+retained with provenance. Subsequent source changes were tests, comments, and docs.
+
+The first attempt, retained in `../bep732-activation-cluster-2026-11-14/`, failed
+before activation because the inherited harness passed `67108864` to a cache
+setting measured in MiB. The fresh rerun corrected it to `64` MiB. No production
+code change was required for that harness failure.
+
 ## Remaining BEP-732 implementation
 
 1. Complete EIP-7928 conformance and differential vectors, including access-list
    warming, out-of-gas boundaries, code/nonce changes, selfdestruct, CAS20, and
    upgrade/epoch/breathe boundaries. Measure recording overhead before making it
    mandatory.
-2. Add fork activation and header commitment generation, connect the implemented
-   execution comparison to activated blocks, extend Parlia seal encoding and `0x68` evidence
-   verification. Keep verification sequential until the engine's BAL parallel
-   path supports BSC's deferred system transactions. Add fork-boundary and
-   malformed-commitment tests.
-3. Extend BidBlock RLP/JSON, validate canonical BAL data before sealing, preserve
-   commitments when signing system transactions, and connect confirmed execution
-   failures to the existing permission lifecycle. Test all three production paths.
+2. Complete activation and production-path integration coverage, including the
+   regular transaction-list SendBid path and cross-client consensus vectors.
+3. Broaden BidBlock adversarial transport coverage and signed-system-transaction
+   differential vectors; HTTP permission lifecycle is covered by the run above.
 4. Add negotiated block attachments, retention/forwarding, and eth/71 retrieval.
    Missing or damaged attachments must remain recoverable through execution.
 5. Implement isolated candidate-parent and child state views, branch-aware Parlia
    queries, and construction overlap. Sealing must wait for successful parent
    import and matching canonical state; reorgs or failures cancel dependent work.
 
-Current Geth local-cluster compatibility checks exercise existing BSC rules and
+The earlier Geth local-cluster compatibility checks exercise existing BSC rules and
 advisory hints. They cannot establish BEP-732 interoperability until a reference
 client implements the same activated rules. This increment makes no throughput
 or latency claim.

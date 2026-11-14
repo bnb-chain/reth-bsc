@@ -61,42 +61,49 @@ pub struct BidBlock {
     /// Blob sidecars for any blob transactions (empty/omitted when there are none).
     #[serde(default)]
     pub sidecars: Vec<BscBlobTransactionSidecar>,
+    /// Canonical full BAL bytes, required after BEP-732 activation.
+    #[serde(default, rename = "blockAccessList", skip_serializing_if = "Option::is_none")]
+    pub block_access_list: Option<Bytes>,
 }
 
-// go-bsc transports BidBlock over gRPC as the ordinary RLP encoding of its three exported fields:
-// [header, transactions, sidecars]. Keep this implementation on the domain type so the gRPC path
+// Legacy gRPC uses [header, transactions, sidecars]; BEP-732 appends a BAL byte string.
+// Keep this implementation on the domain type so the gRPC path
 // and any future binary ingress cannot drift from the structure builders encode with geth/rlp.
 impl Encodable for BidBlock {
     fn encode(&self, out: &mut dyn bytes::BufMut) {
-        let payload_length =
-            self.header.length() + self.transactions.length() + self.sidecars.length();
+        let payload_length = self.header.length() +
+            self.transactions.length() +
+            self.sidecars.length() +
+            self.block_access_list.as_ref().map_or(0, Encodable::length);
         alloy_rlp::Header { list: true, payload_length }.encode(out);
         self.header.encode(out);
         self.transactions.encode(out);
         self.sidecars.encode(out);
+        if let Some(bal) = &self.block_access_list {
+            bal.encode(out);
+        }
     }
 
     fn length(&self) -> usize {
-        let payload_length =
-            self.header.length() + self.transactions.length() + self.sidecars.length();
+        let payload_length = self.header.length() +
+            self.transactions.length() +
+            self.sidecars.length() +
+            self.block_access_list.as_ref().map_or(0, Encodable::length);
         alloy_rlp::Header { list: true, payload_length }.length() + payload_length
     }
 }
 
 impl Decodable for BidBlock {
     fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
-        let header = alloy_rlp::Header::decode(buf)?;
-        if !header.list {
-            return Err(alloy_rlp::Error::UnexpectedString);
-        }
-        let remaining = buf.len();
-
+        let payload = alloy_rlp::Header::decode_bytes(buf, true)?;
+        let mut body = payload;
         let block = Self {
-            header: Header::decode(buf)?,
-            transactions: Vec::<Bytes>::decode(buf)?,
-            sidecars: Vec::<BscBlobTransactionSidecar>::decode(buf)?,
+            header: Header::decode(&mut body)?,
+            transactions: Vec::<Bytes>::decode(&mut body)?,
+            sidecars: Vec::<BscBlobTransactionSidecar>::decode(&mut body)?,
+            block_access_list: if body.is_empty() { None } else { Some(Bytes::decode(&mut body)?) },
         };
-        if remaining.saturating_sub(buf.len()) != header.payload_length {
+        if !body.is_empty() {
             return Err(alloy_rlp::Error::UnexpectedLength);
         }
         Ok(block)
@@ -262,6 +269,7 @@ impl BidBlockArgs {
             txs: self.decode_txs()?,
             submitted_tx_root: submitted_tx_root(&self.bid_block.transactions),
             sidecars: self.bid_block.sidecars.clone(),
+            block_access_list: self.bid_block.block_access_list.clone(),
             gas_fee: U256::ZERO,
             system_tx_start: 0,
             bid_hash: self.bid_block.hash(),
@@ -297,6 +305,8 @@ pub struct DecodedBidBlock {
     pub submitted_tx_root: B256,
     /// Blob sidecars.
     pub sidecars: Vec<BscBlobTransactionSidecar>,
+    /// Full BAL attachment preserved from the signed builder submission.
+    pub block_access_list: Option<Bytes>,
     /// Fees collected from user txs (set during admission).
     pub gas_fee: U256,
     /// Index in `txs` where the trailing unsigned system-tx region begins (set during admission).
@@ -621,6 +631,7 @@ pub fn pre_seal_verify_bid_block(
     // bsc #3798: reject the sentinel root before doing any Parlia or payload work. Builders must
     // commit to their expected post-state even though zero-simulate verifies it after broadcast.
     verify_bid_block_state_root(&decoded.header)?;
+    validate_bid_block_bal(chain_spec, decoded)?;
 
     // go-bsc checks coinbase/gasLimit before VerifyUnsealedHeader (see preSealVerifyBidBlock) —
     // matters now that verify_bid_block_header's cascading checks depend on the header's coinbase
@@ -629,6 +640,37 @@ pub fn pre_seal_verify_bid_block(
     verify_bid_block_coinbase_and_gas_limit(&decoded.header, etherbase, expected_gas_limit)?;
     verify_bid_block_header(parlia, &mev_tagged_header(chain_spec, decoded), parent, snap)?;
     verify_bid_block_payload(chain_spec, decoded, parent, etherbase, expected_gas_limit)
+}
+
+fn validate_bid_block_bal(
+    spec: &BscChainSpec,
+    bid: &DecodedBidBlock,
+) -> Result<(), PreSealVerifyError> {
+    let invalid = |message: &str| PreSealVerifyError::InvalidBal(message.to_owned());
+    if !spec.is_bep732_active_at_timestamp(bid.header.number, bid.header.timestamp) {
+        return if bid.block_access_list.is_some() {
+            Err(invalid("unexpected before activation"))
+        } else {
+            Ok(())
+        };
+    }
+    let raw = bid.block_access_list.as_ref().ok_or_else(|| invalid("missing attachment"))?;
+    let expected =
+        bid.header.block_access_list_hash.ok_or_else(|| invalid("missing header commitment"))?;
+    if keccak256(raw) != expected {
+        return Err(invalid("header commitment mismatch"));
+    }
+    let bal = alloy_rlp::decode_exact::<alloy_eips::eip7928::BlockAccessList>(raw)
+        .map_err(|err| PreSealVerifyError::InvalidBal(err.to_string()))?;
+    if alloy_rlp::encode(&bal).as_slice() != raw.as_ref() {
+        return Err(invalid("non-canonical encoding"));
+    }
+    let bal = alloy_eips::eip7928::bal::Bal::from(bal);
+    bal.validate_structure(bid.txs.len())
+        .map_err(|err| PreSealVerifyError::InvalidBal(err.to_string()))?;
+    bal.validate_gas_limit(bid.header.gas_limit)
+        .map_err(|err| PreSealVerifyError::InvalidBal(err.to_string()))?;
+    Ok(())
 }
 
 /// Header half of [`pre_seal_verify_bid_block`]: the unsealed Parlia header-field checks
@@ -791,6 +833,8 @@ fn verify_bid_block_state_root(header: &Header) -> Result<(), PreSealVerifyError
 pub enum PreSealVerifyError {
     /// Builder supplied the zero state-root sentinel (bsc #3798).
     ZeroStateRoot,
+    /// Invalid or unavailable full BAL attachment.
+    InvalidBal(String),
     /// Header coinbase is not the in-turn validator.
     InvalidCoinbase { got: Address, want: Address },
     /// Header gas limit does not equal the in-turn target.
@@ -830,6 +874,7 @@ impl fmt::Display for PreSealVerifyError {
             Self::InvalidGasLimit { got, want } => {
                 write!(f, "invalid gasLimit: got {got}, want {want}")
             }
+            Self::InvalidBal(detail) => write!(f, "invalid BAL: {detail}"),
             Self::InvalidHeader(detail) => write!(f, "invalid header: {detail}"),
             Self::UnauthorizedValidator { validator } => {
                 write!(f, "invalid header: unauthorized validator: {validator}")
@@ -1126,6 +1171,7 @@ mod tests {
         };
         let args = BidBlockArgs {
             bid_block: BidBlock {
+                block_access_list: None,
                 header: vector_a_block().header,
                 transactions: vec![raw],
                 sidecars: vec![sidecar],
@@ -1146,6 +1192,121 @@ mod tests {
             })
             .unwrap();
         handle.join()
+    }
+
+    #[test]
+    fn bep732_bid_rejects_invalid_structure_and_gas_size() {
+        let mut spec = blob_chain_spec();
+        for fork in [
+            crate::hardforks::bsc::BscHardfork::Bohr,
+            crate::hardforks::bsc::BscHardfork::Jenner,
+            crate::hardforks::bsc::BscHardfork::Bep732,
+        ] {
+            spec.inner.hardforks.insert(fork, reth_chainspec::ForkCondition::Timestamp(0));
+        }
+        let mut bid = decoded_block(
+            Header { number: 1, gas_limit: 2000, ..Default::default() },
+            vec![],
+            vec![],
+        );
+        let account = alloy_eips::eip7928::AccountChanges {
+            address: Address::repeat_byte(1),
+            ..Default::default()
+        };
+        let duplicate = vec![account.clone(), account.clone()];
+        let out_of_order = vec![
+            alloy_eips::eip7928::AccountChanges {
+                address: Address::repeat_byte(2),
+                ..Default::default()
+            },
+            account.clone(),
+        ];
+        let invalid_index = vec![alloy_eips::eip7928::AccountChanges {
+            balance_changes: vec![alloy_eips::eip7928::BalanceChange {
+                block_access_index: alloy_eips::eip7928::BlockAccessIndex::new(2),
+                post_balance: U256::from(1),
+            }],
+            ..account.clone()
+        }];
+        for list in [duplicate, out_of_order, invalid_index] {
+            let bal = alloy_eips::eip7928::bal::Bal::from(list.clone());
+            let expected = bal.validate_structure(0).unwrap_err().to_string();
+            let raw = alloy_rlp::encode(&list);
+            bid.header.block_access_list_hash = Some(keccak256(&raw));
+            bid.block_access_list = Some(raw.into());
+            assert_eq!(
+                validate_bid_block_bal(&spec, &bid).unwrap_err().to_string(),
+                format!("invalid BAL: {expected}")
+            );
+        }
+        let list = vec![account];
+        let raw = alloy_rlp::encode(&list);
+        bid.header.block_access_list_hash = Some(keccak256(&raw));
+        bid.block_access_list = Some(raw.into());
+        assert!(validate_bid_block_bal(&spec, &bid).is_ok());
+        bid.header.gas_limit = 1999;
+        let expected = alloy_eips::eip7928::bal::Bal::from(list)
+            .validate_gas_limit(1999)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            validate_bid_block_bal(&spec, &bid).unwrap_err().to_string(),
+            format!("invalid BAL: {expected}")
+        );
+    }
+
+    #[test]
+    fn bep732_bid_bal_wire_roundtrip_and_admission() {
+        let mut wire = vector_a_block();
+        let legacy = alloy_rlp::encode(&wire);
+        assert_eq!(alloy_rlp::decode_exact::<BidBlock>(&legacy).unwrap(), wire);
+        wire.block_access_list = Some(Bytes::from_static(&[0xc0]));
+        let encoded = alloy_rlp::encode(&wire);
+        assert_eq!(encoded.len(), wire.length());
+        assert_eq!(alloy_rlp::decode_exact::<BidBlock>(&encoded).unwrap(), wire);
+        assert_eq!(serde_json::to_value(&wire).unwrap()["blockAccessList"], "0xc0");
+
+        let mut spec = blob_chain_spec();
+        for fork in [
+            crate::hardforks::bsc::BscHardfork::Bohr,
+            crate::hardforks::bsc::BscHardfork::Jenner,
+            crate::hardforks::bsc::BscHardfork::Bep732,
+        ] {
+            spec.inner.hardforks.insert(fork, reth_chainspec::ForkCondition::Timestamp(100));
+        }
+        let mut bid = decoded_block(
+            Header { number: 1, timestamp: 99, gas_limit: 30_000_000, ..Default::default() },
+            vec![],
+            vec![],
+        );
+        assert!(validate_bid_block_bal(&spec, &bid).is_ok());
+        bid.block_access_list = Some(Bytes::from_static(&[0xc0]));
+        assert_eq!(
+            validate_bid_block_bal(&spec, &bid).unwrap_err().to_string(),
+            "invalid BAL: unexpected before activation"
+        );
+        bid.header.timestamp = 100;
+        assert_eq!(
+            validate_bid_block_bal(&spec, &bid).unwrap_err().to_string(),
+            "invalid BAL: missing header commitment"
+        );
+        bid.header.block_access_list_hash = Some(keccak256([0xc0]));
+        assert!(validate_bid_block_bal(&spec, &bid).is_ok());
+        bid.block_access_list = None;
+        assert_eq!(
+            validate_bid_block_bal(&spec, &bid).unwrap_err().to_string(),
+            "invalid BAL: missing attachment"
+        );
+        bid.block_access_list = Some(Bytes::new());
+        assert_eq!(
+            validate_bid_block_bal(&spec, &bid).unwrap_err().to_string(),
+            "invalid BAL: header commitment mismatch"
+        );
+        bid.header.block_access_list_hash = Some(keccak256([]));
+        assert_eq!(
+            validate_bid_block_bal(&spec, &bid).unwrap_err().to_string(),
+            "invalid BAL: input too short"
+        );
     }
 
     #[test]
@@ -1182,12 +1343,13 @@ mod tests {
             h.number = 1;
             h.extra_data = Bytes::from(vec![0u8; 32]);
         });
-        BidBlock { header, transactions: Vec::new(), sidecars: Vec::new() }
+        BidBlock { block_access_list: None, header, transactions: Vec::new(), sidecars: Vec::new() }
     }
 
     #[test]
     fn bid_block_rlp_roundtrip_matches_grpc_wire_shape() {
         let block = BidBlock {
+            block_access_list: None,
             header: vector_a_block().header,
             transactions: vec![bytes!("0x010203"), bytes!("0xdeadbeef")],
             sidecars: Vec::new(),
@@ -1223,6 +1385,7 @@ mod tests {
             h.extra_data = bytes!("0xaabbcc");
         });
         let block = BidBlock {
+            block_access_list: None,
             header,
             transactions: vec![bytes!("0x010203"), bytes!("0xdeadbeef")],
             sidecars: Vec::new(),
@@ -1349,6 +1512,7 @@ mod tests {
             version: 0,
         };
         let block = BidBlock {
+            block_access_list: None,
             header: vector_a_block().header,
             transactions: Vec::new(),
             sidecars: vec![sidecar],
@@ -1714,6 +1878,7 @@ mod tests {
             header,
             txs,
             submitted_tx_root: root,
+            block_access_list: None,
             sidecars,
             gas_fee: U256::ZERO,
             system_tx_start: 0,
@@ -1790,6 +1955,7 @@ mod tests {
         // `transactions_root` — these two tests must be read together.
         let bare = vector_a_block();
         let with_txs = BidBlock {
+            block_access_list: None,
             header: bare.header.clone(),
             transactions: vec![bytes!("0x010203"), bytes!("0xdeadbeef")],
             sidecars: Vec::new(),
@@ -2215,6 +2381,7 @@ mod tests {
 
         let args = BidBlockArgs {
             bid_block: BidBlock {
+                block_access_list: None,
                 header: vector_a_block().header,
                 transactions: vec![raw],
                 sidecars: Vec::new(),
@@ -2262,6 +2429,7 @@ mod tests {
 
         let args = BidBlockArgs {
             bid_block: BidBlock {
+                block_access_list: None,
                 header: vector_a_block().header,
                 transactions: vec![Bytes::from(out)],
                 sidecars: Vec::new(),
@@ -2291,6 +2459,7 @@ mod tests {
 
         let args = BidBlockArgs {
             bid_block: BidBlock {
+                block_access_list: None,
                 header: vector_a_block().header,
                 transactions: vec![raw],
                 sidecars: Vec::new(),

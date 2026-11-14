@@ -455,4 +455,9 @@ pub trait BscHardforks: EthereumHardforks {
         self.is_london_active_at_block(block_number) &&
             self.bsc_fork_activation(BscHardfork::Jenner).active_at_timestamp(timestamp)
     }
+    /// Whether the custom-chain BEP-732 consensus rules are active.
+    fn is_bep732_active_at_timestamp(&self, block_number: u64, timestamp: u64) -> bool {
+        self.is_jenner_active_at_timestamp(block_number, timestamp) &&
+            self.bsc_fork_activation(BscHardfork::Bep732).active_at_timestamp(timestamp)
+    }
 }

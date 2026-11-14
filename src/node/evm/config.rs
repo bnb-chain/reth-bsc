@@ -729,7 +729,12 @@ where
             SystemContract::new(self.executor_factory.spec().clone()),
         );
 
-        if crate::node::bal::enabled() {
+        if crate::node::bal::enabled() ||
+            self.chain_spec().is_bep732_active_at_timestamp(
+                bsc_executor.evm.block().number.saturating_to(),
+                bsc_executor.evm.block().timestamp.saturating_to(),
+            )
+        {
             bsc_executor.bal_recorder = Some(BscBalRecorder::new(|evm, bal| {
                 evm.db_mut().bal_state.bal_builder = Some(bal);
             }));
@@ -798,7 +803,9 @@ pub fn revm_spec_by_timestamp_and_block_number(
     timestamp: u64,
     block_number: u64,
 ) -> BscHardfork {
-    if chain_spec.is_jenner_active_at_timestamp(block_number, timestamp) {
+    if chain_spec.is_bep732_active_at_timestamp(block_number, timestamp) {
+        BscHardfork::Bep732
+    } else if chain_spec.is_jenner_active_at_timestamp(block_number, timestamp) {
         BscHardfork::Jenner
     } else if chain_spec.is_pasteur_active_at_timestamp(block_number, timestamp) {
         BscHardfork::Pasteur

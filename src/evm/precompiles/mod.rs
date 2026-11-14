@@ -543,9 +543,20 @@ fn jenner_traced() -> &'static TracedPrecompiles {
     INSTANCE.get_or_init(|| Box::new(build_traced_precompiles(build_jenner_precompiles())))
 }
 
+fn bep732_traced() -> &'static TracedPrecompiles {
+    static INSTANCE: OnceBox<TracedPrecompiles> = OnceBox::new();
+    INSTANCE.get_or_init(|| {
+        let mut precompiles = build_jenner_precompiles();
+        precompiles.extend([double_sign::DOUBLE_SIGN_EVIDENCE_VALIDATION_BEP732]);
+        Box::new(build_traced_precompiles(precompiles))
+    })
+}
+
 fn traced_precompiles_for_spec(spec: BscHardfork) -> &'static TracedPrecompiles {
     // Osaka uses updated precompiles (EIP-7823/7883 MODEXP, EIP-7951 P256VERIFY)
-    if spec >= BscHardfork::Jenner {
+    if spec >= BscHardfork::Bep732 {
+        bep732_traced()
+    } else if spec >= BscHardfork::Jenner {
         // Jenner: 0x68 (double-sign evidence) is repriced per input byte.
         jenner_traced()
     } else if spec >= BscHardfork::Pasteur {

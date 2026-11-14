@@ -240,7 +240,12 @@ where
     // SYSTEM_ADDRESS fees) and computes state root / receipts root / bloom / gasUsed.
     let out =
         builder.finish(&state_provider, None).map_err(|e| internal_err(format!("finish: {e}")))?;
-    let BlockBuilderOutcome { block, .. } = out;
+    let BlockBuilderOutcome { block, block_access_list, .. } = out;
+    let block_access_list = if block.header().block_access_list_hash.is_some() {
+        block_access_list.map(|bal| bal.split().1)
+    } else {
+        None
+    };
 
     let mut header = block.clone_header();
     // The assembler leaves prev_randao in mix_hash and env difficulty in the header; a real
@@ -281,7 +286,7 @@ where
     };
 
     Ok(CandidateBlockResult {
-        bid_block: BidBlock { header, transactions, sidecars: Vec::new() },
+        bid_block: BidBlock { block_access_list, header, transactions, sidecars: Vec::new() },
         system_tx_start: user_tx_count,
         gas_fee,
     })

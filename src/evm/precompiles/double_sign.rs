@@ -52,6 +52,13 @@ pub(crate) const DOUBLE_SIGN_EVIDENCE_VALIDATION_JENNER: Precompile = Precompile
     double_sign_evidence_validation_run_jenner,
 );
 
+/// BEP-732 evidence verification, retaining Jenner's input-byte gas pricing.
+pub(crate) const DOUBLE_SIGN_EVIDENCE_VALIDATION_BEP732: Precompile = Precompile::new(
+    PrecompileId::Custom(Cow::Borrowed("VERIFY_DOUBLE_SIGN_EVIDENCE")),
+    u64_to_address(104),
+    double_sign_evidence_validation_run_bep732,
+);
+
 const EXTRA_SEAL_LENGTH: usize = 65;
 
 /// Widest block number accepted as evidence, matching go-bsc's
@@ -299,7 +306,7 @@ fn double_sign_evidence_validation_run(
     gas_limit: u64,
     reservoir: u64,
 ) -> PrecompileResult {
-    double_sign_evidence_validation_run_inner(input, gas_limit, reservoir, 0)
+    double_sign_evidence_validation_run_inner(input, gas_limit, reservoir, 0, false)
 }
 
 /// From Jenner the cost scales with input size, so oversized RLP-encoded headers cannot impose
@@ -314,6 +321,21 @@ fn double_sign_evidence_validation_run_jenner(
         gas_limit,
         reservoir,
         DOUBLE_SIGN_EVIDENCE_VALIDATE_PER_BYTE_GAS,
+        false,
+    )
+}
+
+fn double_sign_evidence_validation_run_bep732(
+    input: &[u8],
+    gas_limit: u64,
+    reservoir: u64,
+) -> PrecompileResult {
+    double_sign_evidence_validation_run_inner(
+        input,
+        gas_limit,
+        reservoir,
+        DOUBLE_SIGN_EVIDENCE_VALIDATE_PER_BYTE_GAS,
+        true,
     )
 }
 
@@ -322,6 +344,7 @@ fn double_sign_evidence_validation_run_inner(
     gas_limit: u64,
     reservoir: u64,
     per_byte_gas: u64,
+    include_bal: bool,
 ) -> PrecompileResult {
     let cost = DOUBLE_SIGN_EVIDENCE_VALIDATION_BASE
         .saturating_add((input.len() as u64).saturating_mul(per_byte_gas));
@@ -398,8 +421,16 @@ fn double_sign_evidence_validation_run_inner(
     }
 
     // check signature
-    let msg_hash1 = seal_hash(&header1, &evidence.chain_id);
-    let msg_hash2 = seal_hash(&header2, &evidence.chain_id);
+    let msg_hash1 = if include_bal {
+        seal_hash_with_bal(&header1, &evidence.chain_id, true)
+    } else {
+        seal_hash(&header1, &evidence.chain_id)
+    };
+    let msg_hash2 = if include_bal {
+        seal_hash_with_bal(&header2, &evidence.chain_id, true)
+    } else {
+        seal_hash(&header2, &evidence.chain_id)
+    };
 
     if msg_hash1.eq(&msg_hash2) {
         return Ok(PrecompileOutput::halt(
@@ -468,6 +499,10 @@ fn recover_evidence_signer(signature: &[u8], msg_hash: &B256, header_index: u8) 
 /// [`crate::consensus::parlia::util::encode_header_with_chain_id`], which additionally requires the
 /// beacon root to be zero.
 fn seal_hash(header: &Header, chain_id: &RlpBigInt) -> B256 {
+    seal_hash_with_bal(header, chain_id, false)
+}
+
+fn seal_hash_with_bal(header: &Header, chain_id: &RlpBigInt, include_bal: bool) -> B256 {
     let mut payload = Vec::new();
 
     chain_id.encode(&mut payload);
@@ -499,6 +534,9 @@ fn seal_hash(header: &Header, chain_id: &RlpBigInt) -> B256 {
         // https://github.com/bnb-chain/BEPs/blob/master/BEPs/BEP-466.md
         if let Some(requests_hash) = header.requests_hash {
             requests_hash.encode(&mut payload);
+            if let Some(hash) = header.block_access_list_hash.filter(|_| include_bal) {
+                hash.encode(&mut payload);
+            }
         }
     }
 
@@ -725,6 +763,56 @@ mod tests {
 
     /// Evidence whose signatures recover to two different signers, so the precompile reverts.
     const INVALID_EVIDENCE_HEX: &str = "f9066b38b90332f9032fa01062d3d5015b9242bc193a9b0769f3d3780ecb55f97f40a752ae26d0b68cd0d8a0fae1a05fcb14bfd9b8a9f2b65007a9b6c2000de0627a73be644dd993d32342c494df87f0e2b8519ea2dd4abd8b639cdd628497ed25a0f385cc58ed297ff0d66eb5580b02853d3478ba418b1819ac659ee05df49b9794a0bf88464af369ed6b8cf02db00f0b9556ffa8d49cd491b00952a7f83431446638a00a6d0870e586a76278fbfdcedf76ef6679af18fc1f9137cfad495f434974ea81b901000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001a1010000000000000000000000000000000000000000000000000000000000000000830f4240830f42408465bc6996b90115d983010306846765746889676f312e32302e3131856c696e7578000053474aa9f8b25fb860b0844a5082bfaa2299d2a23f076e2f6b17b15f839cc3e7d5a875656f6733fd4b87ba3401f906d15f3dea263cd9a6076107c7db620a4630dd3832c4a4b57eb8f497e28a3d69e5c03b30205c4b45675747d513e1accd66329770f3c35b18c9d023f84c84023a5ad6a086a28d985d9a6c8e7f9a4feadd5ace0adba9818e1e1727edca755fcc0bd8344684023a5ad7a0bc3492196b2e68b8e6ceea87cfa7588b4d590089eb885c4f2c1e9d9fb450f7b980988e1b9d0beb91dab063e04879a24c43d33baae3759dee41fd62ffa83c77fd202bea27a829b49e8025bdd198393526dd12b223ab16052fd26a43f3aabf63e76901a0232c9ba2d41b40d36ed794c306747bcbc49bf61a0f37409c18bfe2b5bef26a2d880000000000000000b90332f9032fa01062d3d5015b9242bc193a9b0769f3d3780ecb55f97f40a752ae26d0b68cd0d8a0b2789a5357827ed838335283e15c4dcc42b9bebcbf2919a18613246787e2f96094df87f0e2b8519ea2dd4abd8b639cdd628497ed25a071ce4c09ee275206013f0063761bc19c93c13990582f918cc57333634c94ce89a00e095703e5c9b149f253fe89697230029e32484a410b4b1f2c61442d73c3095aa0d317ae19ede7c8a2d3ac9ef98735b049bcb7278d12f48c42b924538b60a25e12b901000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001a1010000000000000000000000000000000000000000000000000000000000000000830f4240830f42408465bc6996b90115d983010306846765746889676f312e32302e3131856c696e7578000053474aa9f8b25fb860b0844a5082bfaa2299d2a23f076e2f6b17b15f839cc3e7d5a875656f6733fd4b87ba3401f906d15f3dea263cd9a6076107c7db620a4630dd3832c4a4b57eb8f497e28a3d69e5c03b30205c4b45675747d513e1accd66329770f3c35b18c9d023f84c84023a5ad6a086a28d985d9a6c8e7f9a4feadd5ace0adba9818e1e1727edca755fcc0bd8344684023a5ad7a0bc3492196b2e68b8e6ceea87cfa7588b4d590089eb885c4f2c1e9d9fb450f7b9804c71ed015dd0c5c2d7393b68c2927f83f0a5da4c66f761f09e2f950cc610832c7876144599368404096ddef0eadacfde57717e2c7d23982b927285b797d41bfa00a0b56228685be711834d0f154292d07826dea42a0fad3e4f56c31470b7fbfbea26880000000000000000";
+
+    #[test]
+    fn bep732_verifies_extended_and_legacy_evidence() {
+        let legacy = hex::decode(VALID_EVIDENCE_HEX).unwrap();
+        let old = double_sign_evidence_validation_run_jenner(&legacy, 1_000_000, 0).unwrap();
+        let new = double_sign_evidence_validation_run_bep732(&legacy, 1_000_000, 0).unwrap();
+        assert!(new.is_success());
+        assert_eq!(new.bytes, old.bytes);
+        assert_eq!(new.gas_used, old.gas_used);
+
+        let chain_id = big(&[56]);
+        let key = signing_key();
+        let mut first = base_header();
+        first.base_fee = Some(big(&[1]));
+        first.withdrawals_hash = Some([0; 32]);
+        first.blob_gas_used = Some(0);
+        first.excess_blob_gas = Some(0);
+        first.parent_beacon_root = Some([0; 32]);
+        first.requests_hash = Some([0; 32]);
+        first.block_access_list_hash = Some([1; 32]);
+        let mut second = first.clone();
+        second.root = [0x99; 32];
+        for header in [&mut first, &mut second] {
+            let hash = seal_hash_with_bal(header, &chain_id, true);
+            let signature = SECP256K1.sign_ecdsa_recoverable(&Message::from_digest(hash.0), &key);
+            let (id, bytes) = signature.serialize_compact();
+            let mut extra = header.extra.to_vec();
+            extra[32..96].copy_from_slice(&bytes);
+            extra[96] = i32::from(id) as u8;
+            header.extra = extra.into();
+        }
+        let encode = |a: &Header, b: &Header| {
+            alloy_rlp::encode(&DoubleSignEvidence {
+                chain_id: chain_id.clone(),
+                header_bytes1: alloy_rlp::encode(a).into(),
+                header_bytes2: alloy_rlp::encode(b).into(),
+            })
+        };
+        let input = encode(&first, &second);
+        let result = double_sign_evidence_validation_run_bep732(&input, 1_000_000, 0).unwrap();
+        assert!(result.is_success());
+        assert_eq!(result.bytes.len(), 52);
+        assert!(double_sign_evidence_validation_run_jenner(&input, 1_000_000, 0)
+            .unwrap()
+            .is_halt());
+        second.block_access_list_hash = Some([2; 32]);
+        assert!(double_sign_evidence_validation_run_bep732(&encode(&first, &second), 1_000_000, 0)
+            .unwrap()
+            .is_halt());
+    }
 
     #[test]
     fn test_double_sign_evidence_validation_run() {

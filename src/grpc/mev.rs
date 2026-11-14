@@ -556,6 +556,7 @@ mod tests {
 
     fn request_block() -> BidBlock {
         BidBlock {
+            block_access_list: None,
             header: Header {
                 number: 2,
                 gas_limit: 140_000_000,

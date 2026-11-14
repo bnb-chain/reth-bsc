@@ -59,6 +59,11 @@ pub(crate) fn encode_read_hint(bal: BlockAccessList) -> Option<DecodedBal> {
     (encoded.len() <= MAX_HINT_BYTES).then(|| DecodedBal::new(hints.into(), encoded.into()))
 }
 
+/// Convert a built full BAL to advisory bytes without exposing values on `bsc-bal/1`.
+pub(crate) fn built_bal_read_hint(bal: DecodedBal) -> Option<Bytes> {
+    encode_read_hint(bal.as_bal().iter().cloned().collect()).map(|hint| hint.split().1)
+}
+
 #[derive(Debug, Clone, RlpEncodable, RlpDecodable)]
 struct HintPacket {
     hash: B256,
@@ -332,8 +337,10 @@ mod tests {
             }],
             ..Default::default()
         };
-        let hint = encode_read_hint(vec![account]).unwrap();
-        let decoded = BlockAccessList::decode(&mut hint.as_raw().as_ref()).unwrap();
+        let full: BlockAccessList = vec![account];
+        let raw = alloy_rlp::encode(&full);
+        let hint = built_bal_read_hint(DecodedBal::new(full.into(), raw.into())).unwrap();
+        let decoded = BlockAccessList::decode(&mut hint.as_ref()).unwrap();
         assert_eq!(decoded[0].storage_reads, vec![U256::from(3), U256::from(7)]);
         assert!(decoded[0].storage_changes.is_empty());
         assert!(decoded[0].balance_changes.is_empty());
