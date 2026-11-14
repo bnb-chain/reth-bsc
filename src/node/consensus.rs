@@ -273,10 +273,23 @@ impl<ChainSpec: EthChainSpec<Header = Header> + BscHardforks + 'static> FullCons
         block: &RecoveredBlock<BscBlock>,
         result: &BlockExecutionResult<Receipt>,
         _receipt_root_bloom: Option<ReceiptRootBloom>,
-        _block_access_list_hash: Option<alloy_primitives::B256>,
+        block_access_list_hash: Option<B256>,
     ) -> Result<(), ConsensusError> {
         let receipts = &result.receipts;
         let chain_spec = &self.chain_spec;
+
+        // A supplied sidecar is not evidence of correctness. This hash must come from the
+        // independently executed block, including Parlia's deferred system transactions.
+        match (block.header().block_access_list_hash, block_access_list_hash) {
+            (Some(expected), Some(got)) if got != expected => {
+                return Err(ConsensusError::BlockAccessListHashMismatch(
+                    GotExpected { got, expected }.into(),
+                ));
+            }
+            (Some(_), None) => return Err(ConsensusError::BlockAccessListHashMissing),
+            (None, Some(_)) => return Err(ConsensusError::BlockAccessListHashUnexpected),
+            _ => {}
+        }
 
         // Check if gas used matches the value set in header.
         let cumulative_gas_used =
@@ -1137,6 +1150,41 @@ mod tests {
         assert!(matches!(
             consensus.validate_block_post_execution(&block_with(None), &result, None, None),
             Err(ConsensusError::RequestsHashMissing)
+        ));
+    }
+
+    #[test]
+    fn post_execution_bal_commitment_requires_matching_execution() {
+        let consensus =
+            BscConsensus::new(Arc::new(BscChainSpec::from(ChainSpecBuilder::mainnet().build())));
+        let expected = B256::repeat_byte(1);
+        let wrong = B256::repeat_byte(2);
+        let block = |commitment| {
+            RecoveredBlock::new_unhashed(
+                BscBlock {
+                    header: Header { block_access_list_hash: commitment, ..Default::default() },
+                    body: BscBlockBody::default(),
+                },
+                Vec::new(),
+            )
+        };
+        let result = BlockExecutionResult::default();
+        consensus
+            .validate_block_post_execution(&block(Some(expected)), &result, None, Some(expected))
+            .unwrap();
+        consensus.validate_block_post_execution(&block(None), &result, None, None).unwrap();
+        let error = consensus
+            .validate_block_post_execution(&block(Some(expected)), &result, None, Some(wrong))
+            .unwrap_err();
+        assert!(matches!(&error, ConsensusError::BlockAccessListHashMismatch(hashes)
+            if hashes.got == wrong && hashes.expected == expected));
+        assert!(matches!(
+            consensus.validate_block_post_execution(&block(Some(expected)), &result, None, None),
+            Err(ConsensusError::BlockAccessListHashMissing)
+        ));
+        assert!(matches!(
+            consensus.validate_block_post_execution(&block(None), &result, None, Some(expected)),
+            Err(ConsensusError::BlockAccessListHashUnexpected)
         ));
     }
 }

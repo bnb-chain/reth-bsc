@@ -108,14 +108,33 @@ belong to the expected negative cases. The final comparison ran after those case
 settled. Malformed consensus BAL tests remain pending consensus activation;
 this run does not claim that coverage.
 
+## Post-execution commitment verification — 2026-11-14
+
+The BSC post-execution consensus validator now checks the hash rebuilt by execution
+against the header's BAL commitment. A mismatch returns `BlockAccessListHashMismatch`;
+a committed header without a rebuilt hash returns `BlockAccessListHashMissing`;
+an execution hash without a header commitment returns `BlockAccessListHashUnexpected`.
+Matching hashes and legacy blocks without either hash pass this check.
+
+Both the engine's live-import path and the staged execution path calculate this
+argument from the execution-built BAL. It is not taken from an incoming attachment.
+The earlier header guard still rejects BAL commitments: this verification change
+does not activate the fork or change the Parlia signing preimage.
+
+The focused post-execution tests passed, including all five presence/matching cases
+and the existing requests-hash regression. The complete library suite then passed
+serially with localhost socket access: **793 passed, 0 failed, 1 ignored**.
+Logs are retained in `../bep732-commitment-2026-11-14/`. The cluster results above
+belong to the recording increment; the cluster was not rerun for this change.
+
 ## Remaining BEP-732 implementation
 
 1. Complete EIP-7928 conformance and differential vectors, including access-list
    warming, out-of-gas boundaries, code/nonce changes, selfdestruct, CAS20, and
    upgrade/epoch/breathe boundaries. Measure recording overhead before making it
    mandatory.
-2. Add fork activation, header commitment generation and independent execution
-   comparison, extended Parlia seal encoding, and compatible `0x68` evidence
+2. Add fork activation and header commitment generation, connect the implemented
+   execution comparison to activated blocks, extend Parlia seal encoding and `0x68` evidence
    verification. Keep verification sequential until the engine's BAL parallel
    path supports BSC's deferred system transactions. Add fork-boundary and
    malformed-commitment tests.
