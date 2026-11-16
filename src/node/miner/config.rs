@@ -67,6 +67,13 @@ pub struct MiningConfig {
     /// synchronous `state_root_with_updates` path when the global spawner has
     /// not been registered or returns `None`.
     pub use_sparse_trie_state_root: bool,
+    /// Allow sealing blocks while no peers are connected.
+    ///
+    /// The miner normally refuses to mine in isolation to avoid forking off a
+    /// side-chain that peers do not know about. Single-validator dev/CI chains
+    /// (e.g. `--chain local` with `--mining.dev`) have no peers by design, so this
+    /// flag lifts the gate there. Keep `false` in production.
+    pub allow_isolated: bool,
 }
 
 impl std::fmt::Debug for MiningConfig {
@@ -93,6 +100,7 @@ impl std::fmt::Debug for MiningConfig {
             .field("mev_grpc_concurrency", &self.mev_grpc_concurrency)
             .field("mev_grpc_request_timeout_ms", &self.mev_grpc_request_timeout_ms)
             .field("use_sparse_trie_state_root", &self.use_sparse_trie_state_root)
+            .field("allow_isolated", &self.allow_isolated)
             .finish()
     }
 }
@@ -140,6 +148,7 @@ impl Default for MiningConfig {
             mev_grpc_concurrency: 32,
             mev_grpc_request_timeout_ms: 10_000,
             use_sparse_trie_state_root: false, // Opt-in for now (perf testing)
+            allow_isolated: false,
         }
     }
 }
@@ -309,6 +318,7 @@ impl MiningConfig {
                 mev_grpc_request_timeout_ms: 10_000,
                 greedy_merge: true,
                 use_sparse_trie_state_root: false,
+                allow_isolated: true,
             }
         } else {
             // Fallback to default if key generation fails
@@ -342,7 +352,7 @@ impl MiningConfig {
 
     /// Create a ready-to-use development mining configuration
     pub fn development() -> Self {
-        Self { enabled: true, ..Default::default() }.ensure_keys_available()
+        Self { enabled: true, allow_isolated: true, ..Default::default() }.ensure_keys_available()
     }
 
     /// Load configuration from environment variables
@@ -423,6 +433,11 @@ impl MiningConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(10_000);
 
+        let allow_isolated = std::env::var("BSC_MINING_ALLOW_ISOLATED")
+            .ok()
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false);
+
         let mut cfg = Self {
             enabled,
             private_key_hex,
@@ -445,6 +460,7 @@ impl MiningConfig {
             mev_grpc_concurrency,
             mev_grpc_request_timeout_ms,
             use_sparse_trie_state_root,
+            allow_isolated,
             ..Default::default()
         };
 
