@@ -82,8 +82,6 @@ struct RemoteImportResult {
     outcome: Option<Outcome>,
 }
 
-/// A pending import retains its hash even when execution emits no network outcome.
-
 /// Channel message type for incoming blocks
 pub(crate) type IncomingBlock = (BlockMsg, PeerId);
 
@@ -2697,16 +2695,13 @@ mod tests {
         loop {
             assert!(Pin::new(&mut *service).poll(&mut cx).is_pending());
             if let Ok(message) = engine.try_recv() {
-                match &message {
-                    BeaconEngineMessage::NewPayload { payload, .. } => {
-                        service
-                            .forkchoice_engine
-                            .provider
-                            .engine_headers
-                            .write()
-                            .insert(payload.block_hash_cached(), payload.block.header.clone());
-                    }
-                    _ => {}
+                if let BeaconEngineMessage::NewPayload { payload, .. } = &message {
+                    service
+                        .forkchoice_engine
+                        .provider
+                        .engine_headers
+                        .write()
+                        .insert(payload.block_hash_cached(), payload.block.header.clone());
                 }
                 if let BeaconEngineMessage::QueryTd { hash, tx, .. } = message {
                     let _ = tx.send(Ok(service.forkchoice_engine.provider.engine_td(hash)));
