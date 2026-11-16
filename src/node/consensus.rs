@@ -995,6 +995,89 @@ mod tests {
         vote_pool::drain();
     }
 
+    #[tokio::test]
+    async fn td_cache_eviction_requeries_engine_and_missing_results_are_not_cached() {
+        use alloy_primitives::U256;
+        let (tx, mut rx) = mpsc::unbounded_channel::<BeaconEngineMessage<BscPayloadTypes>>();
+        let queries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = queries.clone();
+        let missing = B256::repeat_byte(0xff);
+        let task = tokio::spawn(async move {
+            let mut missing_queries = 0;
+            while let Some(message) = rx.recv().await {
+                let BeaconEngineMessage::QueryTd { hash, tx, .. } = message else {
+                    panic!("TD query expected")
+                };
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let td = if hash == missing {
+                    missing_queries += 1;
+                    (missing_queries > 1).then_some(U256::from(99))
+                } else {
+                    Some(U256::from_be_bytes(hash.0))
+                };
+                tx.send(Ok(td)).unwrap();
+            }
+        });
+        let engine = BscForkChoiceEngine::new(
+            TestProvider,
+            ConsensusEngineHandle::new(tx),
+            Arc::new(BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet())),
+        );
+        for number in 1..=256u64 {
+            let hash = B256::from(U256::from(number).to_be_bytes::<32>());
+            assert_eq!(engine.header_td_by_hash(hash).await.unwrap(), Some(U256::from(number)));
+        }
+        let first = B256::from(U256::from(1).to_be_bytes::<32>());
+        assert_eq!(engine.header_td_by_hash(first).await.unwrap(), Some(U256::from(1)));
+        assert_eq!(queries.load(std::sync::atomic::Ordering::SeqCst), 257);
+        assert_eq!(engine.header_td_by_hash(first).await.unwrap(), Some(U256::from(1)));
+        assert_eq!(
+            queries.load(std::sync::atomic::Ordering::SeqCst),
+            257,
+            "cache hit should avoid engine work"
+        );
+        assert_eq!(engine.header_td_by_hash(missing).await.unwrap(), None);
+        assert_eq!(engine.header_td_by_hash(missing).await.unwrap(), Some(U256::from(99)));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn incoming_td_uses_parent_before_insertion_and_rejects_overflow() {
+        use alloy_primitives::U256;
+        let current = Header { number: 100, difficulty: U256::from(2), ..Default::default() };
+        let incoming = Header {
+            number: 101,
+            parent_hash: current.hash_slow(),
+            difficulty: U256::from(1),
+            ..Default::default()
+        };
+        for td in [U256::from(200), U256::MAX] {
+            let (tx, mut rx) = mpsc::unbounded_channel::<BeaconEngineMessage<BscPayloadTypes>>();
+            let current_hash = current.hash_slow();
+            let task = tokio::spawn(async move {
+                let BeaconEngineMessage::QueryTd { hash, tx, .. } = rx.recv().await.unwrap() else {
+                    panic!("TD query expected")
+                };
+                assert_eq!(hash, current_hash, "incoming block is not in the engine yet");
+                tx.send(Ok(Some(td))).unwrap();
+                assert!(rx.recv().await.is_none(), "parent query must hit the cache");
+            });
+            let engine = BscForkChoiceEngine::new(
+                TestProvider,
+                ConsensusEngineHandle::new(tx),
+                Arc::new(BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet())),
+            );
+            let result = engine.header_td_fcu(&incoming, &current).await;
+            if td == U256::MAX {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(result.unwrap(), (Some(U256::from(201)), Some(td)));
+            }
+            drop(engine);
+            task.await.unwrap();
+        }
+    }
+
     #[test]
     fn post_execution_requests_hash_is_presence_only() {
         use alloy_primitives::b256;
@@ -1138,9 +1221,7 @@ pub struct BscForkChoiceEngine<P> {
     forkchoice_rule: Arc<BscForkChoiceRule>,
     /// Cache for header total difficulties
     header_td_cache: Arc<
-        parking_lot::RwLock<
-            schnellru::LruMap<B256, Option<alloy_primitives::U256>, schnellru::ByLength>,
-        >,
+        parking_lot::RwLock<schnellru::LruMap<B256, alloy_primitives::U256, schnellru::ByLength>>,
     >,
     /// Finality metrics
     finality_metrics: BscFinalityMetrics,
@@ -1376,23 +1457,8 @@ where
         incoming_header: &Header,
         current_header: &Header,
     ) -> Result<bool, ParliaConsensusErr> {
-        let (incoming_td, current_td) =
-            self.header_td_fcu(&self.engine_handle, incoming_header, current_header).await?;
+        let (incoming_td, current_td) = self.header_td_fcu(incoming_header, current_header).await?;
 
-        // Ensure monotonic TD when incoming is a direct child of current.
-        let incoming_td = if incoming_header.parent_hash == current_header.hash_slow() {
-            if let (Some(in_td), Some(cur_td)) = (incoming_td, current_td) {
-                if in_td <= cur_td {
-                    Some(cur_td + incoming_header.difficulty)
-                } else {
-                    Some(in_td)
-                }
-            } else {
-                incoming_td
-            }
-        } else {
-            incoming_td
-        };
         let incoming_justified_num =
             self.get_justified_number_and_hash(incoming_header).map(|(num, _)| num).unwrap_or(0);
         let current_justified_num =
@@ -1484,106 +1550,52 @@ where
     /// with fallback logic for the incoming header if not found directly.
     async fn header_td_fcu(
         &self,
-        engine: &ConsensusEngineHandle<BscPayloadTypes>,
         incoming: &Header,
         current: &Header,
     ) -> Result<(Option<alloy_primitives::U256>, Option<alloy_primitives::U256>), ParliaConsensusErr>
     {
-        let current_td = self.header_td(engine, current.number, current.hash_slow()).await?;
+        let current_td = self.header_td_by_hash(current.hash_slow()).await?;
 
         // The incoming block is typically not imported yet, so its own hash won't resolve a TD
-        // (`header_td` would return `Ok(None)`). Derive it from the parent's TD plus the incoming
-        // block's own difficulty — the parent is the current head or an already-imported ancestor,
-        // so its TD is computable. Fall back to a direct lookup only if the parent is unknown.
-        let incoming_td = match self
-            .header_td(engine, incoming.number.saturating_sub(1), incoming.parent_hash)
-            .await?
-        {
-            Some(parent_td) => Some(parent_td + incoming.difficulty),
+        // (`header_td_by_hash` would return `Ok(None)`). Derive it from the parent's TD plus the
+        // incoming block's own difficulty — the parent is the current head or an
+        // already-imported ancestor, so its TD is computable. Fall back to a direct lookup
+        // only if the parent is unknown.
+        let incoming_td = match self.header_td_by_hash(incoming.parent_hash).await? {
+            Some(parent_td) => {
+                Some(parent_td.checked_add(incoming.difficulty).ok_or_else(|| {
+                    ParliaConsensusErr::internal(
+                        reth_engine_primitives::TotalDifficultyError::Overflow {
+                            hash: incoming.hash_slow(),
+                        },
+                    )
+                })?)
+            }
             None => {
                 tracing::debug!(
                     target: "bsc::forkchoice",
                     incoming_number = incoming.number,
                     "parent TD unknown; trying incoming block's own TD"
                 );
-                self.header_td(engine, incoming.number, incoming.hash_slow()).await?
+                self.header_td_by_hash(incoming.hash_slow()).await?
             }
         };
         Ok((incoming_td, current_td))
     }
 
-    /// Gets the total difficulty for a specific header, keyed by hash.
-    ///
-    /// Recovered fork TDs come from the hash-keyed cache. Provider fallback is allowed only
-    /// after confirming the hash identifies its canonical block number, since the provider's
-    /// TD lookup may otherwise return the canonical chain's TD for a side-branch hash.
-    async fn header_td(
-        &self,
-        _engine: &ConsensusEngineHandle<BscPayloadTypes>,
-        _number: u64,
-        hash: B256,
-    ) -> Result<Option<alloy_primitives::U256>, ParliaConsensusErr> {
-        self.header_td_by_hash(hash)
-    }
-
-    /// Resolve exact-hash TD from the fork cache or a confirmed canonical provider block.
-    /// Provider TD APIs may resolve a noncanonical hash through its canonical block number.
-    pub(crate) fn header_td_by_hash(
+    /// Resolves exact-hash TD from the engine, retaining successful answers as an optimization.
+    /// Eviction and missing ancestry never turn into a height-based chain-weight estimate.
+    pub(crate) async fn header_td_by_hash(
         &self,
         hash: B256,
     ) -> Result<Option<alloy_primitives::U256>, ParliaConsensusErr> {
         if let Some(td) = self.header_td_cache.write().get(&hash) {
-            return Ok(*td);
+            return Ok(Some(*td));
         }
-        let canonical =
-            match self.provider.block_number(hash).map_err(ParliaConsensusErr::internal)? {
-                Some(number) => self
-                    .provider
-                    .header_by_number(number)
-                    .map_err(ParliaConsensusErr::internal)?
-                    .is_some_and(|header| header.hash_slow() == hash),
-                None => false,
-            };
-        if !canonical {
-            return Ok(None);
-        }
-        let td = self.provider.header_td(&hash).map_err(ParliaConsensusErr::internal)?;
-        // Only memoize resolved values; a missing hash may become available later.
-        if td.is_some() {
+        let td = self.engine_handle.query_td(hash).await.map_err(ParliaConsensusErr::internal)?;
+        if let Some(td) = td {
             self.header_td_cache.write().insert(hash, td);
         }
         Ok(td)
-    }
-
-    /// Precomputes and caches total difficulties for a freshly fork-recovered
-    /// chain so fork choice can resolve them.
-    ///
-    /// Fork blocks live in the engine tree, not on the canonical chain, so the
-    /// provider-backed [`Self::header_td`] (which only sees canonical + DB
-    /// blocks) returns `None` for them — the cause of `Unknown total difficulty`
-    /// FCU failures after v2.5 dropped the block-carried TD (`NewBlockMessage.td`).
-    /// Given the imported fork headers oldest→newest, the base TD is taken from
-    /// the fork point (the parent of the oldest block, which is canonical and
-    /// therefore resolvable) and each block's TD is `parent_td + difficulty`,
-    /// inserted by hash into the shared cache that `header_td` consults first.
-    ///
-    /// Best-effort: a no-op if `headers` is empty or the fork point's TD is not
-    /// resolvable, in which case the existing `header_td` fallback still applies.
-    pub(crate) fn prime_fork_chain_tds<'a, I>(&self, headers: I) -> Result<(), ParliaConsensusErr>
-    where
-        I: IntoIterator<Item = &'a Header>,
-    {
-        let mut iter = headers.into_iter().peekable();
-        let Some(first) = iter.peek() else { return Ok(()) };
-        let Some(mut running) = self.header_td_by_hash(first.parent_hash)? else {
-            // Fork point TD unknown; leave resolution to the header_td fallback.
-            return Ok(());
-        };
-        let mut cache = self.header_td_cache.write();
-        for h in iter {
-            running += h.difficulty;
-            cache.insert(h.hash_slow(), Some(running));
-        }
-        Ok(())
     }
 }

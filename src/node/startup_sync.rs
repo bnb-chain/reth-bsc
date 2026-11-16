@@ -584,7 +584,7 @@ impl RangeFetcher for EthRangeFetcher {
 mod tests {
     use super::*;
     use crate::node::network::block_import::fork_recover::MAX_FORK_DEPTH;
-    use alloy_primitives::B256;
+    use alloy_primitives::{B256, U256};
     use alloy_rpc_types_engine::{PayloadStatus, PayloadStatusEnum};
     use reth_engine_primitives::{BeaconEngineMessage, OnForkChoiceUpdated};
     use reth_primitives_traits::SealedHeader;
@@ -626,7 +626,8 @@ mod tests {
         let mut parent_hash = B256::ZERO;
         (0..=count)
             .map(|number| {
-                let header = Header { number, parent_hash, ..Default::default() };
+                let header =
+                    Header { number, parent_hash, difficulty: U256::from(1), ..Default::default() };
                 parent_hash = header.hash_slow();
                 BscBlock { header, body: Default::default() }
             })
@@ -737,8 +738,19 @@ mod tests {
         let responder = async {
             let mut payloads = 0;
             let mut fcus = 0;
-            for _ in 0..7 {
+            while payloads + fcus < 7 {
                 match requests.recv().await.unwrap() {
+                    BeaconEngineMessage::QueryTd { hash, tx, .. } => {
+                        let td = blocks
+                            .iter()
+                            .position(|block| block.header.hash_slow() == hash)
+                            .map(|index| {
+                                blocks[..=index]
+                                    .iter()
+                                    .fold(U256::ZERO, |td, block| td + block.header.difficulty)
+                            });
+                        tx.send(Ok(td)).unwrap();
+                    }
                     BeaconEngineMessage::NewPayload { tx, .. } => {
                         payloads += 1;
                         tx.send(Ok(PayloadStatus::new(PayloadStatusEnum::Valid, None))).unwrap();

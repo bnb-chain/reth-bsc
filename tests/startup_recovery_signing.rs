@@ -1,7 +1,7 @@
 //! Own the process-wide recovery gate so these signing checks cannot race other unit tests.
 
 use alloy_consensus::Header;
-use alloy_primitives::B256;
+use alloy_primitives::{B256, U256};
 use alloy_rpc_types_engine::{PayloadStatus, PayloadStatusEnum};
 use reth_bsc::{
     consensus::parlia::{bls_signer::BlsVoteSigner, vote::VoteData},
@@ -54,6 +54,7 @@ async fn startup_hook_blocks_both_signers_until_engine_recovers_finalized_histor
             let header = SealedHeader::seal_slow(Header {
                 number,
                 parent_hash: parent,
+                difficulty: U256::from(1),
                 ..Default::default()
             });
             parent = header.hash();
@@ -169,9 +170,20 @@ async fn startup_hook_blocks_both_signers_until_engine_recovers_finalized_histor
     let imported_count = imported.clone();
     let canonical = provider.clone();
     let target = headers[3].clone();
+    let mut td = U256::ZERO;
+    let td_by_hash = headers
+        .iter()
+        .map(|header| {
+            td += header.difficulty;
+            (header.hash(), td)
+        })
+        .collect::<std::collections::HashMap<_, _>>();
     tasks.push(tokio::spawn(async move {
         while let Some(request) = receiver.recv().await {
             match request {
+                BeaconEngineMessage::QueryTd { hash, tx, .. } => {
+                    tx.send(Ok(td_by_hash.get(&hash).copied())).unwrap();
+                }
                 BeaconEngineMessage::NewPayload { tx, .. } => {
                     imported_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     tx.send(Ok(PayloadStatus::new(PayloadStatusEnum::Valid, None))).unwrap();

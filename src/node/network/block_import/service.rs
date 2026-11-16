@@ -601,7 +601,7 @@ where
                                 tracing::debug!(target: "bsc::block_import", "Succeed to update fork choice for new payload: number = {:?}, hash = {:?}", header.number, block_hash);
                             }
                             if fetched && publication.is_none() {
-                                match fetched_block_td(&forkchoice_engine, &header) {
+                                match fetched_block_td(&forkchoice_engine, &header).await {
                                     Ok(Some(td)) => Arc::make_mut(&mut block.block).0.td = td,
                                     Ok(None) => {
                                         tracing::debug!(target: "bsc::block_import", %block_hash, "Imported fetched block without local parent TD; suppressing propagation");
@@ -763,7 +763,7 @@ where
                                 return None;
                             }
                             if fetched && publication.is_none() {
-                                match fetched_block_td(&forkchoice_engine, &header) {
+                                match fetched_block_td(&forkchoice_engine, &header).await {
                                     Ok(Some(td)) => Arc::make_mut(&mut block.block).0.td = td,
                                     result => {
                                         tracing::debug!(target: "bsc::block_import", %block_hash, ?result, "Fetched target TD unavailable after recovery; suppressing propagation");
@@ -1978,14 +1978,14 @@ fn obsolete_announcement(number: u64, local_tip: u64, finalized: u64, stale_dist
 }
 
 /// Wire TD is derived from the exact parent, including competing branches.
-fn fetched_block_td<P>(
+async fn fetched_block_td<P>(
     forkchoice: &BscForkChoiceEngine<P>,
     header: &Header,
 ) -> eyre::Result<Option<U128>>
 where
     P: BlockNumReader + HeaderProvider<Header = Header> + Clone + Send + Sync,
 {
-    let Some(parent_td) = forkchoice.header_td_by_hash(header.parent_hash)? else {
+    let Some(parent_td) = forkchoice.header_td_by_hash(header.parent_hash).await? else {
         return Ok(None);
     };
     let total = parent_td
@@ -2157,7 +2157,7 @@ mod tests {
         time::Duration,
     };
 
-    fn local_combined_fixture(
+    async fn local_combined_fixture(
     ) -> (BscForkChoiceEngine<MockProvider>, BuiltPayloadExecutedBlock<BscPrimitives>, Header) {
         let mut provider = MockProvider::new();
         provider.insert(Header { number: 9, ..Default::default() }, U256::from(98));
@@ -2171,16 +2171,23 @@ mod tests {
             hashed_state: Arc::default(),
             trie_updates: Arc::default(),
         };
-        let (tx, _rx) = mpsc::unbounded_channel();
-        (
-            BscForkChoiceEngine::new(
-                provider,
-                ConsensusEngineHandle::new(tx),
-                Arc::new(BscChainSpec::from(bsc_mainnet())),
-            ),
-            payload,
-            header,
-        )
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let engine_provider = provider.clone();
+        tokio::spawn(async move {
+            while let Some(BeaconEngineMessage::QueryTd { hash, tx, .. }) = rx.recv().await {
+                tx.send(Ok(engine_provider.engine_td(hash))).unwrap();
+            }
+        });
+        let forkchoice = BscForkChoiceEngine::new(
+            provider,
+            ConsensusEngineHandle::new(tx),
+            Arc::new(BscChainSpec::from(bsc_mainnet())),
+        );
+        // Warm exact Engine answers so these tests can single-step the combined mutation channel.
+        for header in forkchoice.provider.headers_by_number.values() {
+            forkchoice.header_td_by_hash(header.hash_slow()).await.unwrap().unwrap();
+        }
+        (forkchoice, payload, header)
     }
 
     fn local_combined_reply(
@@ -2200,7 +2207,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_combined_uses_one_request_and_confirms_actual_head() {
-        let (forkchoice, payload, header) = local_combined_fixture();
+        let (forkchoice, payload, header) = local_combined_fixture().await;
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut pending = Box::pin(submit_mined_block(&forkchoice, &tx, payload, &header));
         assert!(futures::poll!(&mut pending).is_pending());
@@ -2232,7 +2239,7 @@ mod tests {
     #[tokio::test]
     async fn local_combined_stale_reprepares_against_engine_hash_and_is_bounded() {
         for exhaust in [false, true] {
-            let (forkchoice, payload, header) = local_combined_fixture();
+            let (forkchoice, payload, header) = local_combined_fixture().await;
             let older = forkchoice.provider.headers_by_number[&9].hash_slow();
             let (tx, mut rx) = mpsc::unbounded_channel();
             let mut pending = Box::pin(submit_mined_block(&forkchoice, &tx, payload, &header));
@@ -2281,7 +2288,7 @@ mod tests {
     #[tokio::test]
     async fn local_combined_nonvalid_and_nonselected_results_are_not_commits() {
         for case in 0..7 {
-            let (forkchoice, payload, header) = local_combined_fixture();
+            let (forkchoice, payload, header) = local_combined_fixture().await;
             let (tx, mut rx) = mpsc::unbounded_channel();
             let mut pending = Box::pin(submit_mined_block(&forkchoice, &tx, payload, &header));
             assert!(futures::poll!(&mut pending).is_pending());
@@ -2353,7 +2360,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_combined_preparation_failure_retains_execution_without_fcu() {
-        let (mut forkchoice, payload, header) = local_combined_fixture();
+        let (mut forkchoice, payload, header) = local_combined_fixture().await;
         forkchoice.provider.headers_by_hash.clear();
         let (tx, mut rx) = mpsc::unbounded_channel();
         assert!(matches!(
@@ -2377,7 +2384,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn local_combined_timeout_and_transport_errors_do_not_mean_no_mutation() {
         for timeout in [false, true] {
-            let (forkchoice, payload, header) = local_combined_fixture();
+            let (forkchoice, payload, header) = local_combined_fixture().await;
             let (tx, mut rx) = mpsc::unbounded_channel();
             let mut pending = Box::pin(submit_mined_block(&forkchoice, &tx, payload, &header));
             assert!(futures::poll!(&mut pending).is_pending());
@@ -2391,7 +2398,7 @@ mod tests {
                 assert!(matches!(pending.await, Err(LocalImportError::ReplyDropped(_))));
             }
         }
-        let (forkchoice, payload, header) = local_combined_fixture();
+        let (forkchoice, payload, header) = local_combined_fixture().await;
         let (tx, rx) = mpsc::unbounded_channel();
         drop(rx);
         assert!(matches!(
@@ -2416,23 +2423,45 @@ mod tests {
             .await;
     }
 
+    // Valid structural header for import-path tests. These tests mock execution and
+    // deliberately have no snapshot authorizing early relay.
+    fn import_test_header(number: u64) -> Header {
+        Header {
+            number,
+            timestamp: number.saturating_mul(3).saturating_add(1),
+            gas_limit: 30_000_000,
+            difficulty: U256::from(2),
+            extra_data: vec![0; 97].into(),
+            ..Default::default()
+        }
+    }
+
+    fn propagation_snapshot(parent: &Header) -> TestSnapshots {
+        let mut snapshot = test_snapshot();
+        snapshot.0.block_hash = parent.hash_slow();
+        snapshot.0.block_number = parent.number;
+        snapshot
+    }
+
     fn propagation_test_parent() -> Header {
         Header { number: 10, timestamp: 1, gas_limit: 200_000_000, ..Default::default() }
     }
 
     fn propagation_test_child(parent: &Header) -> BlockMsg {
-        let block = BscBlock {
+        let mut block = BscBlock {
             header: Header {
                 number: parent.number + 1,
-                timestamp: parent.timestamp + 1,
+                timestamp: parent.timestamp + 3,
                 parent_hash: parent.hash_slow(),
                 gas_limit: parent.gas_limit,
+                beneficiary: create_test_block().block.0.block.header.beneficiary,
                 difficulty: U256::from(2),
                 extra_data: vec![0; 97].into(),
                 ..Default::default()
             },
             ..Default::default()
         };
+        sign_test_header(&mut block.header);
         NewBlockMessage {
             hash: block.header.hash_slow(),
             block: Arc::new(BscNewBlock(NewBlock { block, td: U128::from(102) })),
@@ -2498,16 +2527,19 @@ mod tests {
         let mut provider = MockProvider::new();
         provider.insert(parent.clone(), U256::from(100));
         let (mut service, mut engine, mut events) = fetched_fixture(provider);
+        service.relay_snapshots = Some(Arc::new(propagation_snapshot(&parent)));
         let message = propagation_test_child(&parent);
         assert!(service.can_propagate_before_import(&message));
         service.on_new_block(message.clone(), PeerId::random());
+        let request = poll_until_engine_request(&mut service, &mut engine).await;
+        assert!(matches!(request, BeaconEngineMessage::NewPayload { .. }));
         let BlockImportEvent::Announcement(BlockValidation::ValidHeader { block }) =
             events.try_recv().expect("full block must not wait for child execution")
         else {
             panic!("expected full-block propagation")
         };
         assert_eq!(block.hash, message.hash);
-        assert!(engine.try_recv().is_err(), "Engine future has not even been polled");
+        assert!(engine.try_recv().is_err(), "Engine request remains unanswered");
         assert_eq!(service.pending_imports.len(), 1);
     }
 
@@ -2531,7 +2563,19 @@ mod tests {
             assert_eq!(service.pending_imports.len(), 1, "import/recovery must still run");
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
-            let BeaconEngineMessage::NewPayload { tx, .. } = engine.try_recv().unwrap() else {
+            if has_parent {
+                poll_until_imports_complete(&mut service).await;
+                assert!(engine.try_recv().is_err());
+                assert!(matches!(
+                    events.try_recv(),
+                    Ok(BlockImportEvent::Outcome(Outcome { result: Err(_), .. }))
+                ));
+                assert!(events.try_recv().is_err());
+                continue;
+            }
+            let BeaconEngineMessage::NewPayload { tx, .. } =
+                poll_until_engine_request(&mut service, &mut engine).await
+            else {
                 panic!("Engine import must still be admitted")
             };
             tx.send(Ok(PayloadStatus::new(
@@ -2549,7 +2593,7 @@ mod tests {
         let parent = propagation_test_parent();
         let mut provider = MockProvider::new();
         provider.insert(Header { number: 9, ..Default::default() }, U256::from(98));
-        provider.td_by_hash.insert(parent.hash_slow(), U256::from(100));
+        provider.engine_tds.insert(parent.hash_slow(), U256::from(100));
         let shared_headers = provider.concurrent_headers.clone();
         let (mut service, mut engine, mut events) = fetched_fixture(provider);
         let message = propagation_test_child(&parent);
@@ -2557,7 +2601,9 @@ mod tests {
         assert!(events.try_recv().is_err());
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
-        let BeaconEngineMessage::NewPayload { tx, .. } = engine.try_recv().unwrap() else {
+        let BeaconEngineMessage::NewPayload { tx, .. } =
+            poll_until_engine_request(&mut service, &mut engine).await
+        else {
             panic!("new payload expected")
         };
         // Simulate the parent being imported by the concurrent shared recovery path.
@@ -2566,7 +2612,9 @@ mod tests {
         tx.send(Ok(PayloadStatus::new(PayloadStatusEnum::Valid, None))).unwrap();
         assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
         assert!(events.try_recv().is_err(), "forkchoice must complete before deferred diffusion");
-        let BeaconEngineMessage::ForkchoiceUpdated { tx, .. } = engine.try_recv().unwrap() else {
+        let BeaconEngineMessage::ForkchoiceUpdated { tx, .. } =
+            poll_until_engine_request(&mut service, &mut engine).await
+        else {
             panic!("forkchoice expected")
         };
         tx.send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::new(PayloadStatusEnum::Valid, None))))
@@ -2587,7 +2635,7 @@ mod tests {
         let parent = propagation_test_parent();
         let mut provider = MockProvider::new();
         provider.insert(Header { number: 9, ..Default::default() }, U256::from(98));
-        provider.td_by_hash.insert(parent.hash_slow(), U256::from(100));
+        provider.engine_tds.insert(parent.hash_slow(), U256::from(100));
         let shared_headers = provider.concurrent_headers.clone();
         let (mut service, mut engine, mut events) = fetched_fixture(provider);
         let message = propagation_test_child(&parent);
@@ -2595,12 +2643,16 @@ mod tests {
         service.on_new_block(message.clone(), peer);
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
-        let BeaconEngineMessage::NewPayload { tx, .. } = engine.try_recv().unwrap() else {
+        let BeaconEngineMessage::NewPayload { tx, .. } =
+            poll_until_engine_request(&mut service, &mut engine).await
+        else {
             panic!("new payload expected")
         };
         tx.send(Ok(PayloadStatus::new(PayloadStatusEnum::Valid, None))).unwrap();
         assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
-        let BeaconEngineMessage::ForkchoiceUpdated { tx, .. } = engine.try_recv().unwrap() else {
+        let BeaconEngineMessage::ForkchoiceUpdated { tx, .. } =
+            poll_until_engine_request(&mut service, &mut engine).await
+        else {
             panic!("forkchoice expected")
         };
         tx.send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::new(PayloadStatusEnum::Valid, None))))
@@ -2611,8 +2663,10 @@ mod tests {
         assert!(!service.queued_blocks.contains(&message.hash));
         assert!(service.pending_imports.is_empty());
 
+        service.relay_snapshots = Some(Arc::new(propagation_snapshot(&parent)));
         shared_headers.write().insert(parent.hash_slow(), parent);
         service.on_new_block(message.clone(), peer);
+        let _request = poll_until_engine_request(&mut service, &mut engine).await;
         let BlockImportEvent::Announcement(BlockValidation::ValidHeader { block }) =
             events.try_recv().expect("a safe retry must not be lost to deduplication")
         else {
@@ -2639,14 +2693,29 @@ mod tests {
     ) -> BeaconEngineMessage<BscPayloadTypes> {
         let waker = futures::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             assert!(Pin::new(&mut *service).poll(&mut cx).is_pending());
             if let Ok(message) = engine.try_recv() {
+                match &message {
+                    BeaconEngineMessage::NewPayload { payload, .. } => {
+                        service
+                            .forkchoice_engine
+                            .provider
+                            .engine_headers
+                            .write()
+                            .insert(payload.block_hash_cached(), payload.block.header.clone());
+                    }
+                    _ => {}
+                }
+                if let BeaconEngineMessage::QueryTd { hash, tx, .. } = message {
+                    let _ = tx.send(Ok(service.forkchoice_engine.provider.engine_td(hash)));
+                    continue;
+                }
                 return message;
             }
-            assert!(tokio::time::Instant::now() < deadline, "no engine request");
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            assert!(std::time::Instant::now() < deadline, "no engine request");
+            tokio::task::yield_now().await;
         }
     }
 
@@ -2654,11 +2723,11 @@ mod tests {
     async fn poll_until_imports_complete(service: &mut ImportService<MockProvider>) {
         let waker = futures::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while !service.pending_imports.is_empty() {
             assert!(Pin::new(&mut *service).poll(&mut cx).is_pending());
-            assert!(tokio::time::Instant::now() < deadline, "imports did not complete");
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            assert!(std::time::Instant::now() < deadline, "imports did not complete");
+            tokio::task::yield_now().await;
         }
     }
 
@@ -2742,6 +2811,8 @@ mod tests {
             let (mut service, mut events, mut engine) = direct_service();
             let block = create_test_block();
             let hash = block.hash;
+            // Recovery lifetime is tested separately; isolate terminal import cleanup.
+            service.failed_heads.mark_failed(hash);
             service.on_new_block(block, PeerId::random());
             let BeaconEngineMessage::NewPayload { tx, .. } =
                 poll_until_engine_request(&mut service, &mut engine).await
@@ -2856,7 +2927,10 @@ mod tests {
         assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
         assert_eq!(service.from_local.len(), propagation::LOCAL_BLOCK_CAPACITY);
         assert!(service.pending_local_imports.is_empty());
-        assert!(matches!(engine_rx.try_recv(), Ok(BeaconEngineMessage::NewPayload { .. })));
+        assert!(matches!(
+            poll_until_engine_request(&mut service, &mut engine_rx).await,
+            BeaconEngineMessage::NewPayload { .. }
+        ));
         assert!(send.as_mut().poll(&mut cx).is_pending());
 
         // Taking one grouped local block releases one slot and resumes local admission.
@@ -2976,8 +3050,12 @@ mod tests {
             let block = BscBlock {
                 header: Header {
                     number: 1,
-                    extra_data: n.to_be_bytes().to_vec().into(),
-                    ..Default::default()
+                    extra_data: {
+                        let mut extra = vec![0; 97];
+                        extra[..8].copy_from_slice(&n.to_be_bytes());
+                        extra.into()
+                    },
+                    ..import_test_header(1)
                 },
                 body: BscBlockBody::default(),
             };
@@ -2996,7 +3074,12 @@ mod tests {
         let mut cx = Context::from_waker(&waker);
         assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
         let mut replies = Vec::new();
-        while let Ok(BeaconEngineMessage::NewPayload { tx, .. }) = engine_rx.try_recv() {
+        for _ in 0..MAX_PENDING_IMPORTS {
+            let BeaconEngineMessage::NewPayload { tx, .. } =
+                poll_until_engine_request(&mut service, &mut engine_rx).await
+            else {
+                panic!("new payload");
+            };
             replies.push(tx);
         }
         assert_eq!(replies.len(), MAX_PENDING_IMPORTS);
@@ -3011,7 +3094,8 @@ mod tests {
             )));
         }
         while events_rx.try_recv().is_ok() {}
-        assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
+        // The service deliberately limits completions per poll for fairness.
+        poll_until_imports_complete(&mut service).await;
         assert!(service.pending_imports.is_empty());
         service.on_new_block(rejected.clone(), peer);
         assert_eq!(service.pending_imports.len(), 1);
@@ -3023,13 +3107,13 @@ mod tests {
         // When new_payload returns Invalid, the peer should NOT be penalized.
         // A header-valid block with a queryable parent may be announced early;
         // an Engine execution rejection must still not penalize its sender.
-        let parent = propagation_test_parent();
+        let parent = test_parent();
         let mut provider = MockProvider::new();
         provider.insert(parent.clone(), U256::from(100));
         let mut fixture =
             TestFixture::new_with_provider(EngineResponses::invalid_new_payload(), provider).await;
         fixture
-            .assert_block_import_with_block(propagation_test_child(&parent), |outcome| {
+            .assert_block_import_with_block(create_test_block(), |outcome| {
                 matches!(
                     outcome,
                     BlockImportEvent::Announcement(BlockValidation::ValidHeader { .. })
@@ -3205,6 +3289,14 @@ mod tests {
                 let mut provider = MockProvider::new();
                 if context != "parent" {
                     provider.insert(test_parent(), U256::from(1));
+                } else {
+                    // Keep a canonical head for forkchoice while withholding the
+                    // incoming block's exact parent from public header lookup.
+                    provider.engine_tds.insert(test_parent().hash_slow(), U256::from(1));
+                    provider.insert(
+                        Header { gas_limit: 30_000_000, ..Default::default() },
+                        U256::from(1),
+                    );
                 }
                 let mut snapshots = test_snapshot();
                 if context == "snapshot" {
@@ -3228,41 +3320,40 @@ mod tests {
                 service.failed_heads.mark_failed(block.hash);
                 service.on_new_block(block, PeerId::random());
                 assert!(events.try_recv().is_err());
-                let task = tokio::spawn(async move { service.pending_imports.next().await });
-                let message =
-                    tokio::time::timeout(std::time::Duration::from_secs(2), engine.recv())
-                        .await
-                        .expect(context)
-                        .expect("engine request");
-                let BeaconEngineMessage::NewPayload { tx, .. } = message else {
-                    panic!("expected NewPayload");
+                let BeaconEngineMessage::NewPayload { tx, .. } =
+                    poll_until_engine_request(&mut service, &mut engine).await
+                else {
+                    panic!("expected NewPayload")
                 };
                 assert!(events.try_recv().is_err(), "{context}: relayed before engine verdict");
                 let valid = matches!(status, PayloadStatusEnum::Valid);
                 tx.send(Ok(PayloadStatus::new(status, None))).unwrap();
                 if valid {
-                    let event = tokio::time::timeout(
-                        std::time::Duration::from_secs(2),
-                        futures::future::poll_fn(|cx| events.poll_recv(cx)),
-                    )
-                    .await
-                    .expect(context)
-                    .expect("announcement");
-                    assert!(matches!(
-                        event,
-                        BlockImportEvent::Announcement(BlockValidation::ValidHeader { .. })
-                    ));
-                    // Forkchoice is covered separately; this test stops at the relay boundary.
-                    task.abort();
-                } else {
-                    let result = tokio::time::timeout(std::time::Duration::from_secs(2), task)
-                        .await
-                        .expect(context)
-                        .unwrap();
-                    let outcome = result.and_then(|result| result.outcome);
-                    assert!(outcome.is_none(), "must not penalize peer");
-                    assert!(events.try_recv().is_err(), "must not relay an unvalidated header");
+                    let BeaconEngineMessage::ForkchoiceUpdated { tx, .. } =
+                        poll_until_engine_request(&mut service, &mut engine).await
+                    else {
+                        panic!("expected forkchoice")
+                    };
+                    assert!(events.try_recv().is_err(), "forkchoice still pending");
+                    tx.send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::new(
+                        PayloadStatusEnum::Valid,
+                        None,
+                    ))))
+                    .unwrap();
                 }
+                poll_until_imports_complete(&mut service).await;
+                if valid && context != "parent" {
+                    assert!(matches!(
+                        events.try_recv(),
+                        Ok(BlockImportEvent::Announcement(BlockValidation::ValidHeader { .. }))
+                    ));
+                    assert!(matches!(
+                        events.try_recv(),
+                        Ok(BlockImportEvent::Outcome(Outcome { result: Ok(_), .. }))
+                    ));
+                }
+                // Engine VALID cannot publish a full block whose parent is not queryable.
+                assert!(events.try_recv().is_err(), "{context}: unexpected relay or penalty");
             }
         }
     }
@@ -3647,6 +3738,9 @@ mod tests {
         concurrent_canonical: Arc<RwLock<HashMap<BlockNumber, BlockHash>>>,
         headers_by_hash: HashMap<BlockHash, Header>,
         td_by_hash: HashMap<BlockHash, U256>,
+        /// Executed metadata can be available to the engine before public header serving.
+        engine_tds: HashMap<BlockHash, U256>,
+        engine_headers: Arc<parking_lot::RwLock<HashMap<BlockHash, Header>>>,
         head_number: BlockNumber,
         head_hash: BlockHash,
         /// Configurable receipts for the post-import average-gas-price check
@@ -3666,6 +3760,8 @@ mod tests {
                 concurrent_canonical: Default::default(),
                 headers_by_hash,
                 td_by_hash,
+                engine_tds: Default::default(),
+                engine_headers: Default::default(),
                 head_number: 0,
                 head_hash: BlockHash::ZERO,
                 receipts_by_hash: HashMap::new(),
@@ -3680,6 +3776,34 @@ mod tests {
                 self.head_number = header.number;
                 self.head_hash = header.hash_slow();
             }
+        }
+
+        /// Simulates the engine's exact-hash view, including accepted side-branch headers.
+        fn engine_td(&self, hash: B256) -> Option<U256> {
+            let mut cursor = hash;
+            let mut suffix = U256::ZERO;
+            for _ in 0..8192 {
+                if let Some(td) = self.engine_tds.get(&cursor) {
+                    return td.checked_add(suffix);
+                }
+                let header = self
+                    .engine_headers
+                    .read()
+                    .get(&cursor)
+                    .cloned()
+                    .or_else(|| self.header(cursor).unwrap())?;
+                if self.block_hash(header.number).unwrap() == Some(cursor) {
+                    if let Some(td) = self.td_by_hash.get(&cursor) {
+                        return td.checked_add(suffix);
+                    }
+                }
+                suffix = suffix.checked_add(header.difficulty)?;
+                if header.number == 0 {
+                    return Some(suffix);
+                }
+                cursor = header.parent_hash;
+            }
+            None
         }
 
         fn insert_receipts(&mut self, block_hash: BlockHash, receipts: Vec<Receipt>) {
@@ -4083,7 +4207,16 @@ mod tests {
         tokio::spawn(Box::pin(async move {
             while let Some(message) = from_engine.recv().await {
                 match message {
+                    BeaconEngineMessage::QueryTd { hash, tx, .. } => {
+                        let _ = tx.send(Ok(provider.engine_td(hash)));
+                    }
                     BeaconEngineMessage::NewPayload { payload, tx, .. } => {
+                        if responses.new_payload == PayloadStatusEnum::Valid {
+                            provider
+                                .engine_headers
+                                .write()
+                                .insert(payload.block_hash_cached(), payload.block.header.clone());
+                        }
                         if responses.new_payload_local_fault {
                             let local_fault = payload.local_fault.as_ref().expect("request marker");
                             assert!(!local_fault.load(Ordering::Acquire));
@@ -4126,9 +4259,7 @@ mod tests {
         let mut provider = MockProvider::new();
         let header = Header { number: local_tip, ..Default::default() };
         provider.insert(header, U256::from(1));
-        // "TD unknown" is produced by the provider, not the engine: since v2.5 fork choice resolves
-        // TD through `header_td`, and this mock holds only `local_tip`, both the incoming fork
-        // block's hash and its parent's answer `Ok(None)` — the case that used to wedge the head.
+        // The engine fixture has no ancestry for the announced remote branches.
         let chain_spec =
             Arc::new(crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet()));
 
@@ -4137,9 +4268,13 @@ mod tests {
 
         let (fcu_tx, fcu_rx) = mpsc::unbounded_channel();
         let (np_tx, np_rx) = mpsc::unbounded_channel();
+        let engine_provider = provider.clone();
         tokio::spawn(async move {
             while let Some(message) = from_engine.recv().await {
                 match message {
+                    BeaconEngineMessage::QueryTd { hash, tx, .. } => {
+                        let _ = tx.send(Ok(engine_provider.engine_td(hash)));
+                    }
                     BeaconEngineMessage::NewPayload { payload: _, tx, .. } => {
                         let _ = np_tx.send(());
                         let _ = tx.send(Ok(PayloadStatus::new(PayloadStatusEnum::Valid, None)));
@@ -4212,9 +4347,7 @@ mod tests {
         }
     }
 
-    /// Like [`spawn_service_with_tip`], but the provider cannot resolve the incoming block's TD.
-    /// Since v2.5 fork choice reads TD via `header_td` rather than asking the engine, "TD unknown"
-    /// is what a real node sees for a fork whose divergence point lies below the persisted tip.
+    /// The engine explicitly returns missing TD for unavailable incoming ancestry.
     async fn spawn_service_with_td_unknown(
         local_tip: u64,
     ) -> (ImportHandle, mpsc::UnboundedReceiver<ForkchoiceState>, mpsc::UnboundedReceiver<()>) {
@@ -4229,9 +4362,13 @@ mod tests {
 
         let (fcu_tx, fcu_rx) = mpsc::unbounded_channel();
         let (np_tx, np_rx) = mpsc::unbounded_channel();
+        let engine_provider = provider.clone();
         tokio::spawn(async move {
             while let Some(message) = from_engine.recv().await {
                 match message {
+                    BeaconEngineMessage::QueryTd { hash, tx, .. } => {
+                        let _ = tx.send(Ok(engine_provider.engine_td(hash)));
+                    }
                     BeaconEngineMessage::NewPayload { payload: _, tx, .. } => {
                         let _ = np_tx.send(());
                         let _ = tx.send(Ok(PayloadStatus::new(PayloadStatusEnum::Valid, None)));
@@ -4276,7 +4413,7 @@ mod tests {
     /// Builds a test block message at `number`.
     fn create_test_block_at(number: u64) -> NewBlockMessage<BscNewBlock> {
         let block = BscBlock {
-            header: Header { number, ..Default::default() },
+            header: Header { number, ..import_test_header(number) },
             body: BscBlockBody {
                 inner: BlockBody {
                     transactions: Vec::new(),
@@ -4291,34 +4428,18 @@ mod tests {
         NewBlockMessage { hash, block: Arc::new(new_block) }
     }
 
-    /// Regression test for the unrecoverable-fork wedge (QA net, 2026-07-28).
-    ///
-    /// A node whose persisted tip sits on a branch below the fork point cannot resolve the TD of
-    /// any incoming majority-chain block. Before the fix, `head_choice_with_td` turned that into
-    /// `UnknownTotalDifficulty`, `update_forkchoice` returned `Err`, and **no forkchoice update
-    /// was ever sent** — freezing the canonical head, which kept the DB on the losing branch,
-    /// which kept the TD unresolvable. Four validators stayed dead for an entire run while
-    /// reporting themselves healthy.
-    ///
-    /// This asserts the loop-level property the unit tests cannot: an FCU is actually emitted,
-    /// and it targets the incoming block rather than the stale local tip.
+    /// A VALID payload is not permission to guess the weight of unavailable ancestry.
     #[tokio::test]
-    async fn unresolvable_td_still_emits_forkchoice_update() {
-        // Local tip 63 and incoming 653 mirror the production incident.
-        let (handle, mut fcu_rx, _np_rx) = spawn_service_with_td_unknown(63).await;
-
-        let block = create_test_block_at(653);
-        let expected_head = block.hash;
-        handle.send_block(block, PeerId::random()).unwrap();
-
-        let state = recv_fcu_within(&mut fcu_rx, tokio::time::Duration::from_secs(5)).await.expect(
-            "a forkchoice update must be emitted even when the incoming TD is unresolvable; \
-                 without one the canonical head can never advance and the node is wedged",
-        );
-        assert_eq!(
-            state.head_block_hash, expected_head,
-            "the forkchoice update must target the incoming block, not the stale local tip"
-        );
+    async fn unresolvable_td_does_not_emit_forkchoice_update() {
+        let (handle, mut fcu_rx, mut np_rx) = spawn_service_with_td_unknown(63).await;
+        handle.send_block(create_test_block_at(653), PeerId::random()).unwrap();
+        tokio::time::timeout(tokio::time::Duration::from_secs(2), np_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(recv_fcu_within(&mut fcu_rx, tokio::time::Duration::from_millis(100))
+            .await
+            .is_none());
     }
 
     #[tokio::test]
@@ -4367,11 +4488,7 @@ mod tests {
                 NewBlockHashes(vec![BlockHashNumber { hash, number }]),
                 PeerId::random(),
             );
-            assert_eq!(
-                service.recovering_heads.lock().contains(&hash),
-                recovers,
-                "announced head {number}"
-            );
+            assert_eq!(service.head_fetches.pending_len() > 0, recovers, "announced head {number}");
         }
     }
 
@@ -4505,6 +4622,7 @@ mod tests {
             1,
             std::time::Duration::from_secs(60),
         );
+        service.relay_snapshots = Some(Arc::new(TestSnapshots(Default::default())));
         (service, rx, receiver)
     }
 
@@ -4622,24 +4740,28 @@ mod tests {
             let mut provider = MockProvider::new();
             provider.insert(Header { number: 9, ..Default::default() }, U256::from(98));
             // Forkchoice's already-executed chain metadata remains separate from ETH serving.
-            provider.td_by_hash.insert(parent.hash_slow(), U256::from(100));
+            provider.engine_tds.insert(parent.hash_slow(), U256::from(100));
             let (mut service, mut engine, mut events) = fetched_fixture(provider);
             let (_tx, rx) = tokio::sync::broadcast::channel(4);
             service = service.with_publication(publication.clone(), rx);
             let mut message = propagation_test_child(&parent);
             // Force the post-validation path; the mock Engine, not the propagation checks,
             // authorizes this fixture's execution and forkchoice.
-            Arc::make_mut(&mut message.block).0.block.header.extra_data = Default::default();
+            // No relay snapshot is available, so validation is deferred without
+            // corrupting the structural header.
             message.hash = message.block.0.block.header.hash_slow();
             service.on_new_block_inner(message.clone(), PeerId::random(), fetched);
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
-            let BeaconEngineMessage::NewPayload { tx, .. } = engine.try_recv().unwrap() else {
+            let BeaconEngineMessage::NewPayload { tx, .. } =
+                poll_until_engine_request(&mut service, &mut engine).await
+            else {
                 panic!("execution must run")
             };
             tx.send(Ok(PayloadStatus::new(PayloadStatusEnum::Valid, None))).unwrap();
             assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
-            let BeaconEngineMessage::ForkchoiceUpdated { tx, .. } = engine.try_recv().unwrap()
+            let BeaconEngineMessage::ForkchoiceUpdated { tx, .. } =
+                poll_until_engine_request(&mut service, &mut engine).await
             else {
                 panic!("forkchoice must run")
             };
@@ -4670,7 +4792,7 @@ mod tests {
         let parent = propagation_test_parent();
         let mut provider = MockProvider::new();
         provider.insert(Header { number: 9, ..Default::default() }, U256::from(98));
-        provider.td_by_hash.insert(parent.hash_slow(), U256::from(100));
+        provider.engine_tds.insert(parent.hash_slow(), U256::from(100));
         let ready = Arc::new(parking_lot::Mutex::new(None::<BscBlock>));
         let source = ready.clone();
         let publication = Publication::new(Arc::new(AnnouncedBlocks::default()), move |hash| {
@@ -4687,12 +4809,16 @@ mod tests {
         service.on_new_block(block.clone(), PeerId::random());
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
-        let BeaconEngineMessage::NewPayload { tx, .. } = engine.try_recv().unwrap() else {
+        let BeaconEngineMessage::NewPayload { tx, .. } =
+            poll_until_engine_request(&mut service, &mut engine).await
+        else {
             panic!("missing public parent must not stop execution")
         };
         tx.send(Ok(PayloadStatus::new(PayloadStatusEnum::Valid, None))).unwrap();
         assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
-        let BeaconEngineMessage::ForkchoiceUpdated { tx, .. } = engine.try_recv().unwrap() else {
+        let BeaconEngineMessage::ForkchoiceUpdated { tx, .. } =
+            poll_until_engine_request(&mut service, &mut engine).await
+        else {
             panic!("missing public parent must not stop forkchoice")
         };
         tx.send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::new(PayloadStatusEnum::Valid, None))))
@@ -4730,7 +4856,7 @@ mod tests {
     #[tokio::test]
     async fn known_parent_fetched_block_propagates_exact_branch_td_and_dedups() {
         let mut provider = MockProvider::new();
-        let parent = Header { number: 10, ..Default::default() };
+        let parent = Header { number: 10, ..import_test_header(10) };
         provider.insert(parent.clone(), U256::from(100));
         let (mut service, mut engine, mut events) = fetched_fixture(provider);
         let block = BscBlock {
@@ -4738,7 +4864,7 @@ mod tests {
                 number: 11,
                 parent_hash: parent.hash_slow(),
                 difficulty: U256::from(2),
-                ..Default::default()
+                ..import_test_header(11)
             },
             ..Default::default()
         };
@@ -4752,13 +4878,17 @@ mod tests {
         assert_eq!(service.pending_imports.len(), 1);
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
-        let BeaconEngineMessage::NewPayload { tx, .. } = engine.try_recv().unwrap() else {
+        let BeaconEngineMessage::NewPayload { tx, .. } =
+            poll_until_engine_request(&mut service, &mut engine).await
+        else {
             panic!("new payload expected")
         };
         tx.send(Ok(PayloadStatus::new(PayloadStatusEnum::Valid, None))).unwrap();
         assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
         assert!(events.try_recv().is_err());
-        let BeaconEngineMessage::ForkchoiceUpdated { tx, .. } = engine.try_recv().unwrap() else {
+        let BeaconEngineMessage::ForkchoiceUpdated { tx, .. } =
+            poll_until_engine_request(&mut service, &mut engine).await
+        else {
             panic!("fork choice expected")
         };
         tx.send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::new(PayloadStatusEnum::Valid, None))))
@@ -4781,8 +4911,8 @@ mod tests {
         assert!(events.try_recv().is_err());
     }
 
-    #[test]
-    fn fetched_td_errors_never_wrap_or_truncate() {
+    #[tokio::test]
+    async fn fetched_td_errors_never_wrap_or_truncate() {
         let mut provider = MockProvider::new();
         let parent = Header::default();
         provider.insert(parent.clone(), U256::MAX);
@@ -4791,25 +4921,39 @@ mod tests {
             difficulty: U256::from(1),
             ..Default::default()
         };
-        let (tx, _) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let reply_provider = provider.clone();
+        tokio::spawn(async move {
+            let BeaconEngineMessage::QueryTd { hash, tx, .. } = rx.recv().await.unwrap() else {
+                panic!("TD query expected")
+            };
+            tx.send(Ok(reply_provider.engine_td(hash))).unwrap();
+        });
         let engine = BscForkChoiceEngine::new(
             provider.clone(),
             ConsensusEngineHandle::new(tx),
             Arc::new(BscChainSpec::from(bsc_mainnet())),
         );
         assert_eq!(
-            fetched_block_td(&engine, &header).unwrap_err().to_string(),
+            fetched_block_td(&engine, &header).await.unwrap_err().to_string(),
             "fetched block total difficulty overflow"
         );
         provider.insert(parent, U256::from(u128::MAX));
-        let (tx, _) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let reply_provider = provider.clone();
+        tokio::spawn(async move {
+            let BeaconEngineMessage::QueryTd { hash, tx, .. } = rx.recv().await.unwrap() else {
+                panic!("TD query expected")
+            };
+            tx.send(Ok(reply_provider.engine_td(hash))).unwrap();
+        });
         let engine = BscForkChoiceEngine::new(
             provider,
             ConsensusEngineHandle::new(tx),
             Arc::new(BscChainSpec::from(bsc_mainnet())),
         );
         assert_eq!(
-            fetched_block_td(&engine, &header).unwrap_err().to_string(),
+            fetched_block_td(&engine, &header).await.unwrap_err().to_string(),
             "fetched block total difficulty exceeds wire u128"
         );
     }
@@ -4826,24 +4970,24 @@ mod tests {
         .enumerate()
         {
             let mut provider = MockProvider::new();
-            let common = Header { number: 10, ..Default::default() };
+            let common = Header { number: 10, ..import_test_header(10) };
             provider.insert(common.clone(), U256::from(100));
             let parent = BscBlock {
                 header: Header {
                     number: 11,
                     parent_hash: common.hash_slow(),
                     difficulty: U256::from(1),
-                    ..Default::default()
+                    ..import_test_header(11)
                 },
                 ..Default::default()
             };
             let head = BscBlock {
                 header: Header {
                     number: 12,
-                    extra_data: vec![u8::try_from(case).unwrap()].into(),
+                    extra_data: vec![u8::try_from(case).unwrap(); 97].into(),
                     parent_hash: parent.header.hash_slow(),
                     difficulty: U256::from(1),
-                    ..Default::default()
+                    ..import_test_header(12)
                 },
                 ..Default::default()
             };
@@ -4871,7 +5015,9 @@ mod tests {
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             let mut payloads = Vec::new();
             let mut result = None;
-            for _ in 0..32 {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                tokio::task::yield_now().await;
                 if let Poll::Ready(Some(outcome)) = service.pending_imports.poll_next_unpin(&mut cx)
                 {
                     result = Some(outcome.outcome);
@@ -4897,7 +5043,17 @@ mod tests {
                 }
                 if let Ok(message) = engine.try_recv() {
                     match message {
+                        BeaconEngineMessage::QueryTd { hash, tx, .. } => {
+                            tx.send(Ok(service.forkchoice_engine.provider.engine_td(hash)))
+                                .unwrap();
+                        }
                         BeaconEngineMessage::NewPayload { payload, tx, .. } => {
+                            service
+                                .forkchoice_engine
+                                .provider
+                                .engine_headers
+                                .write()
+                                .insert(payload.block_hash_cached(), payload.block.header.clone());
                             payloads.push(payload.block.header.number);
                             let status = match payloads.len() {
                                 1 => PayloadStatusEnum::Syncing,
@@ -4973,14 +5129,14 @@ mod tests {
     async fn full_new_block_rechecks_target_while_parent_range_is_stalled() {
         for newer_head in [false, true] {
             let mut provider = MockProvider::new();
-            let common = Header { number: 10, difficulty: U256::from(1), ..Default::default() };
+            let common = Header { number: 10, difficulty: U256::from(1), ..import_test_header(10) };
             provider.insert(common.clone(), U256::from(100));
             let parent = BscBlock {
                 header: Header {
                     number: 11,
                     parent_hash: common.hash_slow(),
                     difficulty: U256::from(1),
-                    ..Default::default()
+                    ..import_test_header(11)
                 },
                 ..Default::default()
             };
@@ -4989,17 +5145,17 @@ mod tests {
                     number: 12,
                     parent_hash: parent.header.hash_slow(),
                     difficulty: U256::from(1),
-                    ..Default::default()
+                    ..import_test_header(12)
                 },
                 ..Default::default()
             };
             let hash = head.header.hash_slow();
-            provider.td_by_hash.insert(parent.header.hash_slow(), U256::from(101));
+            provider.engine_tds.insert(parent.header.hash_slow(), U256::from(101));
             let better = Header {
                 number: 13,
                 difficulty: U256::from(100),
                 extra_data: vec![0x7f].into(),
-                ..Default::default()
+                ..import_test_header(13)
             };
             if newer_head {
                 provider.insert(better.clone(), U256::from(200));
@@ -5027,7 +5183,9 @@ mod tests {
             service.on_new_block_inner(message(head.clone()), peer, false);
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
-            let BeaconEngineMessage::NewPayload { tx, .. } = engine.try_recv().unwrap() else {
+            let BeaconEngineMessage::NewPayload { tx, .. } =
+                poll_until_engine_request(&mut service, &mut engine).await
+            else {
                 panic!("original target")
             };
             tx.send(Ok(PayloadStatus::new(PayloadStatusEnum::Syncing, None))).unwrap();
@@ -5070,9 +5228,16 @@ mod tests {
                 Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
             );
             tokio::pin!(parent_import);
-            assert!(parent_import.as_mut().poll(&mut cx).is_pending());
-            let BeaconEngineMessage::NewPayload { payload, tx, .. } = engine.try_recv().unwrap()
-            else {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let request = loop {
+                assert!(parent_import.as_mut().poll(&mut cx).is_pending());
+                if let Ok(request) = engine.try_recv() {
+                    break request;
+                }
+                assert!(std::time::Instant::now() < deadline, "parent authentication stalled");
+                tokio::task::yield_now().await;
+            };
+            let BeaconEngineMessage::NewPayload { payload, tx, .. } = request else {
                 panic!("independent parent payload")
             };
             assert_eq!(payload.block.header.number, 11);
@@ -5082,10 +5247,15 @@ mod tests {
                 // Error arrival racing with local progress must not mark the head failed.
                 stalled.take().unwrap().send(Err("range timed out concurrently".into())).unwrap();
             }
-            assert!(parent_import.as_mut().poll(&mut cx).is_pending());
-            let BeaconEngineMessage::ForkchoiceUpdated { tx, .. } = engine.try_recv().unwrap()
-            else {
-                panic!("parent forkchoice")
+            let tx = loop {
+                assert!(parent_import.as_mut().poll(&mut cx).is_pending());
+                match engine.try_recv().unwrap() {
+                    BeaconEngineMessage::QueryTd { hash, tx, .. } => {
+                        tx.send(Ok(service.forkchoice_engine.provider.engine_td(hash))).unwrap();
+                    }
+                    BeaconEngineMessage::ForkchoiceUpdated { tx, .. } => break tx,
+                    _ => panic!("parent forkchoice"),
+                }
             };
             tx.send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::new(
                 PayloadStatusEnum::Valid,
@@ -5104,6 +5274,10 @@ mod tests {
                 // hash alone cannot identify which future owns a queued response channel.
                 while let Ok(message) = engine.try_recv() {
                     match message {
+                        BeaconEngineMessage::QueryTd { hash, tx, .. } => {
+                            tx.send(Ok(service.forkchoice_engine.provider.engine_td(hash)))
+                                .unwrap();
+                        }
                         BeaconEngineMessage::NewPayload { payload, tx, .. } => {
                             assert_eq!(payload.block.header.number, 12);
                             assert_eq!(payload.block.header.hash_slow(), hash);
@@ -5177,7 +5351,7 @@ mod tests {
         let (tx, mut ranges) = mpsc::unbounded_channel();
         crate::node::network::bsc_protocol::registry::register_peer(peer, tx, 2);
         let block = BscBlock {
-            header: Header { number: 2, parent_hash: B256::random(), ..Default::default() },
+            header: Header { number: 2, parent_hash: B256::random(), ..import_test_header(2) },
             ..Default::default()
         };
         crate::node::network::bsc_protocol::registry::record_announcer(
@@ -5194,7 +5368,9 @@ mod tests {
         assert_eq!(service.pending_imports.len(), 1);
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
-        let BeaconEngineMessage::NewPayload { tx, .. } = engine.try_recv().unwrap() else {
+        let BeaconEngineMessage::NewPayload { tx, .. } =
+            poll_until_engine_request(&mut service, &mut engine).await
+        else {
             panic!("initial target")
         };
         tx.send(Ok(PayloadStatus::new(PayloadStatusEnum::Syncing, None))).unwrap();
@@ -5206,7 +5382,9 @@ mod tests {
         };
         tokio::time::advance(std::time::Duration::from_millis(100)).await;
         assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
-        let BeaconEngineMessage::NewPayload { tx, .. } = engine.try_recv().unwrap() else {
+        let BeaconEngineMessage::NewPayload { tx, .. } =
+            poll_until_engine_request(&mut service, &mut engine).await
+        else {
             panic!("final target recheck before accepting timeout")
         };
         tx.send(Ok(PayloadStatus::new(PayloadStatusEnum::Syncing, None))).unwrap();
@@ -5230,7 +5408,10 @@ mod tests {
         service.on_new_block_inner(message, peer, false);
         assert_eq!(service.pending_imports.len(), 1);
         assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
-        assert!(matches!(engine.try_recv(), Ok(BeaconEngineMessage::NewPayload { .. })));
+        assert!(matches!(
+            poll_until_engine_request(&mut service, &mut engine).await,
+            BeaconEngineMessage::NewPayload { .. }
+        ));
         let gate = service.recovery_gate.clone();
         drop(service);
         assert!(gate.try_acquire(3).is_ok());
@@ -5243,7 +5424,7 @@ mod tests {
         let (tx, mut ranges) = mpsc::unbounded_channel();
         crate::node::network::bsc_protocol::registry::register_peer(peer, tx, 2);
         let block = BscBlock {
-            header: Header { number: 2, parent_hash: B256::random(), ..Default::default() },
+            header: Header { number: 2, parent_hash: B256::random(), ..import_test_header(2) },
             ..Default::default()
         };
         crate::node::network::bsc_protocol::registry::record_announcer(
@@ -5262,7 +5443,9 @@ mod tests {
         assert!(events.try_recv().is_err());
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(service.pending_imports.poll_next_unpin(&mut cx).is_pending());
-        let BeaconEngineMessage::NewPayload { tx, .. } = engine.try_recv().unwrap() else {
+        let BeaconEngineMessage::NewPayload { tx, .. } =
+            poll_until_engine_request(&mut service, &mut engine).await
+        else {
             panic!("new payload expected")
         };
         tx.send(Ok(PayloadStatus::new(PayloadStatusEnum::Syncing, None))).unwrap();
@@ -5282,8 +5465,8 @@ mod tests {
     #[tokio::test]
     async fn known_and_stale_hashes_do_not_claim_recovery_or_import_slots() {
         let mut provider = MockProvider::new();
-        provider.insert(Header { number: 100, ..Default::default() }, U256::from(100));
-        let known = Header { number: 133, ..Default::default() };
+        provider.insert(Header { number: 100, ..import_test_header(100) }, U256::from(100));
+        let known = Header { number: 133, ..import_test_header(133) };
         let known_hash = known.hash_slow();
         provider.headers_by_hash.insert(known_hash, known.clone());
         let (mut service, mut engine, mut events) = fetched_fixture(provider);
@@ -5295,7 +5478,7 @@ mod tests {
             PeerId::random(),
         );
         assert!(service.recovery_gate.try_acquire(134).is_ok());
-        for header in [known, Header { number: 88, ..Default::default() }] {
+        for header in [known, Header { number: 88, ..import_test_header(88) }] {
             let block = BscBlock { header, ..Default::default() };
             let message = NewBlockMessage {
                 hash: block.header.hash_slow(),
@@ -5311,8 +5494,10 @@ mod tests {
     #[tokio::test]
     async fn full_block_arrival_cancels_fetch_before_a_second_import() {
         let (mut service, mut engine, _events) = fetched_fixture(MockProvider::new());
-        let block =
-            BscBlock { header: Header { number: 1, ..Default::default() }, ..Default::default() };
+        let block = BscBlock {
+            header: Header { number: 1, ..import_test_header(1) },
+            ..Default::default()
+        };
         let hash = block.header.hash_slow();
         let (sender, receiver) = tokio::sync::oneshot::channel::<(BscBlock, PeerId)>();
         service.head_fetches.insert(hash, async { Ok(receiver.await?) });
@@ -5328,24 +5513,27 @@ mod tests {
         service.on_new_block(message, PeerId::random());
         assert_eq!(service.pending_imports.len(), 1);
         assert!(service.pending_imports.poll_next_unpin(&mut cx).is_pending());
-        assert!(matches!(engine.try_recv().unwrap(), BeaconEngineMessage::NewPayload { .. }));
+        assert!(matches!(
+            poll_until_engine_request(&mut service, &mut engine).await,
+            BeaconEngineMessage::NewPayload { .. }
+        ));
         assert!(engine.try_recv().is_err());
     }
 
     #[tokio::test]
-    async fn fetched_side_parent_td_uses_primed_hash_cache_not_canonical_height_td() {
-        let common = Header { number: 10, ..Default::default() };
+    async fn fetched_side_parent_td_queries_engine_not_canonical_height_td() {
+        let common = Header { number: 10, ..import_test_header(10) };
         let canonical = Header {
             number: 11,
             parent_hash: common.hash_slow(),
             difficulty: U256::from(1000),
-            ..Default::default()
+            ..import_test_header(11)
         };
         let side = Header {
             number: 11,
             parent_hash: common.hash_slow(),
             difficulty: U256::from(1),
-            ..Default::default()
+            ..import_test_header(11)
         };
         let mut provider = MockProvider::new();
         provider.insert(common, U256::from(100));
@@ -5354,23 +5542,27 @@ mod tests {
         // Model ConsistentProvider's hash -> number -> canonical TD lookup.
         provider.td_by_hash.insert(side.hash_slow(), U256::from(1100));
         let (mut service, mut engine, mut events) = fetched_fixture(provider);
-        assert_eq!(service.forkchoice_engine.header_td_by_hash(side.hash_slow()).unwrap(), None);
-        service.forkchoice_engine.prime_fork_chain_tds([&side]).unwrap();
-        assert_eq!(
-            service.forkchoice_engine.header_td_by_hash(side.hash_slow()).unwrap(),
-            Some(U256::from(101))
-        );
+        let query = service.forkchoice_engine.header_td_by_hash(side.hash_slow());
+        let reply = async {
+            let BeaconEngineMessage::QueryTd { hash, tx, .. } = engine.recv().await.unwrap() else {
+                panic!("TD query expected")
+            };
+            assert_eq!(hash, side.hash_slow());
+            tx.send(Ok(Some(U256::from(101)))).unwrap();
+        };
+        let (td, ()) = tokio::join!(query, reply);
+        assert_eq!(td.unwrap(), Some(U256::from(101)));
         let head = BscBlock {
             header: Header {
                 number: 12,
                 parent_hash: side.hash_slow(),
                 difficulty: U256::from(1),
-                ..Default::default()
+                ..import_test_header(12)
             },
             ..Default::default()
         };
         assert_eq!(
-            fetched_block_td(&service.forkchoice_engine, &head.header).unwrap(),
+            fetched_block_td(&service.forkchoice_engine, &head.header).await.unwrap(),
             Some(U128::from(102))
         );
         let hash = head.header.hash_slow();
@@ -5385,20 +5577,20 @@ mod tests {
         assert!(events.try_recv().is_err());
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
-        let BeaconEngineMessage::NewPayload { tx, .. } = engine.try_recv().unwrap() else {
+        let BeaconEngineMessage::NewPayload { tx, .. } =
+            poll_until_engine_request(&mut service, &mut engine).await
+        else {
             panic!("new payload expected")
         };
         tx.send(Ok(PayloadStatus::new(PayloadStatusEnum::Valid, None))).unwrap();
-        for _ in 0..4 {
-            assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
-            if let Ok(BeaconEngineMessage::ForkchoiceUpdated { tx, .. }) = engine.try_recv() {
-                tx.send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::new(
-                    PayloadStatusEnum::Valid,
-                    None,
-                ))))
-                .unwrap();
-            }
-        }
+        let BeaconEngineMessage::ForkchoiceUpdated { tx, .. } =
+            poll_until_engine_request(&mut service, &mut engine).await
+        else {
+            panic!("forkchoice expected")
+        };
+        tx.send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::new(PayloadStatusEnum::Valid, None))))
+            .unwrap();
+        poll_until_imports_complete(&mut service).await;
         let BlockImportEvent::Announcement(BlockValidation::ValidHeader { block }) =
             events.try_recv().unwrap()
         else {
@@ -5421,7 +5613,7 @@ mod tests {
         let (mut service, mut engine, mut events) = fetched_fixture(MockProvider::new());
         let peer = PeerId::random();
         let block = BscBlock {
-            header: Header { number: 2, parent_hash: B256::random(), ..Default::default() },
+            header: Header { number: 2, parent_hash: B256::random(), ..import_test_header(2) },
             ..Default::default()
         };
         let hash = block.header.hash_slow();
@@ -5442,7 +5634,9 @@ mod tests {
         service.on_new_block_inner(message.clone(), peer, true);
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
-        let BeaconEngineMessage::NewPayload { tx, .. } = engine.try_recv().unwrap() else {
+        let BeaconEngineMessage::NewPayload { tx, .. } =
+            poll_until_engine_request(&mut service, &mut engine).await
+        else {
             panic!("new payload expected")
         };
         // A second complete delivery while Engine is pending remains deduplicated.
