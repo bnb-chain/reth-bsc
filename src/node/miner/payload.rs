@@ -612,14 +612,28 @@ where
         if let Some(control) = &build_control {
             control.check_active(std::time::Instant::now()).map_err(std::io::Error::other)?;
         }
+        let candidate_state = match super::bal_state::prepare(&self.client, &parent_header) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                metrics::counter!("bsc_bal_parent_state_total", "result" => "fallback")
+                    .increment(1);
+                warn!(target: "payload_builder", %parent_hash, %error, "BAL parent state unavailable; using executed parent");
+                None
+            }
+        };
+        if candidate_state.is_some() {
+            // Cached reads must not mask errors in the new parent view during rollout.
+            cached_reads = CachedReads::default();
+        }
 
         // Each candidate owns its root task; all candidates reuse the miner's dedicated
         // executor. `None` keeps the synchronous path when sparse-trie building is disabled.
         let root_setup =
             super::perf_tuning::Phase::new(kind.label(), self.ctx.is_inturn, "root_setup");
         let trie_handle: Arc<Mutex<Option<reth_engine_tree::tree::StateRootHandle>>> = {
-            let use_sparse_trie = crate::node::miner::config::get_global_mining_config()
-                .is_some_and(|c| c.use_sparse_trie_state_root);
+            let use_sparse_trie = candidate_state.is_none() &&
+                crate::node::miner::config::get_global_mining_config()
+                    .is_some_and(|c| c.use_sparse_trie_state_root);
             Arc::new(Mutex::new(if use_sparse_trie {
                 crate::shared::spawn_sparse_trie_state_root(parent_header.as_ref().clone())
             } else {
@@ -639,8 +653,12 @@ where
             super::perf_tuning::Phase::new(kind.label(), self.ctx.is_inturn, "state_provider_open");
         let state_provider = parent_state.open()?;
         provider_setup.complete();
-        let state = StateProviderDatabase::new(EvmStateProviderAdapter(&state_provider));
-        let prewarm_cache = super::prewarm::cache_for_attempt(parent_hash);
+        let read_provider = candidate_state.as_ref().map_or(&state_provider, |(base, _)| base);
+        let state = super::bal_state::BalParentDatabase {
+            base: StateProviderDatabase::new(EvmStateProviderAdapter(read_provider)),
+            overlay: candidate_state.as_ref().map(|(_, overlay)| overlay),
+        };
+        let prewarm_cache = candidate_state.is_none().then(|| super::prewarm::cache_for_attempt(parent_hash)).flatten();
         let (state, read_phase) =
             ObservedStateDb::new(&mut cached_reads, state, kind, self.ctx.is_inturn);
         let state = state.with_shared_prewarm(parent_hash, prewarm_cache.clone());

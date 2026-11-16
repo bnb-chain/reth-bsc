@@ -351,6 +351,50 @@ future work. Fetch completion does not authorize speculative state use or replac
 execution verification. The separate attachment handshake marker remains a
 prototype requiring cross-client agreement.
 
+## BAL-derived parent state rollout
+
+`BSC_BEP732_CANDIDATE_STATE=true` opts the local transaction builder into reading
+parent N from a hash-pinned N−1 provider plus N's retained full BAL. The resulting
+account/storage trie root must match N's header before the view is used. A missing
+attachment, provider failure, or derivation mismatch falls back to executed N.
+The default remains off; this is a correctness rollout, not a performance mode.
+
+The immutable view merges only changed account fields, uses the final indexed
+storage writes (including explicit zeroes), preserves read-only account existence,
+and prevents deleted accounts from exposing old storage. Changed bytecode is
+checked before decoding. The view supplies N's hash for `BLOCKHASH(N)`; older
+hashes still come from the base provider. Each child has its own mutable revm
+state. Cached reads are reset and sparse-trie background computation is disabled
+for this rollout so neither can mask errors in the new parent view. Child roots
+are finalized against the imported N provider.
+
+This increment still starts work after N is imported. It does **not** implement
+construction overlap, announce an unvalidated candidate as canonical, or change
+sealing authorization. Early-announcement scheduling, branch-scoped snapshot and
+ancestor handling, parent-validation cancellation, and the pre-signing gate remain
+necessary before enabling speculative N+1 construction. Empty fallback and bid
+simulation continue using their existing executed-parent paths.
+
+Seven unit tests cover sparse final writes, storage-only updates, code creation,
+read-only/absent accounts, deletion, branch-parent hashes, disabled delegation,
+and child/sibling isolation. The full library suite passed 822 tests with one
+ignored when run serially. The initial concurrent run failed eight existing
+shared vote-pool tests; its log is retained alongside the passing serial run.
+
+Local-cluster evidence is under `../bep732-candidate-cluster-2026-11-16/`.
+One candidate-enabled validator and two baseline validators passed 36 functional
+checks across 67 transactions and all seven bid cases, including malformed BAL
+and false execution commitments. The nodes agreed across 328 canonical blocks
+through height 327. Candidate metrics recorded 186 successful root-checked
+derivations, 105 missing-attachment fallbacks, and no derivation-error fallbacks;
+the baseline nodes recorded no candidate-state activity. The initial metrics
+assertion omitted Reth's `reth_` prefix and failed after the workloads passed.
+The parser was fixed and the saved metrics rechecked without changing source or
+rerunning transactions. `results/final-status.json` records the aggregate result;
+the original harness failure is preserved. All owned nodes were stopped and the
+shared-target baseline binary restored. This does not test construction overlap
+or pre-import invalid-parent cancellation.
+
 ## Remaining BEP-732 implementation
 
 1. Complete EIP-7928 conformance and differential vectors, including access-list
@@ -365,8 +409,8 @@ prototype requiring cross-client agreement.
    historical eth/71 downloader integration, peer failover, and retries. Recent
    announcement retrieval and executed-BAL persistence are implemented above;
    unexecuted attachments retain their separate bounded memory cache.
-5. Implement isolated candidate-parent and child state views, branch-aware Parlia
-   queries, and construction overlap. Sealing must wait for successful parent
+5. Extend the opt-in BAL-derived parent view above to pre-import construction,
+   branch-aware Parlia queries, and construction overlap. Sealing must wait for successful parent
    import and matching canonical state; reorgs or failures cancel dependent work.
 
 The earlier Geth local-cluster compatibility checks exercise existing BSC rules and
