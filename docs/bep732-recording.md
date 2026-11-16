@@ -395,6 +395,84 @@ the original harness failure is preserved. All owned nodes were stopped and the
 shared-target baseline binary restored. This does not test construction overlap
 or pre-import invalid-parent cancellation.
 
+## Early child construction
+
+`BSC_BEP732_PARALLEL=true` enables early construction for received NewBlock
+parents with a retained full BAL. It is independent of the earlier
+`BSC_BEP732_CANDIDATE_STATE` rollout switch and remains off by default.
+
+The import service publishes a bounded early-parent notification before awaiting
+`new_payload`. The miner accepts only a direct extension of the current canonical
+head, checks header/timing rules and the hash-specific Parlia snapshot, and limits
+attempts to one candidate per canonical base. Checkpoints, epoch handovers,
+breathe boundaries and fork transitions use ordinary sequential construction.
+The BAL-derived root must match the parent header; account/storage reads and the
+last 256 block hashes are isolated from child writes and later canonical changes.
+
+User-transaction execution can proceed while parent validation is in flight.
+System finalization and child root calculation wait for successful independent
+execution and fork choice. A live early job is retained when its exact parent
+becomes canonical. Before block finalization/signing, the parent must still be the
+canonical tip, the import guard must report success, and validator eligibility is
+checked against the current snapshot. Invalid/cancelled imports, competing tips,
+job cancellation and bounded deadlines discard speculative work. A 50-ms status
+check resumes ordinary canonical work after failure rather than waiting for the
+normal recovery ticker; the pending-parent wait has a two-second ceiling.
+
+The early snapshot remains in the existing hash-keyed snapshot cache, with
+checkpoint/validator transitions excluded; it is never installed as canonical
+execution state. Missing attachments and historical synchronization use the
+sequential path. Local zero-simulation BidBlock verification does not yet publish
+an early-parent notification, although peers receiving its NewBlock can use this
+path. This is user-transaction construction overlap, not speculative system
+finalization or parallel transaction execution within one block.
+
+Metrics: `reth_bsc_parallel_parent_total` records queued, cancelled, rejected and
+signing-rejected work; `reth_bsc_parallel_build_total` distinguishes builds reaching
+the derived state before/after parent import; `reth_bsc_parallel_transaction_total`
+counts child transactions executed before parent import completes. These counters
+are correctness evidence, not throughput or latency benchmarks.
+
+### Early-construction validation
+
+The full library suite passes 830 tests with one ignored. Added cases cover
+pending/imported/rejected parent lifecycles, exact-tip and reorg checks, deadline
+and explicit cancellation, invalidation during an active wait, pinned ancestor
+hashes, retaining a live job on parent import, and releasing unselected BALs.
+The import guard holds a weak reference, so queued engine import futures do not
+pin evicted attachments outside the bounded early-parent queue.
+
+The normal and delayed local clusters each passed the five scenario groups:
+36 functional assertions, 67 workload transactions, seven adversarial/valid bid
+cases, and a separate 600-transfer BNB burst with receipts compared on all nodes.
+Artifacts are in `../bep732-parallel-cluster-2026-11-16/` and
+`../bep732-parallel-delay-cluster-2026-11-16/`. Initial runs and follow-up runs are
+preserved separately; source patches and binary hashes identify each revision.
+
+The undelayed run did **not** demonstrate overlap: parent execution completed
+before the child reached its derived state. Its initial overlap assertion failed;
+subsequent verification explicitly distinguishes compatibility from overlap.
+This is not evidence of a speedup on small blocks.
+
+A separate test checkout delays the parent executor's finish by 200 ms. Its
+follow-up run recorded 213 builds reaching the derived state before import and
+299 child transaction execution attempts before import, with 752 canonical blocks
+matching through height 751. Timestamp correlation across both delayed runs found
+child transactions executing inside parent executor delay intervals for 215
+distinct parents. Rebuild attempts can execute the same transaction repeatedly;
+these counts are not counts of distinct canonical transactions. Delay hooks and
+extra event instrumentation are not part of the implementation branch.
+
+The live negative driver broadcasts a correctly committed BAL/state root with an
+incorrect receipt root from a sequential validator. The parallel receiver starts
+the child, cancels it without permitting signing, and rejects the parent. The
+recorded child hit its deadline before the parent rejection arrived; rejection
+interrupting an active wait is separately unit-tested. Same-height and base reorg
+cancellation are unit-tested; a deterministic live canonical-reorg injection is
+still future coverage. The final weak-reference ownership change is covered by
+the full suite and a follow-up normal-cluster smoke run; the instrumented delayed
+binary predates only that ownership change.
+
 ## Remaining BEP-732 implementation
 
 1. Complete EIP-7928 conformance and differential vectors, including access-list
@@ -409,9 +487,9 @@ or pre-import invalid-parent cancellation.
    historical eth/71 downloader integration, peer failover, and retries. Recent
    announcement retrieval and executed-BAL persistence are implemented above;
    unexecuted attachments retain their separate bounded memory cache.
-5. Extend the opt-in BAL-derived parent view above to pre-import construction,
-   branch-aware Parlia queries, and construction overlap. Sealing must wait for successful parent
-   import and matching canonical state; reorgs or failures cancel dependent work.
+5. Broaden the opt-in early construction path to transition blocks and local
+   BidBlock verification, and measure resource/latency costs under representative
+   workloads. Preserve independent parent validation and pre-signing gates.
 
 The earlier Geth local-cluster compatibility checks exercise existing BSC rules and
 advisory hints. They cannot establish BEP-732 interoperability until a reference

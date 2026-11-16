@@ -331,6 +331,7 @@ where
             }
         };
         let mut mining_ctx = MiningContext {
+            pending_parent: None,
             parent_snapshot: Arc::new(parent_snapshot),
             parent_header: parent_header.clone(),
             header: None,
@@ -1689,6 +1690,7 @@ mod tests {
             let mut attrs = BscNextBlockEnvAttributes::build_pending_env(&parent, None);
             attrs.mode = BscExecutionMode::BidSimulation;
             let mining_ctx = MiningContext {
+                pending_parent: None,
                 header: Some(Header {
                     number: 1,
                     timestamp: attrs.inner.timestamp,

@@ -27,3 +27,4 @@ pub(crate) mod state_read_diagnostics;
 pub(crate) mod perf_tuning;
 
 pub(crate) mod bal_state;
+pub(crate) mod pending_parent;

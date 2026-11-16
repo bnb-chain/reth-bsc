@@ -4,6 +4,7 @@ use crate::{
     consensus::parlia::{
         provider::SnapshotProvider, util::calculate_millisecond_timestamp, Parlia,
     },
+    hardforks::BscHardforks,
     metrics::BscConsensusMetrics,
     node::{
         engine::BscBuiltPayload,
@@ -22,9 +23,12 @@ use crate::{
 use alloy_consensus::BlockHeader;
 use alloy_primitives::{Address, Sealable, U128};
 use k256::ecdsa::SigningKey;
-use reth::transaction_pool::{PoolTransaction, TransactionPool};
+use reth::{
+    consensus::HeaderValidator,
+    transaction_pool::{PoolTransaction, TransactionPool},
+};
 use reth_basic_payload_builder::{PayloadConfig, PrecachedState};
-use reth_chainspec::EthChainSpec;
+use reth_chainspec::{EthChainSpec, ForkCondition, Hardforks};
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_ethereum_primitives::TransactionSigned;
 use reth_network::message::NewBlockMessage;
@@ -47,6 +51,8 @@ use tracing::{debug, error, info, trace, warn};
 
 #[derive(Clone, Debug)]
 pub struct MiningContext {
+    /// Present only for an early build awaiting independent parent import.
+    pub(crate) pending_parent: Option<Arc<super::pending_parent::PendingParent>>,
     pub header: Option<alloy_consensus::Header>, // tmp header for payload building.
     pub parent_header: reth_primitives_traits::SealedHeader,
     pub parent_snapshot: Arc<crate::consensus::parlia::snapshot::Snapshot>,
@@ -140,6 +146,14 @@ where
         info!("Succeed to spawn new work worker, address: {}", self.validator_address);
 
         let mut notifications = self.provider.canonical_state_stream();
+        let mut early_parents = super::pending_parent::subscribe();
+        let mut last_early_base = None;
+        let mut watched_parent: Option<(
+            Arc<super::pending_parent::PendingParent>,
+            std::time::Instant,
+        )> = None;
+        let mut early_status_tick = tokio::time::interval(Duration::from_millis(50));
+        early_status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         debug!(target: "bsc::miner", "Subscribed to canonical_state_stream");
 
         // Don't block the canonical notifications loop on potentially slow startup checks (DB
@@ -318,6 +332,29 @@ where
                     self.last_triggered_tip = None;
                 }
             }
+            parent = early_parents.recv() => {
+                if let Ok(parent) = parent {
+                    if last_early_base != Some(parent.header.parent_hash) && parent.viable() {
+                        last_early_base = Some(parent.header.parent_hash);
+                        if self.try_early_work(parent.clone()) {
+                            watched_parent = Some((parent, std::time::Instant::now()));
+                        }
+                    }
+                }
+            }
+            _ = early_status_tick.tick(), if watched_parent.is_some() => {
+                if let Some((parent, started)) = &watched_parent {
+                    if parent.ready() {
+                        watched_parent = None;
+                    } else if !parent.viable() || started.elapsed() >= Duration::from_secs(2) {
+                        // Resume ordinary mining immediately; do not wait for the recovery ticker.
+                        watched_parent = None;
+                        if let Some(tip) = self.get_tip_header_at_startup() {
+                            self.try_new_work(&tip).await;
+                        }
+                    }
+                }
+            }
             } // end tokio::select!
         }
     }
@@ -438,6 +475,87 @@ where
         self.pre_cached.as_ref().filter(|pc| pc.block == parent).map(|pc| pc.cached.clone())
     }
 
+    fn try_early_work(&self, pending: Arc<super::pending_parent::PendingParent>) -> bool {
+        if !crate::node::startup_recovery::is_ready() {
+            return false;
+        }
+        let parent = &pending.header;
+        if crate::shared::get_best_canonical_block_number().and_then(|number| number.checked_add(1)) !=
+            Some(parent.number)
+        {
+            return false;
+        }
+        if !crate::shared::is_mining_enabled() || !is_network_ready_to_mine(parent.number) {
+            return false;
+        }
+        let spec = self.consensus.chain_spec();
+        if !spec.is_bep732_active_at_timestamp(parent.number, parent.timestamp) {
+            return false;
+        }
+        let Ok(Some(base)) = self.provider.sealed_header_by_hash(parent.parent_hash) else {
+            return false
+        };
+        let Some(base_snapshot) = self.snapshot_provider.snapshot_by_hash(&base.hash()) else {
+            return false
+        };
+        let epoch = self.consensus.get_epoch_length(parent);
+        let remainder = parent.number % epoch;
+        // Exclude checkpoint persistence, epoch validator handover and all nearby fork boundaries.
+        if parent.number.is_multiple_of(crate::consensus::parlia::CHECKPOINT_INTERVAL) ||
+            remainder <= base_snapshot.miner_history_check_len() + 1 ||
+            remainder + 1 >= epoch
+        {
+            return false;
+        }
+        let consensus = crate::node::consensus::BscConsensus::new(Arc::new(spec.clone()));
+        if consensus.validate_header(parent).is_err() ||
+            consensus.validate_header_against_parent(parent, &base).is_err() ||
+            self.consensus
+                .block_time_verify_for_ramanujan_fork(&base_snapshot, parent, &base)
+                .is_err()
+        {
+            return false;
+        }
+        let Some(snapshot) = self.snapshot_provider.snapshot_by_hash(&parent.hash()) else {
+            return false
+        };
+        if !snapshot.validators.contains(&self.validator_address) ||
+            snapshot.sign_recently(self.validator_address)
+        {
+            return false;
+        }
+        let ctx = MiningContext {
+            pending_parent: Some(pending.clone()),
+            header: None,
+            parent_header: parent.clone(),
+            is_inturn: snapshot.is_inturn(self.validator_address),
+            parent_snapshot: Arc::new(snapshot),
+            cached_reads: None,
+            block_timestamp_ms: 0,
+            end_mining_timestamp_ms: 0,
+        };
+        // Compute the exact child timestamp before checking time-based transition boundaries.
+        let mut probe = ctx.clone();
+        prepare_new_attributes(&mut probe, self.consensus.clone(), parent, self.validator_address);
+        let child_time = probe.block_timestamp_ms / 1000;
+        if crate::consensus::parlia::util::is_breathe_block(base.timestamp, child_time) ||
+            spec.forks_iter().any(|(_, fork)| match fork {
+                ForkCondition::Block(number) => number > base.number && number <= parent.number + 1,
+                ForkCondition::Timestamp(time) => time > base.timestamp && time <= child_time,
+                _ => false,
+            })
+        {
+            return false;
+        }
+        if let Err(error) = self.mining_queue_tx.send(ctx) {
+            debug!(target: "bsc::miner", %error, "Early mining queue closed");
+            false
+        } else {
+            metrics::counter!("bsc_parallel_parent_total", "result" => "queued").increment(1);
+            true
+        }
+    }
+
     async fn try_new_work<H>(&self, tip: &SealedHeader<H>, startup_timing: StartupTiming)
     where
         H: alloy_consensus::BlockHeader + Sealable,
@@ -530,6 +648,7 @@ where
 
         let parent_hash = parent_header.hash();
         let mut mining_ctx = MiningContext {
+            pending_parent: None,
             header: None,
             parent_header,
             parent_snapshot: Arc::new(parent_snapshot),
@@ -659,6 +778,9 @@ where
     /// Purpose: Skip obviously stale contexts to reduce unnecessary work, not to provide
     /// strict correctness guarantees.
     fn recheck_mining_ctx(&self, ctx: &MiningContext) -> bool {
+        if let Some(parent) = &ctx.pending_parent {
+            return parent.viable();
+        }
         let parent_hash = ctx.parent_header.hash();
         let current_best = match self.provider.best_block_number() {
             Ok(num) => num,
@@ -696,6 +818,13 @@ where
         &mut self,
         mut mining_ctx: MiningContext,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self
+            .running_job_handle
+            .as_ref()
+            .is_some_and(|handle| handle.reuses_early_parent(mining_ctx.parent_header.hash()))
+        {
+            return Ok(());
+        }
         if let Some(handle) = self.running_job_handle.take() {
             handle.abort();
         }
@@ -711,6 +840,12 @@ where
             &parent_header,
             self.validator_address,
         );
+
+        if mining_ctx.pending_parent.is_some() &&
+            (crate::consensus::parlia::util::is_breathe_block(parent_header.timestamp, attributes.timestamp) ||
+             self.chain_spec.forks_iter().any(|(_, fork)| matches!(fork, ForkCondition::Timestamp(time) if time > parent_header.timestamp && time <= attributes.timestamp))) {
+            return Err(std::io::Error::other("Early child crosses a time transition").into());
+        }
 
         // Read dynamic config from shared state (updated by miner_* RPC), fall back to init values
         let gas_limit = crate::shared::get_miner_gas_limit().unwrap_or(self.desired_gas_limit);

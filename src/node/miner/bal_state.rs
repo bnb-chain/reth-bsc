@@ -5,7 +5,7 @@ use alloy_eips::eip7928::{bal::Bal, BlockAccessList};
 use alloy_primitives::{
     keccak256,
     map::{AddressMap, B256Map, U256Map},
-    Address, B256, U256,
+    Address, Bytes, B256, U256,
 };
 use reth_primitives_traits::Account;
 use reth_provider::{
@@ -24,6 +24,7 @@ pub(crate) struct BalParentState {
     contracts: B256Map<Bytecode>,
     number: u64,
     hash: B256,
+    ancestors: Option<std::collections::BTreeMap<u64, B256>>,
 }
 
 impl BalParentState {
@@ -38,6 +39,7 @@ impl BalParentState {
             contracts: Default::default(),
             number: header.number,
             hash: header.hash_slow(),
+            ancestors: None,
         };
         let mut hashed = HashedPostState::default();
         for changes in bal.iter() {
@@ -128,23 +130,30 @@ impl<DB: DatabaseRef> DatabaseRef for BalParentDatabase<'_, DB> {
             if number > state.number {
                 return Ok(B256::ZERO);
             }
+            if let Some(ancestors) = &state.ancestors {
+                return Ok(ancestors.get(&number).copied().unwrap_or_default());
+            }
         }
         self.base.block_hash_ref(number)
     }
 }
 
 /// Optional rollout path: build from N−1 plus N's BAL only after matching N's state root.
-/// The caller still waits for imported N and uses its provider to finalize child roots.
+/// Early callers supply retained bytes and use pinned ancestors; finalization must wait for import.
 pub(crate) fn prepare(
     client: &impl StateProviderFactory,
     parent: &Header,
+    early_raw: Option<&Bytes>,
 ) -> ProviderResult<Option<(StateProviderBox, BalParentState)>> {
-    if !matches!(std::env::var("BSC_BEP732_CANDIDATE_STATE").as_deref(), Ok("1" | "true")) ||
+    if (early_raw.is_none() &&
+        !matches!(std::env::var("BSC_BEP732_CANDIDATE_STATE").as_deref(), Ok("1" | "true"))) ||
         parent.number == 0
     {
         return Ok(None);
     }
-    let Some(raw) = crate::node::network::consensus_bal::get(parent.hash_slow()) else {
+    let Some(raw) =
+        early_raw.cloned().or_else(|| crate::node::network::consensus_bal::get(parent.hash_slow()))
+    else {
         metrics::counter!("bsc_bal_parent_state_total", "result" => "missing").increment(1);
         return Ok(None);
     };
@@ -157,12 +166,26 @@ pub(crate) fn prepare(
     bal.validate_gas_limit(parent.gas_limit).map_err(ProviderError::other)?;
     let base = client.state_by_block_hash(parent.parent_hash)?;
     let db = StateProviderDatabase::new(EvmStateProviderAdapter(&base));
-    let (overlay, hashed) = BalParentState::derive(&db, parent, &bal)?;
+    let (mut overlay, hashed) = BalParentState::derive(&db, parent, &bal)?;
     let root = base.state_root(hashed)?;
     if root != parent.state_root {
         return Err(ProviderError::other(std::io::Error::other(
             "BAL-derived parent state root mismatch",
         )));
+    }
+    if early_raw.is_some() {
+        let mut ancestors = std::collections::BTreeMap::new();
+        let mut hash = parent.parent_hash;
+        for number in (parent.number.saturating_sub(255)..parent.number).rev() {
+            let header = crate::shared::get_canonical_header_by_hash(&hash)
+                .filter(|header| header.hash_slow() == hash && header.number == number)
+                .ok_or_else(|| {
+                    ProviderError::other(std::io::Error::other("Missing candidate ancestor"))
+                })?;
+            ancestors.insert(number, hash);
+            hash = header.parent_hash;
+        }
+        overlay.ancestors = Some(ancestors);
     }
     metrics::counter!("bsc_bal_parent_state_total", "result" => "derived").increment(1);
     Ok(Some((base, overlay)))
@@ -322,6 +345,18 @@ mod tests {
         assert_eq!(db.storage_ref(ADDRESS, U256::from(1)).unwrap(), U256::from(50));
         assert_eq!(base.storage_ref(ADDRESS, U256::from(1)).unwrap(), U256::from(100));
         assert_eq!(sibling.basic(ADDRESS).unwrap().unwrap().nonce, 4);
+    }
+
+    #[test]
+    fn pinned_ancestors_override_provider_branch() {
+        let header = Header { number: 10, ..Default::default() };
+        let (mut overlay, _) =
+            BalParentState::derive(&Base::default(), &header, &Bal::default()).unwrap();
+        overlay.ancestors = Some([(9, B256::repeat_byte(3)), (8, B256::repeat_byte(4))].into());
+        let db = BalParentDatabase { base: Base::default(), overlay: Some(&overlay) };
+        assert_eq!(db.block_hash_ref(9).unwrap(), B256::repeat_byte(3));
+        assert_eq!(db.block_hash_ref(8).unwrap(), B256::repeat_byte(4));
+        assert_eq!(db.block_hash_ref(7).unwrap(), B256::ZERO);
     }
 
     #[test]

@@ -578,6 +578,7 @@ where
             };
 
             let header = sealed_block.header().clone();
+            let pending_parent = crate::node::miner::pending_parent::announce(&header);
             let payload = BscPayloadTypes::block_to_payload(sealed_block, None);
             let new_payload_started = std::time::Instant::now();
             let result =
@@ -602,6 +603,9 @@ where
                                     return None;
                                 }
                             } else {
+                                if let Some(guard) = &pending_parent {
+                                    guard.imported();
+                                }
                                 tracing::debug!(target: "bsc::block_import", "Succeed to update fork choice for new payload: number = {:?}, hash = {:?}", header.number, block_hash);
                             }
                             if fetched && publication.is_none() {
