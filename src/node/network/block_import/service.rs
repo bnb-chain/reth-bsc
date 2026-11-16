@@ -168,6 +168,8 @@ where
     sync_config: Arc<BlockSyncConfig>,
     /// Near-head single-block downloads do not occupy ancestor recovery slots.
     head_fetches: super::head_fetch::HeadFetches,
+    /// Bounded, best-effort BAL fetches owned by this service and independent of import.
+    pending_bals: FuturesUnordered<futures::future::BoxFuture<'static, ()>>,
     /// Cache of processed block hashes to avoid reprocessing the same block.
     processed_blocks: LruCache<B256>,
     /// Cache of queued block hashes to avoid processing the same block.
@@ -411,6 +413,7 @@ where
             pending_local_imports: FuturesUnordered::new(),
             head_fetches: super::head_fetch::HeadFetches::new(sync_config.clone()),
             sync_config: sync_config.clone(),
+            pending_bals: FuturesUnordered::new(),
             processed_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
             queued_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
             recovering_heads:
@@ -1257,7 +1260,26 @@ where
         self.queued_blocks.insert(block.hash);
         self.head_fetches.cancel(&block.hash);
 
-        // Record chain delay metrics: time from block creation to first network reception
+        if block.block.0.block.header.block_access_list_hash.is_some() &&
+            crate::node::network::consensus_bal::get(block.hash).is_none()
+        {
+            if self.pending_bals.len() < 8 {
+                if let Some(network) = crate::shared::get_network_handle() {
+                    self.pending_bals.push(Box::pin(
+                        crate::node::network::consensus_bal::fetch_missing(
+                            network,
+                            peer_id,
+                            block.block.0.block.header.clone(),
+                            block.block.0.block.body.inner.transactions.len(),
+                        ),
+                    ));
+                }
+            } else {
+                metrics::counter!("bsc_consensus_bal_fetch_skipped_total").increment(1);
+            }
+        }
+
+        // Record chain delay metrics: time from block creation to first network reception.
         crate::consensus::parlia::block_stats::on_block_received(
             block.hash,
             &block.block.0.block.header,
@@ -1899,6 +1921,8 @@ where
             };
             this.on_new_block_hashes(hashes, peer_id);
         }
+
+        while let Poll::Ready(Some(())) = this.pending_bals.poll_next_unpin(cx) {}
 
         // Process completed imports and send events to network
         for n in 0..POLL_BATCH {

@@ -3,7 +3,8 @@
 The `feat/bep732-v2.8` branch is based on `feat/bal-v2.8` at
 `fad0ff89b448d7ef1acf35e2a0fa6e842264f63e`. It implements a sequential,
 custom-chain BEP-732 prototype. Named BSC networks remain unscheduled.
-Speculative block production and eth/71 retrieval remain unimplemented.
+Speculative block production remains unimplemented. Recent-block eth/71 retrieval
+and executed-BAL persistence are implemented in the later increment below.
 Negotiated full-BAL attachments and bounded memory retention are implemented as a
 prototype; see the transport increment below.
 The recording and commitment milestones below describe their historical validation.
@@ -232,12 +233,13 @@ attachments have an 8 MiB aggregate soft limit and must fit remaining frame spac
 new-block attachments are omitted if they would exceed the frame limit. These are
 local transport/cache limits, not additional block validity rules.
 
-The cache is in memory only. It does not yet persist historical BALs, retain every
+At this transport milestone, the cache was in memory only. It did not yet persist
+historical BALs, retain every
 execution-rebuilt BAL from attachment-free imports, or fetch missing BALs over
-eth/71. This branch deliberately restricts Ethereum protocol negotiation to
+eth/71. That milestone deliberately restricted Ethereum protocol negotiation to
 eth/68 because BSC's newer status handshake differs; enabling eth/71 requires
 integrating and validating that compatibility layer. Existing BSC work at
-`f19020cd0` and `6ad8a1bb9` is a candidate for reuse, not yet incorporated here.
+`f19020cd0` and `6ad8a1bb9` was a candidate for reuse at that point.
 Missing/evicted attachments currently fall back to sequential execution.
 
 ### Transport validation
@@ -283,6 +285,72 @@ bid rejections. Both clusters were stopped, and the shared target's original
 advisory binary was restored. Fault injection exists only in the detached test
 worktree and artifact binary, not in the implementation commits.
 
+## Missing-BAL retrieval and executed retention — 2026-11-16
+
+The network now negotiates BSC eth/70 and eth/71, retaining eth/68 fallback. It
+reuses the BSC status implementation from `f19020cd0` and the database-head status
+fix from `6ad8a1bb9`; unlike that earlier release policy, this branch still accepts
+eth/68 peers. Newer BSC status retains Parlia total difficulty and skips legacy
+UpgradeStatus. Status, fork filtering, head hash, and total difficulty initialize
+from the same database head. Malformed or incompatible status fails the handshake.
+
+For a recently announced block whose committed BAL is missing or unusable, the
+import service attempts one eth/71 request to the announcing peer. There are at
+most eight concurrent requests, each with a two-second deadline including peer
+lookup. Unsupported peers, missing data, disconnects, invalid responses, and
+capacity exhaustion leave sequential execution running independently. Service
+shutdown drops the fetch futures. Responses must contain exactly one matching,
+structurally valid BAL (empty/missing response entries mean unavailable).
+
+The companion engine now preserves its rebuilt BAL even when the incoming block
+has no attachment. Only successfully validated execution reaches the existing
+provider BAL store. Local executed payloads also enter that store; unexecuted
+BidBlock/network attachments remain in the separate bounded cache. Canonical
+persistence flushes executed BALs to RocksDB and applies the existing retention
+policy. The attachment lookup falls back to this provider store after cache misses,
+and the existing eth/71 handler serves the same store. No unverified attachment
+is promoted to durable execution evidence.
+
+The companion engine retention fix is committed at `1f95f85f1d`. The full BSC
+library suite passed 815 tests (one ignored); the companion engine BAL subset
+passed 36 tests, including validated-store insertion, flush, and pruning.
+
+Local test evidence is under `../bep732-retrieval-cluster-2026-11-16/`.
+The first attempt stopped before workload submission because its temporary npm
+cache had been cleaned. Dependencies were pinned and installed in the owned test
+directory. The next attempt passed 36 functional checks, 67 transactions and all
+seven bid cases, then stopped at metrics collection because its copied metrics
+URLs used the previous cluster ports. Those reports are preserved in
+`results-workload/`; the corrected verification reuses their canonical receipts
+rather than rerunning CAS20 initialization. These were harness failures, with no
+production-source changes needed for either correction.
+
+The corrected verification agreed across 430 canonical blocks through height 429
+and rechecked all 67 workload receipts. All seven bid cases passed again. The
+unmodified receiver (advisory hints disabled) sent 18 eth/71 requests: 14 returned
+valid BALs and four returned unavailable, with normal execution continuing. Its
+eth/68 fallback path was also exercised; the attachment-omitting producer counted
+17 omitted attachments. The negotiated versions were recorded in
+`results/retrieval-report.json`.
+
+The immediate restart preflight initially encountered recently closed ports after
+all owned processes had stopped; the harness now uses `SO_REUSEADDR` for its bind
+check. This change only affects test orchestration.
+
+The follow-up restart passed: the nodes agreed at height 447, and both new nodes
+returned the same 69-byte BAL for historical block 172 before and after restart,
+matching the block's commitment. The raw-BAL RPC can rebuild on a store miss, so
+this verifies restart availability, not a disk-only read; storage insertion,
+flushing and pruning are also covered by the engine tests. All owned nodes were
+stopped and the original shared-target advisory binary restored. The aggregate
+result is `results/final-status.json`; earlier failed harness stages remain intact.
+
+This is a recent-announcement fetch path, not a complete historical downloader:
+peer failover, retry scheduling, and historical synchronization requests remain
+future work. Fetch completion does not authorize speculative state use or replace
+execution verification. The separate attachment handshake marker remains a
+prototype requiring cross-client agreement.
+
 ## Remaining BEP-732 implementation
 
 1. Complete EIP-7928 conformance and differential vectors, including access-list
@@ -293,10 +361,10 @@ worktree and artifact binary, not in the implementation commits.
    regular transaction-list SendBid path and cross-client consensus vectors.
 3. Broaden BidBlock adversarial transport coverage and signed-system-transaction
    differential vectors; HTTP permission lifecycle is covered by the run above.
-4. Agree the handshake extension wire format with a reference client; add durable
-   BAL retention, capture execution-rebuilt BALs from attachment-free imports, and
-   implement BSC-compatible eth/71 retrieval. Negotiated push/range attachments
-   and bounded in-memory retention are implemented above.
+4. Agree the attachment handshake wire format with a reference client and complete
+   historical eth/71 downloader integration, peer failover, and retries. Recent
+   announcement retrieval and executed-BAL persistence are implemented above;
+   unexecuted attachments retain their separate bounded memory cache.
 5. Implement isolated candidate-parent and child state views, branch-aware Parlia
    queries, and construction overlap. Sealing must wait for successful parent
    import and matching canonical state; reorgs or failures cancel dependent work.

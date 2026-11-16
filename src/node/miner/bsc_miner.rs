@@ -1071,7 +1071,7 @@ where
         let msg = NewBlockMessage { hash: block_hash, block: Arc::new(new_block) };
 
         if let Some(raw) = &payload.block_access_list {
-            crate::node::network::consensus_bal::retain(
+            crate::node::network::consensus_bal::retain_executed(
                 sealed_block.header(),
                 sealed_block.body().inner.transactions.len(),
                 raw.clone(),
