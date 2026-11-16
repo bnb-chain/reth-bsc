@@ -249,9 +249,8 @@ impl VotePool {
             // swap — push the bucket past the cap, so the first genuine validator
             // vote for that target is refused. That is the censorship this
             // conditional cap exists to prevent.
-            return authenticated
-                && self
-                    .future_votes
+            return authenticated &&
+                self.future_votes
                     .get(&future_key(data))
                     .is_some_and(|vm| vm.authenticated >= MAX_FUTURE_VOTE_AMOUNT_PER_BLOCK);
         }
@@ -2007,8 +2006,7 @@ mod tests {
         pool.insert(latecomer.clone(), 0, true, false);
 
         // Verdicts were taken before `latecomer` arrived.
-        let applied =
-            pool.apply_promotion(100, &verdicts((target, 100), &[(judged.hash(), true)]));
+        let applied = pool.apply_promotion(100, &verdicts((target, 100), &[(judged.hash(), true)]));
 
         assert_eq!(applied.promoted, vec![target]);
         assert_eq!(pool.fetch_vote_by_block_hash(target).len(), 1, "judged vote promoted");
@@ -2076,8 +2074,7 @@ mod tests {
         // Judge exactly what the pass captured; the rest must survive as future.
         let verdicts: HashMap<B256, bool> =
             candidates[0].votes.iter().map(|e| (e.hash, true)).collect();
-        let applied =
-            pool.apply_promotion(100, &[((target, 100), verdicts)].into_iter().collect());
+        let applied = pool.apply_promotion(100, &[((target, 100), verdicts)].into_iter().collect());
 
         assert_eq!(applied.promoted, vec![target]);
         assert_eq!(

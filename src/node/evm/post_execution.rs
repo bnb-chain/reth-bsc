@@ -28,8 +28,10 @@ use crate::{
         SLASH_CONTRACT, STAKE_HUB_CONTRACT, SYSTEM_REWARD_CONTRACT,
     },
 };
-use alloy_consensus::{Header, SignableTransaction, Transaction as AlloyTransaction, TxReceipt};
-use alloy_primitives::{hex, Address, BlockNumber, TxKind, U256};
+use alloy_consensus::{
+    Header, SignableTransaction, Transaction as AlloyTransaction, TxLegacy, TxReceipt,
+};
+use alloy_primitives::{hex, Address, BlockNumber, ChainId, TxKind, B256, U256};
 use bit_set::BitSet;
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use reth_ethereum_primitives::{Transaction, TransactionSigned};
@@ -45,8 +47,6 @@ use revm::{
     state::{Account as RevmAccount, EvmState},
     Database as _, DatabaseCommit,
 };
-use alloy_consensus::{SignableTransaction, TxLegacy};
-use alloy_primitives::ChainId;
 use std::collections::HashMap;
 use tracing::warn;
 
@@ -74,7 +74,6 @@ fn system_tx_signer_hash(tx: &TransactionSigned, chain_id: Option<ChainId>) -> B
         _ => tx.signature_hash(),
     }
 }
-
 
 impl<'a, EVM, Spec, R: ReceiptBuilder> BscBlockExecutor<'a, EVM, Spec, R>
 where
@@ -559,9 +558,9 @@ where
         if !result.is_success() && tx_to != Some(SLASH_CONTRACT) {
             self.executor_metrics.system_contract_errors_total.increment(1);
             warn!("system tx failed: {:?}", result);
-            return Err(BscBlockExecutionError::Validation(BscBlockValidationError::SystemTxFailed {
-                to: tx_to.unwrap_or_default(),
-            })
+            return Err(BscBlockExecutionError::Validation(
+                BscBlockValidationError::SystemTxFailed { to: tx_to.unwrap_or_default() },
+            )
             .into());
         }
         // NOTE(reth-v2.4.1): manual state-hook streaming removed; state hook is DB-level now.

@@ -2,7 +2,7 @@ use super::{Parlia, EMPTY_WITHDRAWALS_HASH};
 use crate::{
     consensus::{eip4844::is_blob_eligible_block, parlia::util::calculate_millisecond_timestamp},
     hardforks::BscHardforks,
-    BscBlock,
+    BscBlock, BscBlockBody,
 };
 use alloy_consensus::{Header, Transaction, EMPTY_OMMER_ROOT_HASH};
 use alloy_eips::eip4844::{DATA_GAS_PER_BLOB, MAX_DATA_GAS_PER_BLOCK_DENCUN};
@@ -13,7 +13,6 @@ use reth::{
 };
 use reth_chainspec::{EthChainSpec, EthereumHardfork, EthereumHardforks};
 use reth_primitives_traits::{Block, GotExpected};
-use crate::{BscBlock, BscBlockBody};
 use std::{sync::Arc, time::SystemTime};
 
 const MAX_RLP_BLOCK_SIZE_OSAKA: usize = 8 * 1024 * 1024;
@@ -358,7 +357,10 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
         validate_body_commitments(block.body(), block.header(), transaction_root)?;
 
         if BscHardforks::is_osaka_active_at_timestamp(&*self.spec, block.number, block.timestamp) {
-            validate_osaka_block_size(BscBlock::canonical_rlp_length(block.header(), block.body()))?;
+            validate_osaka_block_size(BscBlock::canonical_rlp_length(
+                block.header(),
+                block.body(),
+            ))?;
             // Note: Individual transaction gas limit validation (EIP-7825) is intentionally
             // NOT performed here because system transactions use i64::MAX gas limit.
             // The validation happens during EVM execution via cfg_env.tx_gas_limit_cap,

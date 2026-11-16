@@ -1,11 +1,11 @@
 use super::{
     config::BlockSyncConfig,
     handle::ImportHandle,
+    header_validation::{validate_for_relay, RelayValidation},
     metrics::Queue,
     propagation::{self, PropagationSender},
     publication::Publication,
     IMPORT_QUEUE_CAPACITY,
-    header_validation::{validate_for_relay, RelayValidation},
 };
 use crate::{
     chainspec::BscChainSpec,
@@ -425,9 +425,10 @@ where
             publication: None,
             canonical_notifications: None,
             pending_canonical: None,
-            recovery_checkpoints: crate::node::network::block_import::fork_recover::RecoveryCheckpoints::new(
-                LRU_PROCESSED_BLOCKS_SIZE,
-            ),
+            recovery_checkpoints:
+                crate::node::network::block_import::fork_recover::RecoveryCheckpoints::new(
+                    LRU_PROCESSED_BLOCKS_SIZE,
+                ),
             announce_interval: {
                 // 3s ≈ 6-7 BSC slots (450ms each). Fast enough to break fork
                 // livelocks, slow enough to be negligible overhead.
@@ -468,11 +469,20 @@ where
 
     /// Process a new payload and return the outcome
     fn new_payload(&self, block: BlockMsg, peer_id: PeerId) -> ImportFut {
-        self.new_payload_inner(block, peer_id, false, Arc::new(std::sync::atomic::AtomicBool::new(false)))
+        // Local fallback already owns its propagation permit. It still goes through
+        // full Engine validation, but must not enter the remote relay queue.
+        self.new_payload_inner(block, peer_id, false, None)
     }
 
-    fn new_payload_inner(&self, mut block: BlockMsg, peer_id: PeerId, fetched: bool, early_announced: Arc<std::sync::atomic::AtomicBool>) -> ImportFut {
-        let early_eligible = !fetched && self.can_propagate_before_import(&block);
+    fn new_payload_inner(
+        &self,
+        mut block: BlockMsg,
+        peer_id: PeerId,
+        fetched: bool,
+        early_announced: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> ImportFut {
+        let early_eligible =
+            early_announced.is_some() && !fetched && self.can_propagate_before_import(&block);
         let engine = self.engine.clone();
         let forkchoice_engine = self.forkchoice_engine.clone();
         let recovering_heads = self.recovering_heads.clone();
@@ -488,7 +498,7 @@ where
             .clone()
             .or_else(|| crate::shared::get_snapshot_provider().cloned());
         let validation_slots = self.relay_validation_slots.clone();
-        let mut to_network = self.to_network.clone();
+        let to_network = self.to_network.remote_sender();
         let recovery_checkpoints = self.recovery_checkpoints.clone();
 
         let announced_hash = block.hash;
@@ -519,35 +529,51 @@ where
             }
 
             let sealed_block = block.block.0.block.clone().seal_unchecked(block_hash);
-            let permit = validation_slots.acquire_owned().await.ok()?;
-            let validation = tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                let result = validate_for_relay(
-                    &sealed_block, &provider, chain_spec, snapshots.as_deref(),
-                );
-                (sealed_block, result)
-            })
-            .await;
-            let (sealed_block, validation) = match validation {
-                Ok((sealed_block, Ok(validation))) => (sealed_block, validation),
-                Ok((_, Err(error))) => {
-                    return Some(Outcome { peer: peer_id, result: Err(error) });
+            let sealed_block = if let Some(early_announced) = early_announced {
+                let permit = validation_slots.acquire_owned().await.ok()?;
+                let validation = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    let result = validate_for_relay(
+                        &sealed_block,
+                        &provider,
+                        chain_spec,
+                        snapshots.as_deref(),
+                    );
+                    (sealed_block, result)
+                })
+                .await;
+                let (sealed_block, validation) = match validation {
+                    Ok((sealed_block, Ok(validation))) => (sealed_block, validation),
+                    Ok((_, Err(error))) => {
+                        return Some(Outcome { peer: peer_id, result: Err(error) });
+                    }
+                    Err(error) => {
+                        tracing::warn!(target: "bsc::block_import", %error, "Header validation task failed");
+                        return None;
+                    }
+                };
+                let header_announced = early_eligible &&
+                    validation == RelayValidation::Valid &&
+                    publication.as_ref().is_none_or(|p| {
+                        p.prepare_full(&mut block) && p.full_ready(block.clone()).is_some()
+                    });
+                if header_announced {
+                    if let Err(error) = Self::transfer_to_evn_peers_with_publication(
+                        block.clone(),
+                        publication.clone(),
+                    ) {
+                        tracing::debug!(target: "bsc::block_import", %error, "EVN relay unavailable");
+                    }
+                    let sent = to_network.send_remote(BlockImportEvent::Announcement(
+                        BlockValidation::ValidHeader { block: block.clone() },
+                    ));
+                    early_announced.store(sent, std::sync::atomic::Ordering::Relaxed);
                 }
-                Err(error) => {
-                    tracing::warn!(target: "bsc::block_import", %error, "Header validation task failed");
-                    return None;
-                }
+
+                sealed_block
+            } else {
+                sealed_block
             };
-            let header_announced = early_eligible && validation == RelayValidation::Valid && publication.as_ref().is_none_or(|p| p.prepare_full(&mut block) && p.full_ready(block.clone()).is_some());
-            if header_announced {
-                if let Err(error) = Self::transfer_to_evn_peers_with_publication(block.clone(), publication.clone()) {
-                    tracing::debug!(target: "bsc::block_import", %error, "EVN relay unavailable");
-                }
-                let sent = to_network.try_remote(BlockImportEvent::Announcement(
-                    BlockValidation::ValidHeader { block: block.clone() },
-                )).is_ok();
-                early_announced.store(sent, std::sync::atomic::Ordering::Relaxed);
-            }
 
             let header = sealed_block.header().clone();
             let payload = BscPayloadTypes::block_to_payload(sealed_block, None);
@@ -706,10 +732,16 @@ where
                             let recover_target = crate::node::network::block_import::fork_recover::RecoverTarget::single_pair(
                             header.parent_hash, block_number.saturating_sub(1),
                         );
-                            let headers = super::fork_recover::EthHeaderFetcher(forkchoice_engine.chain_spec().clone());
+                            let headers = super::fork_recover::EthHeaderFetcher(
+                                forkchoice_engine.chain_spec().clone(),
+                            );
                             let recovery = recovery_checkpoints.recover(
-                                peer, recover_target, forkchoice_engine.clone(),
-                                &headers, &fetcher, &permit,
+                                peer,
+                                recover_target,
+                                forkchoice_engine.clone(),
+                                &headers,
+                                &fetcher,
+                                &permit,
                             );
                             let validation = validate_target_during_recovery(
                                 block.block.0.block.clone(),
@@ -1080,7 +1112,7 @@ where
                 .map_err(BlockImportError::from)
         };
         if let Err(error) = validation {
-            let _ = self.to_network.send(BlockImportEvent::Outcome(Outcome {
+            let _ = self.to_network.send_remote(BlockImportEvent::Outcome(Outcome {
                 peer: peer_id,
                 result: Err(error),
             }));
@@ -1171,11 +1203,9 @@ where
                 }
             }
         }
-        // Reject overload before cloning or validating the body. A rejected block
-        // remains retryable. Far-ahead targets have their own bounded admission.
-        if delta <= self.sync_config.args.max_depth &&
-            self.pending_imports.len() >= MAX_PENDING_IMPORTS
-        {
+        // Every remote block, including a far-ahead block, uses the same bounded
+        // admission before header/body work. Rejected messages remain retryable.
+        if self.pending_imports.len() >= MAX_PENDING_IMPORTS {
             Queue::RemoteImports.full(MAX_PENDING_IMPORTS, "drop");
             return;
         }
@@ -1197,7 +1227,6 @@ where
             }
         }
 
-
         self.queued_blocks.insert(block.hash);
         self.head_fetches.cancel(&block.hash);
 
@@ -1212,7 +1241,8 @@ where
         tracing::debug!(target: "bsc::block_import", "Sending new block to import service: number = {:?}, hash = {:?}", block.block.0.block.header.number, block.hash);
         let hash = block.hash;
         let early_announced = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let payload_fut = self.new_payload_inner(block, peer_id, fetched, early_announced.clone());
+        let payload_fut =
+            self.new_payload_inner(block, peer_id, fetched, Some(early_announced.clone()));
         let provider = self.forkchoice_engine.provider.clone();
         let publication = self.publication.clone();
         // Keep the slot until the actual Engine response. Dropping a timed-out
@@ -1410,14 +1440,23 @@ where
                         head_hash, head_num,
                     );
                 if let Err(err) = async {
-                    let headers = crate::node::network::block_import::fork_recover::EthHeaderFetcher(
-                        forkchoice_engine.chain_spec().clone(),
-                    );
-                    recovery_checkpoints.recover(
-                        target, recover_target, forkchoice_engine,
-                        &headers, &fetcher, &permit,
-                    ).await
-                }.await {
+                    let headers =
+                        crate::node::network::block_import::fork_recover::EthHeaderFetcher(
+                            forkchoice_engine.chain_spec().clone(),
+                        );
+                    recovery_checkpoints
+                        .recover(
+                            target,
+                            recover_target,
+                            forkchoice_engine,
+                            &headers,
+                            &fetcher,
+                            &permit,
+                        )
+                        .await
+                }
+                .await
+                {
                     log_recovery_error(&err, head_hash, head_num, "announced head");
                     failed_heads.mark_failed(head_hash);
                 }
@@ -1457,7 +1496,10 @@ where
         Self::transfer_to_evn_peers_with_publication(block, self.publication.clone())
     }
 
-    fn transfer_to_evn_peers_with_publication(mut block: BlockMsg, publication: Option<Publication>) -> Result<(), Box<dyn std::error::Error>> {
+    fn transfer_to_evn_peers_with_publication(
+        mut block: BlockMsg,
+        publication: Option<Publication>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let block = if let Some(publication) = &publication {
             if !publication.prepare_full(&mut block) {
                 return Ok(());
@@ -1876,7 +1918,10 @@ where
                     this.processed_blocks.insert(block.hash);
                     // Cache the full block body for later range responses.
                     crate::shared::cache_full_block(block.block.0.block.clone());
-                    if let Err(e) = Self::transfer_to_evn_peers_with_publication(block.clone(), publication.clone()) {
+                    if let Err(e) = Self::transfer_to_evn_peers_with_publication(
+                        block.clone(),
+                        this.publication.clone(),
+                    ) {
                         tracing::warn!(target: "bsc::block_import", "Failed to transfer block to EVN peers: number = {:?}, hash = {:?}, error = {}", block.block.0.block.header.number, block.hash, e);
                     }
                 }
@@ -2579,7 +2624,7 @@ mod tests {
 
     fn direct_service() -> (
         ImportService<MockProvider>,
-        mpsc::UnboundedReceiver<ImportEvent>,
+        propagation::PropagationReceiver,
         mpsc::UnboundedReceiver<BeaconEngineMessage<BscPayloadTypes>>,
     ) {
         let (service, engine, events) = fetched_fixture(MockProvider::new());
@@ -2689,8 +2734,11 @@ mod tests {
 
     #[tokio::test]
     async fn completed_imports_clear_queue_without_penalizing_execution_failures() {
-        for status in [Some(PayloadStatusEnum::Invalid { validation_error: "execution failed".into() }),
-            Some(PayloadStatusEnum::Syncing), None] {
+        for status in [
+            Some(PayloadStatusEnum::Invalid { validation_error: "execution failed".into() }),
+            Some(PayloadStatusEnum::Syncing),
+            None,
+        ] {
             let (mut service, mut events, mut engine) = direct_service();
             let block = create_test_block();
             let hash = block.hash;
@@ -2718,9 +2766,13 @@ mod tests {
     async fn missing_blob_does_not_queue_or_forward_and_can_be_retried() {
         use crate::node::network::data_availability::tests::blob_block;
         let spec = Arc::new(BscChainSpec::from(
-            reth_chainspec::ChainSpecBuilder::mainnet().cancun_activated()
+            reth_chainspec::ChainSpecBuilder::mainnet()
+                .cancun_activated()
                 .without_fork(reth_chainspec::EthereumHardfork::Prague)
-                .with_fork(crate::hardforks::bsc::BscHardfork::Cancun, reth_chainspec::ForkCondition::Timestamp(0))
+                .with_fork(
+                    crate::hardforks::bsc::BscHardfork::Cancun,
+                    reth_chainspec::ForkCondition::Timestamp(0),
+                )
                 .build(),
         ));
         let (to_engine, mut from_engine) = mpsc::unbounded_channel();
@@ -3065,7 +3117,7 @@ mod tests {
                 )
                 .await
                 .expect(case)
-                .and_then(|(_, outcome)| outcome)
+                .and_then(|result| result.outcome)
                 .expect("header rejection")
             };
             assert!(outcome.result.is_err(), "{case}: accepted invalid header");
@@ -3189,11 +3241,13 @@ mod tests {
                 let valid = matches!(status, PayloadStatusEnum::Valid);
                 tx.send(Ok(PayloadStatus::new(status, None))).unwrap();
                 if valid {
-                    let event =
-                        tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
-                            .await
-                            .expect(context)
-                            .expect("announcement");
+                    let event = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        futures::future::poll_fn(|cx| events.poll_recv(cx)),
+                    )
+                    .await
+                    .expect(context)
+                    .expect("announcement");
                     assert!(matches!(
                         event,
                         BlockImportEvent::Announcement(BlockValidation::ValidHeader { .. })
@@ -3205,7 +3259,7 @@ mod tests {
                         .await
                         .expect(context)
                         .unwrap();
-                    let outcome = result.and_then(|(_, outcome)| outcome);
+                    let outcome = result.and_then(|result| result.outcome);
                     assert!(outcome.is_none(), "must not penalize peer");
                     assert!(events.try_recv().is_err(), "must not relay an unvalidated header");
                 }
@@ -3219,26 +3273,11 @@ mod tests {
     ) -> (
         ImportService<MockProvider>,
         mpsc::UnboundedReceiver<BeaconEngineMessage<BscPayloadTypes>>,
-        mpsc::UnboundedReceiver<ImportEvent>,
+        propagation::PropagationReceiver,
     ) {
-        let (to_engine, from_engine) = mpsc::unbounded_channel();
-        let (_, from_network) = mpsc::unbounded_channel();
-        let (_, from_builder) = mpsc::unbounded_channel();
-        let (_, from_bid) = mpsc::unbounded_channel();
-        let (_, from_hashes) = mpsc::unbounded_channel();
-        let (to_network, events) = mpsc::unbounded_channel();
-        let mut service = ImportService::new(
-            provider,
-            Arc::new(BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet())),
-            ConsensusEngineHandle::new(to_engine),
-            from_network,
-            from_builder,
-            from_bid,
-            from_hashes,
-            to_network,
-        );
+        let (mut service, engine, events) = fetched_fixture(provider);
         service.relay_snapshots = Some(Arc::new(snapshots));
-        (service, from_engine, events)
+        (service, engine, events)
     }
 
     #[tokio::test]
@@ -3270,7 +3309,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
-            .and_then(|(_, outcome)| outcome)
+            .and_then(|result| result.outcome)
             .is_none());
         assert!(events.try_recv().is_err());
     }
@@ -3959,11 +3998,9 @@ mod tests {
     /// The test validator's signing key, generated once per test process so the block signer,
     /// the header seal and the snapshot's validator agree.
     fn test_signer_key() -> secp256k1::SecretKey {
-        static KEY: std::sync::LazyLock<secp256k1::SecretKey> = std::sync::LazyLock::new(|| {
-            loop {
-                if let Ok(key) = secp256k1::SecretKey::from_byte_array(&rand::random()) {
-                    break key;
-                }
+        static KEY: std::sync::LazyLock<secp256k1::SecretKey> = std::sync::LazyLock::new(|| loop {
+            if let Ok(key) = secp256k1::SecretKey::from_byte_array(&rand::random()) {
+                break key;
             }
         });
         *KEY
@@ -4298,8 +4335,10 @@ mod tests {
         );
         handle.send_hashes(hashes.clone(), peer).unwrap();
         handle.send_hashes(hashes, peer).unwrap();
-        assert!(recv_fcu_within(&mut fcu_rx, tokio::time::Duration::from_millis(100)).await.is_none(),
-            "unverified far-ahead hashes must not select a raw forkchoice target");
+        assert!(
+            recv_fcu_within(&mut fcu_rx, tokio::time::Duration::from_millis(100)).await.is_none(),
+            "unverified far-ahead hashes must not select a raw forkchoice target"
+        );
     }
 
     #[tokio::test]
@@ -5024,7 +5063,12 @@ mod tests {
             assert!(engine.try_recv().is_err());
             assert!(!stalled.as_ref().unwrap().is_closed());
             // A separate complete NewBlock entrance executes the missing parent.
-            let parent_import = service.new_payload_inner(message(parent.clone()), peer, false);
+            let parent_import = service.new_payload_inner(
+                message(parent.clone()),
+                peer,
+                false,
+                Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
+            );
             tokio::pin!(parent_import);
             assert!(parent_import.as_mut().poll(&mut cx).is_pending());
             let BeaconEngineMessage::NewPayload { payload, tx, .. } = engine.try_recv().unwrap()

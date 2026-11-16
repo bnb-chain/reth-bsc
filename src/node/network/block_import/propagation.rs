@@ -90,17 +90,12 @@ pub(crate) fn channel() -> (PropagationSender, PropagationReceiver) {
 }
 
 impl PropagationSender {
-    pub(crate) fn send_remote(&self, event: ImportEvent) {
-        match self.remote.try_send(event) {
-            Err(TrySendError::Full(_)) => {
-                Queue::RemotePropagation.full(super::IMPORT_QUEUE_CAPACITY, "drop")
-            }
-            Err(TrySendError::Closed(_)) => {
-                tracing::warn!(target: "bsc::block_import", "Remote propagation channel closed; event dropped")
-            }
-            Ok(()) => {}
-        }
-        self.observe();
+    pub(crate) fn remote_sender(&self) -> RemotePropagationSender {
+        RemotePropagationSender(self.remote.clone())
+    }
+
+    pub(crate) fn send_remote(&self, event: ImportEvent) -> bool {
+        self.remote_sender().send_remote(event)
     }
 
     pub(crate) fn observe(&self) {
@@ -349,5 +344,27 @@ mod tests {
         drop(tx.remote);
         assert_event(rx.try_recv().unwrap(), 2, false);
         assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Disconnected)));
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct RemotePropagationSender(Sender<ImportEvent>);
+
+impl RemotePropagationSender {
+    pub(crate) fn send_remote(&self, event: ImportEvent) -> bool {
+        let sent = match self.0.try_send(event) {
+            Err(TrySendError::Full(_)) => {
+                Queue::RemotePropagation.full(super::IMPORT_QUEUE_CAPACITY, "drop");
+                false
+            }
+            Err(TrySendError::Closed(_)) => {
+                tracing::warn!(target: "bsc::block_import", "Remote propagation channel closed; event dropped");
+                false
+            }
+            Ok(()) => true,
+        };
+        Queue::RemotePropagation
+            .observe(self.0.max_capacity() - self.0.capacity(), super::IMPORT_QUEUE_CAPACITY);
+        sent
     }
 }

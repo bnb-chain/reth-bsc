@@ -1,6 +1,10 @@
-use crate::{BscBlock, BscBlockBody, BscPrimitives};
-use crate::node::network::data_availability::validate_sidecar_for_storage;
-use crate::node::primitives::BscBlobTransactionSidecar;
+use crate::{
+    node::{
+        network::data_availability::validate_sidecar_for_storage,
+        primitives::BscBlobTransactionSidecar,
+    },
+    BscBlock, BscBlockBody, BscPrimitives,
+};
 use alloy_consensus::BlockHeader;
 use alloy_eips::{
     eip2718::{Typed2718, EIP4844_TX_TYPE_ID},
@@ -313,8 +317,7 @@ mod tests {
 
         // KZG-valid, but for other data: the commitment cannot match the
         // transaction's versioned hash.
-        let other =
-            SidecarBuilder::<SimpleCoder>::from_slice(b"forged blob").build_4844().unwrap();
+        let other = SidecarBuilder::<SimpleCoder>::from_slice(b"forged blob").build_4844().unwrap();
         let legacy_tx_hash = *block.body.inner.transactions[0].hash();
         type Forge = Box<dyn Fn(&mut BscBlobTransactionSidecar)>;
         let cases: Vec<(&str, Forge)> = vec![

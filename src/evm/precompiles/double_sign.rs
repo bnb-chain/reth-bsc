@@ -613,10 +613,8 @@ mod tests {
     }
 
     fn evidence_with_recovery_id(header_index: usize, recovery_id: u8) -> Vec<u8> {
-        let mut evidence = alloy_rlp::decode_exact::<DoubleSignEvidence>(
-            &signed_evidence(big(&[0x38])),
-        )
-        .unwrap();
+        let mut evidence =
+            alloy_rlp::decode_exact::<DoubleSignEvidence>(&signed_evidence(big(&[0x38]))).unwrap();
         let header_bytes = if header_index == 0 {
             &mut evidence.header_bytes1
         } else {
@@ -636,10 +634,13 @@ mod tests {
             for recovery_id in 0..=u8::MAX {
                 let input = evidence_with_recovery_id(header_index, recovery_id);
                 for per_byte_gas in [0, DOUBLE_SIGN_EVIDENCE_VALIDATE_PER_BYTE_GAS] {
-                    let cost = DOUBLE_SIGN_EVIDENCE_VALIDATION_BASE +
-                        input.len() as u64 * per_byte_gas;
+                    let cost =
+                        DOUBLE_SIGN_EVIDENCE_VALIDATION_BASE + input.len() as u64 * per_byte_gas;
                     let output = double_sign_evidence_validation_run_inner(
-                        &input, cost + 123, 17, per_byte_gas,
+                        &input,
+                        cost + 123,
+                        17,
+                        per_byte_gas,
                     )
                     .unwrap();
                     if recovery_id >= 4 {
@@ -659,16 +660,17 @@ mod tests {
         // r=2 admits the x=r+n recovery branch. These IDs are valid in go-bsc,
         // even though normal Ethereum transaction signatures only use 0 and 1.
         for recovery_id in [2, 3] {
-            let mut evidence = alloy_rlp::decode_exact::<DoubleSignEvidence>(
-                &signed_evidence(big(&[0x38])),
-            )
-            .unwrap();
+            let mut evidence =
+                alloy_rlp::decode_exact::<DoubleSignEvidence>(&signed_evidence(big(&[0x38])))
+                    .unwrap();
             let mut header = alloy_rlp::decode_exact::<Header>(&evidence.header_bytes1).unwrap();
             let mut sig = [0; 64];
             sig[31] = 2;
             sig[63] = 1;
             assert!(secp256k1::ecrecover(
-                &B512::from(sig), recovery_id, &seal_hash(&header, &evidence.chain_id),
+                &B512::from(sig),
+                recovery_id,
+                &seal_hash(&header, &evidence.chain_id),
             )
             .is_ok());
             let mut extra = header.extra.to_vec();
@@ -697,8 +699,8 @@ mod tests {
         let mut header = alloy_rlp::decode_exact::<Header>(&evidence.header_bytes2).unwrap();
         header.parent_hash = [0xff; 32];
         evidence.header_bytes2 = alloy_rlp::encode(header).into();
-        let output = double_sign_evidence_validation_run(&alloy_rlp::encode(evidence), 10_000, 0)
-            .unwrap();
+        let output =
+            double_sign_evidence_validation_run(&alloy_rlp::encode(evidence), 10_000, 0).unwrap();
         assert!(matches!(output.halt_reason(), Some(PrecompileHalt::Other(s))
             if s == "double sign invalid evidence"));
     }

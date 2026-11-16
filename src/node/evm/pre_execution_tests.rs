@@ -2,9 +2,10 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::consensus::parlia::vote::VoteAddress;
     use crate::{
-        consensus::parlia::header_verifier::validate_attestation_source_target_order,
+        consensus::parlia::{
+            header_verifier::validate_attestation_source_target_order, vote::VoteAddress,
+        },
         node::evm::pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE},
     };
     use alloy_primitives::{Address, B256};
@@ -18,10 +19,7 @@ mod tests {
         for (source, target) in [(99, 99), (99, 98)] {
             let error = validate_attestation_source_target_order(source, target)
                 .expect_err("equal or reversed source/target must be rejected");
-            assert!(matches!(
-                error,
-                BscBlockValidationError::InvalidAttestationSourceTargetOrder
-            ));
+            assert!(matches!(error, BscBlockValidationError::InvalidAttestationSourceTargetOrder));
             assert_eq!(
                 error.to_string(),
                 "invalid attestation, SourceNumber not lower than TargetNumber"

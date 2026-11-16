@@ -28,12 +28,12 @@ use prost12::Message;
 use revm::precompile::{
     u64_to_address, Precompile, PrecompileHalt, PrecompileId, PrecompileOutput, PrecompileResult,
 };
+use sha2::{Digest, Sha512};
 use std::{
     borrow::{Cow, ToOwned},
     string::String,
     vec::Vec,
 };
-use sha2::{Digest, Sha512};
 
 pub(crate) const COMETBFT_LIGHT_BLOCK_VALIDATION: Precompile = Precompile::new(
     PrecompileId::Custom(Cow::Borrowed("COMET_BFT_LIGHT_BLOCK_VALIDATE_HERTZ")),
@@ -86,7 +86,11 @@ const COMETBFT_LIGHT_BLOCK_VALIDATE_PER_BYTE_GAS: u64 = 16;
 /// `version.block`; cometbft-rs copies the field through unchecked.
 const COMETBFT_BLOCK_PROTOCOL: u64 = 11;
 
-fn cometbft_light_block_validation_run(input: &[u8], gas_limit: u64, reservoir: u64) -> PrecompileResult {
+fn cometbft_light_block_validation_run(
+    input: &[u8],
+    gas_limit: u64,
+    reservoir: u64,
+) -> PrecompileResult {
     cometbft_light_block_validation_run_inner(input, gas_limit, reservoir, true, false, 0)
 }
 
@@ -227,8 +231,7 @@ fn convert_light_block_from_proto(light_block_proto: &TmLightBlock) -> ConvertLi
     // signature into an enum variant that discards its validator address.
     if let Some(commit) = &signed_header_proto.commit {
         for sig in &commit.signatures {
-            if sig.block_id_flag == BlockIdFlag::Absent as i32 &&
-                !sig.validator_address.is_empty()
+            if sig.block_id_flag == BlockIdFlag::Absent as i32 && !sig.validator_address.is_empty()
             {
                 return Err(BscPrecompileError::InvalidInput.into());
             }
@@ -325,7 +328,9 @@ fn validate_proto_proposer(
         Some(Sum::Secp256k1(key)) => key.len() == 33,
         None => false,
     };
-    if !valid_key || proposer.address.len() != 20 || proposer.voting_power < 0 ||
+    if !valid_key ||
+        proposer.address.len() != 20 ||
+        proposer.voting_power < 0 ||
         !matches!(proposer.bls_key.len(), 0 | 48) ||
         !matches!(proposer.relayer_address.len(), 0 | 20)
     {
@@ -1235,12 +1240,8 @@ mod tests {
     #[test]
     fn consensus_state_next_hash_encoding_rejects_malformed_widths() {
         for len in [1, 31, 33, 64] {
-            let cs = ConsensusState::new(
-                "chain".to_string(),
-                1,
-                Bytes::from(vec![0xab; len]),
-                vec![],
-            );
+            let cs =
+                ConsensusState::new("chain".to_string(), 1, Bytes::from(vec![0xab; len]), vec![]);
             assert_eq!(
                 cs.encode().unwrap_err(),
                 BscPrecompileError::CometBftEncodeConsensusStateFailed.into(),
@@ -1329,15 +1330,14 @@ mod tests {
             types::v1::Validator as TmValidator,
         };
 
-        let validator = |fill: u8, voting_power: i64, relayer_address: Vec<u8>, bls_key: Vec<u8>| {
-            TmValidator {
+        let validator =
+            |fill: u8, voting_power: i64, relayer_address: Vec<u8>, bls_key: Vec<u8>| TmValidator {
                 pub_key: Some(RawPublicKey { sum: Some(Sum::Ed25519(vec![fill; 32])) }),
                 voting_power,
                 relayer_address,
                 bls_key,
                 ..Default::default()
-            }
-        };
+            };
         let validator_set = TmValidatorSet {
             validators: vec![
                 validator(0xa1, 10, vec![0xb1; 20], vec![0xc1; 48]),
@@ -1364,7 +1364,8 @@ mod tests {
         let mut light_block = TmLightBlock::decode(&input[split..]).unwrap();
         modify(&mut light_block);
         // Reattach Greenfield's field 15, which the pinned Rust protobuf drops on re-encoding.
-        let mut wire_block = WireLightBlock::decode(light_block.encode_to_vec().as_slice()).unwrap();
+        let mut wire_block =
+            WireLightBlock::decode(light_block.encode_to_vec().as_slice()).unwrap();
         let mut signed = WireSignedHeader::decode(wire_block.signed_header.as_slice()).unwrap();
         signed.header.extend_from_slice(&HeaderExtensionFields { randao_mix }.encode_to_vec());
         wire_block.signed_header = signed.encode_to_vec();
@@ -1666,9 +1667,7 @@ mod tests {
             decode_light_block_validation_input(&valid_light_block_input(), true).unwrap();
         let before = state.encode().unwrap();
         let validators = block.validators.validators().clone();
-        assert!(state
-            .apply_light_block(&block, &randao_mix, validators_hash, validators)
-            .is_err());
+        assert!(state.apply_light_block(&block, &randao_mix, validators_hash, validators).is_err());
         assert_eq!(state.encode().unwrap(), before);
     }
 
@@ -1676,8 +1675,7 @@ mod tests {
     fn greenfield_header_extension_preserves_protobuf_merge_semantics() {
         let (block, original_randao) = unsigned_light_block();
         let fixture = valid_light_block_input();
-        let (_, original_proto, _) =
-            decode_light_block_validation_input(&fixture, true).unwrap();
+        let (_, original_proto, _) = decode_light_block_validation_input(&fixture, true).unwrap();
         let proto = TmLightBlock {
             signed_header: Some(block.signed_header.clone().into()),
             // The converted set omits the separately validated proposer. Keep the original
@@ -1896,8 +1894,8 @@ mod tests {
                         }
                     });
                     for (fork, (run, per_byte_gas)) in cometbft_forks().into_iter().enumerate() {
-                        let gas = COMETBFT_LIGHT_BLOCK_VALIDATION_BASE
-                            + input.len() as u64 * per_byte_gas;
+                        let gas = COMETBFT_LIGHT_BLOCK_VALIDATION_BASE +
+                            input.len() as u64 * per_byte_gas;
                         let output = run(&input, gas, 17).unwrap();
                         assert_eq!(
                             output.is_success(),
@@ -1960,8 +1958,8 @@ mod tests {
                         set.encode_to_vec()
                     }));
                     for (fork, (run, per_byte_gas)) in cometbft_forks().into_iter().enumerate() {
-                        let gas = COMETBFT_LIGHT_BLOCK_VALIDATION_BASE
-                            + input.len() as u64 * per_byte_gas;
+                        let gas = COMETBFT_LIGHT_BLOCK_VALIDATION_BASE +
+                            input.len() as u64 * per_byte_gas;
                         let output = run(&input, gas, 17).unwrap();
                         assert_eq!(
                             output.is_success(),
@@ -2026,11 +2024,7 @@ mod tests {
         type Mutation = fn(&mut Validator);
         for (label, mutate, accepted) in [
             ("missing_key", (|p| p.pub_key = None) as Mutation, false),
-            (
-                "missing_key_type",
-                |p| p.pub_key.as_mut().unwrap().sum = None,
-                false,
-            ),
+            ("missing_key_type", |p| p.pub_key.as_mut().unwrap().sum = None, false),
             (
                 "ed25519_empty",
                 |p| p.pub_key.as_mut().unwrap().sum = Some(Sum::Ed25519(vec![])),
@@ -2088,11 +2082,7 @@ mod tests {
             for (run, per_byte_gas) in cometbft_forks() {
                 let gas = COMETBFT_LIGHT_BLOCK_VALIDATION_BASE + input.len() as u64 * per_byte_gas;
                 let output = run(&input, gas, 17).unwrap();
-                assert_eq!(
-                    output.is_success(),
-                    accepted,
-                    "{label}, per_byte_gas={per_byte_gas}"
-                );
+                assert_eq!(output.is_success(), accepted, "{label}, per_byte_gas={per_byte_gas}");
                 assert_eq!(output.reservoir, 17);
                 if accepted {
                     let control = run(&valid_light_block_input(), 1_000_000, 17).unwrap();
@@ -2145,11 +2135,7 @@ mod tests {
             for empty in [false, true] {
                 let input = input_with_validator_set(|set| {
                     set.total_voting_power = cache;
-                    set.proposer = if empty {
-                        Some(Default::default())
-                    } else {
-                        None
-                    };
+                    set.proposer = if empty { Some(Default::default()) } else { None };
                 });
                 for (run, per_byte_gas) in cometbft_forks() {
                     let gas =
@@ -2601,8 +2587,18 @@ mod tests {
 
         // Duplicate BLS key (pubkeys and relayer addresses distinct).
         let set = vec![
-            Validator::new_with_bls_and_relayer(pk0(), Power::from(1_u32), bls0.clone(), relayer0.clone()),
-            Validator::new_with_bls_and_relayer(pk1(), Power::from(1_u32), bls0.clone(), relayer1.clone()),
+            Validator::new_with_bls_and_relayer(
+                pk0(),
+                Power::from(1_u32),
+                bls0.clone(),
+                relayer0.clone(),
+            ),
+            Validator::new_with_bls_and_relayer(
+                pk1(),
+                Power::from(1_u32),
+                bls0.clone(),
+                relayer1.clone(),
+            ),
         ];
         match validate_unique_validator_set(&set).unwrap_err() {
             PrecompileHalt::Other(msg) => assert!(msg.contains("duplicate validator bls key")),
@@ -2611,8 +2607,18 @@ mod tests {
 
         // Duplicate relayer address.
         let set = vec![
-            Validator::new_with_bls_and_relayer(pk0(), Power::from(1_u32), bls0.clone(), relayer0.clone()),
-            Validator::new_with_bls_and_relayer(pk1(), Power::from(1_u32), bls1.clone(), relayer0.clone()),
+            Validator::new_with_bls_and_relayer(
+                pk0(),
+                Power::from(1_u32),
+                bls0.clone(),
+                relayer0.clone(),
+            ),
+            Validator::new_with_bls_and_relayer(
+                pk1(),
+                Power::from(1_u32),
+                bls1.clone(),
+                relayer0.clone(),
+            ),
         ];
         match validate_unique_validator_set(&set).unwrap_err() {
             PrecompileHalt::Other(msg) => {
@@ -2623,8 +2629,18 @@ mod tests {
 
         // Unset (all-zero) bridge fields may legitimately repeat across validators.
         let set = vec![
-            Validator::new_with_bls_and_relayer(pk0(), Power::from(1_u32), vec![0u8; 48], vec![0u8; 20]),
-            Validator::new_with_bls_and_relayer(pk1(), Power::from(1_u32), vec![0u8; 48], vec![0u8; 20]),
+            Validator::new_with_bls_and_relayer(
+                pk0(),
+                Power::from(1_u32),
+                vec![0u8; 48],
+                vec![0u8; 20],
+            ),
+            Validator::new_with_bls_and_relayer(
+                pk1(),
+                Power::from(1_u32),
+                vec![0u8; 48],
+                vec![0u8; 20],
+            ),
         ];
         assert!(validate_unique_validator_set(&set).is_ok());
     }
@@ -3273,10 +3289,9 @@ mod tests {
             let height = u64::from_be_bytes(cs[height_at..height_at + 8].try_into().unwrap());
             cs[height_at..height_at + 8].copy_from_slice(&(height - 1).to_be_bytes());
         }
-        let power_at = (CHAIN_ID_LENGTH +
-            HEIGHT_LENGTH +
-            VALIDATOR_SET_HASH_LENGTH +
-            VALIDATOR_PUBKEY_LENGTH) as usize;
+        let power_at =
+            (CHAIN_ID_LENGTH + HEIGHT_LENGTH + VALIDATOR_SET_HASH_LENGTH + VALIDATOR_PUBKEY_LENGTH)
+                as usize;
         cs[power_at..power_at + 8].copy_from_slice(&b_power.to_be_bytes());
         cs.extend_from_slice(&[0x11; 32]);
         cs.extend_from_slice(&x_power.to_be_bytes());

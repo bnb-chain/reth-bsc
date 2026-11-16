@@ -246,7 +246,8 @@ impl<ChainSpec: EthChainSpec<Header = Header> + BscHardforks + 'static> Consensu
         &self,
         block: &SealedBlock<BscBlock>,
     ) -> Result<(), ConsensusError> {
-        // tracing::debug!("Validating block pre-execution, block_number: {:?}", block.header().number);
+        // tracing::debug!("Validating block pre-execution, block_number: {:?}",
+        // block.header().number);
         self.parlia.validate_block_pre_execution(block)
     }
 

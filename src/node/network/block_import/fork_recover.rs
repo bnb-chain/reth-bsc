@@ -88,9 +88,6 @@ pub enum ForkRecoverError {
     #[error("fork base {base} is below the finalized block {finalized}")]
     BelowFinalized { base: u64, finalized: u64 },
 
-    #[error("fork base {base} is below the finalized block {finalized}")]
-    BelowFinalized { base: u64, finalized: u64 },
-
     #[error("local provider error: {0}")]
     Provider(#[from] reth_provider::ProviderError),
 
@@ -215,9 +212,7 @@ pub(crate) struct RecoveryCheckpoints {
 impl RecoveryCheckpoints {
     pub(crate) fn new(capacity: u32) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(schnellru::LruMap::new(
-                schnellru::ByLength::new(capacity),
-            ))),
+            inner: Arc::new(Mutex::new(schnellru::LruMap::new(schnellru::ByLength::new(capacity)))),
         }
     }
 
@@ -244,8 +239,14 @@ impl RecoveryCheckpoints {
         let announced = original.fcu_target_hash;
         let mut next = self.resume(original.clone());
         loop {
-            let target =
-                resolve_recovery_target_with_limit(next, peer, &forkchoice_engine.provider, headers, blocks.max_depth()).await?;
+            let target = resolve_recovery_target_with_limit(
+                next,
+                peer,
+                &forkchoice_engine.provider,
+                headers,
+                blocks.max_depth(),
+            )
+            .await?;
             let result = recover_ancestors(
                 peer,
                 target,
@@ -292,10 +293,7 @@ impl RecoveryCheckpoints {
                 let mut checkpoints = self.inner.lock();
                 if header.hash_slow() == announced {
                     checkpoints.remove(&announced);
-                } else if checkpoints
-                    .get(&announced)
-                    .is_none_or(|old| old.number < header.number)
-                {
+                } else if checkpoints.get(&announced).is_none_or(|old| old.number < header.number) {
                     checkpoints.insert(announced, header);
                 }
                 Ok(())
@@ -305,8 +303,8 @@ impl RecoveryCheckpoints {
                 // A different ancestry must start a fresh, bounded discovery too.
                 if matches!(
                     err,
-                    ForkRecoverError::ImportHalted { .. }
-                        | ForkRecoverError::RecoveryAncestryMismatch { .. }
+                    ForkRecoverError::ImportHalted { .. } |
+                        ForkRecoverError::RecoveryAncestryMismatch { .. }
                 ) {
                     self.inner.lock().remove(&announced);
                 }
@@ -491,10 +489,7 @@ pub async fn discover_fork_blocks<
     fetcher: &dyn RangeFetcher,
     progress: &dyn ProgressSink,
 ) -> Result<Discovery, ForkRecoverError> {
-    discover_fork_blocks_after(
-        peer, start_hash, start_num, provider, fetcher, progress, None,
-    )
-    .await
+    discover_fork_blocks_after(peer, start_hash, start_num, provider, fetcher, progress, None).await
 }
 
 async fn discover_fork_blocks_after<
@@ -599,7 +594,9 @@ async fn discover_fork_blocks_after<
             }
             cursor_hash = block.header.parent_hash;
             cursor_num = cursor_num.saturating_sub(1);
-            if validated_ancestor.is_none() && provider.block_hash(block.header.number)? == Some(got) {
+            if validated_ancestor.is_none() &&
+                provider.block_hash(block.header.number)? == Some(got)
+            {
                 found_ancestor = true;
                 break;
             }
@@ -765,7 +762,10 @@ where
         outcome = ?discovery.outcome,
         "Phase 1 complete"
     );
-    ensure_fork_above_finalized(&discovery.fork_blocks, forkchoice_engine.finalized_number_at_head(provider.best_block_number()?)?)?;
+    ensure_fork_above_finalized(
+        &discovery.fork_blocks,
+        forkchoice_engine.finalized_number_at_head(provider.best_block_number()?)?,
+    )?;
 
     import_discovered_header(
         RecoverTarget {
@@ -804,7 +804,9 @@ where
         + Sync
         + 'static,
 {
-    import_discovered_header(target, discovery, provider, engine, forkchoice_engine, progress).await.map(|_| ())
+    import_discovered_header(target, discovery, provider, engine, forkchoice_engine, progress)
+        .await
+        .map(|_| ())
 }
 
 pub(crate) async fn import_discovered_header<P>(
@@ -2327,28 +2329,21 @@ mod tests {
         }
 
         async fn assert_losing_segment_progress(use_justification: bool) {
-            use crate::consensus::parlia::{Snapshot, SnapshotProvider, VoteData};
-            use crate::hardforks::bsc::BscHardfork;
-            use reth_chainspec::ChainSpecBuilder;
-            use reth_chainspec::ForkCondition;
+            use crate::{
+                consensus::parlia::{Snapshot, SnapshotProvider, VoteData},
+                hardforks::bsc::BscHardfork,
+            };
+            use reth_chainspec::{ChainSpecBuilder, ForkCondition};
 
             let (provider, _, _) = scenario(100, 0);
             let canonical = provider.header_by_number(100).unwrap().unwrap();
             let ancestor = provider.block_hash(99).unwrap().unwrap();
-            let (branch, hashes) = linear_chain(
-                100,
-                2501,
-                ancestor,
-                if use_justification { 0xD } else { 0xE },
-            );
+            let (branch, hashes) =
+                linear_chain(100, 2501, ancestor, if use_justification { 0xD } else { 0xE });
             let intermediate = branch[1024].clone();
             let head = branch.last().unwrap().clone();
             let fetcher = ChainFetcher {
-                blocks: branch
-                    .iter()
-                    .cloned()
-                    .map(|h| (h.hash_slow(), make_block(h)))
-                    .collect(),
+                blocks: branch.iter().cloned().map(|h| (h.hash_slow(), make_block(h))).collect(),
                 ..Default::default()
             };
             let headers = ScriptedHeaders::new(vec![
@@ -2428,9 +2423,7 @@ mod tests {
                 &(),
             )
             .await;
-            checkpoints
-                .finish(original.fcu_target_hash, result)
-                .unwrap();
+            checkpoints.finish(original.fcu_target_hash, result).unwrap();
             assert_eq!(submissions.lock().unwrap().len(), 1025);
             assert!(fcus.lock().unwrap().iter().all(|h| *h == canonical_hash));
             // Keep the provider unchanged: Valid payloads need not become canonical
@@ -2460,9 +2453,7 @@ mod tests {
                 &(),
             )
             .await;
-            assert!(checkpoints
-                .finish(original.fcu_target_hash, result)
-                .is_err());
+            assert!(checkpoints.finish(original.fcu_target_hash, result).is_err());
             assert_eq!(
                 checkpoints.resume(original.clone()).validated_ancestor,
                 Some(intermediate),
@@ -2475,12 +2466,7 @@ mod tests {
             assert!(checkpoints.resume(original).validated_ancestor.is_none());
             assert_eq!(*fcus.lock().unwrap().last().unwrap(), head.hash_slow());
             assert_eq!(
-                submissions
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .map(|(n, _)| *n)
-                    .collect::<Vec<_>>(),
+                submissions.lock().unwrap().iter().map(|(n, _)| *n).collect::<Vec<_>>(),
                 (100..=2600).collect::<Vec<_>>(),
                 "continue after the validated checkpoint without replaying its segment",
             );
@@ -2513,30 +2499,15 @@ mod tests {
             let (engine, submissions, fcus) = recording_engine(vec![]);
             let fce = BscForkChoiceEngine::new(provider.clone(), engine, chain_spec());
             checkpoints
-                .recover(
-                    fake_peer(),
-                    original.clone(),
-                    fce,
-                    &headers,
-                    fetcher.as_ref(),
-                    &(),
-                )
+                .recover(fake_peer(), original.clone(), fce, &headers, fetcher.as_ref(), &())
                 .await
                 .unwrap();
             assert_eq!(provider.best_block_number().unwrap(), 100);
             assert_eq!(
-                submissions
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .map(|(n, _)| *n)
-                    .collect::<Vec<_>>(),
+                submissions.lock().unwrap().iter().map(|(n, _)| *n).collect::<Vec<_>>(),
                 (101..=5100).collect::<Vec<_>>(),
             );
-            assert_eq!(
-                *fcus.lock().unwrap().last().unwrap(),
-                original.fcu_target_hash
-            );
+            assert_eq!(*fcus.lock().unwrap().last().unwrap(), original.fcu_target_hash);
             assert_eq!(
                 *headers.requests.lock().unwrap(),
                 [1124, 2148, 3172].map(|n| (fake_peer(), n)),
@@ -2551,34 +2522,16 @@ mod tests {
             let second = RecoverTarget::single_pair(B256::repeat_byte(0x72), 5000);
             let third = RecoverTarget::single_pair(B256::repeat_byte(0x73), 5000);
             let checkpoint = make_header(1124, B256::ZERO, 0x71);
-            checkpoints
-                .finish(first.fcu_target_hash, Ok(checkpoint.clone()))
-                .unwrap();
-            assert!(checkpoints
-                .resume(second.clone())
-                .validated_ancestor
-                .is_none());
+            checkpoints.finish(first.fcu_target_hash, Ok(checkpoint.clone())).unwrap();
+            assert!(checkpoints.resume(second.clone()).validated_ancestor.is_none());
             let clone = checkpoints.clone();
-            assert_eq!(
-                clone.resume(first.clone()).validated_ancestor,
-                Some(checkpoint.clone())
-            );
+            assert_eq!(clone.resume(first.clone()).validated_ancestor, Some(checkpoint.clone()));
             checkpoints
-                .finish(
-                    first.fcu_target_hash,
-                    Ok(make_header(1000, B256::ZERO, 0x71)),
-                )
+                .finish(first.fcu_target_hash, Ok(make_header(1000, B256::ZERO, 0x71)))
                 .unwrap();
-            assert_eq!(
-                clone.resume(first.clone()).validated_ancestor,
-                Some(checkpoint.clone())
-            );
-            checkpoints
-                .finish(second.fcu_target_hash, Ok(checkpoint.clone()))
-                .unwrap();
-            checkpoints
-                .finish(third.fcu_target_hash, Ok(checkpoint))
-                .unwrap();
+            assert_eq!(clone.resume(first.clone()).validated_ancestor, Some(checkpoint.clone()));
+            checkpoints.finish(second.fcu_target_hash, Ok(checkpoint.clone())).unwrap();
+            checkpoints.finish(third.fcu_target_hash, Ok(checkpoint)).unwrap();
             assert!(
                 checkpoints.resume(first).validated_ancestor.is_none(),
                 "old cursor is evicted"
@@ -2593,9 +2546,7 @@ mod tests {
             let original = RecoverTarget::single_pair(B256::repeat_byte(0x74), 5000);
             let checkpoints = RecoveryCheckpoints::new(100);
             let checkpoint = make_header(1124, B256::ZERO, 0x74);
-            checkpoints
-                .finish(original.fcu_target_hash, Ok(checkpoint.clone()))
-                .unwrap();
+            checkpoints.finish(original.fcu_target_hash, Ok(checkpoint.clone())).unwrap();
             let next = make_header(2148, B256::ZERO, 0x74);
             let headers = ScriptedHeaders::new(vec![Ok(vec![next.clone()])]);
             let target = resolve_recovery_target(
@@ -2621,17 +2572,12 @@ mod tests {
             provider.insert_side(unrelated.clone());
             let (branch, hashes) = linear_chain(1125, 4, unrelated.hash_slow(), 0x76);
             let fetcher = ChainFetcher {
-                blocks: branch
-                    .into_iter()
-                    .map(|h| (h.hash_slow(), make_block(h)))
-                    .collect(),
+                blocks: branch.into_iter().map(|h| (h.hash_slow(), make_block(h))).collect(),
                 ..Default::default()
             };
             let original = RecoverTarget::single_pair(*hashes.last().unwrap(), 1128);
             let checkpoints = RecoveryCheckpoints::new(100);
-            checkpoints
-                .finish(original.fcu_target_hash, Ok(checkpoint.clone()))
-                .unwrap();
+            checkpoints.finish(original.fcu_target_hash, Ok(checkpoint.clone())).unwrap();
             let target = resolve_recovery_target(
                 checkpoints.resume(original.clone()),
                 fake_peer(),
@@ -2644,16 +2590,12 @@ mod tests {
             let fce = BscForkChoiceEngine::new(provider.clone(), engine.clone(), chain_spec());
             let result =
                 recover_ancestors(fake_peer(), target, provider, engine, fce, &fetcher, &()).await;
-            assert!(
-                matches!(&result, Err(ForkRecoverError::RecoveryAncestryMismatch {
-                number: 1124, expected, got,
-            }) if *expected == checkpoint.hash_slow() && *got == unrelated.hash_slow())
-            );
+            assert!(matches!(&result, Err(ForkRecoverError::RecoveryAncestryMismatch {
+                number: 1124, expected, got, ..
+            }) if *expected == checkpoint.hash_slow() && *got == unrelated.hash_slow()));
             assert!(submissions.lock().unwrap().is_empty());
             assert!(fcus.lock().unwrap().is_empty());
-            assert!(checkpoints
-                .finish(original.fcu_target_hash, result)
-                .is_err());
+            assert!(checkpoints.finish(original.fcu_target_hash, result).is_err());
             assert!(checkpoints.resume(original).validated_ancestor.is_none());
         }
 
@@ -2671,9 +2613,7 @@ mod tests {
             for response in cases {
                 let checkpoints = RecoveryCheckpoints::new(100);
                 let original = RecoverTarget::single_pair(hashes[1], 1126);
-                checkpoints
-                    .finish(original.fcu_target_hash, Ok(checkpoint.clone()))
-                    .unwrap();
+                checkpoints.finish(original.fcu_target_hash, Ok(checkpoint.clone())).unwrap();
                 let target = checkpoints.resume(original);
                 let fetcher = ScriptedFetcher::new(vec![Ok(response)]);
                 let (engine, submissions, fcus) = recording_engine(vec![]);
@@ -2701,9 +2641,7 @@ mod tests {
             let head = make_header(1125, checkpoint.hash_slow(), 0x79);
             let original = RecoverTarget::single_pair(head.hash_slow(), 1125);
             let checkpoints = RecoveryCheckpoints::new(100);
-            checkpoints
-                .finish(original.fcu_target_hash, Ok(checkpoint))
-                .unwrap();
+            checkpoints.finish(original.fcu_target_hash, Ok(checkpoint)).unwrap();
             let fetcher = ScriptedFetcher::new(vec![Ok(vec![make_block(head)])]);
             let (engine, submissions, _) = recording_engine(vec![1125]);
             let fce = BscForkChoiceEngine::new(provider.clone(), engine.clone(), chain_spec());
@@ -2717,17 +2655,9 @@ mod tests {
                 &(),
             )
             .await;
-            assert!(matches!(
-                result,
-                Err(ForkRecoverError::ImportHalted {
-                    committed: None,
-                    ..
-                })
-            ));
+            assert!(matches!(result, Err(ForkRecoverError::ImportHalted { committed: None, .. })));
             assert_eq!(submissions.lock().unwrap().len(), 1);
-            assert!(checkpoints
-                .finish(original.fcu_target_hash, result)
-                .is_err());
+            assert!(checkpoints.finish(original.fcu_target_hash, result).is_err());
             assert!(checkpoints.resume(original).validated_ancestor.is_none());
         }
 
