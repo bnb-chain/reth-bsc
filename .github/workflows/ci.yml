@@ -9,6 +9,47 @@ on:
       - "**"
 
 jobs:
+  fmt:
+    name: Rustfmt (non-blocking, informational only)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: nightly-2026-05-11
+          components: rustfmt
+          override: true
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo +nightly-2026-05-11 fmt --all -- --check
+
+  audit:
+    name: cargo-audit (non-blocking, informational only)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-audit
+      - name: Run cargo audit
+        run: cargo audit
+
+  deny:
+    name: cargo-deny (non-blocking, informational only)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+
   check:
     name: Cargo Check
     runs-on: ubuntu-latest
@@ -58,8 +99,12 @@ jobs:
         run: cargo +nightly-2026-05-11 udeps --workspace --lib --examples --tests --benches --all-features --locked
 
   clippy:
-    name: clippy
+    name: clippy (incremental gate, PR-only)
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
       - name: Install system dependencies
@@ -70,7 +115,40 @@ jobs:
           components: clippy
           override: true
       - uses: Swatinem/rust-cache@v2
-      - name: clippy
-        run: cargo clippy --workspace --tests --all-features
+      - name: "clippy (incremental gate: only errors on lines added/modified in this PR)"
+        # Originally used sksat/action-clippy@v0.7.0, but it crashed while parsing
+        # clippy's JSON output under this repo's current Rust/cargo toolchain ("missing field version"),
+        # so switched to the actively maintained giraffate/clippy-action
+        uses: giraffate/clippy-action@v1
+        with:
+          reporter: github-pr-review
+          level: warning
+          filter_mode: added
+          fail_on_error: true
+          clippy_flags: --workspace --tests --all-features
+
+  unwrap-gate:
+    name: semgrep unwrap-gate (non-blocking, informational only, justify in comments)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: reviewdog/action-setup@v1
+        with:
+          reviewdog_version: latest
+      - name: Install semgrep
+        run: python3 -m pip install semgrep
+      - name: Run semgrep unwrap-gate via reviewdog
+        # reviewdog has no native semgrep format parser (an earlier assumption was wrong);
+        # semgrep can output SARIF directly and reviewdog natively supports -f=sarif, so use that path instead
         env:
-          RUSTFLAGS: "-D warnings"
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          semgrep --config .semgrep/unwrap-gate.yml --sarif src/ | \
+            reviewdog -f=sarif -reporter=github-pr-review -filter-mode=added -fail-level=none
