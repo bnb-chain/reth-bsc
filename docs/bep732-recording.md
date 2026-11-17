@@ -8,7 +8,7 @@ The sections below preserve each milestone's behavior and validation history;
 the early-construction section describes the current implementation.
 
 Cargo dependencies pin companion `bnb-chain/reth` commit
-`1f95f85f1d235f783a41c1b90c5c9eeb6af92ab9` (`feat/bep732-v2.8`).
+`4453d5b620701eca966f579feb11e684ae83e3cf` (`feat/bep732-v2.8`).
 No sibling checkout is required. Earlier local tests used the identical companion
 source through path patches.
 

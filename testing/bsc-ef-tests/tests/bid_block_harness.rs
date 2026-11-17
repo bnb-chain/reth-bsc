@@ -644,7 +644,12 @@ fn execution_gate_round_trip() {
     // sealed header — and the state root this test compares — is unaffected.
     let mut bid_header = block2_ref.header().clone();
     bid_header.transactions_root = submitted_tx_root(&submitted_txs);
-    let bid = BidBlock { header: bid_header, transactions: submitted_txs, sidecars: vec![] };
+    let bid = BidBlock {
+        header: bid_header,
+        transactions: submitted_txs,
+        sidecars: vec![],
+        block_access_list: None,
+    };
     let args =
         BidBlockArgs { bid_block: bid, signature: alloy_primitives::Bytes::from(vec![0u8; 65]) };
     let decoded = args

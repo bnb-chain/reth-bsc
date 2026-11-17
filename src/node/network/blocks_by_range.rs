@@ -220,10 +220,8 @@ fn decode_wire_block_data(buf: &mut &[u8]) -> alloy_rlp::Result<BscBlock> {
         if header.block_access_list_hash.is_some() && remaining > 0 && remaining <= buf.len() {
             // Legacy BEP-592 lists and malformed attachments are ignored, preserving block
             // fallback.
-            match alloy_rlp::decode_exact::<alloy_primitives::Bytes>(&buf[..remaining]) {
-                Ok(raw) => Some(raw),
-                Err(_) => None, // Attachment decoding must not reject an otherwise decodable block.
-            }
+            // Attachment decoding must not reject an otherwise decodable block.
+            alloy_rlp::decode_exact::<alloy_primitives::Bytes>(&buf[..remaining]).ok()
         } else {
             None
         };
