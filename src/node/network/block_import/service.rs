@@ -3377,7 +3377,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-        assert!(result.1.is_none(), "clock skew must not penalize the peer");
+        assert!(result.outcome.is_none(), "clock skew must not penalize the peer");
         assert!(engine.try_recv().is_err());
         assert!(events.try_recv().is_err());
     }
