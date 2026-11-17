@@ -67,6 +67,11 @@ impl Encodable for UpgradeStatusExtension {
 
 impl Decodable for UpgradeStatusExtension {
     fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
+        // The buffer is peer-controlled during the handshake; guard before indexing so a
+        // truncated/empty message returns an error instead of panicking the connection task.
+        if buf.is_empty() {
+            return Err(alloy_rlp::Error::InputTooShort);
+        }
         // if got empty extension, return false
         if buf[0] == 0x80 {
             buf.advance(1);
@@ -104,5 +109,13 @@ mod tests {
             UpgradeStatus { extension: UpgradeStatusExtension { disable_peer_tx_broadcast: false } }.encode(&mut enc);
             println!("enc: {:x?}", enc.freeze());
         }
+    }
+
+    #[test]
+    fn test_decode_empty_extension_buffer_is_error_not_panic() {
+        // A peer could send a truncated handshake message; decoding an empty buffer must
+        // return an error rather than panic on indexing.
+        let mut empty: &[u8] = &[];
+        assert!(UpgradeStatusExtension::decode(&mut empty).is_err());
     }
 }
