@@ -1,18 +1,16 @@
-# BEP-732 sequential consensus prototype
+# BEP-732 consensus and opt-in early child construction
 
-The `feat/bep732-v2.8` branch is based on `feat/bal-v2.8` at
-`fad0ff89b448d7ef1acf35e2a0fa6e842264f63e`. It implements a sequential,
-custom-chain BEP-732 prototype. Named BSC networks remain unscheduled.
-Speculative block production remains unimplemented. Recent-block eth/71 retrieval
-and executed-BAL persistence are implemented in the later increment below.
-Negotiated full-BAL attachments and bounded memory retention are implemented as a
-prototype; see the transport increment below.
-The recording and commitment milestones below describe their historical validation.
+This experimental v2.8 branch includes optional advisory BAL prefetching, custom-chain
+BEP-732 recording/commitment enforcement, negotiated full-BAL transport, recent
+eth/71 retrieval, and opt-in construction of a child while its parent is executing.
+Named BSC networks remain unscheduled. Early construction is disabled by default.
+The sections below preserve each milestone's behavior and validation history;
+the early-construction section describes the current implementation.
 
-The companion worktree is `../reth-bep732-v2.8`, also on `feat/bep732-v2.8`,
-based at `9278c0cddbd86dc9c85ee0b8a2d530eb037faaae`. The recording and activation
-increments made no Rust changes there. The transport increment adds the per-peer
-payload hook described below. Cargo's local Reth patches point to that worktree.
+Cargo dependencies pin companion `bnb-chain/reth` commit
+`1f95f85f1d235f783a41c1b90c5c9eeb6af92ab9` (`feat/bep732-v2.8`).
+No sibling checkout is required. Earlier local tests used the identical companion
+source through path patches.
 
 The design follows the recording section of the
 [BEP-732 draft](https://raw.githubusercontent.com/flywukong/BEPs/bal-mev-bep/BEPs/BEP-732.md),
@@ -468,10 +466,34 @@ incorrect receipt root from a sequential validator. The parallel receiver starts
 the child, cancels it without permitting signing, and rejects the parent. The
 recorded child hit its deadline before the parent rejection arrived; rejection
 interrupting an active wait is separately unit-tested. Same-height and base reorg
-cancellation are unit-tested; a deterministic live canonical-reorg injection is
-still future coverage. The final weak-reference ownership change is covered by
+cancellation are unit-tested; the follow-up below adds a deterministic live
+canonical-reorg test. The final weak-reference ownership change is covered by
 the full suite and a follow-up normal-cluster smoke run; the instrumented delayed
 binary predates only that ownership change.
+
+## Live canonical reorg validation — 2026-11-16
+
+A separate test checkout based on `02ed9bd24` passed a controlled three-Reth-validator
+reorg test. At height 358, a valid out-of-turn parent A became canonical while
+node0's BAL-derived child waited immediately before the signing gate. A valid
+in-turn sibling B then replaced A through normal validation and total-difficulty
+fork choice. Releasing the barrier produced `ready=false`, `eligible=true`, and
+`cancelled=false`: canonical-parent invalidation caused rejection. No validator
+signed a child of A. Node0 produced block 359 on B, and all three validators
+matched canonical hashes, state/receipt/transaction roots and transactions at 367.
+
+Only the isolated test checkout contains the 200-ms parent-execution delay,
+pre-sign barrier, ordinary-work freeze, signed-candidate/import RPC helpers and
+signature instrumentation. Consensus validation and fork choice were unchanged.
+The test used empty user-transaction candidates with normal system finalization;
+it did not rerun the five transaction scenario groups or measure performance.
+Geth 1.8.1 initialized genesis only; this is not cross-client BEP-732 coverage.
+
+Evidence, exact source patch, binary hashes, and prior harness failures are retained
+in `../bep732-reorg-cluster-2026-11-16/`, especially `results/final-status.json`
+and `results/reorg-events.json`. Earlier attempts corrected header JSON names,
+placement of the timing pause, and broadcast timing. All owned processes stopped.
+The implementation branch required no production-code fix for this test.
 
 ## Remaining BEP-732 implementation
 
