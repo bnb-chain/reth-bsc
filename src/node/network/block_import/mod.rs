@@ -21,6 +21,7 @@ use crate::node::network::BscNewBlock;
 
 pub mod config;
 pub(crate) mod fork_recover;
+pub(crate) mod future_payload;
 pub mod handle;
 pub(crate) mod head_fetch;
 mod header_validation;

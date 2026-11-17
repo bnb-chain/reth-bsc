@@ -576,7 +576,9 @@ where
             let header = sealed_block.header().clone();
             let payload = BscPayloadTypes::block_to_payload(sealed_block, None);
             let new_payload_started = std::time::Instant::now();
-            let result = engine.new_payload(payload).await;
+            let result =
+                super::future_payload::submit(&engine, payload, &forkchoice_engine.future_payloads)
+                    .await;
             startup_diagnostics::new_payload_finished(block_hash, new_payload_started.elapsed());
             if admitted_at.elapsed() >= std::time::Duration::from_millis(500) {
                 tracing::info!(target: "bsc::block_import", %block_hash, block_number = header.number,
@@ -927,7 +929,13 @@ where
         let local_fault = Arc::new(AtomicBool::new(false));
         payload.local_fault = Some(local_fault.clone());
         tokio::spawn(async move {
-            match engine.new_payload(payload).await {
+            match super::future_payload::submit(
+                &engine,
+                payload,
+                &forkchoice_engine.future_payloads,
+            )
+            .await
+            {
                 Ok(status) => match status.status {
                     PayloadStatusEnum::Valid => {
                         tracing::info!(target: "bsc::block_import", number = block_number, hash = %block_hash, %bid_hash, "[BID BLOCK VERIFIED] advancing fork choice");
@@ -3274,7 +3282,7 @@ mod tests {
 
     #[tokio::test]
     async fn deferred_peer_headers_relay_only_after_engine_validation() {
-        for context in ["parent", "snapshot", "snapshot_mismatch", "future_time"] {
+        for context in ["parent", "snapshot", "snapshot_mismatch"] {
             for status in [
                 PayloadStatusEnum::Valid,
                 PayloadStatusEnum::Invalid { validation_error: "test rejection".into() },
@@ -3299,17 +3307,7 @@ mod tests {
                 } else if context == "snapshot_mismatch" {
                     snapshots.0.block_number = 123;
                 }
-                let mut block = create_test_block();
-                if context == "future_time" {
-                    let header = &mut Arc::make_mut(&mut block.block).0.block.header;
-                    header.timestamp = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs() +
-                        60;
-                    sign_test_header(header);
-                    block.hash = header.hash_slow();
-                }
+                let block = create_test_block();
                 let (mut service, mut engine, mut events) = relay_test_service(provider, snapshots);
                 // Keep this test isolated from ancestor-recovery tasks.
                 service.failed_heads.mark_failed(block.hash);
@@ -3321,8 +3319,17 @@ mod tests {
                     panic!("expected NewPayload")
                 };
                 assert!(events.try_recv().is_err(), "{context}: relayed before engine verdict");
-                let valid = matches!(status, PayloadStatusEnum::Valid);
+                let accepted = matches!(status, PayloadStatusEnum::Accepted);
+                let valid = matches!(status, PayloadStatusEnum::Valid) || accepted;
                 tx.send(Ok(PayloadStatus::new(status, None))).unwrap();
+                if accepted {
+                    let message = poll_until_engine_request(&mut service, &mut engine).await;
+                    assert!(events.try_recv().is_err(), "ACCEPTED must not authorize relay");
+                    let BeaconEngineMessage::NewPayload { tx, .. } = message else {
+                        panic!("forkchoice must wait for VALID");
+                    };
+                    tx.send(Ok(PayloadStatus::from_status(PayloadStatusEnum::Valid))).unwrap();
+                }
                 if valid {
                     let BeaconEngineMessage::ForkchoiceUpdated { tx, .. } =
                         poll_until_engine_request(&mut service, &mut engine).await
@@ -3351,6 +3358,28 @@ mod tests {
                 assert!(events.try_recv().is_err(), "{context}: unexpected relay or penalty");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn far_future_peer_header_is_neither_submitted_nor_relayed() {
+        let (mut service, mut engine, mut events) =
+            relay_test_service(MockProvider::new(), test_snapshot());
+        let mut block = create_test_block();
+        let header = &mut Arc::make_mut(&mut block.block).0.block.header;
+        header.timestamp =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() +
+                60;
+        sign_test_header(header);
+        block.hash = header.hash_slow();
+        service.on_new_block(block, PeerId::random());
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), service.pending_imports.next())
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(result.1.is_none(), "clock skew must not penalize the peer");
+        assert!(engine.try_recv().is_err());
+        assert!(events.try_recv().is_err());
     }
 
     fn relay_test_service(
@@ -3485,10 +3514,11 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn bid_block_verdict_controls_revoke_and_forkchoice() {
-        for (valid, local_fault, builder, block_number) in [
-            (false, false, 0x7e, 900_102),
-            (false, true, 0x7d, 900_103),
-            (true, false, 0x7b, 900_104),
+        for (valid, local_fault, accepted_first, builder, block_number) in [
+            (false, false, false, 0x7e, 900_102),
+            (false, true, false, 0x7d, 900_103),
+            (true, false, false, 0x7b, 900_104),
+            (true, false, true, 0x7a, 900_105),
         ] {
             let sealed = create_bid_sealed_block(block_number);
             let sealed_hash = sealed.hash();
@@ -3504,6 +3534,7 @@ mod tests {
                 EngineResponses::invalid_new_payload()
             };
             responses.new_payload_local_fault = local_fault;
+            responses.accepted_first = accepted_first;
             responses.new_payload_observed = Some(observed_tx);
             let mut fixture = TestFixture::new_with_provider(responses, provider).await;
             let builder = Address::repeat_byte(builder);
@@ -3537,6 +3568,17 @@ mod tests {
                 .await
                 .expect("engine.new_payload was never called")
                 .expect("engine mock closed without observing new_payload");
+            if accepted_first {
+                assert!(pm.is_allowed(builder), "ACCEPTED must not revoke a builder");
+                assert!(fixture.forkchoice_updates.try_recv().is_err());
+                tokio::time::timeout(
+                    tokio::time::Duration::from_secs(2),
+                    new_payload_observed.recv(),
+                )
+                .await
+                .expect("BidBlock was not retried")
+                .unwrap();
+            }
             // The paused clock advances after ready verification work has run.
             tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
 
@@ -3964,6 +4006,7 @@ mod tests {
     /// Response configuration for engine messages
     struct EngineResponses {
         new_payload: PayloadStatusEnum,
+        accepted_first: bool,
         new_payload_local_fault: bool,
         fcu: PayloadStatusEnum,
         /// Drop the responder so `new_payload` returns `EngineUnavailable`.
@@ -3976,6 +4019,7 @@ mod tests {
         fn both_valid() -> Self {
             Self {
                 new_payload: PayloadStatusEnum::Valid,
+                accepted_first: false,
                 new_payload_local_fault: false,
                 fcu: PayloadStatusEnum::Valid,
                 new_payload_unavailable: false,
@@ -4200,6 +4244,7 @@ mod tests {
     ) -> mpsc::UnboundedReceiver<ForkchoiceState> {
         let (fcu_tx, fcu_rx) = mpsc::unbounded_channel();
         tokio::spawn(Box::pin(async move {
+            let mut accepted_first = responses.accepted_first;
             while let Some(message) = from_engine.recv().await {
                 match message {
                     BeaconEngineMessage::QueryTd { hash, tx, .. } => {
@@ -4219,6 +4264,9 @@ mod tests {
                         }
                         if responses.new_payload_unavailable {
                             drop(tx);
+                        } else if std::mem::take(&mut accepted_first) {
+                            tx.send(Ok(PayloadStatus::from_status(PayloadStatusEnum::Accepted)))
+                                .unwrap();
                         } else {
                             tx.send(Ok(PayloadStatus::new(responses.new_payload.clone(), None)))
                                 .unwrap();
