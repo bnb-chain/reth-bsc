@@ -254,7 +254,7 @@ async fn simulation_converts_both_directions_with_and_without_inspection() {
             for trace_transfers in [false, true] {
                 for validation in [false, true] {
                     for (difficulty, random, expected) in [
-                        (None, None, 0),
+                        (None, None, 2),
                         (Some(U256::ZERO), None, 0),
                         (Some(U256::from(7)), None, 7),
                         (Some(U256::from(7)), Some(B256::from(U256::from(9))), 9),
@@ -283,7 +283,7 @@ async fn simulation_converts_both_directions_with_and_without_inspection() {
                         let synthetic = &result[0].inner.header.inner;
                         assert_eq!(
                             synthetic.difficulty,
-                            difficulty.unwrap_or_default(),
+                            difficulty.unwrap_or(U256::from(2)),
                             "EVM representation must not rewrite the requested header difficulty"
                         );
                         assert_eq!(

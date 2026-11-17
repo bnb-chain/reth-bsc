@@ -274,15 +274,16 @@ where
                         evm_env.block_env.inner_mut().basefee = 0;
                     }
 
-                    // Set prevrandao to zero for simulated blocks by default,
-                    // matching spec behavior where MixDigest is zero-initialized.
-                    // If user provides an override, it will be applied by apply_block_overrides.
+                    // Parlia keeps its parent's difficulty in synthetic headers.
+                    // The opcode view is separate from mixHash, whose zero default
+                    // represents a .000 millisecond remainder. Explicit overrides
+                    // below may replace either value independently.
+                    evm_env.block_env.inner_mut().difficulty = parent.difficulty();
                     evm_env.block_env.inner_mut().prevrandao = Some(B256::ZERO);
-                    // Unlike upstream, the parent difficulty is not carried over: BSC never
-                    // activates Paris, and the synthetic header keeps the requested difficulty.
+                    evm_env.block_env.opcode_44_override = Some(parent.difficulty());
 
                     if let Some(block_overrides) = block_overrides {
-                        // ensure we don't allow uncapped gas limit per block
+                        // Ensure we do not allow an uncapped gas limit per block.
                         if block_overrides.gas_limit.is_some_and(|limit| {
                             limit > evm_env.block_env.gas_limit() && limit > this.call_gas_limit()
                         }) {
