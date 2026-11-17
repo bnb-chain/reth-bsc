@@ -72,11 +72,19 @@
 | `txpool_status` | Support |  |
 | `eth_getHeaderByNumber` | Support | Size field contains block + header size |
 | `eth_getBlockByNumber` | Support | Size field contains block + header size |
-| `eth_newFinalizedHeaderFilter` | Support |  |
+| `eth_newFinalizedHeaderFilter` | Support | Poll finalized header hashes with `eth_getFilterChanges`; uninstall with `eth_uninstallFilter`. |
 | `eth_getFinalizedHeader` | Support |  |
 | `eth_getFinalizedBlock` | Support |  |
 | `eth_getBlobSidecarByTxHash` | Planned |  |
 | `eth_getBlobSidecars` | Planned |  |
 | `eth_getTransactionsByBlockNumber` | Support |  |
 | `eth_getTransactionDataAndReceipt` | Support |  |
+
+Finalized-header filters return hashes from finality updates received after filter creation,
+in event order. `eth_getFilterChanges` drains the queued hashes and returns `[]` when no
+updates are available; every successful poll refreshes the filter's configured inactivity
+timeout. The event buffer retains 4,096 updates. A filter that falls behind this buffer is
+invalidated and returns `filter not found`, so clients must create a new filter and reconcile
+their last observed finalized head. No hashes are synthesized for heights skipped by a
+finality update.
 
