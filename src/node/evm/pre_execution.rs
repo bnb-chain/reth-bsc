@@ -1,6 +1,8 @@
-use super::config::{evm_env_for_header, BscExecutionMode};
-use super::executor::BscBlockExecutor;
-use super::factory::BscEvmFactory;
+use super::{
+    config::{evm_env_for_header, BscExecutionMode},
+    executor::BscBlockExecutor,
+    factory::BscEvmFactory,
+};
 use crate::evm::transaction::BscTxEnv;
 
 use crate::{
@@ -20,10 +22,8 @@ use reth_evm::{
     FromRecoveredTx, FromTxWithEncoded, IntoTxEnv,
 };
 use reth_primitives_traits::SealedHeader;
-use reth_revm::{
-    database::{EvmStateProvider, StateProviderDatabase},
-    db::State,
-};
+use reth_provider::EvmStateProvider;
+use reth_revm::{database::StateProviderDatabase, db::State};
 use revm::{
     context::{result::ExecutionResult, BlockEnv, TxEnv},
     context_interface::block::Block,
@@ -77,13 +77,11 @@ fn classify_working_validator(
 type ValidatorCache = LruMap<BlockHash, EpochValidators, ByLength>;
 type TurnLengthCache = LruMap<BlockHash, u8, ByLength>;
 
-pub static VALIDATOR_CACHE: LazyLock<Mutex<ValidatorCache>> = LazyLock::new(|| {
-    Mutex::new(LruMap::new(ByLength::new(1024)))
-});
+pub static VALIDATOR_CACHE: LazyLock<Mutex<ValidatorCache>> =
+    LazyLock::new(|| Mutex::new(LruMap::new(ByLength::new(1024))));
 
-pub static TURN_LENGTH_CACHE: LazyLock<Mutex<TurnLengthCache>> = LazyLock::new(|| {
-    Mutex::new(LruMap::new(ByLength::new(1024)))
-});
+pub static TURN_LENGTH_CACHE: LazyLock<Mutex<TurnLengthCache>> =
+    LazyLock::new(|| Mutex::new(LruMap::new(ByLength::new(1024))));
 
 /// Runs a read-only system-contract call in `header`'s env over `header`'s post-state.
 pub(crate) fn view_call_at_header<DB, Spec>(
@@ -124,9 +122,8 @@ where
 
     let (to, data) = system_contracts.get_all_validators();
     let output = view_call_at_header(&mut db, &spec, parent.header(), to, data)?;
-    let validators = system_contracts
-        .unpack_all_validators(&output)
-        .map_err(BlockExecutionError::msg)?;
+    let validators =
+        system_contracts.unpack_all_validators(&output).map_err(BlockExecutionError::msg)?;
     let (to, data) = system_contracts.get_num_of_cabinets();
     let output = view_call_at_header(&mut db, &spec, parent.header(), to, data)?;
     let configured_cabinets =
@@ -238,9 +235,8 @@ fn view_call_output<H>(
         tracing::error!("Failed to eth call, to: {:?}, data: {:?}", to, data);
         return Err(BlockExecutionError::msg("ETH call failed"));
     }
-    let output = result
-        .into_output()
-        .ok_or_else(|| BlockExecutionError::msg("ETH call output is None"))?;
+    let output =
+        result.into_output().ok_or_else(|| BlockExecutionError::msg("ETH call output is None"))?;
     // Treat empty returndata as an invalid read instead of letting ABI unpack panic.
     if output.is_empty() {
         tracing::error!("Empty eth call output, to: {:?}, data: {:?}", to, data);
@@ -282,10 +278,9 @@ where
             .clone()
             .ok_or_else(|| BlockExecutionError::msg("Missing header in execution context"))?;
 
-        let parent_header =
-            crate::node::evm::util::get_header_by_hash_from_cache(&header.parent_hash).ok_or(
-                BlockExecutionError::msg("Failed to get parent header from global header reader"),
-            )?;
+        let parent_header = self.ctx.header_by_hash(&header.parent_hash).ok_or(
+            BlockExecutionError::msg("Failed to get parent header from global header reader"),
+        )?;
         self.inner_ctx.parent_header = Some(parent_header.clone());
 
         let snap = self
@@ -314,8 +309,12 @@ where
                 header.parent_hash,
                 CallBlockEnv::Parent,
             )?;
-            tracing::debug!("validator_set: {:?}, vote_addresses: {:?}", validator_set, vote_addresses);
-            
+            tracing::debug!(
+                "validator_set: {:?}, vote_addresses: {:?}",
+                validator_set,
+                vote_addresses
+            );
+
             let vote_addrs_map = if vote_addresses.is_empty() {
                 HashMap::new()
             } else {
@@ -350,7 +349,11 @@ where
                         Some((_consensus_addrs, node_ids_list)) => {
                             tracing::debug!("node_ids_list: {:?}", node_ids_list);
                             let mut flat: Vec<[u8; 32]> = Vec::new();
-                            for ids in node_ids_list { for id in ids { flat.push(id); } }
+                            for ids in node_ids_list {
+                                for id in ids {
+                                    flat.push(id);
+                                }
+                            }
                             crate::node::network::evn_peers::update_onchain_nodeids(flat);
                         }
                         // Advisory data for EVN peering only, so a decode failure must not
@@ -360,9 +363,13 @@ where
                 }
             }
         }
-    
+
         if self.spec.is_feynman_active_at_timestamp(header.number, header.timestamp) &&
-            !self.spec.is_feynman_transition_at_timestamp(header.number, header.timestamp, parent_header.timestamp) &&
+            !self.spec.is_feynman_transition_at_timestamp(
+                header.number,
+                header.timestamp,
+                parent_header.timestamp,
+            ) &&
             is_breathe_block(parent_header.timestamp, header.timestamp)
         {
             let (to, data) = self.system_contracts.get_max_elected_validators();
@@ -412,7 +419,7 @@ where
     }
 
     pub(crate) fn get_current_validators_with_cache(
-        &mut self, 
+        &mut self,
         block_number: BlockNumber,
         block_hash: BlockHash,
         at: CallBlockEnv,
@@ -431,23 +438,31 @@ where
         {
             let mut cache = VALIDATOR_CACHE.lock().unwrap();
             cache.insert(block_hash, result.clone());
-            tracing::debug!("Succeed to update cache, block_number: {}, block_hash: {}, evm_block_number: {}", 
-                block_number, block_hash, self.evm.block().number());
+            tracing::debug!(
+                "Succeed to update cache, block_number: {}, block_hash: {}, evm_block_number: {}",
+                block_number,
+                block_hash,
+                self.evm.block().number()
+            );
         }
 
         Ok(result)
     }
 
-
     /// Runs a read-only system-contract call in the env of the block being executed.
     pub(crate) fn eth_call(
         &mut self,
         to: Address,
-        data: Bytes
+        data: Bytes,
     ) -> Result<Bytes, BlockExecutionError> {
-        let tx_env =
-            view_call_tx_env(to, data.clone(), self.evm.block().gas_limit(), self.spec.chain().id());
-        let result_and_state = self.evm.transact(tx_env.into_tx_env()).map_err(BlockExecutionError::other)?;
+        let tx_env = view_call_tx_env(
+            to,
+            data.clone(),
+            self.evm.block().gas_limit(),
+            self.spec.chain().id(),
+        );
+        let result_and_state =
+            self.evm.transact(tx_env.into_tx_env()).map_err(BlockExecutionError::other)?;
         view_call_output(to, &data, result_and_state.result)
     }
 
@@ -545,14 +560,12 @@ where
 
     /// prepare some intermediate data for produce new block.
     pub(crate) fn prepare_new_block(
-        &mut self, 
-        block: &BlockEnv
+        &mut self,
+        block: &BlockEnv,
     ) -> Result<(), BlockExecutionError> {
-        let parent_header =
-            crate::node::evm::util::get_header_by_hash_from_cache(&self.ctx.base.parent_hash)
-                .ok_or(BlockExecutionError::msg(
-                    "Failed to get parent header from global header reader",
-                ))?;
+        let parent_header = self.ctx.header_by_hash(&self.ctx.base.parent_hash).ok_or(
+            BlockExecutionError::msg("Failed to get parent header from global header reader"),
+        )?;
         self.inner_ctx.parent_header = Some(parent_header.clone());
 
         // Only the Parlia finalization in `finish` reads the snapshot, and simulation skips
@@ -580,7 +593,11 @@ where
         // finalization.
         if self.ctx.mode != BscExecutionMode::Simulation &&
             self.spec.is_feynman_active_at_timestamp(header_number, header_timestamp) &&
-            !self.spec.is_feynman_transition_at_timestamp(header_number, header_timestamp, parent_header.timestamp) &&
+            !self.spec.is_feynman_transition_at_timestamp(
+                header_number,
+                header_timestamp,
+                parent_header.timestamp,
+            ) &&
             is_breathe_block(parent_header.timestamp, header_timestamp)
         {
             let (to, data) = self.system_contracts.get_max_elected_validators();
@@ -639,7 +656,12 @@ where
                 + FromTxWithEncoded<TransactionSigned>,
         BlockEnv = crate::evm::block_env::BscBlockEnv,
     >,
-    Spec: EthereumHardforks + crate::hardforks::BscHardforks + EthChainSpec + Hardforks + Clone + 'static,
+    Spec: EthereumHardforks
+        + crate::hardforks::BscHardforks
+        + EthChainSpec
+        + Hardforks
+        + Clone
+        + 'static,
     R: ReceiptBuilder<Transaction = TransactionSigned, Receipt: TxReceipt>,
     <R as ReceiptBuilder>::Transaction: Unpin + From<TransactionSigned>,
     <EVM as alloy_evm::Evm>::Tx: FromTxWithEncoded<<R as ReceiptBuilder>::Transaction>,

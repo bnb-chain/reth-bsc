@@ -23,7 +23,9 @@ pub struct BscProtoMessage;
 
 impl BscProtoMessage {
     /// Returns the capability for the `bsc` protocol version.
-    pub fn capability_for(version: u64) -> Capability { Capability::new_static(BSC_PROTOCOL_NAME, version as usize) }
+    pub fn capability_for(version: u64) -> Capability {
+        Capability::new_static(BSC_PROTOCOL_NAME, version as usize)
+    }
 
     /// Returns the protocol for the `bsc` protocol with the message count for the given version.
     pub fn protocol_for(version: u64) -> Protocol {
@@ -38,15 +40,15 @@ impl BscProtoMessage {
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::{hex, B256, FixedBytes};
-    use alloy_rlp::{RlpEncodable, RlpDecodable};
     use crate::consensus::parlia::vote::{VoteData, VoteEnvelope};
+    use alloy_primitives::{hex, FixedBytes, B256};
+    use alloy_rlp::{RlpDecodable, RlpEncodable};
 
     /// Wrapper struct to match Go's RLP encoding of struct{Votes []*VoteEnvelope}
     #[derive(RlpEncodable, RlpDecodable)]
     struct VotesWrapper(Vec<VoteEnvelope>);
 
-    fn b256(s: &str) -> B256 { 
+    fn b256(s: &str) -> B256 {
         let hex_str = s.trim_start_matches("0x");
         B256::from_slice(&hex::decode(hex_str).unwrap())
     }
@@ -79,23 +81,83 @@ mod tests {
         ];
 
         let vote_data_set = [
-            (0u64, "0x6d3c66c5357ec91d5c43af47e234a939b22557cbb552dc45bebbceeed90fbe34", 1u64, "0xd0bc67b50915467ada963c35ee00950f664788e47da8139d8c178653171034f1"),
-            (0, "0x6d3c66c5357ec91d5c43af47e234a939b22557cbb552dc45bebbceeed90fbe34", 2, "0xc2d18d5a59d65da573f70c4d30448482418894e018b0d189db24ea4fd02d7aa1"),
-            (0, "0x6d3c66c5357ec91d5c43af47e234a939b22557cbb552dc45bebbceeed90fbe34", 4, "0xbd1bdaf8a8f5c00c464df2856a9e2ef23b8dcc906e6490d3cd295ebb5eb124c3"),
-            (0, "0x6d3c66c5357ec91d5c43af47e234a939b22557cbb552dc45bebbceeed90fbe34", 8, "0x3073782ecabb5ef0673e95962273482347a2c7b30a0a7124c664443d0a43f1e1"),
-            (0, "0x6d3c66c5357ec91d5c43af47e234a939b22557cbb552dc45bebbceeed90fbe34", 16, "0xc119833266327fd7e0cd929c6a847ae7d1689df5066dfdde2e52f51c0ecbcc3f"),
-            (0, "0x6d3c66c5357ec91d5c43af47e234a939b22557cbb552dc45bebbceeed90fbe34", 32, "0x3b5650bcb98381e463871a15a3f601cdc26843d76f4d3461333d7feae38a1786"),
-            (0, "0x6d3c66c5357ec91d5c43af47e234a939b22557cbb552dc45bebbceeed90fbe34", 64, "0x5e38b4d98904178d60d58f5bc1687b0c7df114a51f2007d3ee3e6e732539f130"),
-            (0, "0x6d3c66c5357ec91d5c43af47e234a939b22557cbb552dc45bebbceeed90fbe34", 128, "0xa4a64a7d511d3ff6982b5a79e9a485508477b98996c570a220f9daea0c7682f8"),
-            (0, "0x6d3c66c5357ec91d5c43af47e234a939b22557cbb552dc45bebbceeed90fbe34", 256, "0xd313672c2653fc13e75a9dafdcee93f444caf2cffb04585d3e306fd15418b7e2"),
-            (0, "0x6d3c66c5357ec91d5c43af47e234a939b22557cbb552dc45bebbceeed90fbe34", 512, "0x3c5fe2e5439ca7a7f1a3de7d5c0914c37261451c87654397dd45f207109839ae"),
-            (0, "0x6d3c66c5357ec91d5c43af47e234a939b22557cbb552dc45bebbceeed90fbe34", 1024, "0x088eeeb07acff0db3ae2585195e9fd23bdf54b55077cab87d1632b08dd2c043b"),
+            (
+                0u64,
+                "0x6d3c66c5357ec91d5c43af47e234a939b22557cbb552dc45bebbceeed90fbe34",
+                1u64,
+                "0xd0bc67b50915467ada963c35ee00950f664788e47da8139d8c178653171034f1",
+            ),
+            (
+                0,
+                "0x6d3c66c5357ec91d5c43af47e234a939b22557cbb552dc45bebbceeed90fbe34",
+                2,
+                "0xc2d18d5a59d65da573f70c4d30448482418894e018b0d189db24ea4fd02d7aa1",
+            ),
+            (
+                0,
+                "0x6d3c66c5357ec91d5c43af47e234a939b22557cbb552dc45bebbceeed90fbe34",
+                4,
+                "0xbd1bdaf8a8f5c00c464df2856a9e2ef23b8dcc906e6490d3cd295ebb5eb124c3",
+            ),
+            (
+                0,
+                "0x6d3c66c5357ec91d5c43af47e234a939b22557cbb552dc45bebbceeed90fbe34",
+                8,
+                "0x3073782ecabb5ef0673e95962273482347a2c7b30a0a7124c664443d0a43f1e1",
+            ),
+            (
+                0,
+                "0x6d3c66c5357ec91d5c43af47e234a939b22557cbb552dc45bebbceeed90fbe34",
+                16,
+                "0xc119833266327fd7e0cd929c6a847ae7d1689df5066dfdde2e52f51c0ecbcc3f",
+            ),
+            (
+                0,
+                "0x6d3c66c5357ec91d5c43af47e234a939b22557cbb552dc45bebbceeed90fbe34",
+                32,
+                "0x3b5650bcb98381e463871a15a3f601cdc26843d76f4d3461333d7feae38a1786",
+            ),
+            (
+                0,
+                "0x6d3c66c5357ec91d5c43af47e234a939b22557cbb552dc45bebbceeed90fbe34",
+                64,
+                "0x5e38b4d98904178d60d58f5bc1687b0c7df114a51f2007d3ee3e6e732539f130",
+            ),
+            (
+                0,
+                "0x6d3c66c5357ec91d5c43af47e234a939b22557cbb552dc45bebbceeed90fbe34",
+                128,
+                "0xa4a64a7d511d3ff6982b5a79e9a485508477b98996c570a220f9daea0c7682f8",
+            ),
+            (
+                0,
+                "0x6d3c66c5357ec91d5c43af47e234a939b22557cbb552dc45bebbceeed90fbe34",
+                256,
+                "0xd313672c2653fc13e75a9dafdcee93f444caf2cffb04585d3e306fd15418b7e2",
+            ),
+            (
+                0,
+                "0x6d3c66c5357ec91d5c43af47e234a939b22557cbb552dc45bebbceeed90fbe34",
+                512,
+                "0x3c5fe2e5439ca7a7f1a3de7d5c0914c37261451c87654397dd45f207109839ae",
+            ),
+            (
+                0,
+                "0x6d3c66c5357ec91d5c43af47e234a939b22557cbb552dc45bebbceeed90fbe34",
+                1024,
+                "0x088eeeb07acff0db3ae2585195e9fd23bdf54b55077cab87d1632b08dd2c043b",
+            ),
         ];
 
         let vote_address = bytes48(bls_pub);
         let mut votes: Vec<VoteEnvelope> = Vec::with_capacity(vote_data_set.len());
         for (i, (sn, sh, tn, th)) in vote_data_set.into_iter().enumerate() {
-            let data = VoteData { source_number: sn, source_hash: b256(sh), target_number: tn, target_hash: b256(th) };
+            let data = VoteData {
+                source_number: sn,
+                source_hash: b256(sh),
+                target_number: tn,
+                target_hash: b256(th),
+            };
             let signature = bytes96(signatures[i]);
             votes.push(VoteEnvelope { vote_address, signature, data });
         }

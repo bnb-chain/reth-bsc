@@ -1,11 +1,15 @@
 #![allow(missing_docs)]
 //! Credits to <https://github.com/bnb-chain/reth/blob/main/crates/bsc/primitives/src/system_contracts/mod.rs>
 use crate::{
-    chainspec::{bsc::bsc_mainnet, bsc_chapel::bsc_testnet, bsc_rialto::bsc_qanet, bsc_rialto::RIALTO_CHAIN_ID},
+    chainspec::{
+        bsc::bsc_mainnet,
+        bsc_chapel::bsc_testnet,
+        bsc_rialto::{bsc_qanet, RIALTO_CHAIN_ID},
+    },
     consensus::parlia::VoteAddress,
     hardforks::{bsc::BscHardfork, BscHardforks},
 };
-use abi::{STAKE_HUB_ABI, VALIDATOR_SET_ABI, VALIDATOR_SET_ABI_BEFORE_LUBAN, SLASH_INDICATOR_ABI};
+use abi::{SLASH_INDICATOR_ABI, STAKE_HUB_ABI, VALIDATOR_SET_ABI, VALIDATOR_SET_ABI_BEFORE_LUBAN};
 use alloy_chains::Chain;
 use alloy_consensus::TxLegacy;
 use alloy_dyn_abi::{DynSolValue, FunctionExt, JsonAbiExt};
@@ -43,16 +47,13 @@ lazy_static! {
             .expect("validator set ABI before Luban JSON is valid")
     );
     static ref VALIDATOR_SET_ABI_JSON: Arc<JsonAbi> = Arc::new(
-        serde_json::from_str(*VALIDATOR_SET_ABI)
-            .expect("validator set ABI JSON is valid")
+        serde_json::from_str(*VALIDATOR_SET_ABI).expect("validator set ABI JSON is valid")
     );
     static ref SLASH_INDICATOR_ABI_JSON: Arc<JsonAbi> = Arc::new(
-        serde_json::from_str(*SLASH_INDICATOR_ABI)
-            .expect("slash indicator ABI JSON is valid")
+        serde_json::from_str(*SLASH_INDICATOR_ABI).expect("slash indicator ABI JSON is valid")
     );
-    static ref STAKE_HUB_ABI_JSON: Arc<JsonAbi> = Arc::new(
-        serde_json::from_str(*STAKE_HUB_ABI).expect("stake hub ABI JSON is valid")
-    );
+    static ref STAKE_HUB_ABI_JSON: Arc<JsonAbi> =
+        Arc::new(serde_json::from_str(*STAKE_HUB_ABI).expect("stake hub ABI JSON is valid"));
 }
 
 /// `(consensusAddresses, votingPowers, voteAddresses, totalLength)` from
@@ -72,7 +73,10 @@ impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
     }
 
     /// Return system address and input which is used to query current validators before luban.
-    pub fn get_current_validators_before_luban(&self, block_number: BlockNumber) -> (Address, Bytes) {
+    pub fn get_current_validators_before_luban(
+        &self,
+        block_number: BlockNumber,
+    ) -> (Address, Bytes) {
         let function = if self.chain_spec.is_euler_active_at_block(block_number) {
             self.validator_abi_before_luban
                 .function("getMiningValidators")
@@ -94,12 +98,7 @@ impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
             self.validator_abi_before_luban.function("getValidators").unwrap().first().unwrap();
         let output = function.abi_decode_output(data).ok()?;
 
-        output
-            .first()?
-            .as_array()?
-            .iter()
-            .map(|val| val.as_address())
-            .collect()
+        output.first()?.as_array()?.iter().map(|val| val.as_address()).collect()
     }
 
     /// Return system address and input which is used to query current validators.
@@ -118,8 +117,12 @@ impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
         let function = self.validator_abi.function("getMiningValidators").unwrap().first().unwrap();
         let output = function.abi_decode_output(data).ok()?;
 
-        let consensus_addresses: Vec<Address> =
-            output.first()?.as_array()?.iter().map(|val| val.as_address()).collect::<Option<_>>()?;
+        let consensus_addresses: Vec<Address> = output
+            .first()?
+            .as_array()?
+            .iter()
+            .map(|val| val.as_address())
+            .collect::<Option<_>>()?;
         let vote_address = output
             .get(1)?
             .as_array()?
@@ -145,10 +148,7 @@ impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
 
     /// Decode the validator addresses returned by `getValidators()` without panicking on
     /// malformed returndata.
-    pub(crate) fn unpack_all_validators(
-        &self,
-        data: &[u8],
-    ) -> Result<Vec<Address>, String> {
+    pub(crate) fn unpack_all_validators(&self, data: &[u8]) -> Result<Vec<Address>, String> {
         let function = self.validator_abi.function("getValidators").unwrap().first().unwrap();
         let output = function
             .abi_decode_output(data)
@@ -217,8 +217,8 @@ impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
         self.get_validator_election_info_with(U256::from(0), U256::from(0))
     }
 
-    /// Return system address and input which is used to query validator election info with pagination.
-    /// Offset and limit follow the StakeHub contract's semantics.
+    /// Return system address and input which is used to query validator election info with
+    /// pagination. Offset and limit follow the StakeHub contract's semantics.
     pub fn get_validator_election_info_with(&self, offset: U256, limit: U256) -> (Address, Bytes) {
         let function =
             self.stake_hub_abi.function("getValidatorElectionInfo").unwrap().first().unwrap();
@@ -226,10 +226,7 @@ impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
             STAKE_HUB_CONTRACT,
             Bytes::from(
                 function
-                    .abi_encode_input(&[
-                        DynSolValue::from(offset),
-                        DynSolValue::from(limit),
-                    ])
+                    .abi_encode_input(&[DynSolValue::from(offset), DynSolValue::from(limit)])
                     .unwrap(),
             ),
         )
@@ -246,8 +243,12 @@ impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
             self.stake_hub_abi.function("getValidatorElectionInfo").unwrap().first().unwrap();
         let output = function.abi_decode_output(data).ok()?;
 
-        let consensus_address: Vec<Address> =
-            output.first()?.as_array()?.iter().map(|val| val.as_address()).collect::<Option<_>>()?;
+        let consensus_address: Vec<Address> = output
+            .first()?
+            .as_array()?
+            .iter()
+            .map(|val| val.as_address())
+            .collect::<Option<_>>()?;
         let voting_powers: Vec<U256> = output
             .get(1)?
             .as_array()?
@@ -283,7 +284,8 @@ impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
     }
 
     /// Return system address and input to query validator NodeIDs from StakeHub.
-    /// Note: This function should only be called after Maxwell hardfork when StakeHub.getNodeIDs is available.
+    /// Note: This function should only be called after Maxwell hardfork when StakeHub.getNodeIDs is
+    /// available.
     pub fn get_node_ids(&self, validators: Vec<Address>) -> (Address, Bytes) {
         let function = self.stake_hub_abi.function("getNodeIDs").unwrap().first().unwrap();
         let vals = validators.into_iter().map(DynSolValue::from).collect::<Vec<_>>();
@@ -292,18 +294,20 @@ impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
     }
 
     /// Unpack the data into (consensusAddresses, nodeIDsList)
-    /// Note: This function should only be called after Maxwell hardfork when StakeHub.getNodeIDs is available.
+    /// Note: This function should only be called after Maxwell hardfork when StakeHub.getNodeIDs is
+    /// available.
     ///
     /// `None` if the returned data does not match the ABI compiled in here.
-    pub fn unpack_data_into_node_ids(
-        &self,
-        data: &[u8],
-    ) -> Option<NodeIds> {
+    pub fn unpack_data_into_node_ids(&self, data: &[u8]) -> Option<NodeIds> {
         let function = self.stake_hub_abi.function("getNodeIDs").unwrap().first().unwrap();
         let output = function.abi_decode_output(data).ok()?;
 
-        let consensus_addresses: Vec<Address> =
-            output.first()?.as_array()?.iter().map(|val| val.as_address()).collect::<Option<_>>()?;
+        let consensus_addresses: Vec<Address> = output
+            .first()?
+            .as_array()?
+            .iter()
+            .map(|val| val.as_address())
+            .collect::<Option<_>>()?;
 
         let node_ids_list: Vec<Vec<[u8; 32]>> = output
             .get(1)?
@@ -398,7 +402,8 @@ impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
 
     /// Creates a transaction to add NodeIDs for the validator in StakeHub.
     /// Mirrors BSC's StakeHub.addNodeIDs(bytes32[] nodeIDs).
-    /// Note: This function should only be called after Maxwell hardfork when StakeHub.addNodeIDs is available.
+    /// Note: This function should only be called after Maxwell hardfork when StakeHub.addNodeIDs is
+    /// available.
     #[allow(dead_code)]
     pub fn add_node_ids_tx(&self, node_ids: Vec<[u8; 32]>, nonce: u64) -> Transaction {
         let function = self.stake_hub_abi.function("addNodeIDs").unwrap().first().unwrap();
@@ -411,9 +416,7 @@ impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
                 DynSolValue::FixedBytes(fb, 32)
             })
             .collect();
-        let input = function
-            .abi_encode_input(&[DynSolValue::Array(node_ids_values)])
-            .unwrap();
+        let input = function.abi_encode_input(&[DynSolValue::Array(node_ids_values)]).unwrap();
 
         Transaction::Legacy(TxLegacy {
             chain_id: Some(self.chain_spec.chain().id()),
@@ -428,7 +431,8 @@ impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
 
     /// Creates a transaction to remove NodeIDs for the validator in StakeHub.
     /// Mirrors BSC's StakeHub.removeNodeIDs(bytes32[] nodeIDs).
-    /// Note: This function should only be called after Maxwell hardfork when StakeHub.removeNodeIDs is available.
+    /// Note: This function should only be called after Maxwell hardfork when StakeHub.removeNodeIDs
+    /// is available.
     #[allow(dead_code)]
     pub fn remove_node_ids_tx(&self, node_ids: Vec<[u8; 32]>, nonce: u64) -> Transaction {
         let function = self.stake_hub_abi.function("removeNodeIDs").unwrap().first().unwrap();
@@ -440,9 +444,7 @@ impl<Spec: EthChainSpec + crate::hardforks::BscHardforks> SystemContract<Spec> {
                 DynSolValue::FixedBytes(fb, 32)
             })
             .collect();
-        let input = function
-            .abi_encode_input(&[DynSolValue::Array(node_ids_values)])
-            .unwrap();
+        let input = function.abi_encode_input(&[DynSolValue::Array(node_ids_values)]).unwrap();
 
         Transaction::Legacy(TxLegacy {
             chain_id: Some(self.chain_spec.chain().id()),
@@ -598,9 +600,7 @@ pub fn encode_add_node_ids_call(node_ids: Vec<[u8; 32]>) -> (Address, Bytes) {
             DynSolValue::FixedBytes(fb, 32)
         })
         .collect();
-    let input = function
-        .abi_encode_input(&[DynSolValue::Array(node_ids_values)])
-        .unwrap();
+    let input = function.abi_encode_input(&[DynSolValue::Array(node_ids_values)]).unwrap();
     (STAKE_HUB_CONTRACT, Bytes::from(input))
 }
 
@@ -615,9 +615,7 @@ pub fn encode_remove_node_ids_call(node_ids: Vec<[u8; 32]>) -> (Address, Bytes) 
             DynSolValue::FixedBytes(fb, 32)
         })
         .collect();
-    let input = function
-        .abi_encode_input(&[DynSolValue::Array(node_ids_values)])
-        .unwrap();
+    let input = function.abi_encode_input(&[DynSolValue::Array(node_ids_values)]).unwrap();
     (STAKE_HUB_CONTRACT, Bytes::from(input))
 }
 
@@ -857,10 +855,10 @@ where
 }
 
 /// Get all system contracts to be upgraded.
-/// 
+///
 /// This function follows the exact upgrade order from Geth-BSC:
 /// https://github.com/bnb-chain/bsc/blob/master/core/systemcontracts/upgrade.go#L1078
-/// 
+///
 /// The order is critical because:
 /// 1. Multiple hardforks may activate at the same block/timestamp
 /// 2. Later hardforks may upgrade the same contract addresses as earlier ones
@@ -875,7 +873,7 @@ where
     ChainSpec: EthChainSpec + BscHardforks + Hardforks,
 {
     use tracing::trace;
-    
+
     trace!(
         target: "bsc::system_contracts::upgrade",
         block_number,
@@ -883,16 +881,16 @@ where
         parent_block_time,
         "get_upgrade_system_contracts called"
     );
-    
+
     let mut m = HashMap::new();
-    
+
     // Apply upgrades in the exact order as Geth-BSC upgradeBuildInSystemContract
     // Each hardfork upgrade will overwrite previous upgrades for the same address
 
     if spec.is_ramanujan_transition_at_block(block_number) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Ramanujan.name()) {
-                for (address, v) in &contracts {
-                    m.insert(*address, v.clone());
+            for (address, v) in &contracts {
+                m.insert(*address, v.clone());
                 info!(
                     target: "bsc::system_contracts::upgrade",
                     block_number = block_number,
@@ -904,7 +902,7 @@ where
             }
         }
     }
-    
+
     if spec.is_niels_transition_at_block(block_number) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Niels.name()) {
             for (address, v) in &contracts {
@@ -920,7 +918,7 @@ where
             }
         }
     }
-    
+
     if spec.is_mirror_sync_transition_at_block(block_number) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::MirrorSync.name()) {
             for (address, v) in &contracts {
@@ -936,7 +934,7 @@ where
             }
         }
     }
-    
+
     if spec.is_bruno_transition_at_block(block_number) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Bruno.name()) {
             for (address, v) in &contracts {
@@ -952,7 +950,7 @@ where
             }
         }
     }
-    
+
     if spec.is_euler_transition_at_block(block_number) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Euler.name()) {
             for (address, v) in &contracts {
@@ -968,7 +966,7 @@ where
             }
         }
     }
-    
+
     if spec.is_gibbs_transition_at_block(block_number) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Gibbs.name()) {
             for (address, v) in &contracts {
@@ -984,7 +982,7 @@ where
             }
         }
     }
-    
+
     if spec.is_moran_transition_at_block(block_number) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Moran.name()) {
             for (address, v) in &contracts {
@@ -1000,7 +998,7 @@ where
             }
         }
     }
-    
+
     if spec.is_planck_transition_at_block(block_number) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Planck.name()) {
             for (address, v) in &contracts {
@@ -1016,7 +1014,7 @@ where
             }
         }
     }
-    
+
     if spec.is_luban_transition_at_block(block_number) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Luban.name()) {
             for (address, v) in &contracts {
@@ -1032,7 +1030,7 @@ where
             }
         }
     }
-    
+
     if spec.is_plato_transition_at_block(block_number) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Plato.name()) {
             for (address, v) in &contracts {
@@ -1048,7 +1046,7 @@ where
             }
         }
     }
-    
+
     if spec.is_kepler_transition_at_timestamp(block_number, block_time, parent_block_time) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Kepler.name()) {
             for (address, v) in &contracts {
@@ -1064,7 +1062,7 @@ where
             }
         }
     }
-    
+
     if spec.is_feynman_transition_at_timestamp(block_number, block_time, parent_block_time) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Feynman.name()) {
             for (address, v) in &contracts {
@@ -1080,7 +1078,7 @@ where
             }
         }
     }
-    
+
     if spec.is_feynman_fix_transition_at_timestamp(block_number, block_time, parent_block_time) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::FeynmanFix.name()) {
             for (address, v) in &contracts {
@@ -1096,7 +1094,7 @@ where
             }
         }
     }
-    
+
     if spec.is_haber_fix_transition_at_timestamp(block_number, block_time, parent_block_time) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::HaberFix.name()) {
             for (address, v) in &contracts {
@@ -1112,7 +1110,7 @@ where
             }
         }
     }
-    
+
     if spec.is_bohr_transition_at_timestamp(block_number, block_time, parent_block_time) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Bohr.name()) {
             for (address, v) in &contracts {
@@ -1128,7 +1126,7 @@ where
             }
         }
     }
-    
+
     if spec.is_pascal_transition_at_timestamp(block_number, block_time, parent_block_time) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Pascal.name()) {
             for (address, v) in &contracts {
@@ -1144,7 +1142,7 @@ where
             }
         }
     }
-    
+
     if spec.is_lorentz_transition_at_timestamp(block_number, block_time, parent_block_time) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Lorentz.name()) {
             for (address, v) in &contracts {
@@ -1160,7 +1158,7 @@ where
             }
         }
     }
-    
+
     if spec.is_maxwell_transition_at_timestamp(block_number, block_time, parent_block_time) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Maxwell.name()) {
             for (address, v) in &contracts {
@@ -1176,7 +1174,7 @@ where
             }
         }
     }
-    
+
     if spec.is_fermi_transition_at_timestamp(block_number, block_time, parent_block_time) {
         if let Ok(contracts) = get_system_contract_codes(spec, BscHardfork::Fermi.name()) {
             for (address, v) in &contracts {
@@ -1303,14 +1301,9 @@ mod tests {
             .unwrap()
             .first()
             .unwrap()
-            .abi_encode_output(&[
-                DynSolValue::Array(validator_values),
-            ])
+            .abi_encode_output(&[DynSolValue::Array(validator_values)])
             .unwrap();
-        assert_eq!(
-            contracts.unpack_all_validators(&validators_output).unwrap(),
-            validators
-        );
+        assert_eq!(contracts.unpack_all_validators(&validators_output).unwrap(), validators);
 
         let cabinets = U256::from(21);
         let cabinets_output = contracts
@@ -1412,13 +1405,14 @@ mod tests {
         assert_eq!(upgraded.len(), 2);
 
         // A block fully after Pasteur (parent already active) is not a transition => no upgrade.
-        let after =
-            get_upgrade_system_contracts(&spec, block, pasteur_time + 10, pasteur_time + 9).unwrap();
+        let after = get_upgrade_system_contracts(&spec, block, pasteur_time + 10, pasteur_time + 9)
+            .unwrap();
         assert!(!after.contains_key(&STAKE_HUB_CONTRACT));
 
         // A block fully before Pasteur is likewise not a Pasteur transition.
         let before =
-            get_upgrade_system_contracts(&spec, block, pasteur_time - 10, pasteur_time - 11).unwrap();
+            get_upgrade_system_contracts(&spec, block, pasteur_time - 10, pasteur_time - 11)
+                .unwrap();
         assert!(!before.contains_key(&STAKE_HUB_CONTRACT));
     }
 

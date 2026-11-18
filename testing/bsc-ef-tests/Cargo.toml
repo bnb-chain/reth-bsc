@@ -15,12 +15,11 @@ reth_bsc = { path = "../.." }
 # Used only by the test harness, to generate its validator key instead of embedding one.
 rand = "0.9"
 
-# Inherit Reth sources from the workspace; only test-specific features are set here.
+# reth dependencies aligned with root crate branch to avoid duplicate crate versions
 reth-chainspec = { workspace = true }
 reth-consensus = { workspace = true }
 reth-ethereum-forks = { workspace = true }
-reth-db = { workspace = true, features = [
-    "mdbx",
+reth-db = { workspace = true, features = [    "mdbx",
     "test-utils",
     "disable-lock",
 ] }
@@ -40,19 +39,12 @@ reth-revm = { workspace = true, features = [
 reth-tracing = { workspace = true }
 reth-trie = { workspace = true }
 reth-trie-db = { workspace = true }
-
 # revm
-revm = { version = "38.0.0", features = [
-    "secp256k1",
-    "blst",
-    "c-kzg",
-    "memory_limit",
-] }
 
 # alloy
-alloy-consensus = "2.0.0"
-alloy-eips = "2.0.0"
-alloy-genesis = "2.0.0"
+alloy-consensus = "2.5.0"
+alloy-eips = "2.5.0"
+alloy-genesis = "2.5.0"
 alloy-primitives = "1.5.6"
 alloy-rlp = "0.3.13"
 

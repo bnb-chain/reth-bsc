@@ -8,7 +8,7 @@ use reth_chainspec::ChainSpecBuilder;
 use reth_primitives_traits::Recovered;
 use reth_rpc_eth_api::helpers::pending_block::BuildPendingEnv;
 use reth_transaction_pool::{
-    blobstore::InMemoryBlobStore, noop::MockTransactionValidator, CoinbaseTipOrdering,
+    blobstore::InMemoryBlobStore, noop::MockTransactionValidator, BlobStore, CoinbaseTipOrdering,
     EthPooledTransaction, Pool, PoolConfig, TransactionPool,
 };
 use revm::{database::InMemoryDB, state::AccountInfo};
@@ -32,11 +32,12 @@ fn legacy_bid_sidecars_are_checked_before_execution_and_storage() {
             let mut bid_sidecars = HashMap::new();
             if case != "missing" {
                 if from_pool {
-                    pool.insert_blob(
-                        *blob_tx.hash(),
-                        BlobTransactionSidecarVariant::Eip4844(sidecar.clone()),
-                    )
-                    .unwrap();
+                    pool.blob_store()
+                        .insert(
+                            *blob_tx.hash(),
+                            BlobTransactionSidecarVariant::Eip4844(sidecar.clone()).into(),
+                        )
+                        .unwrap();
                 } else {
                     bid_sidecars.insert(*blob_tx.hash(), sidecar.clone());
                 }
@@ -54,7 +55,7 @@ fn legacy_bid_sidecars_are_checked_before_execution_and_storage() {
                 blob_gas_used: Some(0),
                 ..Default::default()
             });
-            let mut attrs = BscNextBlockEnvAttributes::build_pending_env(&parent);
+            let mut attrs = BscNextBlockEnvAttributes::build_pending_env(&parent, None);
             attrs.mode = BscExecutionMode::BidSimulation;
             let mining_ctx = MiningContext {
                 header: Some(Header {
@@ -68,6 +69,7 @@ fn legacy_bid_sidecars_are_checked_before_execution_and_storage() {
                 cached_reads: None,
                 block_timestamp_ms: attrs.inner.timestamp * 1000,
                 end_mining_timestamp_ms: 0,
+                startup_timing: None,
             };
             let bid = Bid {
                 builder: sender,

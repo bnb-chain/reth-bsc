@@ -17,9 +17,11 @@ use super::{
     malicious_vote_monitor::MaliciousVoteMonitor,
     vote::{VoteData, VoteEnvelope},
 };
-use crate::consensus::parlia::util::calculate_millisecond_timestamp;
-use crate::metrics::{BscFinalityMetrics, BscVoteMetrics};
-use crate::shared;
+use crate::{
+    consensus::parlia::util::calculate_millisecond_timestamp,
+    metrics::{BscFinalityMetrics, BscVoteMetrics},
+    shared,
+};
 use std::time::SystemTime;
 
 const LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER: u64 = 256;
@@ -132,6 +134,21 @@ struct PromotionOutcome {
     requeue: bool,
 }
 
+/// Key of a future bucket: the target hash *and* the target number its votes claim.
+///
+/// Neither half is checked until promotion, so keying by hash alone would let
+/// the first vote for a target choose the queue position, and so the prune
+/// deadline, of every vote that follows it. A peer could claim `head - 255` for
+/// a block nobody holds yet, have the genuine votes join that bucket, and see
+/// them evicted at the next head advance; votes are never re-sent. Keyed on the
+/// pair, a wrong number lands in a bucket of its own, which `verify_vote_origin`
+/// rejects whole at promotion.
+type FutureKey = (B256, BlockNumber);
+
+fn future_key(data: &VoteData) -> FutureKey {
+    (data.target_hash, data.target_number)
+}
+
 /// Container for votes associated with a specific block hash.
 #[derive(Default)]
 struct VoteMessages {
@@ -190,8 +207,9 @@ struct VotePool {
     cur_votes: HashMap<B256, VoteMessages>,
     /// Priority queue for efficiently finding votes to prune.
     cur_votes_pq: VotesPriorityQueue,
-    /// Votes whose target block we do not hold yet, keyed by target hash.
-    future_votes: HashMap<B256, VoteMessages>,
+    /// Votes whose target block we do not hold yet, keyed by target hash and
+    /// claimed target number; see [`FutureKey`].
+    future_votes: HashMap<FutureKey, VoteMessages>,
     /// Priority queue over `future_votes`, ordered by target number.
     future_votes_pq: VotesPriorityQueue,
     /// Total number of votes stored in the pool.
@@ -220,7 +238,7 @@ impl VotePool {
     /// vote per target is all that counts, and the cap sits at the validator
     /// count. Future votes are intentionally uncapped; see the note above the
     /// absent `MAX_FUTURE_VOTE_AMOUNT_PER_BLOCK`.
-    fn is_at_capacity(&self, block_hash: &B256, is_future: bool, authenticated: bool) -> bool {
+    fn is_at_capacity(&self, data: &VoteData, is_future: bool, authenticated: bool) -> bool {
         if is_future {
             // Only cap a future bucket whose sender we authenticated; see the
             // note on MAX_FUTURE_VOTE_AMOUNT_PER_BLOCK.
@@ -231,14 +249,13 @@ impl VotePool {
             // swap — push the bucket past the cap, so the first genuine validator
             // vote for that target is refused. That is the censorship this
             // conditional cap exists to prevent.
-            return authenticated
-                && self
-                    .future_votes
-                    .get(block_hash)
+            return authenticated &&
+                self.future_votes
+                    .get(&future_key(data))
                     .is_some_and(|vm| vm.authenticated >= MAX_FUTURE_VOTE_AMOUNT_PER_BLOCK);
         }
         self.cur_votes
-            .get(block_hash)
+            .get(&data.target_hash)
             .is_some_and(|vm| vm.vote_messages.len() >= MAX_CUR_VOTE_AMOUNT_PER_BLOCK)
     }
 
@@ -266,26 +283,23 @@ impl VotePool {
 
         let block_hash = vote.data.target_hash;
         let vote_data = vote.data;
-        {
-            let (votes, pq) = if is_future {
-                (&mut self.future_votes, &mut self.future_votes_pq)
-            } else {
-                (&mut self.cur_votes, &mut self.cur_votes_pq)
-            };
-            // Only push to the queue for a hash we are not already tracking, so
-            // the queue holds one entry per target rather than one per vote.
-            if !votes.contains_key(&block_hash) {
-                pq.push(vote_data);
+        // Only push to the queue for a bucket we are not already tracking, so the
+        // queue holds one entry per bucket rather than one per vote.
+        let bucket = if is_future {
+            let key = future_key(&vote_data);
+            if !self.future_votes.contains_key(&key) {
+                self.future_votes_pq.push(vote_data);
             }
-            let bucket = votes.entry(block_hash).or_default();
-            bucket.vote_messages.push(VoteEntry {
-                hash: vote_hash,
-                envelope: vote,
-                authenticated,
-            });
-            if authenticated {
-                bucket.authenticated += 1;
+            self.future_votes.entry(key).or_default()
+        } else {
+            if !self.cur_votes.contains_key(&block_hash) {
+                self.cur_votes_pq.push(vote_data);
             }
+            self.cur_votes.entry(block_hash).or_default()
+        };
+        bucket.vote_messages.push(VoteEntry { hash: vote_hash, envelope: vote, authenticated });
+        if authenticated {
+            bucket.authenticated += 1;
         }
         self.total_votes += 1;
 
@@ -319,7 +333,8 @@ impl VotePool {
     fn get_votes(&self) -> Vec<VoteEnvelope> {
         let mut all_votes = Vec::new();
         for vote_messages in self.cur_votes.values() {
-            all_votes.extend(vote_messages.vote_messages.iter().map(|entry| entry.envelope.clone()));
+            all_votes
+                .extend(vote_messages.vote_messages.iter().map(|entry| entry.envelope.clone()));
         }
         all_votes
     }
@@ -339,11 +354,7 @@ impl VotePool {
 
     fn fetch_vote_by_block_hash(&self, block_hash: B256) -> Vec<VoteEnvelope> {
         if let Some(vote_messages) = self.cur_votes.get(&block_hash) {
-            vote_messages
-                .vote_messages
-                .iter()
-                .map(|entry| entry.envelope.clone())
-                .collect()
+            vote_messages.vote_messages.iter().map(|entry| entry.envelope.clone()).collect()
         } else {
             Vec::new()
         }
@@ -405,7 +416,7 @@ impl VotePool {
             }
             let votes: Vec<VoteEntry> = self
                 .future_votes
-                .get(&target_hash)
+                .get(&(target_hash, target_number))
                 .map(|vm| vm.vote_messages.iter().take(vote_budget).cloned().collect())
                 .unwrap_or_default();
             vote_budget -= votes.len();
@@ -426,7 +437,7 @@ impl VotePool {
     fn apply_promotion(
         &mut self,
         latest: BlockNumber,
-        resolved: &HashMap<B256, HashMap<B256, bool>>,
+        resolved: &HashMap<FutureKey, HashMap<B256, bool>>,
     ) -> PromotionApplied {
         let mut promoted = Vec::new();
         let mut deferred = Vec::new();
@@ -447,9 +458,10 @@ impl VotePool {
             let vd = *vd;
             self.future_votes_pq.pop();
             examined += 1;
-            match resolved.get(&vd.target_hash) {
+            let key = future_key(&vd);
+            match resolved.get(&key) {
                 Some(verdicts) => {
-                    let outcome = self.promote_judged(vd.target_hash, verdicts);
+                    let outcome = self.promote_judged(key, verdicts);
                     if outcome.promoted {
                         promoted.push(vd.target_hash);
                     }
@@ -461,7 +473,7 @@ impl VotePool {
                 }
                 // A target whose bucket is gone — shed, or pruned — leaves a
                 // stale queue entry. Drop it rather than deferring it forever.
-                None if !self.future_votes.contains_key(&vd.target_hash) => {}
+                None if !self.future_votes.contains_key(&key) => {}
                 None => deferred.push(vd),
             }
         }
@@ -482,10 +494,11 @@ impl VotePool {
     /// re-queued, so the next pass judges them rather than this one guessing.
     fn promote_judged(
         &mut self,
-        block_hash: B256,
+        key: FutureKey,
         verdicts: &HashMap<B256, bool>,
     ) -> PromotionOutcome {
-        let Some(box_) = self.future_votes.remove(&block_hash) else {
+        let block_hash = key.0;
+        let Some(box_) = self.future_votes.remove(&key) else {
             return PromotionOutcome { promoted: false, requeue: false };
         };
 
@@ -508,7 +521,7 @@ impl VotePool {
         let requeue = !unjudged.is_empty();
         if requeue {
             let still_authenticated = unjudged.iter().filter(|e| e.authenticated).count();
-            let bucket = self.future_votes.entry(block_hash).or_default();
+            let bucket = self.future_votes.entry(key).or_default();
             bucket.vote_messages.extend(unjudged);
             bucket.authenticated += still_authenticated;
         }
@@ -544,7 +557,7 @@ impl VotePool {
             if shed >= target {
                 break;
             }
-            if let Some(box_) = self.future_votes.remove(&vd.target_hash) {
+            if let Some(box_) = self.future_votes.remove(&future_key(&vd)) {
                 shed += box_.vote_messages.len();
                 self.total_votes = self.total_votes.saturating_sub(box_.vote_messages.len());
                 for entry in box_.vote_messages {
@@ -575,8 +588,8 @@ impl VotePool {
             // `head + 11`, but it fails open while the head is unknown at
             // startup, so an extreme value can still reach the pool. A plain add
             // would then wrap in release and trap in debug.
-            if vote_data.target_number.saturating_add(LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER)
-                <= latest_block_number
+            if vote_data.target_number.saturating_add(LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER) <=
+                latest_block_number
             {
                 // Remove from priority queue
                 let vote_data = self.cur_votes_pq.pop().unwrap();
@@ -584,7 +597,8 @@ impl VotePool {
 
                 // Remove from votes map and received_votes set
                 if let Some(vote_box) = self.cur_votes.remove(&block_hash) {
-                    self.total_votes = self.total_votes.saturating_sub(vote_box.vote_messages.len());
+                    self.total_votes =
+                        self.total_votes.saturating_sub(vote_box.vote_messages.len());
                     for vote in vote_box.vote_messages {
                         self.received_votes.remove(&vote.hash);
                     }
@@ -595,14 +609,14 @@ impl VotePool {
         }
         // Future entries below the lower bound can never be promoted usefully.
         while let Some(vd) = self.future_votes_pq.peek() {
-            if vd.target_number.saturating_add(LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER)
-                > latest_block_number
+            if vd.target_number.saturating_add(LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER) >
+                latest_block_number
             {
                 break;
             }
-            let hash = vd.target_hash;
+            let key = future_key(vd);
             self.future_votes_pq.pop();
-            if let Some(box_) = self.future_votes.remove(&hash) {
+            if let Some(box_) = self.future_votes.remove(&key) {
                 self.total_votes = self.total_votes.saturating_sub(box_.vote_messages.len());
                 for entry in box_.vote_messages {
                     self.received_votes.remove(&entry.hash);
@@ -640,7 +654,8 @@ static VOTE_METRICS: Lazy<BscVoteMetrics> = Lazy::new(BscVoteMetrics::default);
 static FINALITY_METRICS: Lazy<BscFinalityMetrics> = Lazy::new(BscFinalityMetrics::default);
 
 /// LRU cache to track which blocks have already been notified for finality.
-/// This prevents repeated update_forkchoice calls for the same block (matches geth's finalizedNotified).
+/// This prevents repeated update_forkchoice calls for the same block (matches geth's
+/// finalizedNotified).
 static FINALIZED_NOTIFIED: Lazy<RwLock<LruCache<B256, ()>>> =
     Lazy::new(|| RwLock::new(LruCache::new(NonZero::new(FINALIZED_NOTIFIED_CACHE_SIZE).unwrap())));
 
@@ -711,13 +726,12 @@ fn justified_pair_of(
 /// authoritative check at promotion.
 ///
 /// Returns:
-/// - `Some(true)`  sender is a validator in our head's set, which we believe
-///   governs the target
-/// - `Some(false)` sender is not — refused early to keep minted keys from
-///   creating a bucket, accepting that a cross-branch sender may be refused with
-///   them. Never cached, so the refusal costs one copy rather than the envelope.
-/// - `None` undecidable: no snapshot, or the governing sets differ. Callers admit
-///   these uncapped rather than guess.
+/// - `Some(true)`  sender is a validator in our head's set, which we believe governs the target
+/// - `Some(false)` sender is not — refused early to keep minted keys from creating a bucket,
+///   accepting that a cross-branch sender may be refused with them. Never cached, so the refusal
+///   costs one copy rather than the envelope.
+/// - `None` undecidable: no snapshot, or the governing sets differ. Callers admit these uncapped
+///   rather than guess.
 fn future_vote_sender_is_validator(vote: &VoteEnvelope) -> Option<bool> {
     let head_number = shared::get_best_canonical_block_number()?;
     let head = shared::get_canonical_header_by_number(head_number)?;
@@ -800,8 +814,8 @@ fn verify_vote_origin(vote: &VoteEnvelope) -> OriginVerdict {
 
     match justified_pair_for_hash(&vote.data.target_hash) {
         Some((justified_number, justified_hash)) => {
-            if vote.data.source_number != justified_number
-                || vote.data.source_hash != justified_hash
+            if vote.data.source_number != justified_number ||
+                vote.data.source_hash != justified_hash
             {
                 metrics::counter!("votes.rejected.source_mismatch").increment(1);
                 return OriginVerdict::Rejected;
@@ -895,8 +909,10 @@ pub fn put_vote(vote: VoteEnvelope) {
     // Height window first of all: it costs nothing, while everything below costs
     // at least a hash. go-bsc orders it ahead of verification the same way in
     // `putIntoVotePool`.
-    if !is_within_admission_window(vote.data.target_number, shared::get_best_canonical_block_number())
-    {
+    if !is_within_admission_window(
+        vote.data.target_number,
+        shared::get_best_canonical_block_number(),
+    ) {
         metrics::counter!("votes.rejected.out_of_range").increment(1);
         tracing::debug!(
             target: "bsc::vote_pool",
@@ -956,7 +972,7 @@ pub fn put_vote(vote: VoteEnvelope) {
 pub fn put_vote_unchecked(vote: VoteEnvelope) {
     let target_hash = vote.data.target_hash;
     let mut pool = VOTE_POOL.write().expect("vote pool poisoned");
-    if pool.is_at_capacity(&target_hash, false, false) {
+    if pool.is_at_capacity(&vote.data, false, false) {
         return;
     }
     let votes_for_block = pool.insert(vote, 0, false, false);
@@ -988,8 +1004,8 @@ fn put_vote_inner(vote: VoteEnvelope, vote_hash: B256) {
     // `maybe_notify_finality` (so they cannot manufacture quorum), and they are
     // fully origin-checked at promotion once the provider appears.
     let can_classify = shared::has_header_by_hash_provider();
-    let is_future = !can_classify
-        || shared::get_canonical_header_by_hash_from_provider(&target_hash).is_none();
+    let is_future =
+        !can_classify || shared::get_canonical_header_by_hash_from_provider(&target_hash).is_none();
 
     // Future votes cannot be origin-checked (membership lives in the target's
     // parent snapshot, which we do not hold), but we can still ask whether the
@@ -1054,7 +1070,7 @@ fn put_vote_inner(vote: VoteEnvelope, vote_hash: B256) {
 
     let mut pool = VOTE_POOL.write().expect("vote pool poisoned");
 
-    if pool.is_at_capacity(&target_hash, is_future, future_sender_authenticated) {
+    if pool.is_at_capacity(&vote.data, is_future, future_sender_authenticated) {
         drop(pool);
         metrics::counter!("votes.rejected.block_at_capacity").increment(1);
         tracing::debug!(
@@ -1149,11 +1165,11 @@ pub fn promote_future_votes(head_number: BlockNumber) {
     }
 
     // Phase 2 — no lock held: the provider and snapshot reads.
-    let mut resolved: HashMap<B256, HashMap<B256, bool>> = HashMap::new();
+    let mut resolved: HashMap<FutureKey, HashMap<B256, bool>> = HashMap::new();
     for candidate in candidates {
         let target_hash = candidate.target_hash;
-        if !candidate.expired
-            && shared::get_canonical_header_by_hash_from_provider(&target_hash).is_none()
+        if !candidate.expired &&
+            shared::get_canonical_header_by_hash_from_provider(&target_hash).is_none()
         {
             // Still future: we do not hold the target yet.
             tracing::trace!(
@@ -1164,7 +1180,7 @@ pub fn promote_future_votes(head_number: BlockNumber) {
             continue;
         }
         resolved.insert(
-            target_hash,
+            (target_hash, candidate.target_number),
             candidate
                 .votes
                 .iter()
@@ -1237,8 +1253,10 @@ pub fn fetch_vote_by_block_hash(block_hash: B256) -> Vec<VoteEnvelope> {
 pub fn fetch_any_vote_by_block_hash(block_hash: B256) -> Vec<VoteEnvelope> {
     let pool = VOTE_POOL.read().expect("vote pool poisoned");
     let mut out = pool.fetch_vote_by_block_hash(block_hash);
-    if let Some(vm) = pool.future_votes.get(&block_hash) {
-        out.extend(vm.vote_messages.iter().map(|e| e.envelope.clone()));
+    for ((hash, _), vm) in &pool.future_votes {
+        if *hash == block_hash {
+            out.extend(vm.vote_messages.iter().map(|e| e.envelope.clone()));
+        }
     }
     out
 }
@@ -1300,8 +1318,8 @@ fn maybe_notify_finality(target_hash: B256, votes_for_block: usize) {
     let eligible_votes = fetch_vote_by_block_hash(target_hash)
         .into_iter()
         .filter(|vote| {
-            vote.data.source_number == current_justified_number
-                && vote.data.target_number == head.number
+            vote.data.source_number == current_justified_number &&
+                vote.data.target_number == head.number
         })
         .count();
 
@@ -1318,7 +1336,8 @@ fn maybe_notify_finality(target_hash: B256, votes_for_block: usize) {
     // Record early finalization latency: time from the finalized block's millisecond
     // timestamp to now, equivalent to chain/finalized/latency/early in geth.
     // The finalized block is current_justified (head - 1), identified by current_justified_number.
-    if let Some(justified_header) = shared::get_canonical_header_by_number(current_justified_number) {
+    if let Some(justified_header) = shared::get_canonical_header_by_number(current_justified_number)
+    {
         let now_ms = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1338,8 +1357,10 @@ fn maybe_notify_finality(target_hash: B256, votes_for_block: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consensus::parlia::bls_signer::random_test_signer;
-    use crate::consensus::parlia::vote::{VoteAddress, VoteData, VoteEnvelope, VoteSignature};
+    use crate::consensus::parlia::{
+        bls_signer::random_test_signer,
+        vote::{VoteAddress, VoteData, VoteEnvelope, VoteSignature},
+    };
     use alloy_primitives::B256;
 
     fn vote_with_source(target_hash: B256, source_number: u64, unique: u8) -> VoteEnvelope {
@@ -1409,15 +1430,16 @@ mod tests {
 
         // Baseline: a correctly signed vote is admitted.
         put_vote(genuine.clone());
-        assert_eq!(fetch_any_vote_by_block_hash(data.target_hash).len(), 1, "genuine vote rejected");
+        assert_eq!(
+            fetch_any_vote_by_block_hash(data.target_hash).len(),
+            1,
+            "genuine vote rejected"
+        );
 
         // Undecodable signature under a real validator's address. Before
         // verification existed this reached attestation assembly and panicked
         // in `Signature::from_bytes(..).unwrap()`.
-        put_vote(VoteEnvelope {
-            signature: VoteSignature::from([0x42u8; 96]),
-            ..genuine.clone()
-        });
+        put_vote(VoteEnvelope { signature: VoteSignature::from([0x42u8; 96]), ..genuine.clone() });
         assert_eq!(
             fetch_any_vote_by_block_hash(data.target_hash).len(),
             1,
@@ -1436,10 +1458,7 @@ mod tests {
         );
 
         // Signature valid in isolation, but attributed to another validator.
-        put_vote(VoteEnvelope {
-            vote_address: VoteAddress::from([0x07u8; 48]),
-            ..genuine
-        });
+        put_vote(VoteEnvelope { vote_address: VoteAddress::from([0x07u8; 48]), ..genuine });
         assert_eq!(
             fetch_any_vote_by_block_hash(data.target_hash).len(),
             1,
@@ -1448,7 +1467,6 @@ mod tests {
 
         let _ = drain();
     }
-
 
     /// Verification is gated behind two cheap exclusions, so unsolicited traffic
     /// cannot buy unbounded pairings.
@@ -1501,7 +1519,6 @@ mod tests {
 
         let _ = drain();
     }
-
 
     // === D2: (head-256, head+11] admission window ===
 
@@ -1567,9 +1584,6 @@ mod tests {
         let _ = drain();
     }
 
-
-
-
     // === D1: per-target vote caps ===
 
     /// The future-vote cap applies only once the sender is authenticated.
@@ -1603,13 +1617,13 @@ mod tests {
         let unauth = B256::from([0x77; 32]);
         for i in 0..(MAX_FUTURE_VOTE_AMOUNT_PER_BLOCK * 4) {
             assert!(
-                !pool.is_at_capacity(&unauth, true, false),
+                !pool.is_at_capacity(&envelope(unauth, i).data, true, false),
                 "an unauthenticated future bucket must never refuse (i={i})",
             );
             pool.insert(envelope(unauth, i), 0, true, false);
         }
         assert_eq!(
-            pool.future_votes.get(&unauth).map(|vm| vm.vote_messages.len()),
+            pool.future_votes.get(&(unauth, 11)).map(|vm| vm.vote_messages.len()),
             Some(MAX_FUTURE_VOTE_AMOUNT_PER_BLOCK * 4),
             "every unauthenticated future vote is retained",
         );
@@ -1617,22 +1631,24 @@ mod tests {
         // Authenticated future sender: capped.
         let auth = B256::from([0x79; 32]);
         for i in 0..MAX_FUTURE_VOTE_AMOUNT_PER_BLOCK {
-            assert!(!pool.is_at_capacity(&auth, true, true), "below the future cap (i={i})");
-            pool.insert(envelope(auth, 5_000 + i), 0, true, true);
+            let vote = envelope(auth, 5_000 + i);
+            assert!(!pool.is_at_capacity(&vote.data, true, true), "below the future cap (i={i})");
+            pool.insert(vote, 0, true, true);
         }
         assert!(
-            pool.is_at_capacity(&auth, true, true),
+            pool.is_at_capacity(&envelope(auth, 0).data, true, true),
             "an authenticated future bucket stops at MAX_FUTURE_VOTE_AMOUNT_PER_BLOCK",
         );
 
         // Current votes stop at the validator-count cap.
         let cur_target = B256::from([0x78; 32]);
         for i in 0..MAX_CUR_VOTE_AMOUNT_PER_BLOCK {
-            assert!(!pool.is_at_capacity(&cur_target, false, false), "below the cap (i={i})");
-            pool.insert(envelope(cur_target, 1_000 + i), 0, false, false);
+            let vote = envelope(cur_target, 1_000 + i);
+            assert!(!pool.is_at_capacity(&vote.data, false, false), "below the cap (i={i})");
+            pool.insert(vote, 0, false, false);
         }
         assert!(
-            pool.is_at_capacity(&cur_target, false, false),
+            pool.is_at_capacity(&envelope(cur_target, 0).data, false, false),
             "current votes must stop at MAX_CUR_VOTE_AMOUNT_PER_BLOCK",
         );
     }
@@ -1671,23 +1687,24 @@ mod tests {
             pool.insert(envelope(i), 0, true, false);
         }
         assert_eq!(
-            pool.future_votes.get(&target).map(|vm| vm.vote_messages.len()),
+            pool.future_votes.get(&(target, 11)).map(|vm| vm.vote_messages.len()),
             Some(MAX_FUTURE_VOTE_AMOUNT_PER_BLOCK * 4),
         );
 
         // A validator's vote for the same target must still be admitted.
         assert!(
-            !pool.is_at_capacity(&target, true, true),
+            !pool.is_at_capacity(&envelope(0).data, true, true),
             "an unauthenticated flood must not exhaust the authenticated cap",
         );
 
         // And the cap still applies to authenticated votes themselves.
         for i in 0..MAX_FUTURE_VOTE_AMOUNT_PER_BLOCK {
-            assert!(!pool.is_at_capacity(&target, true, true), "below the cap (i={i})");
-            pool.insert(envelope(10_000 + i), 0, true, true);
+            let vote = envelope(10_000 + i);
+            assert!(!pool.is_at_capacity(&vote.data, true, true), "below the cap (i={i})");
+            pool.insert(vote, 0, true, true);
         }
         assert!(
-            pool.is_at_capacity(&target, true, true),
+            pool.is_at_capacity(&envelope(0).data, true, true),
             "MAX_FUTURE_VOTE_AMOUNT_PER_BLOCK authenticated votes still close the bucket",
         );
     }
@@ -1732,11 +1749,11 @@ mod tests {
         let shed = pool.shed_future_votes(1);
         assert_eq!(shed, 2, "the whole furthest-ahead bucket is released");
         assert!(
-            !pool.future_votes.contains_key(&B256::from([0xb3; 32])),
+            !pool.future_votes.contains_key(&(B256::from([0xb3; 32]), 300)),
             "height 300 shed first",
         );
         assert!(
-            pool.future_votes.contains_key(&B256::from([0xb1; 32])),
+            pool.future_votes.contains_key(&(B256::from([0xb1; 32]), 100)),
             "height 100 retained: nearest to promotion",
         );
         assert_eq!(pool.len(), 4, "accounting follows the shed votes");
@@ -1770,7 +1787,6 @@ mod tests {
 
         let _ = drain();
     }
-
 
     /// An extreme `target_number` must not be able to empty the pool.
     ///
@@ -1843,7 +1859,6 @@ mod tests {
         let _ = drain();
     }
 
-
     /// A vote that cannot be classified must not be treated as current.
     ///
     /// The network begins accepting peers in `build_network`, while the header
@@ -1889,7 +1904,7 @@ mod tests {
         // Uncapped, so it cannot be used to crowd out validator votes.
         {
             let pool = VOTE_POOL.read().expect("vote pool poisoned");
-            assert!(!pool.is_at_capacity(&data.target_hash, true, false));
+            assert!(!pool.is_at_capacity(&data, true, false));
         }
 
         let _ = drain();
@@ -1944,9 +1959,12 @@ mod tests {
         }
     }
 
-    fn verdicts(target: B256, entries: &[(B256, bool)]) -> HashMap<B256, HashMap<B256, bool>> {
+    fn verdicts(
+        key: FutureKey,
+        entries: &[(B256, bool)],
+    ) -> HashMap<FutureKey, HashMap<B256, bool>> {
         let inner: HashMap<B256, bool> = entries.iter().copied().collect();
-        [(target, inner)].into_iter().collect()
+        [(key, inner)].into_iter().collect()
     }
 
     /// Promotion applies verdicts computed outside the lock: accepted votes reach
@@ -1962,12 +1980,12 @@ mod tests {
 
         let applied = pool.apply_promotion(
             100,
-            &verdicts(target, &[(accepted.hash(), true), (rejected.hash(), false)]),
+            &verdicts((target, 100), &[(accepted.hash(), true), (rejected.hash(), false)]),
         );
 
         assert_eq!(applied.promoted, vec![target]);
         assert_eq!(pool.fetch_vote_by_block_hash(target).len(), 1, "accepted vote is current");
-        assert!(!pool.future_votes.contains_key(&target), "nothing left in the future pool");
+        assert!(pool.future_votes.is_empty(), "nothing left in the future pool");
         assert!(
             !pool.received_votes.contains(&rejected.hash()),
             "a rejected vote leaves the dedup set, so a legitimate copy can still arrive",
@@ -1988,12 +2006,12 @@ mod tests {
         pool.insert(latecomer.clone(), 0, true, false);
 
         // Verdicts were taken before `latecomer` arrived.
-        let applied = pool.apply_promotion(100, &verdicts(target, &[(judged.hash(), true)]));
+        let applied = pool.apply_promotion(100, &verdicts((target, 100), &[(judged.hash(), true)]));
 
         assert_eq!(applied.promoted, vec![target]);
         assert_eq!(pool.fetch_vote_by_block_hash(target).len(), 1, "judged vote promoted");
         assert_eq!(
-            pool.future_votes.get(&target).map(|vm| vm.vote_messages.len()),
+            pool.future_votes.get(&(target, 100)).map(|vm| vm.vote_messages.len()),
             Some(1),
             "the unjudged vote stays future",
         );
@@ -2056,11 +2074,11 @@ mod tests {
         // Judge exactly what the pass captured; the rest must survive as future.
         let verdicts: HashMap<B256, bool> =
             candidates[0].votes.iter().map(|e| (e.hash, true)).collect();
-        let applied = pool.apply_promotion(100, &[(target, verdicts)].into_iter().collect());
+        let applied = pool.apply_promotion(100, &[((target, 100), verdicts)].into_iter().collect());
 
         assert_eq!(applied.promoted, vec![target]);
         assert_eq!(
-            pool.future_votes.get(&target).map(|vm| vm.vote_messages.len()),
+            pool.future_votes.get(&(target, 100)).map(|vm| vm.vote_messages.len()),
             Some(oversized - MAX_PROMOTION_VOTES_PER_PASS),
             "the unjudged remainder stays future",
         );
@@ -2126,10 +2144,12 @@ mod tests {
         assert_eq!(selected, expected, "the k smallest eligible targets, in pop order");
 
         // And the write phase reaches exactly those.
-        let resolved: HashMap<B256, HashMap<B256, bool>> = pool
+        let resolved: HashMap<FutureKey, HashMap<B256, bool>> = pool
             .promotion_candidates(1000)
             .into_iter()
-            .map(|c| (c.target_hash, c.votes.iter().map(|e| (e.hash, true)).collect()))
+            .map(|c| {
+                ((c.target_hash, c.target_number), c.votes.iter().map(|e| (e.hash, true)).collect())
+            })
             .collect();
         let applied = pool.apply_promotion(1000, &resolved);
         assert_eq!(applied.promoted.len(), MAX_PROMOTION_TARGETS_PER_PASS, "all judged promoted");
@@ -2154,6 +2174,74 @@ mod tests {
         assert_eq!(overflow_shed_target(remaining), None, "and does not re-trigger");
     }
 
+    /// Runs one promotion pass the way `promote_future_votes` does, with `judge`
+    /// standing in for `verify_vote_origin` (unit tests have no provider).
+    fn promotion_pass(pool: &mut VotePool, latest: u64, judge: impl Fn(&VoteEnvelope) -> bool) {
+        let resolved: HashMap<FutureKey, HashMap<B256, bool>> = pool
+            .promotion_candidates(latest)
+            .into_iter()
+            .map(|c| {
+                let verdicts = c.votes.iter().map(|e| (e.hash, judge(&e.envelope))).collect();
+                ((c.target_hash, c.target_number), verdicts)
+            })
+            .collect();
+        pool.apply_promotion(latest, &resolved);
+    }
+
+    /// SRC-2714: a vote claiming the wrong number for a target must not decide
+    /// when the genuine votes for that target are pruned.
+    ///
+    /// While our head is `N - 1`, a peer whose membership we cannot judge seeds
+    /// target `N` with votes claiming `N - 256`, the lowest number the window
+    /// admits, and enough of them to outlast the two promotion passes that run
+    /// when `N` is imported. Keyed by hash alone, the genuine votes joined that
+    /// bucket, sat behind the flood in the budget, were re-queued under the stale
+    /// number and pruned by that same advance, never to be re-sent.
+    #[test]
+    fn a_wrong_target_number_cannot_steer_the_genuine_votes_into_the_prune() {
+        let target = B256::from([0xe7; 32]);
+        let real_number = 1_000u64;
+        let head_at_admission = real_number - 1;
+        let stale_number = head_at_admission - (LOWER_LIMIT_OF_VOTE_BLOCK_NUMBER - 1);
+        assert!(is_within_admission_window(stale_number, Some(head_at_admission)), "precondition");
+
+        let mut pool = VotePool::new();
+        let flood = 2 * MAX_PROMOTION_VOTES_PER_PASS + 76;
+        for i in 0..flood {
+            let mut vote = future_vote(target, stale_number, 0xaa);
+            vote.vote_address[1..3].copy_from_slice(&(i as u16).to_be_bytes());
+            pool.insert(vote, 0, true, false);
+        }
+        let genuine: Vec<VoteEnvelope> =
+            (1..=3u8).map(|unique| future_vote(target, real_number, unique)).collect();
+        for vote in &genuine {
+            pool.insert(vote.clone(), 0, true, false);
+        }
+        assert_eq!(
+            pool.future_votes.get(&(target, real_number)).map(|vm| vm.vote_messages.len()),
+            Some(genuine.len()),
+            "the genuine votes are bucketed under their own number",
+        );
+
+        // The target is imported, then one more block. Each advance runs the
+        // fork-choice pass and `put_vote`'s pass, then prunes. `verify_vote_origin`
+        // rejects any vote whose number disagrees with the header.
+        let judge = |vote: &VoteEnvelope| vote.data.target_number == real_number;
+        for latest in [real_number, real_number + 1] {
+            promotion_pass(&mut pool, latest, judge);
+            promotion_pass(&mut pool, latest, judge);
+            pool.prune(latest);
+        }
+
+        assert_eq!(
+            pool.fetch_vote_by_block_hash(target).len(),
+            genuine.len(),
+            "every genuine vote is promoted rather than pruned",
+        );
+        assert!(pool.future_votes.is_empty(), "and the flood is gone");
+        assert_eq!(pool.len(), genuine.len(), "accounting follows");
+    }
+
     /// A queue entry whose bucket was shed or pruned must be discarded, not
     /// deferred: deferring re-queues it every pass, forever.
     #[test]
@@ -2164,7 +2252,7 @@ mod tests {
         assert_eq!(pool.future_votes_pq.heap.len(), 1);
 
         // Simulate shedding having removed the bucket while its queue entry stays.
-        pool.future_votes.remove(&target);
+        pool.future_votes.remove(&(target, 100));
 
         let applied = pool.apply_promotion(100, &HashMap::new());
         assert!(applied.promoted.is_empty());
@@ -2310,8 +2398,7 @@ mod tests {
             for target in lowest..=(head + UPPER_LIMIT_OF_VOTE_BLOCK_NUMBER) {
                 // Membership comes from the target's parent.
                 let governing = target.saturating_sub(1);
-                let (lo, hi) =
-                    if governing < head { (governing, head) } else { (head, governing) };
+                let (lo, hi) = if governing < head { (governing, head) } else { (head, governing) };
                 // `is_epoch_boundary` in provider.rs, applied block by block.
                 let expected = ((lo + 1)..=hi).any(|n| n > 0 && n % EPOCH == OFFSET);
                 assert_eq!(

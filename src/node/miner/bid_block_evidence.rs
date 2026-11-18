@@ -24,7 +24,7 @@ use reth_engine_primitives::InvalidBlockHook;
 use reth_ethereum_primitives::Receipt;
 use reth_execution_types::BlockExecutionOutput;
 use reth_primitives_traits::{RecoveredBlock, SealedBlock, SealedHeader};
-use reth_provider::StateProviderFactory;
+use reth_provider::{EvmStateProviderAdapter, StateProviderFactory};
 use reth_tasks::TaskExecutor;
 use reth_trie_common::updates::TrieUpdates;
 use std::{
@@ -259,7 +259,7 @@ async fn run_evidence_service<P>(
             }
         };
         let (role, cabinet_count, total_count) = match validator_role_at_parent(
-            state,
+            EvmStateProviderAdapter(state),
             chain_spec.as_ref().clone(),
             &evidence.parent,
             evidence.sealer,
@@ -412,10 +412,7 @@ mod tests {
     #[test]
     fn snapshot_membership_covers_epoch_transition_lag() {
         // Contract already holds the next set, snapshot still authorizes the sealer.
-        assert_eq!(
-            resolve_sealer_role(ValidatorRole::None, true),
-            Some(ValidatorRole::Candidate)
-        );
+        assert_eq!(resolve_sealer_role(ValidatorRole::None, true), Some(ValidatorRole::Candidate));
         // In neither source: not evidence.
         assert_eq!(resolve_sealer_role(ValidatorRole::None, false), None);
         // Contract classification wins whenever it exists.

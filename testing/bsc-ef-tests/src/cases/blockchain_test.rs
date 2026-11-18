@@ -24,12 +24,14 @@ use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives_traits::{RecoveredBlock, SealedBlock};
 use reth_provider::{
     test_utils::create_test_provider_factory_with_chain_spec, BlockWriter, DatabaseProviderFactory,
-    ExecutionOutcome, HistoryWriter, OriginalValuesKnown, StateWriteConfig, StateWriter,
-    StaticFileProviderFactory, StaticFileSegment, StaticFileWriter,
+    EvmStateProviderAdapter, ExecutionOutcome, HistoryWriter, OriginalValuesKnown,
+    StateWriteConfig, StateWriter, StaticFileProviderFactory, StaticFileSegment, StaticFileWriter,
 };
 use reth_revm::{database::StateProviderDatabase, State};
 use reth_trie::{HashedPostState, KeccakKeyHasher, StateRoot};
-use reth_trie_db::{DatabaseHashedCursorFactory, DatabaseStateRoot, DatabaseTrieCursorFactory, LegacyKeyAdapter};
+use reth_trie_db::{
+    DatabaseHashedCursorFactory, DatabaseStateRoot, DatabaseTrieCursorFactory, LegacyKeyAdapter,
+};
 use std::{
     collections::BTreeMap,
     fs,
@@ -72,12 +74,12 @@ impl BlockchainTestCase {
     const fn excluded_fork(network: ForkSpec) -> bool {
         matches!(
             network,
-            ForkSpec::ByzantiumToConstantinopleAt5
-                | ForkSpec::Constantinople
-                | ForkSpec::ConstantinopleFix
-                | ForkSpec::MergeEOF
-                | ForkSpec::MergeMeterInitCode
-                | ForkSpec::MergePush0
+            ForkSpec::ByzantiumToConstantinopleAt5 |
+                ForkSpec::Constantinople |
+                ForkSpec::ConstantinopleFix |
+                ForkSpec::MergeEOF |
+                ForkSpec::MergeMeterInitCode |
+                ForkSpec::MergePush0
         )
     }
 
@@ -219,7 +221,7 @@ fn run_case(
 
         // Execute the block
         let state_provider = provider.latest();
-        let state_db = StateProviderDatabase::new(&state_provider);
+        let state_db = StateProviderDatabase::new(EvmStateProviderAdapter(&state_provider));
         let executor = executor_provider.batch_executor(state_db);
 
         // Execute with state closure to get the full output including state
@@ -312,8 +314,7 @@ pub fn should_skip(path: &Path) -> bool {
     matches!(
         name,
         // funky test with `bigint 0x00` value in json
-        | "ValueOverflow.json"
-        | "ValueOverflowParis.json"
+        |"ValueOverflow.json"| "ValueOverflowParis.json"
         // txbyte is of type 02 and we don't parse tx bytes for this test to fail.
         | "typeTwoBerlin.json"
         // Test checks if nonce overflows.

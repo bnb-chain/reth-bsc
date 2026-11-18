@@ -18,14 +18,16 @@ pub mod vote;
 pub mod vote_pool;
 
 #[cfg(test)]
-mod tests;  
+mod tests;
 
-pub use snapshot::{Snapshot, ValidatorInfo, CHECKPOINT_INTERVAL};
-pub use vote::{VoteAddress, VoteAttestation, VoteData, VoteEnvelope, VoteSignature, ValidatorsBitSet};
+pub use consensus::Parlia;
 pub use constants::*;
 pub use error::ParliaConsensusError;
-pub use util::hash_with_chain_id;
-pub use provider::SnapshotProvider;
-pub use vote_pool as votes;
-pub use consensus::Parlia;
 pub use forkchoice_rule::{BscForkChoiceRule, HeaderForForkchoice};
+pub use provider::SnapshotProvider;
+pub use snapshot::{Snapshot, ValidatorInfo, CHECKPOINT_INTERVAL};
+pub use util::hash_with_chain_id;
+pub use vote::{
+    ValidatorsBitSet, VoteAddress, VoteAttestation, VoteData, VoteEnvelope, VoteSignature,
+};
+pub use vote_pool as votes;

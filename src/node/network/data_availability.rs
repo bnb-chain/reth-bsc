@@ -1,4 +1,6 @@
-use crate::{chainspec::BscChainSpec, BscBlock};
+use crate::{
+    chainspec::BscChainSpec, node::primitives::BscBlobTransactionSidecar, BscBlock, BscBlockBody,
+};
 use alloy_consensus::Transaction;
 use alloy_eips::eip4844::env_settings::EnvKzgSettings;
 use eyre::{ensure, WrapErr};
@@ -19,6 +21,25 @@ pub(crate) fn validate_data_availability(
 }
 
 fn validate_at(block: &mut BscBlock, chain_spec: &BscChainSpec, now: u64) -> eyre::Result<()> {
+    validate_available_data(block, chain_spec, now, true)
+}
+
+/// Stored canonical blocks have already passed cryptographic validation. Recheck completeness
+/// and correspondence when assembling their network body from the independently pruned blob store.
+pub(crate) fn validate_stored_data_availability(
+    block: &mut BscBlock,
+    chain_spec: &BscChainSpec,
+) -> eyre::Result<()> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    validate_available_data(block, chain_spec, now, false)
+}
+
+fn validate_available_data(
+    block: &mut BscBlock,
+    chain_spec: &BscChainSpec,
+    now: u64,
+    verify_proofs: bool,
+) -> eyre::Result<()> {
     if !chain_spec.is_cancun_active_at_timestamp(block.header.timestamp) {
         ensure!(
             block.body.sidecars.as_ref().is_none_or(Vec::is_empty),
@@ -64,18 +85,63 @@ fn validate_at(block: &mut BscBlock, chain_spec: &BscChainSpec, now: u64) -> eyr
             sidecar.tx_index == tx_index as u64 && sidecar.tx_hash == *tx.hash(),
             "sidecar transaction metadata mismatch at tx {tx_index}"
         );
-        sidecar
-            .inner
-            .validate(tx.blob_versioned_hashes().unwrap_or_default(), EnvKzgSettings::Default.get())
-            .wrap_err_with(|| format!("invalid blob sidecar at tx {tx_index}"))?;
+        let hashes = tx.blob_versioned_hashes().unwrap_or_default();
+        if verify_proofs {
+            sidecar
+                .inner
+                .validate(hashes, EnvKzgSettings::Default.get())
+                .wrap_err_with(|| format!("invalid blob sidecar at tx {tx_index}"))?;
+        } else {
+            ensure!(
+                sidecar.inner.blobs.len() == hashes.len() &&
+                    sidecar.inner.commitments.len() == hashes.len() &&
+                    sidecar.inner.proofs.len() == hashes.len() &&
+                    sidecar.inner.versioned_hashes().eq(hashes.iter().copied()),
+                "incomplete or mismatched blob sidecar at tx {tx_index}"
+            );
+        }
     }
     Ok(())
+}
+
+/// Validate one sidecar against the body it is stored with, before its bytes are
+/// written to the blob store and served as canonical for `tx_hash`.
+///
+/// Every body write passes through here, so this also covers the staged body
+/// downloader, whose `GetBlockBodies` responses `validate_data_availability`
+/// never sees. Nothing in the header commits to sidecars, so a peer can pair the
+/// genuine transactions with forged blobs and still pass the body checks. The
+/// block hash is not checked: it is unknown at write time, and the read path
+/// re-attaches the canonical one.
+pub(crate) fn validate_sidecar_for_storage(
+    body: &BscBlockBody,
+    block_number: u64,
+    sidecar: &BscBlobTransactionSidecar,
+) -> eyre::Result<()> {
+    ensure!(sidecar.version == 0, "unsupported sidecar version {}", sidecar.version);
+    ensure!(
+        sidecar.block_number == block_number,
+        "sidecar block number mismatch: expected {block_number}, got {}",
+        sidecar.block_number
+    );
+    let tx = usize::try_from(sidecar.tx_index)
+        .ok()
+        .and_then(|index| body.inner.transactions.get(index))
+        .filter(|tx| *tx.hash() == sidecar.tx_hash)
+        .ok_or_else(|| {
+            eyre::eyre!("no transaction {} at index {}", sidecar.tx_hash, sidecar.tx_index)
+        })?;
+    let versioned_hashes =
+        tx.blob_versioned_hashes().ok_or_else(|| eyre::eyre!("not a blob transaction"))?;
+    sidecar
+        .inner
+        .validate(versioned_hashes, EnvKzgSettings::Default.get())
+        .wrap_err("invalid blob sidecar")
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::node::primitives::BscBlobTransactionSidecar;
     use alloy_consensus::{Header, TxEip4844, TxLegacy};
     use alloy_eips::eip4844::{
         builder::{SidecarBuilder, SimpleCoder},
