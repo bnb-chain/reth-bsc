@@ -1,19 +1,17 @@
-use clap::{Args, Parser};
+use clap::{Args, CommandFactory, FromArgMatches};
 use reth::{
     builder::NodeHandle,
     cli::Cli,
     consensus::FullConsensus,
     version::{default_reth_version_metadata, try_init_version_metadata},
 };
-use reth_bsc::consensus::parlia::bls_signer;
-use reth_bsc::node::consensus::BscConsensus;
 use reth_bsc::{
     chainspec::{genesis_override, parser::BscChainSpecParser},
-    node::{evm::config::BscEvmConfig, BscNode},
+    consensus::parlia::bls_signer,
+    node::{consensus::BscConsensus, evm::config::BscEvmConfig, BscNode},
     BscPrimitives,
 };
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 // We use jemalloc for performance reasons
 #[cfg(all(feature = "jemalloc", unix))]
@@ -151,6 +149,17 @@ pub struct BscCliArgs {
     /// Disable TX broadcast forbidden for EVN peers.
     #[arg(long = "evn.disable-tx-broadcast-forbidden")]
     pub evn_disable_tx_broadcast_forbidden: bool,
+
+    /// Block download, ancestor recovery, and active startup catch-up tuning.
+    #[command(flatten)]
+    pub block_sync: reth_bsc::node::network::block_import::config::BlockSyncArgs,
+
+    /// Disable unsolicited transaction bodies and hash announcements to all peers.
+    /// Receiving transactions, fetching them, and serving explicit requests remain enabled
+    /// under the existing ingress and propagation policies. Intended for validators fed by
+    /// fullnodes in controlled topologies; disabled by default.
+    #[arg(long = "bsc.disable-proactive-tx-broadcast")]
+    pub disable_proactive_tx_broadcast: bool,
 }
 
 /// BSC default for `--gpo.ignoreprice` (wei), matching geth and pre-v2.2 reth-bsc.
@@ -166,7 +175,21 @@ fn user_set_gpo_ignore_price(mut args: impl Iterator<Item = String>) -> bool {
     args.any(|arg| arg == "--gpo.ignoreprice" || arg.starts_with("--gpo.ignoreprice="))
 }
 
+fn bsc_cli_command() -> clap::Command {
+    Cli::<BscChainSpecParser, BscCliArgs>::command().mut_subcommand("node", |node| {
+        node.mut_arg("max_seen_tx_history", |arg| {
+            // Upstream's derived long help hardcodes its own 320-entry default.
+            arg.help("Max number of seen transactions to remember per peer; BSC defaults to Geth's 32768-entry history.")
+                .long_help(None)
+        })
+    })
+}
+
 fn main() -> eyre::Result<()> {
+    reth_bsc::node::network::bsc_network_args()
+        .try_init()
+        .map_err(|_| eyre::eyre!("network defaults initialized before BSC defaults"))?;
+
     // Override reth's global version metadata so startup/P2P logs identify
     // this binary as Reth-BSC with its own version + commit.
     {
@@ -225,7 +248,8 @@ fn main() -> eyre::Result<()> {
     // Initialize bid package queue at startup
     reth_bsc::shared::init_bid_package_queue();
 
-    Cli::<BscChainSpecParser, BscCliArgs>::parse().run_with_components::<BscNode>(
+    let matches = bsc_cli_command().get_matches();
+    Cli::<BscChainSpecParser, BscCliArgs>::from_arg_matches(&matches)?.run_with_components::<BscNode>(
         |spec| {
             (
                 BscEvmConfig::new(spec.clone()),
@@ -234,6 +258,7 @@ fn main() -> eyre::Result<()> {
             )
         },
         async move |mut builder, args| {
+            let block_sync = args.block_sync.into_config()?;
             // Set genesis hash override if provided
             if let Err(e) = genesis_override::set_genesis_hash_override(args.genesis_hash) {
                 tracing::error!("Failed to set genesis hash override: {}", e);
@@ -248,7 +273,7 @@ fn main() -> eyre::Result<()> {
                 tracing::info!(limit, "Prune delete limit override set");
             }
 
-            if builder.config().rpc.ipcdisable {    
+            if builder.config().rpc.ipcdisable {
                 panic!("IPC is disabled, please enable it by setting --ipc.enable to true");
             }
             let ipc_path = builder.config().rpc.ipcpath.clone();
@@ -258,6 +283,31 @@ fn main() -> eyre::Result<()> {
                 builder.config_mut().rpc.gas_price_oracle.ignore_price =
                     BSC_DEFAULT_GPO_IGNORE_PRICE;
             }
+
+            // v2.5 VALIDATION: parallel import sparse-trie state-root re-enabled.
+            //
+            // On reth v2.4.1 this was forced to `true` (serial import) because the sparse-trie
+            // task corrupted shared state on a *reorg* block whose parent is a historical
+            // (below-tip) in-memory block: `PreservedSparseTrie` reuse on an anchor mismatch
+            // produced a wrong reconstructed parent state root, the block's computed root
+            // mismatched its header, and the valid block was rejected — permanently stalling sync.
+            // BSC parlia hits that reorg path constantly via out-of-turn "slash" blocks.
+            //
+            // reth v2.5 reworked that subsystem (overlay-manager anchoring, `anchor_hash`,
+            // `into_trie_for -> Result<Option<..>>`). We set `false` here to exercise the parallel
+            // import path and confirm on the devnet that v2.5 no longer diverges on the reorg path.
+            // If a validator stalls with `mismatched block state root`, flip back to `true`.
+            // 2026-08-20: fallback=false wedges PRODUCING validators — reth mis-roots an incoming
+            // fork block during reorg (anchored to wrong parent state). Testing fallback=true.
+            // TEST-ONLY (uncommitted): allow overriding via env so one binary can exercise both
+            // the parallel sparse path (default false) and the serial path (true) — the latter is
+            // needed to test the v2.5.1 storage-wipe batched-persistence fix (#26750).
+            let state_root_fallback = std::env::var("STATE_ROOT_FALLBACK")
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            builder.config_mut().engine.state_root_fallback = state_root_fallback;
+            tracing::info!(target: "reth_bsc", state_root_fallback, "engine.state_root_fallback");
 
             // Map CLI args into a global MiningConfig override before launching services
             {
@@ -302,7 +352,7 @@ fn main() -> eyre::Result<()> {
                 } else {
                     None
                 };
-                
+
                 if let Some(gas_limit) = args.mining_gas_limit {
                     mining_config.gas_limit = Some(gas_limit);
                 }
@@ -441,13 +491,13 @@ fn main() -> eyre::Result<()> {
                     .unwrap_or_default();
                 let mut peer_ids_str = peers_from_env;
                 peer_ids_str.extend(args.proxyed_peer_ids.iter().cloned());
-                
+
                 let mut parsed_peer_ids = Vec::new();
                 for peer_id_str in peer_ids_str {
                     // Parse as 64-character hex PeerId (64 bytes total)
                     let peer_id_str = peer_id_str.trim();
                     if peer_id_str.is_empty() { continue; }
-                    
+
                     let hex = peer_id_str.strip_prefix("0x").unwrap_or(peer_id_str);
                     match alloy_primitives::hex::decode(hex) {
                         Ok(bytes) if bytes.len() == 64 => {
@@ -460,7 +510,7 @@ fn main() -> eyre::Result<()> {
                         Err(e) => tracing::warn!("Failed to parse proxyed peer ID '{}': {}", peer_id_str, e),
                     }
                 }
-                
+
                 if !parsed_peer_ids.is_empty() {
                     tracing::info!(target: "bsc::init", "Configured {} proxyed peer(s)", parsed_peer_ids.len());
                 }
@@ -497,10 +547,15 @@ fn main() -> eyre::Result<()> {
             let mev_grpc_handle_for_rpc = Arc::clone(&mev_grpc_handle);
 
             let (node, engine_handle_tx) = BscNode::new();
+            let node = node
+                .with_block_sync(block_sync.clone())
+                .with_disable_proactive_tx_broadcast(args.disable_proactive_tx_broadcast);
             let NodeHandle { node, node_exit_future: exit_future } =
                 builder.node(node)
                     .extend_rpc_modules(move |ctx| {
-                        if ctx.config().metrics.prometheus.is_some() || ctx.config().metrics.push_gateway_url.is_some() {
+                        let metrics_enabled = ctx.config().metrics.prometheus.is_some()
+                            || ctx.config().metrics.push_gateway_url.is_some();
+                        if metrics_enabled {
                             reth_bsc::evm::precompiles::cas20::enable_metrics();
                         }
                         // Every BSC namespace below is registered with `merge_if_module_configured`
@@ -516,14 +571,14 @@ fn main() -> eyre::Result<()> {
 
                         tracing::info!("Start to register Parlia RPC API...");
                         use reth_bsc::rpc::parlia::{ParliaApiImpl, ParliaApiServer, DynSnapshotProvider};
-                        
+
                         let snapshot_provider = if let Some(provider) = reth_bsc::shared::get_snapshot_provider() {
                             provider.clone()
                         } else {
                             tracing::error!("Failed to register Parlia RPC due to can not get snapshot provider");
                             return Err(eyre::eyre!("Failed to get snapshot provider"));
                         };
-                        
+
                         let wrapped_provider = Arc::new(DynSnapshotProvider::new(snapshot_provider));
                         let parlia_api = ParliaApiImpl::new(wrapped_provider, ctx.provider().clone());
                         // `parlia` stays unconditional: reth's CLI rejects module names outside its
@@ -572,9 +627,11 @@ fn main() -> eyre::Result<()> {
 
                         // Remove the default unimplemented eth_coinbase before registering our version
                         ctx.modules.remove_method_from_configured("eth_coinbase");
+                        let rpc_health = reth_bsc::rpc::health::RpcHealth::default();
                         let eth_ext_api = BscEthExtApiImpl::new(
                             ctx.provider().clone(),
                             ctx.registry.eth_api().blocking_io_task_guard().clone(),
+                            rpc_health.clone(),
                         );
                         ctx.modules.merge_if_module_configured(RethRpcModule::Eth, eth_ext_api.into_rpc())?;
                         tracing::info!("Succeed to register BSC Eth extension API");
@@ -643,6 +700,8 @@ fn main() -> eyre::Result<()> {
                         ctx.modules.merge_if_module_configured(RethRpcModule::Eth, eth_config.into_rpc())?;
                         tracing::info!("Succeed to register eth_config (EIP-7910) API");
 
+                        rpc_health.instrument(ctx.modules, metrics_enabled)?;
+
                         // Bind only after all RPC module registration succeeded, so a later merge
                         // error cannot leave a detached gRPC listener behind during failed startup.
                         if let Some((port, grpc_config)) = mev_grpc_config {
@@ -656,7 +715,12 @@ fn main() -> eyre::Result<()> {
                         }
                         Ok(())
                     })
-                    .launch().await?;
+                    .launch_with_fn(|builder| {
+                        let launcher = builder.engine_api_launcher().with_backfill(
+                            reth_bsc::node::startup_recovery::BscRecoveryBackfill,
+                        );
+                        builder.launch_with(launcher)
+                    }).await?;
 
             // Send the engine handle to the network
             engine_handle_tx.send(node.beacon_engine_handle.clone()).unwrap();
@@ -674,6 +738,26 @@ fn main() -> eyre::Result<()> {
             // failure here is a startup error rather than something to panic on.
             reth_bsc::shared::set_ipc_client(ipc_path).await?;
 
+            let recovery_provider = node.provider.clone();
+            let recovery_engine = node.beacon_engine_handle.clone();
+            let recovery_network = node.network.clone();
+            let recovery_chain_spec = node.chain_spec();
+            node.task_executor.spawn_critical_task("bsc-startup-recovery", async move {
+                if let Err(error) = reth_bsc::node::startup_recovery::run(
+                    recovery_provider, recovery_engine,
+                ).await {
+                    tracing::error!(target: "bsc::startup_recovery", %error, "Startup finality recovery failed");
+                    panic!("Startup finality recovery failed: {error}");
+                }
+            });
+            let sync_provider = node.provider.clone();
+            let sync_engine = node.beacon_engine_handle.clone();
+            node.task_executor.spawn_critical_task("bsc-startup-sync", async move {
+                reth_bsc::node::startup_sync::run_with_config(
+                    sync_provider, sync_engine, recovery_network, recovery_chain_spec, block_sync,
+                ).await;
+            });
+
             let grpc_handle = mev_grpc_handle.lock().unwrap().take();
             let exit_result = exit_future.await;
             if let Some(handle) = grpc_handle {
@@ -687,7 +771,8 @@ fn main() -> eyre::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::user_set_gpo_ignore_price;
+    use super::*;
+    use clap::Parser;
 
     fn args(v: &[&str]) -> std::vec::IntoIter<String> {
         v.iter().map(|s| s.to_string()).collect::<Vec<_>>().into_iter()
@@ -699,5 +784,71 @@ mod tests {
         assert!(user_set_gpo_ignore_price(args(&["reth-bsc", "node", "--gpo.ignoreprice=7"])));
         assert!(!user_set_gpo_ignore_price(args(&["reth-bsc", "node", "--chain", "bsc"])));
         assert!(!user_set_gpo_ignore_price(args(&["reth-bsc", "node", "--gpo.blocks", "20"])));
+    }
+
+    #[test]
+    fn real_node_cli_exposes_and_parses_block_sync_tuning() {
+        let help =
+            Cli::<BscChainSpecParser, BscCliArgs>::try_parse_from(["reth-bsc", "node", "--help"])
+                .unwrap_err();
+        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert!(help.to_string().contains("--bsc.block-sync.quick-timeout"));
+        let cli = Cli::<BscChainSpecParser, BscCliArgs>::try_parse_from([
+            "reth-bsc",
+            "node",
+            "--bsc.block-sync.max-head-fetches",
+            "48",
+            "--bsc.block-sync.quick-timeout",
+            "80ms",
+        ])
+        .unwrap();
+        let reth::cli::Commands::Node(node) = cli.command else { panic!("node command expected") };
+        assert_eq!(node.ext.block_sync.max_head_fetches, 48);
+        assert_eq!(node.ext.block_sync.quick_timeout, std::time::Duration::from_millis(80));
+        node.ext.block_sync.into_config().unwrap();
+    }
+
+    #[test]
+    fn explicit_transaction_history_overrides_network_default() {
+        let matches = bsc_cli_command()
+            .try_get_matches_from(["reth-bsc", "node", "--max-seen-tx-history", "64000"])
+            .unwrap();
+        let cli = Cli::<BscChainSpecParser, BscCliArgs>::from_arg_matches(&matches).unwrap();
+        let reth::cli::Commands::Node(node) = cli.command else { panic!("node command expected") };
+        assert_eq!(
+            node.network.transactions_manager_config().max_transactions_seen_by_peer_history,
+            64000
+        );
+    }
+
+    #[test]
+    fn transaction_history_help_describes_bsc_default() {
+        let help =
+            bsc_cli_command().try_get_matches_from(["reth-bsc", "node", "--help"]).unwrap_err();
+        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+        let text = help.to_string();
+        assert!(text.contains("BSC defaults to Geth's 32768-entry history"));
+        assert!(!text.contains("Default is 320 transaction hashes"));
+    }
+
+    #[test]
+    fn proactive_transaction_broadcast_switch_is_opt_in() {
+        for disabled in [false, true] {
+            let mut argv = vec!["reth-bsc", "node"];
+            if disabled {
+                argv.push("--bsc.disable-proactive-tx-broadcast");
+            }
+            let matches = bsc_cli_command().try_get_matches_from(argv).unwrap();
+            let cli = Cli::<BscChainSpecParser, BscCliArgs>::from_arg_matches(&matches).unwrap();
+            let reth::cli::Commands::Node(node) = cli.command else {
+                panic!("node command expected")
+            };
+            assert_eq!(node.ext.disable_proactive_tx_broadcast, disabled);
+            assert!(!node.network.disable_tx_gossip);
+            assert_eq!(
+                node.network.tx_propagation_policy,
+                reth_network::transactions::config::TransactionPropagationKind::All
+            );
+        }
     }
 }

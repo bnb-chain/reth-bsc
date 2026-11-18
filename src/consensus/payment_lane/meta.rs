@@ -354,7 +354,11 @@ mod tests {
             commit(&mut state, None);
             let mut previous = 0;
             for &value in writes {
-                let slot = EvmStorageSlot::new_changed(U256::from(previous), U256::from(value), 0);
+                let slot = EvmStorageSlot::new_changed(
+                    U256::from(previous),
+                    U256::from(value),
+                    revm::state::TransactionId::ZERO,
+                );
                 commit(&mut state, Some(slot));
                 previous = value;
             }

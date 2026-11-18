@@ -1,6 +1,7 @@
 //! Fork recovery: ancestor-aware block pull that replaces the naive
 //! batch range-request call in the import service.
 
+use super::config::{BlockSyncArgs, BlockSyncConfig};
 use std::{sync::Arc, time::Duration};
 
 use alloy_primitives::B256;
@@ -19,24 +20,18 @@ use crate::{
     BscBlock,
 };
 
-/// Hard cap on how many blocks we will walk back from the peer's announced
-/// head before giving up.
+/// Default ancestor walk depth; runtime recovery uses the configured max-depth.
 pub const MAX_FORK_DEPTH: u64 = 2048;
 
-/// Blocks fetched per `GetBlocksByRange` hop. Kept small because BSC blocks
-/// are large (full tx bodies + sidecars).
+/// Default blocks per ancestor hop. Runtime requests use recovery-hop-count.
 pub const FORK_RECOVER_HOP_COUNT: u64 = 4;
 
-/// Per-hop network timeout.
+/// Default per-peer ancestor request timeout, overridden by recovery-timeout.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Max peer attempts per hop before `BscRangeFetcher` gives up. Attempts are
-/// sequential, so worst-case per-hop stall is
-/// `MAX_PEER_ATTEMPTS * FETCH_TIMEOUT` (~15s at current values); a full
-/// recovery is bounded by
-/// `FORK_RECOVER_HOP_COUNT * MAX_PEER_ATTEMPTS * FETCH_TIMEOUT` in adversarial
-/// conditions. The announcing peer is tried first; failover rotates through
-/// other registered BSC peers.
+/// Default bounded BSC peer attempts per hop. Runtime uses recovery-peer-attempts.
+/// The default stalled-hop window is 5s + 2 * 200ms; a full walk's network budget
+/// scales with ceil(max-depth / recovery-hop-count), excluding Engine execution.
 pub const MAX_PEER_ATTEMPTS: usize = 3;
 
 /// How long a head stays suppressed after `recover_ancestors` fails.
@@ -55,8 +50,8 @@ pub const FAILED_HEAD_COOLDOWN: Duration = Duration::from_secs(30);
 /// concurrency this gate exists to prevent.
 ///
 /// Derived rather than guessed: the longest legitimate silence is one stalled
-/// hop, `MAX_PEER_ATTEMPTS * FETCH_TIMEOUT` = 15s, plus the execution of a
-/// single heavy block. 60s leaves ~4x margin over that.
+/// hop, `FETCH_TIMEOUT + (MAX_PEER_ATTEMPTS - 1) * 200ms` = 5.4s, plus
+/// execution of a single heavy block. 60s leaves ample margin over that.
 pub const RECOVERY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How many ancestor recoveries may run at once.
@@ -79,11 +74,19 @@ pub enum ForkRecoverError {
     #[error("peer returned empty response at cursor ({num}, {hash})")]
     EmptyResponse { num: u64, hash: alloy_primitives::B256 },
 
-    #[error("no common ancestor found within MAX_FORK_DEPTH={MAX_FORK_DEPTH} blocks")]
-    ForkTooDeep,
+    #[error("no common ancestor found within max_depth={max_depth} blocks")]
+    ForkTooDeep { max_depth: u64 },
 
     #[error("range fetch failed: {0}")]
     FetchFailed(String),
+
+    #[error(
+        "recovery block ({got_number}, {got}) does not match requested ({number}, {expected})"
+    )]
+    RecoveryAncestryMismatch { number: u64, expected: B256, got_number: u64, got: B256 },
+
+    #[error("fork base {base} is below the finalized block {finalized}")]
+    BelowFinalized { base: u64, finalized: u64 },
 
     #[error("local provider error: {0}")]
     Provider(#[from] reth_provider::ProviderError),
@@ -118,6 +121,16 @@ pub enum ForkRecoverError {
 /// forwards to `bsc_protocol::registry::request_blocks_by_range_with_failover`,
 /// which rotates through registered BSC peers on empty/error responses.
 pub trait RangeFetcher: Send + Sync {
+    /// Maximum ancestor walk depth for this fetcher; must be positive.
+    fn max_depth(&self) -> u64 {
+        BlockSyncArgs::default().max_depth
+    }
+
+    /// Maximum blocks per ancestor hop; must be in 1..=64.
+    fn hop_count(&self) -> u64 {
+        BlockSyncArgs::default().recovery_hop_count
+    }
+
     /// Fetch up to `count` blocks starting at `(start_num, start_hash)` and
     /// walking backwards via `parent_hash`. Response is ordered
     /// **newest -> oldest**.
@@ -130,11 +143,249 @@ pub trait RangeFetcher: Send + Sync {
     ) -> BoxFuture<'a, Result<Vec<BscBlock>, String>>;
 }
 
+/// Fetches an intermediate header from the announcing ETH peer.
+pub(crate) trait HeaderFetcher: Send + Sync {
+    fn fetch<'a>(
+        &'a self,
+        peer: PeerId,
+        number: u64,
+    ) -> BoxFuture<'a, Result<Vec<alloy_consensus::Header>, String>>;
+}
+
+/// Production ETH header lookup, addressed to the same peer as range recovery.
+pub(crate) struct EthHeaderFetcher(pub Arc<crate::chainspec::BscChainSpec>);
+
+impl HeaderFetcher for EthHeaderFetcher {
+    fn fetch<'a>(
+        &'a self,
+        peer: PeerId,
+        number: u64,
+    ) -> BoxFuture<'a, Result<Vec<alloy_consensus::Header>, String>> {
+        Box::pin(async move {
+            use reth::consensus::HeaderValidator;
+            use reth_eth_wire::{GetBlockHeaders, HeadersDirection};
+            use reth_network::PeerRequest;
+
+            let network = crate::shared::get_network_handle()
+                .ok_or_else(|| "network handle unavailable for recovery header".to_string())?;
+            let (response, receiver) = tokio::sync::oneshot::channel();
+            network.send_request(
+                peer,
+                PeerRequest::GetBlockHeaders {
+                    request: GetBlockHeaders {
+                        start_block: number.into(),
+                        limit: 1,
+                        skip: 0,
+                        direction: HeadersDirection::Rising,
+                    },
+                    response,
+                },
+            );
+            let headers = receiver
+                .await
+                .map_err(|err| format!("header response dropped: {err}"))?
+                .map_err(|err| format!("header request failed: {err}"))?
+                .0;
+            if headers.len() != 1 {
+                return Err(format!("expected one recovery header, got {}", headers.len()));
+            }
+            let consensus = crate::node::consensus::BscConsensus::new(self.0.clone());
+            let header = &headers[0];
+            consensus
+                .validate_header(&reth_primitives_traits::SealedHeader::new(
+                    header.clone(),
+                    header.hash_slow(),
+                ))
+                .map_err(|err| format!("invalid recovery header: {err}"))?;
+            Ok(headers)
+        })
+    }
+}
+
+/// Validated noncanonical progress, bounded and isolated by announced head hash.
+/// DB-backed providers need not expose blocks accepted into the engine tree.
+#[derive(Clone)]
+pub(crate) struct RecoveryCheckpoints {
+    inner: Arc<Mutex<schnellru::LruMap<B256, alloy_consensus::Header, schnellru::ByLength>>>,
+}
+
+impl RecoveryCheckpoints {
+    pub(crate) fn new(capacity: u32) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(schnellru::LruMap::new(schnellru::ByLength::new(capacity)))),
+        }
+    }
+
+    /// Continue within the same admitted task: newer announcements may use a
+    /// different head hash, so progress must not depend on this head repeating.
+    pub(crate) async fn recover<P>(
+        &self,
+        peer: PeerId,
+        original: RecoverTarget,
+        forkchoice_engine: BscForkChoiceEngine<P>,
+        headers: &dyn HeaderFetcher,
+        blocks: &dyn RangeFetcher,
+        progress: &dyn ProgressSink,
+    ) -> Result<(), ForkRecoverError>
+    where
+        P: BlockHashReader
+            + BlockNumReader
+            + HeaderProvider<Header = alloy_consensus::Header>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+    {
+        let announced = original.fcu_target_hash;
+        let mut next = self.resume(original.clone());
+        loop {
+            let target = resolve_recovery_target_with_limit(
+                next,
+                peer,
+                &forkchoice_engine.provider,
+                headers,
+                blocks.max_depth(),
+            )
+            .await?;
+            let result = recover_ancestors(
+                peer,
+                target,
+                forkchoice_engine.provider.clone(),
+                forkchoice_engine.engine_handle.clone(),
+                forkchoice_engine.clone(),
+                blocks,
+                progress,
+            )
+            .await;
+            let header = match result {
+                Ok(header) => header,
+                Err(err) => return self.finish(announced, Err(err)),
+            };
+            let complete = header.hash_slow() == announced;
+            self.finish(announced, Ok(header.clone()))?;
+            if complete {
+                return Ok(());
+            }
+            next = original.clone();
+            next.validated_ancestor = Some(header);
+        }
+    }
+
+    pub(crate) fn resume(&self, mut target: RecoverTarget) -> RecoverTarget {
+        target.validated_ancestor = self
+            .inner
+            .lock()
+            .get(&target.fcu_target_hash)
+            .filter(|header| header.number < target.fcu_target_num)
+            .cloned();
+        target
+    }
+
+    /// Only a completed, payload-validated segment can advance this cursor.
+    /// A successful FCU by itself does not mean the candidate became canonical.
+    pub(crate) fn finish(
+        &self,
+        announced: B256,
+        result: Result<alloy_consensus::Header, ForkRecoverError>,
+    ) -> Result<(), ForkRecoverError> {
+        match result {
+            Ok(header) => {
+                let mut checkpoints = self.inner.lock();
+                if header.hash_slow() == announced {
+                    checkpoints.remove(&announced);
+                } else if checkpoints.get(&announced).is_none_or(|old| old.number < header.number) {
+                    checkpoints.insert(announced, header);
+                }
+                Ok(())
+            }
+            Err(err) => {
+                // Syncing can mean the engine forgot our accepted ancestor.
+                // A different ancestry must start a fresh, bounded discovery too.
+                if matches!(
+                    err,
+                    ForkRecoverError::ImportHalted { .. } |
+                        ForkRecoverError::RecoveryAncestryMismatch { .. }
+                ) {
+                    self.inner.lock().remove(&announced);
+                }
+                Err(err)
+            }
+        }
+    }
+}
+
+/// Resolve under the recovery permit. An announced height is only a fetch hint:
+/// an intermediate header still needs full recovery, execution and Parlia selection.
+#[cfg(test)]
+pub(crate) async fn resolve_recovery_target<P>(
+    original: RecoverTarget,
+    peer: PeerId,
+    provider: &P,
+    headers: &dyn HeaderFetcher,
+) -> Result<RecoverTarget, ForkRecoverError>
+where
+    P: BlockNumReader + HeaderProvider<Header = alloy_consensus::Header>,
+{
+    resolve_recovery_target_with_limit(original, peer, provider, headers, MAX_FORK_DEPTH).await
+}
+
+pub(crate) async fn resolve_recovery_target_with_limit<P>(
+    original: RecoverTarget,
+    peer: PeerId,
+    provider: &P,
+    headers: &dyn HeaderFetcher,
+    max_depth: u64,
+) -> Result<RecoverTarget, ForkRecoverError>
+where
+    P: BlockNumReader + HeaderProvider<Header = alloy_consensus::Header>,
+{
+    if let Some(header) = provider.header(original.fcu_target_hash)? {
+        return Ok(RecoverTarget::single_pair(original.fcu_target_hash, header.number));
+    }
+    let local_tip = match original.validated_ancestor.as_ref() {
+        Some(header) => header.number,
+        None => provider.best_block_number()?,
+    };
+    if original.fcu_target_num.saturating_sub(local_tip) <= max_depth {
+        // Preserve the parent-start broadcast-before-commit protection near tip.
+        return Ok(original);
+    }
+    let number = local_tip.saturating_add((max_depth / 2).max(1)).min(original.fcu_target_num);
+    let mut response = tokio::time::timeout(FETCH_TIMEOUT, headers.fetch(peer, number))
+        .await
+        .map_err(|_| ForkRecoverError::FetchFailed("recovery header lookup timed out".into()))?
+        .map_err(ForkRecoverError::FetchFailed)?;
+    if response.len() != 1 {
+        return Err(ForkRecoverError::FetchFailed(format!(
+            "expected one recovery header at {number}, got {}",
+            response.len(),
+        )));
+    }
+    let header = response.pop().expect("checked singleton response");
+    if header.number != number {
+        return Err(ForkRecoverError::FetchFailed(format!(
+            "expected recovery header {number}, got {}",
+            header.number,
+        )));
+    }
+    // Never carry the original head/override across an intermediate recovery.
+    let mut target = RecoverTarget::single_pair(header.hash_slow(), header.number);
+    target.validated_ancestor = original.validated_ancestor;
+    Ok(target)
+}
+
 /// Production fetcher that calls into the BSC sub-protocol registry.
 #[derive(Clone)]
-pub struct BscRangeFetcher(pub Arc<crate::chainspec::BscChainSpec>);
+pub struct BscRangeFetcher(pub Arc<crate::chainspec::BscChainSpec>, pub Arc<BlockSyncConfig>);
 
 impl RangeFetcher for BscRangeFetcher {
+    fn max_depth(&self) -> u64 {
+        self.1.args.max_depth
+    }
+    fn hop_count(&self) -> u64 {
+        self.1.args.recovery_hop_count
+    }
+
     fn fetch<'a>(
         &'a self,
         peer: PeerId,
@@ -145,16 +396,58 @@ impl RangeFetcher for BscRangeFetcher {
         Box::pin(async move {
             let resp = crate::node::network::bsc_protocol::registry::request_blocks_by_range_with_failover(
                 peer,
-                start_num,
-                start_hash,
+                reth_eth_wire::BlockHashNumber { number: start_num, hash: start_hash },
                 count,
-                FETCH_TIMEOUT,
-                MAX_PEER_ATTEMPTS,
+                self.1.args.recovery_timeout,
+                usize::from(self.1.args.recovery_peer_attempts),
+                self.1.args.recovery_fallback_delay,
                 &self.0,
             )
             .await?;
             Ok(resp.blocks)
         })
+    }
+}
+
+/// Near-head missing parents use the same single-block downloader as hash
+/// announcements; older cursors retain the configured range batch strategy.
+pub(crate) struct ParentRangeFetcher {
+    pub range: BscRangeFetcher,
+    pub eth_peer: PeerId,
+    pub single_block_floor: Option<u64>,
+}
+
+impl RangeFetcher for ParentRangeFetcher {
+    fn max_depth(&self) -> u64 {
+        self.range.max_depth()
+    }
+    fn hop_count(&self) -> u64 {
+        self.range.hop_count()
+    }
+    fn fetch<'a>(
+        &'a self,
+        peer: PeerId,
+        start_num: u64,
+        start_hash: B256,
+        count: u64,
+    ) -> BoxFuture<'a, Result<Vec<BscBlock>, String>> {
+        if self.single_block_floor.is_some_and(|floor| start_num >= floor) {
+            let download = self.range.1.downloader.download(
+                reth_eth_wire::BlockHashNumber { hash: start_hash, number: start_num },
+                self.eth_peer,
+                false,
+                self.range.0.clone(),
+                self.range.1.args,
+            );
+            return Box::pin(async move {
+                let (block, _) = download.await.map_err(|error| format!("{error:#}"))?;
+                if block.header.number != start_num || block.header.hash_slow() != start_hash {
+                    return Err("shared parent download target mismatch".into());
+                }
+                Ok(vec![block])
+            });
+        }
+        self.range.fetch(peer, start_num, start_hash, count)
     }
 }
 
@@ -180,7 +473,7 @@ pub struct Discovery {
 
 /// Walk backwards from `(start_num, start_hash)` via `parent_hash`-walked
 /// `GetBlocksByRange` hops until a local-chain match is found or
-/// `MAX_FORK_DEPTH` is exhausted.
+/// the fetcher's configured maximum depth is exhausted.
 ///
 /// The starting cursor is the *first block we want to learn about*, not
 /// necessarily the announced head: the parent-start path (`on_new_block`)
@@ -196,23 +489,48 @@ pub async fn discover_fork_blocks<
     fetcher: &dyn RangeFetcher,
     progress: &dyn ProgressSink,
 ) -> Result<Discovery, ForkRecoverError> {
+    discover_fork_blocks_after(peer, start_hash, start_num, provider, fetcher, progress, None).await
+}
+
+async fn discover_fork_blocks_after<
+    P: BlockHashReader + HeaderProvider<Header = alloy_consensus::Header>,
+>(
+    peer: PeerId,
+    start_hash: B256,
+    start_num: u64,
+    provider: &P,
+    fetcher: &dyn RangeFetcher,
+    progress: &dyn ProgressSink,
+    validated_ancestor: Option<&alloy_consensus::Header>,
+) -> Result<Discovery, ForkRecoverError> {
     let mut fork_blocks: Vec<crate::BscBlock> = Vec::new();
     let mut cursor_num = start_num;
     let mut cursor_hash = start_hash;
     let mut walked: u64 = 0;
 
     loop {
-        // Pre-hop local checks: if this cursor is already local, we've
-        // reached the common ancestor (or short-circuited because the
-        // starting cursor was itself locally known).
-        //
-        // The side-chain hit (`provider.header(cursor_hash).is_some()`) is
-        // safe to treat as "ancestor reached" because engine-tree only stores
-        // a header when its parent was already Valid via a prior new_payload.
-        // Transitively, any side-block in our provider is rooted at the
-        // canonical chain, so no further walking is required.
-        let cursor_is_local = provider.block_hash(cursor_num)? == Some(cursor_hash)
-            || provider.header(cursor_hash)?.is_some();
+        // Only executed canonical history or this task's exact payload-validated
+        // checkpoint can terminate discovery. A side-chain header alone is insufficient.
+        let cursor_is_local = if let Some(ancestor) = validated_ancestor {
+            // Continue on this exact validated branch, even if the provider
+            // cannot see it. Never substitute a canonical/side-chain hit.
+            if cursor_num <= ancestor.number {
+                let expected = ancestor.hash_slow();
+                if cursor_num != ancestor.number || cursor_hash != expected {
+                    return Err(ForkRecoverError::RecoveryAncestryMismatch {
+                        number: cursor_num,
+                        expected,
+                        got_number: cursor_num,
+                        got: cursor_hash,
+                    });
+                }
+                true
+            } else {
+                false
+            }
+        } else {
+            provider.block_hash(cursor_num)? == Some(cursor_hash)
+        };
         if cursor_is_local {
             let outcome = if fork_blocks.is_empty() {
                 DiscoveryOutcome::Shortcircuit
@@ -222,49 +540,90 @@ pub async fn discover_fork_blocks<
             return Ok(Discovery { fork_blocks, outcome });
         }
 
-        if walked >= MAX_FORK_DEPTH {
-            return Err(ForkRecoverError::ForkTooDeep);
+        let max_depth = fetcher.max_depth();
+        if walked >= max_depth {
+            return Err(ForkRecoverError::ForkTooDeep { max_depth });
         }
 
-        let remaining = MAX_FORK_DEPTH - walked;
-        let count = FORK_RECOVER_HOP_COUNT.min(remaining);
+        let remaining = max_depth - walked;
+        let mut count = fetcher.hop_count().min(remaining);
+        if let Some(ancestor) = validated_ancestor {
+            count = count.min(cursor_num - ancestor.number);
+        }
 
-        let resp = fetcher
-            .fetch(peer, cursor_num, cursor_hash, count)
-            .await
-            .map_err(ForkRecoverError::FetchFailed)?;
+        let request = fetcher.fetch(peer, cursor_num, cursor_hash, count);
+        tokio::pin!(request);
+        let result = loop {
+            tokio::select! {
+                result = &mut request => break result,
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                    if validated_ancestor.is_none() && provider.block_hash(cursor_num)? == Some(cursor_hash) {
+                        tracing::info!(target: "bsc::fork_recover", cursor_num, %cursor_hash,
+                            "Local canonical progress canceled pending ancestor request");
+                        return Ok(Discovery { fork_blocks, outcome: DiscoveryOutcome::Shortcircuit });
+                    }
+                }
+            }
+        };
+        // Another importer may have completed at the same instant as a timeout/error.
+        if validated_ancestor.is_none() && provider.block_hash(cursor_num)? == Some(cursor_hash) {
+            return Ok(Discovery { fork_blocks, outcome: DiscoveryOutcome::Shortcircuit });
+        }
+        let resp = result.map_err(ForkRecoverError::FetchFailed)?;
         if resp.is_empty() {
             return Err(ForkRecoverError::EmptyResponse { num: cursor_num, hash: cursor_hash });
         }
         // A hop came back: this walk is alive, however deep it still has to go.
         progress.record_progress();
 
-        // Iterate newest -> oldest (the order we got them in).
+        // Check the discovery boundary as well as the production fetcher: every response must
+        // follow the requested cursor before any locally known ancestor can end the walk.
+        if resp.len() as u64 > count {
+            return Err(ForkRecoverError::FetchFailed("oversized recovery range".into()));
+        }
         let mut found_ancestor = false;
-        for b in &resp {
-            if provider.block_hash(b.header.number)? == Some(b.header.hash_slow()) {
+        for block in &resp {
+            let got = block.header.hash_slow();
+            if block.header.number != cursor_num || got != cursor_hash {
+                return Err(ForkRecoverError::RecoveryAncestryMismatch {
+                    number: cursor_num,
+                    expected: cursor_hash,
+                    got_number: block.header.number,
+                    got,
+                });
+            }
+            cursor_hash = block.header.parent_hash;
+            cursor_num = cursor_num.saturating_sub(1);
+            if validated_ancestor.is_none() &&
+                provider.block_hash(block.header.number)? == Some(got)
+            {
                 found_ancestor = true;
                 break;
             }
-            // Side-chain already present: skip adding to fork_blocks, but keep walking.
-            if provider.header(b.header.hash_slow())?.is_some() {
-                continue;
-            }
-            fork_blocks.push(b.clone());
+            fork_blocks.push(block.clone());
         }
         if found_ancestor {
             return Ok(Discovery { fork_blocks, outcome: DiscoveryOutcome::AncestorFound });
         }
 
-        // Advance cursor to the block just below the oldest in this response.
-        // saturating_sub: if we're already at block 0 with no match, the next
-        // pre-hop check fails and `walked >= MAX_FORK_DEPTH` eventually trips
-        // ForkTooDeep rather than panicking on underflow.
-        let oldest = resp.last().unwrap();
         walked += resp.len() as u64;
-        cursor_num = oldest.header.number.saturating_sub(1);
-        cursor_hash = oldest.header.parent_hash;
     }
+}
+
+/// Checks the validated recovery range before opening any historical execution state.
+/// A fork may build on the finalized block, but cannot replace it or an older block.
+fn ensure_fork_above_finalized(
+    fork_blocks: &[BscBlock],
+    finalized: Option<u64>,
+) -> Result<(), ForkRecoverError> {
+    let (Some(oldest), Some(finalized)) = (fork_blocks.last(), finalized) else {
+        return Ok(());
+    };
+    let base = oldest.header.number.saturating_sub(1);
+    if base < finalized {
+        return Err(ForkRecoverError::BelowFinalized { base, finalized });
+    }
+    Ok(())
 }
 
 /// Inputs to [`recover_ancestors`]. The discovery start and FCU target are
@@ -289,6 +648,9 @@ pub struct RecoverTarget {
     /// that may miss a block engine-tree just unbuffered but hasn't persisted.
     /// `None` falls back to phase-2 tail / provider.
     pub fcu_target_header: Option<alloy_consensus::Header>,
+    /// Previously payload-validated cursor on this recovery branch. It can
+    /// remain absent from the provider while losing Parlia fork choice.
+    validated_ancestor: Option<alloy_consensus::Header>,
 }
 
 impl RecoverTarget {
@@ -302,6 +664,7 @@ impl RecoverTarget {
             fcu_target_hash: hash,
             fcu_target_num: num,
             fcu_target_header: None,
+            validated_ancestor: None,
         }
     }
 
@@ -326,18 +689,18 @@ impl RecoverTarget {
             fcu_target_hash: target_hash,
             fcu_target_num: target_num,
             fcu_target_header: Some(target_header),
+            validated_ancestor: None,
         }
     }
 }
 
 /// Three-phase ancestor-aware recovery:
 ///
-/// 1. `discover_fork_blocks` walks back from `target.fetch_start_*` to the
-///    common ancestor.
-/// 2. Imports fork blocks oldest → newest via `engine.new_payload`, awaiting
-///    `Valid` then `fork_choice_updated` on each before submitting the next.
-/// 3. `fork_choice_updated` for `target.fcu_target_*` so engine-tree
-///    re-evaluates canonical selection.
+/// 1. `discover_fork_blocks` walks back from `target.fetch_start_*` to the common ancestor.
+/// 2. Imports fork blocks oldest → newest via `engine.new_payload`, awaiting `Valid` then
+///    `fork_choice_updated` on each before submitting the next.
+/// 3. `fork_choice_updated` for `target.fcu_target_*` so engine-tree re-evaluates canonical
+///    selection.
 ///
 /// See [`RecoverTarget`] for the parent-start vs single-pair design.
 pub async fn recover_ancestors<P>(
@@ -348,7 +711,7 @@ pub async fn recover_ancestors<P>(
     forkchoice_engine: BscForkChoiceEngine<P>,
     fetcher: &dyn RangeFetcher,
     progress: &dyn ProgressSink,
-) -> Result<(), ForkRecoverError>
+) -> Result<alloy_consensus::Header, ForkRecoverError>
 where
     P: BlockHashReader
         + BlockNumReader
@@ -364,6 +727,7 @@ where
         fcu_target_hash,
         fcu_target_num,
         fcu_target_header,
+        validated_ancestor,
     } = target;
 
     tracing::info!(
@@ -377,9 +741,16 @@ where
     );
 
     // ---- Phase 1 ----
-    let discovery =
-        discover_fork_blocks(peer, fetch_start_hash, fetch_start_num, &provider, fetcher, progress)
-            .await?;
+    let discovery = discover_fork_blocks_after(
+        peer,
+        fetch_start_hash,
+        fetch_start_num,
+        &provider,
+        fetcher,
+        progress,
+        validated_ancestor.as_ref(),
+    )
+    .await?;
     tracing::debug!(
         target: "bsc::fork_recover",
         %peer,
@@ -391,7 +762,78 @@ where
         outcome = ?discovery.outcome,
         "Phase 1 complete"
     );
+    ensure_fork_above_finalized(
+        &discovery.fork_blocks,
+        forkchoice_engine.finalized_number_at_head(provider.best_block_number()?)?,
+    )?;
 
+    import_discovered_header(
+        RecoverTarget {
+            fetch_start_hash,
+            fetch_start_num,
+            fcu_target_hash,
+            fcu_target_num,
+            fcu_target_header,
+            validated_ancestor,
+        },
+        discovery,
+        provider,
+        engine,
+        forkchoice_engine,
+        progress,
+    )
+    .await
+}
+
+/// Import an already hash-linked ancestor walk through the ordinary recovery/fork-choice path.
+/// Startup callers authenticate its common ancestor against executed and finalized history first.
+pub(crate) async fn import_discovered<P>(
+    target: RecoverTarget,
+    discovery: Discovery,
+    provider: P,
+    engine: ConsensusEngineHandle<BscPayloadTypes>,
+    forkchoice_engine: BscForkChoiceEngine<P>,
+    progress: &dyn ProgressSink,
+) -> Result<(), ForkRecoverError>
+where
+    P: BlockHashReader
+        + BlockNumReader
+        + HeaderProvider<Header = alloy_consensus::Header>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+{
+    import_discovered_header(target, discovery, provider, engine, forkchoice_engine, progress)
+        .await
+        .map(|_| ())
+}
+
+pub(crate) async fn import_discovered_header<P>(
+    target: RecoverTarget,
+    discovery: Discovery,
+    provider: P,
+    engine: ConsensusEngineHandle<BscPayloadTypes>,
+    forkchoice_engine: BscForkChoiceEngine<P>,
+    progress: &dyn ProgressSink,
+) -> Result<alloy_consensus::Header, ForkRecoverError>
+where
+    P: BlockHashReader
+        + BlockNumReader
+        + HeaderProvider<Header = alloy_consensus::Header>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+{
+    let RecoverTarget { fcu_target_hash, fcu_target_num, fcu_target_header, .. } = target;
+    // Finality may advance while discovery waits for peers. Recheck at the shared import
+    // boundary so neither network recovery nor startup callers bypass the floor.
+    let local_tip = provider.best_block_number()?;
+    ensure_fork_above_finalized(
+        &discovery.fork_blocks,
+        forkchoice_engine.finalized_number_at_head(local_tip)?,
+    )?;
     // ---- Phase 2: import oldest → newest via new_payload ----
     let mut to_import = discovery.fork_blocks;
     to_import.reverse();
@@ -406,9 +848,11 @@ where
         let block_hash = header.hash_slow();
         let block_num = header.number;
         let sealed = block.seal_unchecked(block_hash);
-        let payload = BscPayloadTypes::block_to_payload(sealed);
+        let payload = BscPayloadTypes::block_to_payload(sealed, None);
 
-        match engine.new_payload(payload).await {
+        match super::future_payload::submit(&engine, payload, &forkchoice_engine.future_payloads)
+            .await
+        {
             Ok(status) => match status.status {
                 PayloadStatusEnum::Valid => {
                     tracing::debug!(
@@ -516,18 +960,16 @@ where
         );
     }
 
-    Ok(())
+    Ok(head_header)
 }
 
 /// Resolve the FCU target header in priority order:
 ///
-/// 1. Caller override (`fcu_target_header`) — used by `on_new_block` to skip
-///    a provider lookup for a block engine-tree just unbuffered.
-/// 2. Phase-2 tail iff its hash equals `fcu_target_hash` — single-pair
-///    callers; sidesteps the qanet livelock where the DB-backed provider
-///    misses freshly-imported blocks.
-/// 3. Provider — Shortcircuit path or last resort; missing →
-///    `HeadHeaderMissing`.
+/// 1. Caller override (`fcu_target_header`) — used by `on_new_block` to skip a provider lookup for
+///    a block engine-tree just unbuffered.
+/// 2. Phase-2 tail iff its hash equals `fcu_target_hash` — single-pair callers; sidesteps the qanet
+///    livelock where the DB-backed provider misses freshly-imported blocks.
+/// 3. Provider — Shortcircuit path or last resort; missing → `HeadHeaderMissing`.
 fn resolve_fcu_head_header<P>(
     provider: &P,
     fcu_target_hash: B256,
@@ -578,9 +1020,7 @@ pub struct FailedHeadsCooler {
 impl FailedHeadsCooler {
     pub fn new(capacity: u32, cooldown: Duration) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(schnellru::LruMap::new(
-                schnellru::ByLength::new(capacity),
-            ))),
+            inner: Arc::new(Mutex::new(schnellru::LruMap::new(schnellru::ByLength::new(capacity)))),
             cooldown,
         }
     }
@@ -618,7 +1058,7 @@ pub fn new_failed_heads_cooler(capacity: u32) -> FailedHeadsCooler {
 /// payload submissions for `O(depth)` of useful work, with `in_flight` growing
 /// as the node falls further behind. See bnb-chain/reth-bsc#456.
 ///
-/// The cap is [`MAX_CONCURRENT_RECOVERIES`] rather than 1 deliberately.
+/// The default cap is [`MAX_CONCURRENT_RECOVERIES`]; runtime uses max-recoveries.
 /// Strict single-flight bounds duplicated work perfectly, but it also removes
 /// the redundancy the old storm provided by accident: with one slot and
 /// `resolve_bsc_peer_static` always choosing the same peer, a single
@@ -663,7 +1103,7 @@ impl RecoveryGate {
     }
 
     /// A handle onto the same slots with a different idle threshold.
-    /// Test-only: production always uses [`RECOVERY_IDLE_TIMEOUT`].
+    /// Test-only: production receives its idle threshold from the per-node config.
     #[cfg(test)]
     fn with_idle_timeout(&self, idle_timeout: Duration) -> Self {
         Self { inner: self.inner.clone(), idle_timeout, capacity: self.capacity, epoch: self.epoch }
@@ -783,6 +1223,7 @@ mod tests {
     use reth_provider::{BlockHashReader, HeaderProvider, ProviderError};
     use std::{
         collections::HashMap,
+        future::Future,
         sync::{Arc, Mutex},
     };
 
@@ -793,11 +1234,13 @@ mod tests {
     struct FakeProvider {
         canonical_by_num: HashMap<u64, B256>, // number -> canonical hash
         headers_by_hash: HashMap<B256, Header>, // every known header (canonical + side)
+        td_by_hash: HashMap<B256, alloy_primitives::U256>,
     }
 
     impl FakeProvider {
         fn insert_canonical(&mut self, header: Header) {
             let hash = header.hash_slow();
+            self.td_by_hash.entry(hash).or_insert(alloy_primitives::U256::from(header.number));
             self.canonical_by_num.insert(header.number, hash);
             self.headers_by_hash.insert(hash, header);
         }
@@ -828,14 +1271,17 @@ mod tests {
         fn header_by_number(&self, num: u64) -> Result<Option<Self::Header>, ProviderError> {
             Ok(self.canonical_by_num.get(&num).and_then(|h| self.headers_by_hash.get(h).cloned()))
         }
-        fn header_td(&self, _: &B256) -> Result<Option<alloy_primitives::U256>, ProviderError> {
-            Ok(None)
+        fn header_td(&self, hash: &B256) -> Result<Option<alloy_primitives::U256>, ProviderError> {
+            Ok(self.td_by_hash.get(hash).copied())
         }
         fn header_td_by_number(
             &self,
-            _: u64,
+            number: u64,
         ) -> Result<Option<alloy_primitives::U256>, ProviderError> {
-            Ok(None)
+            Ok(self
+                .canonical_by_num
+                .get(&number)
+                .and_then(|hash| self.td_by_hash.get(hash).copied()))
         }
         fn headers_range(
             &self,
@@ -846,14 +1292,16 @@ mod tests {
         fn sealed_header(
             &self,
             _number: u64,
-        ) -> Result<Option<reth_primitives_traits::SealedHeader<Self::Header>>, ProviderError> {
+        ) -> Result<Option<reth_primitives_traits::SealedHeader<Self::Header>>, ProviderError>
+        {
             Ok(None)
         }
         fn sealed_headers_while(
             &self,
             _range: impl core::ops::RangeBounds<u64>,
             _predicate: impl FnMut(&reth_primitives_traits::SealedHeader<Self::Header>) -> bool,
-        ) -> Result<Vec<reth_primitives_traits::SealedHeader<Self::Header>>, ProviderError> {
+        ) -> Result<Vec<reth_primitives_traits::SealedHeader<Self::Header>>, ProviderError>
+        {
             Ok(vec![])
         }
     }
@@ -893,7 +1341,13 @@ mod tests {
     // ---------- Header & block builders ----------
     fn make_header(number: u64, parent_hash: B256, tag: u8) -> Header {
         // `tag` makes hash_slow deterministic-yet-distinguishable.
-        Header { number, parent_hash, extra_data: vec![tag].into(), ..Default::default() }
+        Header {
+            number,
+            parent_hash,
+            difficulty: alloy_primitives::U256::from(u64::from(number != 0)),
+            extra_data: vec![tag].into(),
+            ..Default::default()
+        }
     }
 
     fn make_block(header: Header) -> BscBlock {
@@ -924,6 +1378,91 @@ mod tests {
         PeerId::from([0u8; 64])
     }
 
+    #[tokio::test]
+    async fn discover_rejects_spliced_first_walk_and_wrong_start() {
+        let mut provider = FakeProvider::default();
+        let (canonical, hashes) = linear_chain(0, 201, B256::ZERO, 0xC);
+        for header in &canonical {
+            provider.insert_canonical(header.clone());
+        }
+        let crafted = make_header(10_001, hashes[128], 0xD);
+        let crafted_hash = crafted.hash_slow();
+        for (response, number, expected, got_number, got) in [
+            (
+                vec![make_block(crafted.clone()), make_block(canonical[128].clone())],
+                10_000,
+                hashes[128],
+                128,
+                hashes[128],
+            ),
+            (vec![make_block(canonical[200].clone())], 10_001, crafted_hash, 200, hashes[200]),
+        ] {
+            let fetcher = ScriptedFetcher::new(vec![Ok(response)]);
+            let error = discover_fork_blocks(
+                fake_peer(),
+                crafted_hash,
+                10_001,
+                &provider,
+                fetcher.as_ref(),
+                &(),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                ForkRecoverError::RecoveryAncestryMismatch {
+                    number: actual_number, expected: actual_expected,
+                    got_number: actual_got_number, got: actual_got,
+                } if (actual_number, actual_expected, actual_got_number, actual_got)
+                    == (number, expected, got_number, got)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn discover_rejects_broken_continuation_and_oversized_range() {
+        let provider = FakeProvider::default();
+        let (chain, hashes) = linear_chain(1, 8, B256::ZERO, 0xD);
+        let first: Vec<_> = chain[4..].iter().rev().cloned().map(make_block).collect();
+        let wrong = make_header(4, B256::ZERO, 0xE);
+        let wrong_hash = wrong.hash_slow();
+        let fetcher = ScriptedFetcher::new(vec![Ok(first), Ok(vec![make_block(wrong)])]);
+        let error =
+            discover_fork_blocks(fake_peer(), hashes[7], 8, &provider, fetcher.as_ref(), &())
+                .await
+                .unwrap_err();
+        assert!(matches!(
+            error,
+            ForkRecoverError::RecoveryAncestryMismatch {
+                number: 4, expected, got_number: 4, got,
+            } if expected == hashes[3] && got == wrong_hash
+        ));
+        assert_eq!(fetcher.calls().len(), 2);
+
+        let oversized = chain[3..].iter().rev().cloned().map(make_block).collect();
+        let fetcher = ScriptedFetcher::new(vec![Ok(oversized)]);
+        let error =
+            discover_fork_blocks(fake_peer(), hashes[7], 8, &provider, fetcher.as_ref(), &())
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(error, ForkRecoverError::FetchFailed(reason) if reason == "oversized recovery range")
+        );
+    }
+
+    #[test]
+    fn fork_base_finality_floor_allows_only_eligible_recovery() {
+        let (chain, _) = linear_chain(129, 2, B256::ZERO, 0xD);
+        let fork: Vec<_> = chain.into_iter().rev().map(make_block).collect();
+        assert!(matches!(
+            ensure_fork_above_finalized(&fork, Some(9_900)),
+            Err(ForkRecoverError::BelowFinalized { base: 128, finalized: 9_900 })
+        ));
+        ensure_fork_above_finalized(&fork, Some(128)).unwrap();
+        ensure_fork_above_finalized(&fork, None).unwrap();
+        ensure_fork_above_finalized(&[], Some(9_900)).unwrap();
+    }
+
     // ---- Spec test #1: head already on canonical (pre-hop short-circuit) ----
     #[tokio::test]
     async fn discover_head_on_canonical_no_fetch() {
@@ -934,9 +1473,10 @@ mod tests {
         }
 
         let fetcher = ScriptedFetcher::new(vec![]);
-        let out = discover_fork_blocks(fake_peer(), hashes[100], 100, &provider, fetcher.as_ref(), &())
-            .await
-            .unwrap();
+        let out =
+            discover_fork_blocks(fake_peer(), hashes[100], 100, &provider, fetcher.as_ref(), &())
+                .await
+                .unwrap();
 
         assert!(out.fork_blocks.is_empty(), "no blocks to import");
         assert!(matches!(out.outcome, DiscoveryOutcome::Shortcircuit));
@@ -958,9 +1498,10 @@ mod tests {
         let fetcher = ScriptedFetcher::new(vec![Ok(hop1)]);
 
         let head_hash = peer_ext.last().unwrap().hash_slow();
-        let out = discover_fork_blocks(fake_peer(), head_hash, 104, &provider, fetcher.as_ref(), &())
-            .await
-            .unwrap();
+        let out =
+            discover_fork_blocks(fake_peer(), head_hash, 104, &provider, fetcher.as_ref(), &())
+                .await
+                .unwrap();
 
         assert!(matches!(out.outcome, DiscoveryOutcome::AncestorFound));
         // Ascending-hash list after reverse; we assert on numbers for clarity.
@@ -998,10 +1539,16 @@ mod tests {
         hop2.push(make_block(shared[95].clone()));
         let fetcher = ScriptedFetcher::new(vec![Ok(hop1), Ok(hop2)]);
 
-        let out =
-            discover_fork_blocks(fake_peer(), peer_y_hashes[6], 102, &provider, fetcher.as_ref(), &())
-                .await
-                .unwrap();
+        let out = discover_fork_blocks(
+            fake_peer(),
+            peer_y_hashes[6],
+            102,
+            &provider,
+            fetcher.as_ref(),
+            &(),
+        )
+        .await
+        .unwrap();
 
         assert!(matches!(out.outcome, DiscoveryOutcome::AncestorFound));
         let nums: Vec<u64> = out.fork_blocks.iter().map(|b| b.header.number).collect();
@@ -1060,13 +1607,13 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, ForkRecoverError::ForkTooDeep));
+        assert!(matches!(err, ForkRecoverError::ForkTooDeep { max_depth: MAX_FORK_DEPTH }));
         assert_eq!(fetcher.calls().len(), hops);
     }
 
-    // ---- Spec test #7: head already present as side-chain (short-circuit, empty fork_blocks) ----
+    // A side-chain header alone cannot establish executed ancestry.
     #[tokio::test]
-    async fn discover_head_side_chain_shortcircuit() {
+    async fn discover_head_side_chain_requires_payload_validation() {
         let mut provider = FakeProvider::default();
         let (shared, shared_hashes) = linear_chain(0, 96, B256::ZERO, 0xC);
         for h in &shared {
@@ -1075,20 +1622,21 @@ mod tests {
         // Insert a side-chain block at 96 (not canonical).
         let side_96 = make_header(96, shared_hashes[95], 0xB);
         let side_hash = side_96.hash_slow();
-        provider.insert_side(side_96);
+        provider.insert_side(side_96.clone());
 
-        let fetcher = ScriptedFetcher::new(vec![]);
-        let out = discover_fork_blocks(fake_peer(), side_hash, 96, &provider, fetcher.as_ref(), &())
-            .await
-            .unwrap();
-        assert!(matches!(out.outcome, DiscoveryOutcome::Shortcircuit));
-        assert!(out.fork_blocks.is_empty());
-        assert_eq!(fetcher.calls().len(), 0);
+        let fetcher = ScriptedFetcher::new(vec![Ok(vec![make_block(side_96)])]);
+        let out =
+            discover_fork_blocks(fake_peer(), side_hash, 96, &provider, fetcher.as_ref(), &())
+                .await
+                .unwrap();
+        assert!(matches!(out.outcome, DiscoveryOutcome::AncestorFound));
+        assert_eq!(out.fork_blocks.len(), 1);
+        assert_eq!(fetcher.calls().len(), 1);
     }
 
     // ---- Spec test #8: mid-chain side block already present, skipped ----
     #[tokio::test]
-    async fn discover_mid_chain_side_block_skipped() {
+    async fn discover_mid_chain_side_header_is_revalidated() {
         let mut provider = FakeProvider::default();
         let (shared, shared_hashes) = linear_chain(0, 96, B256::ZERO, 0xC);
         for h in &shared {
@@ -1105,19 +1653,76 @@ mod tests {
         let hop1: Vec<BscBlock> = peer_y.iter().cloned().rev().map(make_block).collect();
         let fetcher = ScriptedFetcher::new(vec![Ok(hop1)]);
 
-        let out =
-            discover_fork_blocks(fake_peer(), peer_y_hashes[3], 99, &provider, fetcher.as_ref(), &())
-                .await
-                .unwrap();
+        let out = discover_fork_blocks(
+            fake_peer(),
+            peer_y_hashes[3],
+            99,
+            &provider,
+            fetcher.as_ref(),
+            &(),
+        )
+        .await
+        .unwrap();
 
         assert!(matches!(out.outcome, DiscoveryOutcome::AncestorFound));
         let nums: Vec<u64> = out.fork_blocks.iter().map(|b| b.header.number).collect();
-        // Non-contiguous fork_blocks: 97Y is omitted because it's already a
-        // known side-block. Task 4's import loop must therefore tolerate gaps
-        // — it imports [96, 98, 99] oldest-first and relies on engine-tree
-        // already holding 97Y as Valid (which is why the side-block exists).
-        assert_eq!(nums, vec![99, 98, 96], "97Y skipped because already on side-chain");
+        assert_eq!(nums, vec![99, 98, 97, 96], "side headers still require Engine validation");
         assert_eq!(fetcher.calls().len(), 1);
+    }
+
+    // ---- SRC-2598: the first walk binds every block to the cursor ----
+    #[tokio::test]
+    async fn discover_rejects_spliced_ranges_on_the_first_walk() {
+        let mut provider = FakeProvider::default();
+        let (local, local_hashes) = linear_chain(0, 201, B256::ZERO, 0xC);
+        for h in &local {
+            provider.insert_canonical(h.clone());
+        }
+        // Declares a near-tip height but points at old canonical block 128.
+        let crafted = make_header(10_001, local_hashes[128], 0xD);
+        let crafted_hash = crafted.hash_slow();
+
+        let splices = [
+            // The reported splice: the old parent ends discovery on block 128.
+            vec![make_block(crafted.clone()), make_block(local[128].clone())],
+            // A response that does not start at the requested hash.
+            vec![make_block(local[200].clone())],
+        ];
+        for resp in splices {
+            let fetcher = ScriptedFetcher::new(vec![Ok(resp)]);
+            let err = discover_fork_blocks(
+                fake_peer(),
+                crafted_hash,
+                10_001,
+                &provider,
+                fetcher.as_ref(),
+                &(),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, ForkRecoverError::RecoveryAncestryMismatch { .. }), "{err}");
+        }
+    }
+
+    // ---- SRC-2598: a linked fork below finality never reaches Phase 2 ----
+    #[test]
+    fn fork_base_below_finalized_is_rejected() {
+        // Fork blocks newest -> oldest: [130', 129'] on canonical block 128.
+        let fork = |oldest: u64| {
+            vec![
+                make_block(make_header(oldest + 1, B256::ZERO, 0xD)),
+                make_block(make_header(oldest, B256::ZERO, 0xD)),
+            ]
+        };
+
+        let err = ensure_fork_above_finalized(&fork(129), Some(9_900)).unwrap_err();
+        assert!(
+            matches!(err, ForkRecoverError::BelowFinalized { base: 128, finalized: 9_900 }),
+            "{err}"
+        );
+        ensure_fork_above_finalized(&fork(129), Some(128)).expect("a fork may start at finality");
+        ensure_fork_above_finalized(&fork(129), None).expect("no floor before fast finality");
+        ensure_fork_above_finalized(&[], Some(9_900)).expect("nothing to import");
     }
 
     // ---- RecoverTarget constructor tests ----
@@ -1220,8 +1825,7 @@ mod tests {
         let side_hash = side.hash_slow();
         provider.insert_side(side);
 
-        let resolved =
-            super::resolve_fcu_head_header(&provider, side_hash, None, None).unwrap();
+        let resolved = super::resolve_fcu_head_header(&provider, side_hash, None, None).unwrap();
         assert_eq!(resolved.hash_slow(), side_hash);
     }
 
@@ -1233,8 +1837,7 @@ mod tests {
         let provider = FakeProvider::default();
         let head_hash = B256::repeat_byte(0xAB);
 
-        let err =
-            super::resolve_fcu_head_header(&provider, head_hash, None, None).unwrap_err();
+        let err = super::resolve_fcu_head_header(&provider, head_hash, None, None).unwrap_err();
         match err {
             ForkRecoverError::HeadHeaderMissing { hash } => assert_eq!(hash, head_hash),
             other => panic!("expected HeadHeaderMissing, got {other:?}"),
@@ -1276,13 +1879,9 @@ mod tests {
         let supplied_hash = supplied.hash_slow();
         let claimed_target_hash = B256::repeat_byte(0x99); // ≠ supplied_hash
 
-        let err = super::resolve_fcu_head_header(
-            &provider,
-            claimed_target_hash,
-            Some(&supplied),
-            None,
-        )
-        .unwrap_err();
+        let err =
+            super::resolve_fcu_head_header(&provider, claimed_target_hash, Some(&supplied), None)
+                .unwrap_err();
         match err {
             ForkRecoverError::FcuTargetHeaderMismatch { expected, got } => {
                 assert_eq!(expected, claimed_target_hash);
@@ -1325,13 +1924,9 @@ mod tests {
 
         let tail_block = make_block(make_header(9, parent_hash, 0x1));
 
-        let err = super::resolve_fcu_head_header(
-            &provider,
-            target_hash,
-            None,
-            Some(&tail_block.header),
-        )
-        .unwrap_err();
+        let err =
+            super::resolve_fcu_head_header(&provider, target_hash, None, Some(&tail_block.header))
+                .unwrap_err();
         match err {
             ForkRecoverError::HeadHeaderMissing { hash } => assert_eq!(hash, target_hash),
             other => panic!("expected HeadHeaderMissing, got {other:?}"),
@@ -1437,11 +2032,18 @@ mod tests {
         /// `syncing_at`, which get `Syncing` — the shape reported in issue #456
         /// §6 (2046 of 2047 recovery failures).
         ///
-        /// `QueryTd` answers with the block number so the BSC fork-choice rule
-        /// sees a higher-height head as the better chain and actually emits the
-        /// FCU, rather than erroring out on an unanswered TD query.
+        /// Resolve TD from persisted fixtures plus payloads accepted by this engine.
         fn recording_engine(
+            provider: FakeProvider,
             syncing_at: Vec<u64>,
+        ) -> (ConsensusEngineHandle<BscPayloadTypes>, Submissions, Fcus) {
+            recording_engine_with_retry(provider, syncing_at, None)
+        }
+
+        fn recording_engine_with_retry(
+            mut provider: FakeProvider,
+            syncing_at: Vec<u64>,
+            mut accepted_at: Option<u64>,
         ) -> (ConsensusEngineHandle<BscPayloadTypes>, Submissions, Fcus) {
             let (to_engine, mut from_engine) =
                 tokio::sync::mpsc::unbounded_channel::<BeaconEngineMessage<BscPayloadTypes>>();
@@ -1453,15 +2055,39 @@ mod tests {
             tokio::spawn(async move {
                 while let Some(msg) = from_engine.recv().await {
                     match msg {
-                        BeaconEngineMessage::NewPayload { payload, tx } => {
+                        BeaconEngineMessage::NewPayload { payload, tx, .. } => {
                             let (num, hash) = (payload.block_number(), payload.block_hash());
                             recorder.lock().unwrap().push((num, hash));
-                            let status = if syncing_at.contains(&num) {
+                            let status = if accepted_at == Some(num) {
+                                accepted_at = None;
+                                PayloadStatusEnum::Accepted
+                            } else if syncing_at.contains(&num) {
                                 PayloadStatusEnum::Syncing
                             } else {
                                 PayloadStatusEnum::Valid
                             };
+                            if status == PayloadStatusEnum::Valid {
+                                provider.headers_by_hash.insert(hash, payload.block.header.clone());
+                            }
                             let _ = tx.send(Ok(PayloadStatus::new(status, None)));
+                        }
+                        BeaconEngineMessage::QueryTd { hash, tx, .. } => {
+                            let mut cursor = hash;
+                            let mut suffix = alloy_primitives::U256::ZERO;
+                            let td = loop {
+                                if let Some(td) = provider.td_by_hash.get(&cursor) {
+                                    break td.checked_add(suffix);
+                                }
+                                let Some(header) = provider.headers_by_hash.get(&cursor) else {
+                                    break None
+                                };
+                                suffix = suffix.checked_add(header.difficulty).unwrap();
+                                if header.number == 0 {
+                                    break Some(suffix);
+                                }
+                                cursor = header.parent_hash;
+                            };
+                            let _ = tx.send(Ok(td));
                         }
                         BeaconEngineMessage::ForkchoiceUpdated { state, tx, .. } => {
                             fcu_recorder.lock().unwrap().push(state.head_block_hash);
@@ -1469,9 +2095,6 @@ mod tests {
                                 PayloadStatusEnum::Valid,
                                 None,
                             ))));
-                        }
-                        BeaconEngineMessage::QueryTd { number, tx, .. } => {
-                            let _ = tx.send(Ok(Some(alloy_primitives::U256::from(number))));
                         }
                         // Dropping any other message drops its responder, which the
                         // handle maps to an error rather than hanging.
@@ -1516,6 +2139,623 @@ mod tests {
             Arc::new(crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet()))
         }
 
+        struct ScriptedHeaders {
+            responses: Mutex<Vec<Result<Vec<Header>, String>>>,
+            requests: Mutex<Vec<(PeerId, u64)>>,
+        }
+
+        impl ScriptedHeaders {
+            fn new(responses: Vec<Result<Vec<Header>, String>>) -> Self {
+                Self { responses: Mutex::new(responses), requests: Mutex::new(vec![]) }
+            }
+        }
+
+        impl HeaderFetcher for ScriptedHeaders {
+            fn fetch<'a>(
+                &'a self,
+                peer: PeerId,
+                number: u64,
+            ) -> BoxFuture<'a, Result<Vec<Header>, String>> {
+                self.requests.lock().unwrap().push((peer, number));
+                let response = self.responses.lock().unwrap().remove(0);
+                Box::pin(async move { response })
+            }
+        }
+
+        #[tokio::test]
+        async fn recovery_target_is_locally_bounded_and_drops_original_override() {
+            let (provider, fetcher, heads) = scenario(100, 2500);
+            let intermediate = fetcher.blocks[&heads[1023].0].header.clone();
+            let headers = ScriptedHeaders::new(vec![Ok(vec![intermediate.clone()])]);
+            let announced = fetcher.blocks[&heads.last().unwrap().0].header.clone();
+            let original = RecoverTarget::from_parent(
+                announced.parent_hash,
+                2599,
+                announced.hash_slow(),
+                u64::MAX,
+                announced,
+            );
+            let target =
+                resolve_recovery_target(original, fake_peer(), &provider, &headers).await.unwrap();
+            assert_eq!(*headers.requests.lock().unwrap(), vec![(fake_peer(), 1124)]);
+            assert_eq!(target.fetch_start_num, 1124);
+            assert_eq!(target.fetch_start_hash, intermediate.hash_slow());
+            assert_eq!(target.fcu_target_hash, intermediate.hash_slow());
+            assert!(target.fcu_target_header.is_none());
+            let (engine, submissions, fcus) = recording_engine(provider.clone(), vec![]);
+            let fce = BscForkChoiceEngine::new(provider.clone(), engine.clone(), chain_spec());
+            recover_ancestors(fake_peer(), target, provider, engine, fce, fetcher.as_ref(), &())
+                .await
+                .unwrap();
+            assert_eq!(submissions.lock().unwrap().len(), 1024);
+            assert_eq!(*fcus.lock().unwrap().last().unwrap(), intermediate.hash_slow());
+            assert!(!fcus.lock().unwrap().contains(&heads.last().unwrap().0));
+        }
+
+        struct PendingHeaders;
+
+        impl HeaderFetcher for PendingHeaders {
+            fn fetch<'a>(
+                &'a self,
+                _peer: PeerId,
+                _number: u64,
+            ) -> BoxFuture<'a, Result<Vec<Header>, String>> {
+                Box::pin(std::future::pending())
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn recovery_target_times_out_header_lookup() {
+            let (provider, _, _) = scenario(100, 0);
+            let lookup = resolve_recovery_target(
+                RecoverTarget::single_pair(B256::random(), u64::MAX),
+                fake_peer(),
+                &provider,
+                &PendingHeaders,
+            );
+            tokio::pin!(lookup);
+            assert!(futures::poll!(&mut lookup).is_pending());
+            tokio::time::advance(FETCH_TIMEOUT).await;
+            assert!(matches!(
+                futures::poll!(&mut lookup),
+                std::task::Poll::Ready(Err(ForkRecoverError::FetchFailed(_)))
+            ));
+        }
+
+        #[tokio::test]
+        async fn recovery_target_rejects_bad_header_responses_before_import() {
+            let (provider, _, _) = scenario(100, 0);
+            for response in [
+                Ok(vec![]),
+                Ok(vec![make_header(1123, B256::ZERO, 0)]),
+                Ok(vec![Header::default(), Header::default()]),
+                Err("lookup failed".into()),
+            ] {
+                let headers = ScriptedHeaders::new(vec![response]);
+                let target = RecoverTarget::single_pair(B256::random(), u64::MAX);
+                assert!(matches!(
+                    resolve_recovery_target(target, fake_peer(), &provider, &headers).await,
+                    Err(ForkRecoverError::FetchFailed(_))
+                ));
+                assert_eq!(*headers.requests.lock().unwrap(), vec![(fake_peer(), 1124)]);
+            }
+        }
+
+        #[tokio::test]
+        async fn recovery_target_keeps_near_parent_start_and_known_actual_height() {
+            let (mut provider, fetcher, heads) = scenario(100, 1);
+            let header = fetcher.blocks[&heads[0].0].header.clone();
+            let headers = ScriptedHeaders::new(vec![]);
+            let original = RecoverTarget::from_parent(
+                header.parent_hash,
+                100,
+                heads[0].0,
+                101,
+                header.clone(),
+            );
+            let target =
+                resolve_recovery_target(original.clone(), fake_peer(), &provider, &headers)
+                    .await
+                    .unwrap();
+            assert_eq!(target.fetch_start_hash, original.fetch_start_hash);
+            assert_eq!(target.fcu_target_header, original.fcu_target_header);
+            let side = make_header(4, B256::ZERO, 0xB);
+            provider.insert_side(side.clone());
+            let target = resolve_recovery_target(
+                RecoverTarget::single_pair(side.hash_slow(), u64::MAX),
+                fake_peer(),
+                &provider,
+                &headers,
+            )
+            .await
+            .unwrap();
+            assert_eq!(target.fetch_start_num, 4);
+            assert_eq!(target.fcu_target_num, 4);
+            assert!(headers.requests.lock().unwrap().is_empty());
+            let (engine, submissions, fcus) = recording_engine(provider.clone(), vec![]);
+            let fce = BscForkChoiceEngine::new(provider.clone(), engine.clone(), chain_spec());
+            let result = recover_ancestors(
+                fake_peer(),
+                target,
+                provider.clone(),
+                engine,
+                fce,
+                fetcher.as_ref(),
+                &(),
+            )
+            .await;
+            // A side header alone is not an executed ancestor. Empty range recovery
+            // must fail without importing or selecting it through forkchoice.
+            assert!(matches!(result, Err(ForkRecoverError::EmptyResponse { num: 4, .. })));
+            assert!(submissions.lock().unwrap().is_empty());
+            assert!(fcus.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn recovery_target_repeated_announcement_catches_up_past_depth_cap() {
+            let (mut provider, fetcher, heads) = scenario(100, 2500);
+            let intermediate = fetcher.blocks[&heads[1023].0].header.clone();
+            let headers = ScriptedHeaders::new(vec![Ok(vec![intermediate.clone()])]);
+            let original = RecoverTarget::single_pair(heads.last().unwrap().0, 2600);
+            let (engine, submissions, fcus) = recording_engine(provider.clone(), vec![]);
+            for expected in [1124, 2600] {
+                let target =
+                    resolve_recovery_target(original.clone(), fake_peer(), &provider, &headers)
+                        .await
+                        .unwrap();
+                let fce = BscForkChoiceEngine::new(provider.clone(), engine.clone(), chain_spec());
+                recover_ancestors(
+                    fake_peer(),
+                    target,
+                    provider.clone(),
+                    engine.clone(),
+                    fce,
+                    fetcher.as_ref(),
+                    &(),
+                )
+                .await
+                .unwrap();
+                let selected = *fcus.lock().unwrap().last().unwrap();
+                assert_eq!(fetcher.blocks[&selected].header.number, expected);
+                if expected == 1124 {
+                    assert!(!fcus.lock().unwrap().contains(&original.fcu_target_hash));
+                }
+                // Model the accepted FCU landing in the provider between announcements.
+                let mut cursor = selected;
+                while !provider.headers_by_hash.contains_key(&cursor) {
+                    let header = fetcher.blocks[&cursor].header.clone();
+                    cursor = header.parent_hash;
+                    provider.insert_canonical(header);
+                }
+            }
+            assert_eq!(provider.best_block_number().unwrap(), 2600);
+            let submitted = submissions.lock().unwrap();
+            assert_eq!(
+                submitted.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+                (101..=2600).collect::<Vec<_>>()
+            );
+            for hash in fcus.lock().unwrap().iter() {
+                assert!(submitted.iter().any(|(_, submitted)| submitted == hash));
+            }
+            assert_eq!(*headers.requests.lock().unwrap(), vec![(fake_peer(), 1124)]);
+        }
+
+        #[derive(Default)]
+        struct RecoverySnapshots(Mutex<HashMap<B256, crate::consensus::parlia::Snapshot>>);
+
+        impl crate::consensus::parlia::SnapshotProvider for RecoverySnapshots {
+            fn snapshot_by_hash(&self, hash: &B256) -> Option<crate::consensus::parlia::Snapshot> {
+                self.0.lock().unwrap().get(hash).cloned()
+            }
+
+            fn insert(&self, snapshot: crate::consensus::parlia::Snapshot) {
+                self.0.lock().unwrap().insert(snapshot.block_hash, snapshot);
+            }
+        }
+
+        async fn assert_losing_segment_progress(use_justification: bool) {
+            use crate::{
+                consensus::parlia::{Snapshot, SnapshotProvider, VoteData},
+                hardforks::bsc::BscHardfork,
+            };
+            use reth_chainspec::{ChainSpecBuilder, ForkCondition};
+
+            let (mut provider, _, _) = scenario(100, 0);
+            let canonical = provider.header_by_number(100).unwrap().unwrap();
+            let ancestor = provider.block_hash(99).unwrap().unwrap();
+            let (mut branch, _) =
+                linear_chain(100, 2501, ancestor, if use_justification { 0xD } else { 0xE });
+            let mut parent_hash = ancestor;
+            let hashes: Vec<_> = branch
+                .iter_mut()
+                .map(|header| {
+                    header.parent_hash = parent_hash;
+                    header.difficulty = alloy_primitives::U256::from(1);
+                    parent_hash = header.hash_slow();
+                    parent_hash
+                })
+                .collect();
+            let intermediate = branch[1024].clone();
+            let head = branch.last().unwrap().clone();
+            let fetcher = ChainFetcher {
+                blocks: branch.iter().cloned().map(|h| (h.hash_slow(), make_block(h))).collect(),
+                ..Default::default()
+            };
+            let headers = ScriptedHeaders::new(vec![
+                Ok(vec![intermediate.clone()]),
+                Ok(vec![intermediate.clone()]),
+            ]);
+            let spec = if use_justification {
+                Arc::new(crate::chainspec::BscChainSpec::from(
+                    ChainSpecBuilder::mainnet()
+                        .with_fork(BscHardfork::Luban, ForkCondition::Block(0))
+                        .with_fork(BscHardfork::Plato, ForkCondition::Block(0))
+                        .build(),
+                ))
+            } else {
+                chain_spec()
+            };
+            if use_justification {
+                let snapshots: Arc<dyn SnapshotProvider + Send + Sync> =
+                    crate::shared::get_snapshot_provider().cloned().unwrap_or_else(|| {
+                        let snapshots: Arc<dyn SnapshotProvider + Send + Sync> =
+                            Arc::new(RecoverySnapshots::default());
+                        assert!(crate::shared::set_snapshot_provider(snapshots.clone()).is_ok());
+                        snapshots
+                    });
+                for header in std::iter::once(&canonical).chain(branch.iter()) {
+                    let target_number: u64 = if header.hash_slow() == canonical.hash_slow() {
+                        99
+                    } else if header.number == 2600 {
+                        2599
+                    } else {
+                        98
+                    };
+                    snapshots.insert(Snapshot {
+                        block_number: header.number,
+                        block_hash: header.hash_slow(),
+                        vote_data: VoteData {
+                            source_number: target_number.saturating_sub(1),
+                            source_hash: ancestor,
+                            target_number,
+                            target_hash: ancestor,
+                        },
+                        ..Default::default()
+                    });
+                }
+            }
+            let canonical_hash = canonical.hash_slow();
+            // The longer branch ties the heavier canonical chain at 1124, then wins.
+            provider.td_by_hash.insert(ancestor, alloy_primitives::U256::from(99));
+            provider.td_by_hash.insert(
+                canonical_hash,
+                alloy_primitives::U256::from(if use_justification { 100 } else { 1124 }),
+            );
+            let (engine, submissions, fcus) = recording_engine(provider.clone(), vec![]);
+            let fce = BscForkChoiceEngine::new(provider.clone(), engine.clone(), spec);
+            // The engine retains validated ancestry across recovery segments.
+            let original = RecoverTarget::single_pair(*hashes.last().unwrap(), 2600);
+            let checkpoints = RecoveryCheckpoints::new(100);
+            let target = resolve_recovery_target(
+                checkpoints.resume(original.clone()),
+                fake_peer(),
+                &provider,
+                &headers,
+            )
+            .await
+            .unwrap();
+            assert_eq!(target.fcu_target_num, 1124);
+            let result = recover_ancestors(
+                fake_peer(),
+                target,
+                provider.clone(),
+                engine.clone(),
+                fce.clone(),
+                &fetcher,
+                &(),
+            )
+            .await;
+            checkpoints.finish(original.fcu_target_hash, result).unwrap();
+            assert_eq!(submissions.lock().unwrap().len(), 1025);
+            assert!(fcus.lock().unwrap().iter().all(|h| *h == canonical_hash));
+            // Keep the provider unchanged: Valid payloads need not become canonical
+            // or appear in the DB-backed provider at all.
+            assert_eq!(provider.best_block_number().unwrap(), 100);
+            assert!(provider.header(intermediate.hash_slow()).unwrap().is_none());
+            let target = resolve_recovery_target(
+                checkpoints.resume(original.clone()),
+                fake_peer(),
+                &provider,
+                &headers,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                target.fcu_target_num, 2600,
+                "validated losing segment must advance recovery"
+            );
+            let failed_fetcher = ScriptedFetcher::new(vec![Err("temporary disconnect".into())]);
+            let result = recover_ancestors(
+                fake_peer(),
+                target.clone(),
+                provider.clone(),
+                engine.clone(),
+                fce.clone(),
+                failed_fetcher.as_ref(),
+                &(),
+            )
+            .await;
+            assert!(checkpoints.finish(original.fcu_target_hash, result).is_err());
+            assert_eq!(
+                checkpoints.resume(original.clone()).validated_ancestor,
+                Some(intermediate),
+                "a network failure must retain previously validated progress",
+            );
+            checkpoints
+                .recover(fake_peer(), original.clone(), fce, &headers, &fetcher, &())
+                .await
+                .unwrap();
+            assert!(checkpoints.resume(original).validated_ancestor.is_none());
+            assert_eq!(*fcus.lock().unwrap().last().unwrap(), head.hash_slow());
+            assert_eq!(
+                submissions.lock().unwrap().iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+                (100..=2600).collect::<Vec<_>>(),
+                "continue after the validated checkpoint without replaying its segment",
+            );
+        }
+
+        /// Diagnostic regression: an Engine-VALID prefix can still lose Parlia forkchoice.
+        #[tokio::test]
+        async fn recovery_must_not_select_lower_td_prefix_after_cache_eviction() {
+            use alloy_primitives::U256;
+            let mut provider = FakeProvider::default();
+            let mut parent = B256::ZERO;
+            let mut ancestor = B256::ZERO;
+            // Canonical height 200 has TD 400; its height-100 ancestor has TD 200.
+            for number in 0..=200 {
+                let mut header = make_header(number, parent, 0x41);
+                header.difficulty = U256::from(if number == 0 { 0 } else { 2 });
+                parent = header.hash_slow();
+                if number == 100 {
+                    ancestor = parent;
+                }
+                provider.td_by_hash.insert(parent, U256::from(number * 2));
+                provider.insert_canonical(header);
+            }
+            let canonical_hash = parent;
+            parent = ancestor;
+            let mut branch = Vec::new();
+            for number in 101..=356 {
+                let mut header = make_header(number, parent, 0x42);
+                header.difficulty = U256::from(1);
+                parent = header.hash_slow();
+                branch.push(header);
+            }
+            let fetcher = ChainFetcher {
+                blocks: branch.iter().cloned().map(|h| (h.hash_slow(), make_block(h))).collect(),
+                ..Default::default()
+            };
+            let (engine, submissions, fcus) = recording_engine(provider.clone(), vec![]);
+            let fce = BscForkChoiceEngine::new(provider.clone(), engine.clone(), chain_spec());
+            recover_ancestors(
+                fake_peer(),
+                RecoverTarget::single_pair(parent, 356),
+                provider,
+                engine,
+                fce,
+                &fetcher,
+                &(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(submissions.lock().unwrap().len(), 256);
+            assert_eq!(*fcus.lock().unwrap().last().unwrap(), parent);
+            let losing_selections: Vec<_> = fcus
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|hash| {
+                    if *hash == canonical_hash {
+                        return None;
+                    }
+                    let header = &fetcher.blocks[hash].header;
+                    let td = 200 + (header.number - 100);
+                    (td <= 400).then_some((header.number, td))
+                })
+                .collect();
+            assert!(losing_selections.is_empty(),
+                "FCU selected losing prefixes (height, TD), canonical=(200,400): {losing_selections:?}");
+        }
+
+        #[tokio::test]
+        async fn recovery_progress_survives_losing_justified_segment() {
+            assert_losing_segment_progress(true).await;
+        }
+
+        #[tokio::test]
+        async fn recovery_progress_survives_losing_td_tie_segment() {
+            assert_losing_segment_progress(false).await;
+        }
+
+        #[tokio::test]
+        async fn recovery_checkpoint_completes_all_segments_without_more_announcements() {
+            let (provider, fetcher, heads) = scenario(100, 5000);
+            let headers = ScriptedHeaders::new(
+                [1124, 2148, 3172]
+                    .into_iter()
+                    .map(|number| {
+                        let hash = heads.iter().find(|(_, n)| *n == number).unwrap().0;
+                        Ok(vec![fetcher.blocks[&hash].header.clone()])
+                    })
+                    .collect(),
+            );
+            let original = RecoverTarget::single_pair(heads.last().unwrap().0, 5100);
+            let checkpoints = RecoveryCheckpoints::new(100);
+            let (engine, submissions, fcus) = recording_engine(provider.clone(), vec![]);
+            let fce = BscForkChoiceEngine::new(provider.clone(), engine, chain_spec());
+            checkpoints
+                .recover(fake_peer(), original.clone(), fce, &headers, fetcher.as_ref(), &())
+                .await
+                .unwrap();
+            assert_eq!(provider.best_block_number().unwrap(), 100);
+            assert_eq!(
+                submissions.lock().unwrap().iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+                (101..=5100).collect::<Vec<_>>(),
+            );
+            assert_eq!(*fcus.lock().unwrap().last().unwrap(), original.fcu_target_hash);
+            assert_eq!(
+                *headers.requests.lock().unwrap(),
+                [1124, 2148, 3172].map(|n| (fake_peer(), n)),
+            );
+            assert!(checkpoints.resume(original).validated_ancestor.is_none());
+        }
+
+        #[test]
+        fn recovery_checkpoints_are_bounded_isolated_and_monotonic() {
+            let checkpoints = RecoveryCheckpoints::new(2);
+            let first = RecoverTarget::single_pair(B256::repeat_byte(0x71), 5000);
+            let second = RecoverTarget::single_pair(B256::repeat_byte(0x72), 5000);
+            let third = RecoverTarget::single_pair(B256::repeat_byte(0x73), 5000);
+            let checkpoint = make_header(1124, B256::ZERO, 0x71);
+            checkpoints.finish(first.fcu_target_hash, Ok(checkpoint.clone())).unwrap();
+            assert!(checkpoints.resume(second.clone()).validated_ancestor.is_none());
+            let clone = checkpoints.clone();
+            assert_eq!(clone.resume(first.clone()).validated_ancestor, Some(checkpoint.clone()));
+            checkpoints
+                .finish(first.fcu_target_hash, Ok(make_header(1000, B256::ZERO, 0x71)))
+                .unwrap();
+            assert_eq!(clone.resume(first.clone()).validated_ancestor, Some(checkpoint.clone()));
+            checkpoints.finish(second.fcu_target_hash, Ok(checkpoint.clone())).unwrap();
+            checkpoints.finish(third.fcu_target_hash, Ok(checkpoint)).unwrap();
+            assert!(
+                checkpoints.resume(first).validated_ancestor.is_none(),
+                "old cursor is evicted"
+            );
+            assert!(checkpoints.resume(second).validated_ancestor.is_some());
+            assert!(checkpoints.resume(third).validated_ancestor.is_some());
+        }
+
+        #[tokio::test]
+        async fn recovery_checkpoint_bounds_the_next_segment_without_canonical_progress() {
+            let (provider, _, _) = scenario(100, 0);
+            let original = RecoverTarget::single_pair(B256::repeat_byte(0x74), 5000);
+            let checkpoints = RecoveryCheckpoints::new(100);
+            let checkpoint = make_header(1124, B256::ZERO, 0x74);
+            checkpoints.finish(original.fcu_target_hash, Ok(checkpoint.clone())).unwrap();
+            let next = make_header(2148, B256::ZERO, 0x74);
+            let headers = ScriptedHeaders::new(vec![Ok(vec![next.clone()])]);
+            let target = resolve_recovery_target(
+                checkpoints.resume(original),
+                fake_peer(),
+                &provider,
+                &headers,
+            )
+            .await
+            .unwrap();
+            assert_eq!(target.fcu_target_hash, next.hash_slow());
+            assert_eq!(target.fcu_target_num, 2148);
+            assert_eq!(target.validated_ancestor, Some(checkpoint));
+            assert_eq!(provider.best_block_number().unwrap(), 100);
+            assert_eq!(*headers.requests.lock().unwrap(), vec![(fake_peer(), 2148)]);
+        }
+
+        #[tokio::test]
+        async fn recovery_checkpoint_rejects_a_different_locally_known_ancestry_before_import() {
+            let (mut provider, _, _) = scenario(100, 0);
+            let checkpoint = make_header(1124, B256::ZERO, 0x75);
+            let unrelated = make_header(1124, B256::ZERO, 0x76);
+            provider.insert_side(unrelated.clone());
+            let (branch, hashes) = linear_chain(1125, 4, unrelated.hash_slow(), 0x76);
+            let fetcher = ChainFetcher {
+                blocks: branch.into_iter().map(|h| (h.hash_slow(), make_block(h))).collect(),
+                ..Default::default()
+            };
+            let original = RecoverTarget::single_pair(*hashes.last().unwrap(), 1128);
+            let checkpoints = RecoveryCheckpoints::new(100);
+            checkpoints.finish(original.fcu_target_hash, Ok(checkpoint.clone())).unwrap();
+            let target = resolve_recovery_target(
+                checkpoints.resume(original.clone()),
+                fake_peer(),
+                &provider,
+                &ScriptedHeaders::new(vec![]),
+            )
+            .await
+            .unwrap();
+            let (engine, submissions, fcus) = recording_engine(provider.clone(), vec![]);
+            let fce = BscForkChoiceEngine::new(provider.clone(), engine.clone(), chain_spec());
+            let result =
+                recover_ancestors(fake_peer(), target, provider, engine, fce, &fetcher, &()).await;
+            assert!(matches!(&result, Err(ForkRecoverError::RecoveryAncestryMismatch {
+                number: 1124, expected, got, ..
+            }) if *expected == checkpoint.hash_slow() && *got == unrelated.hash_slow()));
+            assert!(submissions.lock().unwrap().is_empty());
+            assert!(fcus.lock().unwrap().is_empty());
+            assert!(checkpoints.finish(original.fcu_target_hash, result).is_err());
+            assert!(checkpoints.resume(original).validated_ancestor.is_none());
+        }
+
+        #[tokio::test]
+        async fn recovery_checkpoint_rejects_malformed_range_links_and_oversized_responses() {
+            let (provider, _, _) = scenario(100, 0);
+            let checkpoint = make_header(1124, B256::ZERO, 0x77);
+            let (branch, hashes) = linear_chain(1125, 2, checkpoint.hash_slow(), 0x77);
+            let wrong_parent = make_header(1125, checkpoint.hash_slow(), 0x78);
+            let cases = [
+                vec![make_block(branch[1].clone()), make_block(wrong_parent)],
+                vec![make_block(branch[0].clone())], // Wrong first number/hash.
+                vec![make_block(branch[1].clone()); 3], // Requested only two.
+            ];
+            for response in cases {
+                let checkpoints = RecoveryCheckpoints::new(100);
+                let original = RecoverTarget::single_pair(hashes[1], 1126);
+                checkpoints.finish(original.fcu_target_hash, Ok(checkpoint.clone())).unwrap();
+                let target = checkpoints.resume(original);
+                let fetcher = ScriptedFetcher::new(vec![Ok(response)]);
+                let (engine, submissions, fcus) = recording_engine(provider.clone(), vec![]);
+                let fce = BscForkChoiceEngine::new(provider.clone(), engine.clone(), chain_spec());
+                let result = recover_ancestors(
+                    fake_peer(),
+                    target,
+                    provider.clone(),
+                    engine,
+                    fce,
+                    fetcher.as_ref(),
+                    &(),
+                )
+                .await;
+                assert!(result.is_err());
+                assert!(submissions.lock().unwrap().is_empty());
+                assert!(fcus.lock().unwrap().is_empty());
+            }
+        }
+
+        #[tokio::test]
+        async fn recovery_checkpoint_is_discarded_when_engine_forgets_the_ancestor() {
+            let (provider, _, _) = scenario(100, 0);
+            let checkpoint = make_header(1124, B256::ZERO, 0x79);
+            let head = make_header(1125, checkpoint.hash_slow(), 0x79);
+            let original = RecoverTarget::single_pair(head.hash_slow(), 1125);
+            let checkpoints = RecoveryCheckpoints::new(100);
+            checkpoints.finish(original.fcu_target_hash, Ok(checkpoint)).unwrap();
+            let fetcher = ScriptedFetcher::new(vec![Ok(vec![make_block(head)])]);
+            let (engine, submissions, _) = recording_engine(provider.clone(), vec![1125]);
+            let fce = BscForkChoiceEngine::new(provider.clone(), engine.clone(), chain_spec());
+            let result = recover_ancestors(
+                fake_peer(),
+                checkpoints.resume(original.clone()),
+                provider,
+                engine,
+                fce,
+                fetcher.as_ref(),
+                &(),
+            )
+            .await;
+            assert!(matches!(result, Err(ForkRecoverError::ImportHalted { committed: None, .. })));
+            assert_eq!(submissions.lock().unwrap().len(), 1);
+            assert!(checkpoints.finish(original.fcu_target_hash, result).is_err());
+            assert!(checkpoints.resume(original).validated_ancestor.is_none());
+        }
+
         /// Admission is what the service does synchronously at announcement
         /// time: acquire the gate, then spawn. Returns one entry per admitted
         /// head, holding its permit for the lifetime of the recovery.
@@ -1535,7 +2775,7 @@ mod tests {
         #[tokio::test]
         async fn overlapping_announcements_are_capped_at_capacity() {
             let (provider, fetcher, heads) = scenario(100, 12);
-            let (engine, submissions, _fcus) = recording_engine(vec![]);
+            let (engine, submissions, _fcus) = recording_engine(provider.clone(), vec![]);
             let fce = BscForkChoiceEngine::new(provider.clone(), engine.clone(), chain_spec());
             let gate = new_recovery_gate();
 
@@ -1600,7 +2840,7 @@ mod tests {
             const HEADS: usize = 10;
 
             let (provider, fetcher, heads) = scenario(1_000, DEPTH);
-            let (engine, submissions, _fcus) = recording_engine(vec![]);
+            let (engine, submissions, _fcus) = recording_engine(provider.clone(), vec![]);
             let fce = BscForkChoiceEngine::new(provider.clone(), engine.clone(), chain_spec());
             let gate = new_recovery_gate();
 
@@ -1644,7 +2884,7 @@ mod tests {
         #[tokio::test]
         async fn every_imported_block_gets_its_own_fcu() {
             let (provider, fetcher, heads) = scenario(100, 5);
-            let (engine, submissions, fcus) = recording_engine(vec![]);
+            let (engine, submissions, fcus) = recording_engine(provider.clone(), vec![]);
             let (head_hash, head_num) = heads[4];
 
             let fce = BscForkChoiceEngine::new(provider.clone(), engine.clone(), chain_spec());
@@ -1660,8 +2900,7 @@ mod tests {
             .await
             .unwrap();
 
-            let imported: Vec<u64> =
-                submissions.lock().unwrap().iter().map(|(n, _)| *n).collect();
+            let imported: Vec<u64> = submissions.lock().unwrap().iter().map(|(n, _)| *n).collect();
             assert_eq!(imported, vec![101, 102, 103, 104, 105], "the whole extension imports");
 
             let mut expected: Vec<B256> = heads.iter().map(|(h, _)| *h).collect();
@@ -1675,6 +2914,29 @@ mod tests {
             );
         }
 
+        #[tokio::test]
+        async fn accepted_ancestor_is_retried_before_descendants_and_forkchoice() {
+            let (provider, fetcher, heads) = scenario(100, 3);
+            let (engine, submissions, fcus) =
+                recording_engine_with_retry(provider.clone(), vec![], Some(102));
+            let (head_hash, head_num) = heads[2];
+            let fce = BscForkChoiceEngine::new(provider.clone(), engine.clone(), chain_spec());
+            recover_ancestors(
+                fake_peer(),
+                RecoverTarget::single_pair(head_hash, head_num),
+                provider,
+                engine,
+                fce,
+                fetcher.as_ref(),
+                &(),
+            )
+            .await
+            .unwrap();
+            let imported: Vec<_> = submissions.lock().unwrap().iter().map(|(n, _)| *n).collect();
+            assert_eq!(imported, vec![101, 102, 102, 103]);
+            assert_eq!(*fcus.lock().unwrap(), vec![heads[0].0, heads[1].0, head_hash, head_hash]);
+        }
+
         /// A `Syncing` part-way through Phase 2 used to abort the recovery and
         /// discard every block already imported, so the canonical tip never
         /// moved and the next attempt replayed the identical prefix (issue #456
@@ -1684,7 +2946,7 @@ mod tests {
         async fn halted_recovery_commits_partial_progress() {
             let (mut provider, fetcher, heads) = scenario(100, 10);
             // Block 105 comes back Syncing; 101-104 are imported Valid first.
-            let (engine, submissions, fcus) = recording_engine(vec![105]);
+            let (engine, submissions, fcus) = recording_engine(provider.clone(), vec![105]);
             let (head_hash, head_num) = heads[9];
 
             let fce = BscForkChoiceEngine::new(provider.clone(), engine.clone(), chain_spec());
@@ -1751,6 +3013,103 @@ mod tests {
                 "the retry resumes at 105 instead of replaying 101-104",
             );
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_bsc_hops_depth_timeout_and_attempt_limit_control_real_requests() {
+        let spec =
+            Arc::new(crate::chainspec::BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet()));
+        let config = BlockSyncArgs {
+            recovery_hop_count: 2,
+            max_depth: 3,
+            near_head_distance: 1,
+            recovery_timeout: Duration::from_millis(25),
+            recovery_peer_attempts: 2,
+            ..Default::default()
+        }
+        .into_config()
+        .unwrap();
+        let fetcher = BscRangeFetcher(spec.clone(), config);
+        let (headers, hashes) = linear_chain(0, 4, B256::ZERO, 0xA9);
+        let blocks = headers.into_iter().map(make_block).collect::<Vec<_>>();
+        let first = PeerId::random();
+        let second = PeerId::random();
+        let (first_tx, mut first_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (second_tx, mut second_rx) = tokio::sync::mpsc::unbounded_channel();
+        crate::node::network::bsc_protocol::registry::register_peer(first, first_tx, 2);
+        crate::node::network::bsc_protocol::registry::register_peer(second, second_tx, 2);
+        crate::node::network::bsc_protocol::registry::record_announcer(hashes[3], second);
+        let provider = FakeProvider::default();
+        let discovery = discover_fork_blocks(first, hashes[3], 3, &provider, &fetcher, &());
+        tokio::pin!(discovery);
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        assert!(discovery.as_mut().poll(&mut cx).is_pending());
+        let crate::node::network::bsc_protocol::stream::BscCommand::GetBlocksByRange(
+            request,
+            stalled,
+        ) = first_rx.try_recv().unwrap()
+        else {
+            panic!("first range expected")
+        };
+        assert_eq!(request.count, 2);
+        tokio::time::advance(Duration::from_millis(24)).await;
+        assert!(discovery.as_mut().poll(&mut cx).is_pending());
+        assert!(second_rx.try_recv().is_err());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(discovery.as_mut().poll(&mut cx).is_pending());
+        assert!(stalled.is_closed());
+        let crate::node::network::bsc_protocol::stream::BscCommand::GetBlocksByRange(
+            request,
+            response,
+        ) = second_rx.try_recv().unwrap()
+        else {
+            panic!("configured failover expected")
+        };
+        response
+            .send(Ok(crate::node::network::blocks_by_range::BlocksByRangePacket {
+                request_id: request.request_id,
+                blocks: vec![blocks[3].clone(), blocks[2].clone()],
+            }))
+            .unwrap();
+        assert!(discovery.as_mut().poll(&mut cx).is_pending());
+        let crate::node::network::bsc_protocol::stream::BscCommand::GetBlocksByRange(
+            request,
+            response,
+        ) = first_rx.try_recv().unwrap()
+        else {
+            panic!("second ancestor hop expected")
+        };
+        assert_eq!((request.start_block_height, request.count), (1, 1));
+        response
+            .send(Ok(crate::node::network::blocks_by_range::BlocksByRangePacket {
+                request_id: request.request_id,
+                blocks: vec![blocks[1].clone()],
+            }))
+            .unwrap();
+        let error = discovery.await.unwrap_err();
+        assert!(matches!(error, ForkRecoverError::ForkTooDeep { max_depth: 3 }));
+        assert_eq!(error.to_string(), "no common ancestor found within max_depth=3 blocks");
+
+        let config = BlockSyncArgs {
+            recovery_peer_attempts: 1,
+            recovery_timeout: Duration::from_millis(25),
+            ..Default::default()
+        }
+        .into_config()
+        .unwrap();
+        let fetcher = BscRangeFetcher(spec, config);
+        let request = fetcher.fetch(first, 3, hashes[3], 2);
+        tokio::pin!(request);
+        assert!(request.as_mut().poll(&mut cx).is_pending());
+        let crate::node::network::bsc_protocol::stream::BscCommand::GetBlocksByRange(_, response) =
+            first_rx.try_recv().unwrap()
+        else {
+            panic!("single attempt expected")
+        };
+        tokio::time::advance(Duration::from_millis(25)).await;
+        assert_eq!(request.await.unwrap_err(), "request timed out");
+        assert!(response.is_closed());
+        assert!(second_rx.try_recv().is_err(), "one configured attempt must not query second peer");
     }
 }
 

@@ -182,6 +182,13 @@ This client implements the BSC upgrade-status handshake extension. When EVN is e
 
 Note: This currently affects the outgoing handshake signaling. Further EVN behaviors (e.g., peer whitelists, conditional broadcast policies) can be added incrementally.
 
+For validators fed by fullnodes in a controlled topology,
+`--bsc.disable-proactive-tx-broadcast` suppresses outgoing transaction bodies and
+hash announcements to all peers while preserving transaction ingress, fetching,
+and explicit request responses under the existing policies. This is independent
+of EVN handshake signaling and is disabled by default. See
+[Validator transaction broadcast control](docs/validator-transaction-broadcast.md).
+
 ## Storage migration (v1 → v2)
 
 Existing nodes on the legacy v1 storage layout can upgrade to the v2 layout

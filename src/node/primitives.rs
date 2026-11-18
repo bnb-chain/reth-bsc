@@ -59,9 +59,8 @@ mod hex_quantity {
 
     pub(super) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
         let s = String::deserialize(deserializer)?;
-        let digits = s
-            .strip_prefix("0x")
-            .ok_or_else(|| D::Error::custom("hex string without 0x prefix"))?;
+        let digits =
+            s.strip_prefix("0x").ok_or_else(|| D::Error::custom("hex string without 0x prefix"))?;
         u64::from_str_radix(digits, 16).map_err(D::Error::custom)
     }
 }
@@ -127,8 +126,8 @@ fn hex_decode_fixed<const N: usize, E: serde::de::Error>(
     let mut out = Vec::with_capacity(hexes.len());
     for h in hexes {
         let s = h.strip_prefix("0x").unwrap_or(&h);
-        let bytes = alloy_primitives::hex::decode(s)
-            .map_err(|e| E::custom(format!("invalid hex: {e}")))?;
+        let bytes =
+            alloy_primitives::hex::decode(s).map_err(|e| E::custom(format!("invalid hex: {e}")))?;
         if bytes.len() != N {
             return Err(E::custom(format!("expected {N} bytes, got {}", bytes.len())));
         }
@@ -162,14 +161,14 @@ impl Encodable for BscBlobTransactionSidecar {
     fn encode(&self, out: &mut dyn bytes::BufMut) {
         // Inner BlobTxSidecar encoded as a nested sub-list: [blobs, commitments, proofs]
         let inner_fields_len = self.inner.rlp_encoded_fields_length();
-        let inner_header =
-            alloy_rlp::Header { list: true, payload_length: inner_fields_len };
+        let inner_header = alloy_rlp::Header { list: true, payload_length: inner_fields_len };
 
-        let payload_len = inner_header.length() + inner_fields_len
-            + self.block_number.length()
-            + self.block_hash.length()
-            + self.tx_index.length()
-            + self.tx_hash.length();
+        let payload_len = inner_header.length() +
+            inner_fields_len +
+            self.block_number.length() +
+            self.block_hash.length() +
+            self.tx_index.length() +
+            self.tx_hash.length();
         alloy_rlp::Header { list: true, payload_length: payload_len }.encode(out);
         inner_header.encode(out);
         self.inner.rlp_encode_fields(out);
@@ -181,14 +180,14 @@ impl Encodable for BscBlobTransactionSidecar {
 
     fn length(&self) -> usize {
         let inner_fields_len = self.inner.rlp_encoded_fields_length();
-        let inner_header =
-            alloy_rlp::Header { list: true, payload_length: inner_fields_len };
+        let inner_header = alloy_rlp::Header { list: true, payload_length: inner_fields_len };
 
-        let payload_len = inner_header.length() + inner_fields_len
-            + self.block_number.length()
-            + self.block_hash.length()
-            + self.tx_index.length()
-            + self.tx_hash.length();
+        let payload_len = inner_header.length() +
+            inner_fields_len +
+            self.block_number.length() +
+            self.block_hash.length() +
+            self.tx_index.length() +
+            self.tx_hash.length();
         alloy_rlp::Header { list: true, payload_length: payload_len }.length() + payload_len
     }
 }
@@ -286,6 +285,23 @@ impl BlockBodyTrait for BscBlockBody {
 pub struct BscBlock {
     pub header: Header,
     pub body: BscBlockBody,
+}
+
+impl BscBlock {
+    /// Canonical block RLP size, matching go-bsc's `Block.Size()`.
+    ///
+    /// Blob sidecars are part of BSC's network encoding, but are excluded from the
+    /// Osaka block-size limit. Preserve the body's optional withdrawals exactly.
+    pub(crate) fn canonical_rlp_length(header: &Header, body: &BscBlockBody) -> usize {
+        rlp::BlockHelper {
+            header: Cow::Borrowed(header),
+            transactions: Cow::Borrowed(&body.inner.transactions),
+            ommers: Cow::Borrowed(&body.inner.ommers),
+            withdrawals: body.inner.withdrawals.as_ref().map(Cow::Borrowed),
+            sidecars: None,
+        }
+        .length()
+    }
 }
 
 impl InMemorySize for BscBlock {
@@ -453,7 +469,6 @@ mod rlp {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,11 +481,7 @@ mod tests {
 
     fn create_test_body_no_withdrawals() -> BscBlockBody {
         BscBlockBody {
-            inner: BlockBody {
-                transactions: vec![],
-                ommers: vec![],
-                withdrawals: None,
-            },
+            inner: BlockBody { transactions: vec![], ommers: vec![], withdrawals: None },
             sidecars: None,
         }
     }
@@ -501,6 +512,80 @@ mod tests {
             },
             sidecars: None,
         }
+    }
+
+    // Serialization-only fixture: blob proof validity is not relevant to RLP sizing.
+    fn size_test_sidecar() -> BscBlobTransactionSidecar {
+        BscBlobTransactionSidecar {
+            inner: BlobTransactionSidecar {
+                blobs: vec![alloy_eips::eip4844::Blob::default()],
+                commitments: vec![alloy_eips::eip4844::Bytes48::default()],
+                proofs: vec![alloy_eips::eip4844::Bytes48::default()],
+            },
+            block_number: 1,
+            block_hash: B256::ZERO,
+            tx_index: 0,
+            tx_hash: B256::ZERO,
+            version: 0,
+        }
+    }
+
+    #[test]
+    fn canonical_rlp_length_matches_go_bsc_with_or_without_sidecars() {
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            name: String,
+            size: usize,
+            rlp: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Fixtures {
+            cases: Vec<Fixture>,
+        }
+
+        // Generated with go-bsc Block.Size() and EncodeToBytes(Block). Covers legacy
+        // and typed transactions plus absent, empty, and non-empty withdrawals.
+        let fixtures: Fixtures =
+            serde_json::from_str(include_str!("testdata/canonical_block_sizes.json")).unwrap();
+        for fixture in fixtures.cases {
+            let encoded = alloy_primitives::hex::decode(&fixture.rlp).unwrap();
+            let mut remaining = encoded.as_slice();
+            let mut block = BscBlock::decode(&mut remaining).unwrap();
+            assert!(remaining.is_empty());
+            assert_eq!(encoded.len(), fixture.size, "{}", fixture.name);
+
+            for sidecars in [None, Some(Vec::new()), Some(vec![size_test_sidecar()])] {
+                block.body.sidecars = sidecars;
+                assert_eq!(
+                    BscBlock::canonical_rlp_length(&block.header, &block.body),
+                    fixture.size,
+                    "canonical size must match go-bsc regardless of sidecars: {}",
+                    fixture.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_rlp_length_preserves_network_sidecars() {
+        let block = BscBlock {
+            header: create_test_header(),
+            body: BscBlockBody {
+                sidecars: Some(vec![size_test_sidecar()]),
+                ..create_test_body_empty_withdrawals()
+            },
+        };
+        let canonical_size = BscBlock::canonical_rlp_length(&block.header, &block.body);
+        let mut encoded = Vec::new();
+        block.encode(&mut encoded);
+
+        assert!(encoded.len() > canonical_size);
+        assert_eq!(encoded.len(), BscBlock::rlp_length(&block.header, &block.body));
+        let mut remaining = encoded.as_slice();
+        let decoded = BscBlock::decode(&mut remaining).unwrap();
+        assert!(remaining.is_empty());
+        assert_eq!(decoded, block, "network encoding must retain the complete sidecar");
+        assert_eq!(BscBlock::canonical_rlp_length(&decoded.header, &decoded.body), canonical_size);
     }
 
     #[test]
@@ -608,7 +693,7 @@ mod tests {
             inner: BlockBody {
                 transactions: vec![],
                 ommers: vec![],
-                withdrawals: None,  // <-- None, but sidecars present
+                withdrawals: None, // <-- None, but sidecars present
             },
             sidecars: Some(Vec::new()),
         };
@@ -621,10 +706,7 @@ mod tests {
             .expect("Failed to decode body with backfilled withdrawals");
 
         // The decoded body should have withdrawals = Some(empty), not None
-        assert!(
-            decoded.inner.withdrawals.is_some(),
-            "withdrawals should be Some after backfill"
-        );
+        assert!(decoded.inner.withdrawals.is_some(), "withdrawals should be Some after backfill");
         assert!(
             decoded.inner.withdrawals.as_ref().unwrap().is_empty(),
             "withdrawals should be empty"
@@ -652,11 +734,7 @@ mod tests {
         let block = BscBlock {
             header: Header::default(),
             body: BscBlockBody {
-                inner: BlockBody {
-                    transactions: vec![],
-                    ommers: vec![],
-                    withdrawals: None,
-                },
+                inner: BlockBody { transactions: vec![], ommers: vec![], withdrawals: None },
                 sidecars: Some(Vec::new()),
             },
         };
@@ -680,11 +758,7 @@ mod tests {
         use alloy_rlp::{Decodable, Encodable};
 
         let body = BscBlockBody {
-            inner: BlockBody {
-                transactions: vec![],
-                ommers: vec![],
-                withdrawals: None,
-            },
+            inner: BlockBody { transactions: vec![], ommers: vec![], withdrawals: None },
             sidecars: None,
         };
 
@@ -767,10 +841,7 @@ mod tests {
 
         // Inside the nested BlobTxSidecar list, first sub-element should also be a list (blobs)
         let blobs_hdr = alloy_rlp::Header::decode(&mut cursor).unwrap();
-        assert!(
-            blobs_hdr.list,
-            "blobs field inside BlobTxSidecar must be a list of Blob items"
-        );
+        assert!(blobs_hdr.list, "blobs field inside BlobTxSidecar must be a list of Blob items");
 
         // Roundtrip
         let decoded = BscBlobTransactionSidecar::decode(&mut buf.as_slice())
@@ -778,11 +849,7 @@ mod tests {
         assert_eq!(sidecar, decoded, "sidecar should roundtrip through RLP");
 
         // Verify length() matches actual encoded size
-        assert_eq!(
-            sidecar.length(),
-            buf.len(),
-            "length() must match actual encoded size"
-        );
+        assert_eq!(sidecar.length(), buf.len(), "length() must match actual encoded size");
     }
 
     fn sample_sidecar() -> BscBlobTransactionSidecar {

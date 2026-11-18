@@ -9,8 +9,9 @@ use lru::LruCache;
 use once_cell::sync::Lazy;
 use std::{num::NonZero, sync::RwLock};
 
-use crate::consensus::parlia::util::calculate_millisecond_timestamp;
-use crate::metrics::BscChainDelayMetrics;
+use crate::{
+    consensus::parlia::util::calculate_millisecond_timestamp, metrics::BscChainDelayMetrics,
+};
 
 /// Size of the block stats LRU cache.
 const BLOCK_STATS_CACHE_SIZE: usize = 64;

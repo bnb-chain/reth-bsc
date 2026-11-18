@@ -1,4 +1,8 @@
 #![allow(unused)]
+pub(crate) mod metrics;
+pub(crate) mod pipeline_targets;
+pub(crate) mod propagation;
+pub(crate) mod publication;
 use handle::ImportHandle;
 use reth_engine_primitives::EngineTypes;
 use reth_eth_wire_types::DisconnectReason;
@@ -15,20 +19,35 @@ use std::{
 
 use crate::node::network::BscNewBlock;
 
+pub mod config;
 pub(crate) mod fork_recover;
+pub(crate) mod future_payload;
 pub mod handle;
+pub(crate) mod head_fetch;
+mod header_validation;
 pub mod service;
 
 const MAX_NEW_BLOCK_HASHES: usize = 1024;
+/// Bound remote ingress and propagation independently of Engine throughput.
+/// Each of the block, hashes and propagation queues has 128 message slots. For example,
+/// the 129th hashes message is dropped if none have been consumed; a message may contain
+/// up to MAX_NEW_BLOCK_HASHES hashes. Remote traffic never borrows local queue capacity.
+pub(crate) const IMPORT_QUEUE_CAPACITY: usize = 128;
 
 #[derive(Debug)]
 pub struct BscBlockImport {
     handle: ImportHandle,
+    publication: Option<publication::Publication>,
 }
 
 impl BscBlockImport {
     pub fn new(handle: ImportHandle) -> Self {
-        Self { handle }
+        Self { handle, publication: None }
+    }
+
+    pub(crate) fn with_publication(mut self, publication: publication::Publication) -> Self {
+        self.publication = Some(publication);
+        self
     }
 }
 
@@ -58,10 +77,15 @@ impl BlockImport<BscNewBlock> for BscBlockImport {
     }
 
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<ImportEvent> {
-        match ready!(self.handle.poll_outcome(cx)) {
-            Some(outcome) => Poll::Ready(outcome),
-            None => Poll::Pending,
+        for _ in 0..32 {
+            let Some(outcome) = ready!(self.handle.poll_outcome(cx)) else { return Poll::Pending };
+            let Some(publication) = &self.publication else { return Poll::Ready(outcome) };
+            if let Some(outcome) = publication.filter_event(outcome) {
+                return Poll::Ready(outcome);
+            }
         }
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 }
 
@@ -71,13 +95,44 @@ mod tests {
     use alloy_primitives::{B256, U256};
     use reth_eth_wire::BlockHashNumber;
     use reth_eth_wire_types::broadcast::NewBlockHashes;
-    use tokio::sync::mpsc::{error::TryRecvError, unbounded_channel};
+    use tokio::sync::mpsc::{channel, error::TryRecvError};
+
+    #[test]
+    fn full_hash_queue_rejects_without_blocking_and_accepts_after_drain() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let snapshot = recorder.handle();
+        ::metrics::with_local_recorder(&recorder, || {
+            let (blocks, _) = channel(IMPORT_QUEUE_CAPACITY);
+            let (hashes, mut rx) = channel(IMPORT_QUEUE_CAPACITY);
+            let (_, events) = propagation::channel();
+            let handle = ImportHandle::new(blocks, hashes, events);
+            let peer = PeerId::default();
+            for _ in 0..IMPORT_QUEUE_CAPACITY {
+                handle.send_hashes(NewBlockHashes::default(), peer).unwrap();
+            }
+            for _ in 0..10 {
+                assert!(handle.send_hashes(NewBlockHashes::default(), peer).is_err());
+            }
+            rx.try_recv().unwrap();
+            handle.send_hashes(NewBlockHashes::default(), peer).unwrap();
+            assert_eq!(rx.len(), IMPORT_QUEUE_CAPACITY);
+            assert!(snapshot
+                .render()
+                .contains("bsc_block_import_queue_used{queue=\"remote_hashes\"} 128"));
+            drop(rx);
+            assert!(handle.send_hashes(NewBlockHashes::default(), peer).is_err());
+            // Every full rejection counts even when WARNs are throttled. Closure is distinct.
+            assert!(snapshot
+                .render()
+                .contains("bsc_block_import_queue_full_total{queue=\"remote_hashes\"} 10"));
+        });
+    }
 
     #[test]
     fn block_hash_announcement_limit() {
-        let (to_import, _blocks) = unbounded_channel();
-        let (to_hashes, mut hashes_rx) = unbounded_channel();
-        let (_outcomes, import_outcome) = unbounded_channel();
+        let (to_import, _blocks) = channel(IMPORT_QUEUE_CAPACITY);
+        let (to_hashes, mut hashes_rx) = channel(IMPORT_QUEUE_CAPACITY);
+        let (_outcomes, import_outcome) = propagation::channel();
         let mut importer =
             BscBlockImport::new(ImportHandle::new(to_import, to_hashes, import_outcome));
         let peer = PeerId::default();

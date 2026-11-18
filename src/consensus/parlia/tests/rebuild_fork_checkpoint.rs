@@ -1,19 +1,26 @@
 //! Regression: the epoch checkpoint must be reached by parent_hash, not by number - the
 //! by-number header cache can hold a rejected sibling (geth parlia `FindAncientHeader`).
 
-use super::super::{
-    provider::{EnhancedDbSnapshotProvider, SnapshotProvider},
-    snapshot::Snapshot,
+use super::{
+    super::{
+        provider::{EnhancedDbSnapshotProvider, SnapshotProvider},
+        snapshot::Snapshot,
+    },
+    snapshot_persistence::TestCleanup,
 };
-use super::snapshot_persistence::TestCleanup;
-use crate::chainspec::{bsc_testnet, BscChainSpec};
-use crate::consensus::parlia::constants::{EXTRA_SEAL_LEN, EXTRA_VANITY_LEN};
-use crate::hardforks::BscHardforks;
-use crate::node::evm::util::insert_header_to_cache_with_hash;
+use crate::{
+    chainspec::{bsc_testnet, BscChainSpec},
+    consensus::parlia::constants::{EXTRA_SEAL_LEN, EXTRA_VANITY_LEN},
+    hardforks::BscHardforks,
+    node::evm::util::insert_header_to_cache_with_hash,
+};
 use alloy_consensus::Header;
 use alloy_primitives::{Address, B256};
 use reth_db::{
-    init_db, mdbx::DatabaseArguments, tables::{HeaderNumbers, Headers}, transaction::{DbTx, DbTxMut},
+    init_db,
+    mdbx::DatabaseArguments,
+    tables::{HeaderNumbers, Headers},
+    transaction::{DbTx, DbTxMut},
     Database,
 };
 use std::sync::Arc;
@@ -94,8 +101,11 @@ fn db_fallback_rejects_a_header_that_is_not_the_requested_hash() -> eyre::Result
     std::fs::create_dir_all(&db_path)?;
     let _cleanup = TestCleanup { path: db_path.clone() };
     let db = Arc::new(init_db(&db_path, DatabaseArguments::new(Default::default()))?);
-    let provider =
-        EnhancedDbSnapshotProvider::new(db.clone(), 256, Arc::new(BscChainSpec::from(bsc_testnet())));
+    let provider = EnhancedDbSnapshotProvider::new(
+        db.clone(),
+        256,
+        Arc::new(BscChainSpec::from(bsc_testnet())),
+    );
 
     // Seeds distinct from the test above: the header cache is process-global with no reset, so
     // every hash built here must be one no other test inserted.

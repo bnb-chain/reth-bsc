@@ -1,5 +1,5 @@
 use crate::hardforks::bsc::BscHardfork;
-use alloy_primitives::{BlockHash, U256, B256};
+use alloy_primitives::{BlockHash, B256, U256};
 use reth_chainspec::{
     make_genesis_header, BaseFeeParams, BaseFeeParamsKind, Chain, ChainSpec, Head,
 };
@@ -33,12 +33,12 @@ pub fn bsc_qanet() -> ChainSpec {
 
 // Dummy Head for BSC Qanet
 pub fn head() -> Head {
-    Head { 
-        number: 1376256, 
+    Head {
+        number: 1376256,
         hash: B256::from_str("0xd4d2ad3ff55bb663c0fcde91b99e5da1dad4aeb03b1605693650b2f2b0f2d88b")
             .unwrap(),
         difficulty: U256::from(2),
         total_difficulty: U256::from(2746312),
-        timestamp: 1756074108, 
+        timestamp: 1756074108,
     }
 }

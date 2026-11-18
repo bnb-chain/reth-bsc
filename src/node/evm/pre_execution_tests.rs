@@ -2,9 +2,30 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::consensus::parlia::vote::VoteAddress;
-    use crate::node::evm::pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE};
+    use crate::{
+        consensus::parlia::{
+            header_verifier::validate_attestation_source_target_order, vote::VoteAddress,
+        },
+        node::evm::pre_execution::{TURN_LENGTH_CACHE, VALIDATOR_CACHE},
+    };
     use alloy_primitives::{Address, B256};
+
+    #[test]
+    fn attestation_source_must_be_lower_than_target() {
+        use crate::node::evm::error::BscBlockValidationError;
+
+        assert!(validate_attestation_source_target_order(99, 100).is_ok());
+
+        for (source, target) in [(99, 99), (99, 98)] {
+            let error = validate_attestation_source_target_order(source, target)
+                .expect_err("equal or reversed source/target must be rejected");
+            assert!(matches!(error, BscBlockValidationError::InvalidAttestationSourceTargetOrder));
+            assert_eq!(
+                error.to_string(),
+                "invalid attestation, SourceNumber not lower than TargetNumber"
+            );
+        }
+    }
 
     /// Multi-block `eth_simulateV1` parent resolution (regression for bnb-chain/reth#194).
     /// A simulated block must be resolvable by hash for the next block's parent lookup,
@@ -452,23 +473,27 @@ mod tests {
 /// Helper-level regression tests for parent-vs-current validator reads.
 #[cfg(test)]
 mod parent_block_env {
-    use crate::chainspec::{bsc::bsc_mainnet, BscChainSpec};
-    use crate::consensus::parlia::snapshot::MAXWELL_EPOCH_LENGTH;
-    use crate::evm::api::BscEvm;
-    use crate::node::evm::config::{
-        evm_env_for_header, BscBlockExecutionCtx, BscExecutionMode, BscExecutionSharedCtx,
+    use crate::{
+        chainspec::{bsc::bsc_mainnet, BscChainSpec},
+        consensus::parlia::snapshot::MAXWELL_EPOCH_LENGTH,
+        evm::api::BscEvm,
+        node::evm::{
+            config::{
+                evm_env_for_header, BscBlockExecutionCtx, BscExecutionMode, BscExecutionSharedCtx,
+            },
+            executor::BscBlockExecutor,
+            pre_execution::{CallBlockEnv, VALIDATOR_CACHE},
+        },
+        system_contracts::{SystemContract, VALIDATOR_CONTRACT},
     };
-    use crate::node::evm::executor::BscBlockExecutor;
-    use crate::node::evm::pre_execution::{CallBlockEnv, VALIDATOR_CACHE};
-    use crate::system_contracts::{SystemContract, VALIDATOR_CONTRACT};
     use alloy_consensus::Header;
     use alloy_evm::eth::EthBlockExecutionCtx;
     use alloy_primitives::{hex, Address, Bytes, U160};
+    use reth_ethereum_primitives::Transaction;
     use reth_evm_ethereum::RethReceiptBuilder;
-    use revm::bytecode::Bytecode;
-    use revm::database::InMemoryDB;
-    use revm::inspector::NoOpInspector;
-    use revm::state::AccountInfo;
+    use revm::{
+        bytecode::Bytecode, database::InMemoryDB, inspector::NoOpInspector, state::AccountInfo,
+    };
     use std::sync::Arc;
 
     /// Hard-coded interval used by the mock validator contract below.
@@ -526,8 +551,7 @@ mod parent_block_env {
         use crate::node::evm::pre_execution::validators_at_parent;
         use alloy_primitives::{B256, U256};
         use reth_primitives_traits::{Account, Bytecode as PrimitivesBytecode, SealedHeader};
-        use reth_provider::ProviderResult;
-        use reth_revm::database::EvmStateProvider;
+        use reth_provider::{EvmStateProvider, ProviderResult};
 
         /// Serves [`WINDOW_REPORTING_VALIDATOR_SET`] as the code of `VALIDATOR_CONTRACT`, or an
         /// empty state when `code` is `None` — i.e. the contract not deployed.
@@ -580,11 +604,7 @@ mod parent_block_env {
 
             let (set, _) = validators_at_parent(parent_state(), spec, &parent).unwrap();
 
-            assert_eq!(
-                set,
-                vec![window_address(EPOCH_BLOCK - 1)],
-                "must draw from the parent env"
-            );
+            assert_eq!(set, vec![window_address(EPOCH_BLOCK - 1)], "must draw from the parent env");
         }
 
         /// A call to an address with no code succeeds with empty returndata, which the ABI unpack
@@ -598,7 +618,6 @@ mod parent_block_env {
             let err = validators_at_parent(ParentState { code: None }, spec, &parent).unwrap_err();
             assert!(err.to_string().contains("no data"), "unexpected error: {err}");
         }
-
     }
 
     type TestExecutor = BscBlockExecutor<
@@ -652,6 +671,8 @@ mod parent_block_env {
             state_root_precomputed_sink: None,
             trie_handle: None,
             state_root_deadline_ms: None,
+            build_control: None,
+            finish_diagnostics: None,
         };
 
         let mut executor = BscBlockExecutor::new(
@@ -679,8 +700,8 @@ mod parent_block_env {
             state::LaneState,
             Budget, PAYMENT_LANE_CONTRACT,
         };
-        use alloy_primitives::{B256, U256};
         use alloy_evm::Evm as _;
+        use alloy_primitives::{B256, U256};
         use revm::state::{Account, EvmState, EvmStorageSlot};
 
         let code = Bytecode::new_raw(Bytes::from_static(&[0x00]));
@@ -711,7 +732,13 @@ mod parent_block_env {
 
         assert!(inherits(0x11, vec![touched(Address::repeat_byte(0xaa))]), "an unrelated account");
         assert!(
-            inherits(0x22, vec![shape(deployed.clone(), Some(EvmStorageSlot::new(U256::ZERO, 0)))]),
+            inherits(
+                0x22,
+                vec![shape(
+                    deployed.clone(),
+                    Some(EvmStorageSlot::new(U256::ZERO, revm::state::TransactionId::ZERO))
+                )]
+            ),
             "a getter transaction: touched, slots read but unchanged"
         );
         assert!(
@@ -720,9 +747,16 @@ mod parent_block_env {
                 vec![
                     shape(
                         deployed.clone(),
-                        Some(EvmStorageSlot::new_changed(U256::ZERO, U256::from(1), 0)),
+                        Some(EvmStorageSlot::new_changed(
+                            U256::ZERO,
+                            U256::from(1),
+                            revm::state::TransactionId::ZERO
+                        )),
                     ),
-                    shape(deployed, Some(EvmStorageSlot::new(U256::from(1), 0))),
+                    shape(
+                        deployed,
+                        Some(EvmStorageSlot::new(U256::from(1), revm::state::TransactionId::ZERO))
+                    ),
                 ]
             ),
             "a getter after a governance write must not restore inheritance"
@@ -782,8 +816,10 @@ mod parent_block_env {
 
     #[test]
     fn a_pool_transaction_may_not_eat_the_idle_payment_lane() {
-        use crate::consensus::payment_lane::{meta::LaneMeta, state::LaneState, Budget};
-        use crate::node::evm::LaneAdmission;
+        use crate::{
+            consensus::payment_lane::{meta::LaneMeta, state::LaneState, Budget},
+            node::evm::LaneAdmission,
+        };
         use alloy_consensus::TxLegacy;
         use alloy_primitives::{Signature, TxKind, U256};
         use reth_ethereum_primitives::TransactionSigned;
@@ -894,5 +930,196 @@ mod parent_block_env {
             .get_current_validators(EPOCH_BLOCK - 1, CallBlockEnv::Parent)
             .expect_err("must not silently fall back to the current env");
         assert!(err.to_string().contains("parent header"), "unexpected error: {err}");
+    }
+
+    /// A geth validator may seal `[coinbase 0-gas tx -> StakeCredit, deposit]`: go-bsc runs the
+    /// first as a normal tx, since StakeCredit is not in its system-tx whitelist. Import must
+    /// do the same, or the injected tx takes the head of the system-tx queue and the deposit
+    /// fails to match it.
+    #[test]
+    fn coinbase_zero_gas_tx_to_stake_credit_executes_inline() {
+        use crate::{node::evm::util::set_nonce, system_contracts::STAKE_CREDIT_CONTRACT};
+        use alloy_consensus::TxLegacy;
+        use alloy_evm::block::BlockExecutor;
+        use alloy_primitives::{Signature, TxKind};
+        use reth_ethereum_primitives::{Transaction, TransactionSigned};
+        use reth_primitives_traits::Recovered;
+
+        let mut executor = executor();
+        let coinbase = header_at(EPOCH_BLOCK).beneficiary;
+        let signed = |tx: Transaction| {
+            let tx = TransactionSigned::new_unhashed(
+                tx,
+                Signature::new(Default::default(), Default::default(), false),
+            );
+            Recovered::new_unchecked(tx, coinbase)
+        };
+
+        let injected = signed(Transaction::Legacy(TxLegacy {
+            chain_id: Some(56),
+            nonce: 0,
+            gas_price: 0,
+            gas_limit: 21_000,
+            to: TxKind::Call(STAKE_CREDIT_CONTRACT),
+            ..Default::default()
+        }));
+        let deposit_call = executor.system_contracts.distribute_to_validator(coinbase, 0);
+        let deposit = signed(set_nonce(deposit_call.clone(), 1));
+
+        executor.execute_transaction(&injected).expect("the injected tx executes");
+        executor.execute_transaction(&deposit).expect("the deposit is queued");
+
+        let (receipts, gas_used, queued) =
+            (executor.receipts().len(), executor.gas_used, executor.system_txs.len());
+
+        executor
+            .transact_system_tx(deposit_call, coinbase)
+            .expect("the deposit matches the head of the system-tx queue");
+        assert_eq!(receipts, 1, "the injected tx must get a receipt inline");
+        assert_eq!(gas_used, 21_000);
+        assert_eq!(queued, 1, "only the deposit is a system tx");
+    }
+
+    /// Queues `block_tx(deposit)` as the block's system tx, then matches the deposit against it.
+    fn match_deposit_against(
+        block_tx: impl FnOnce(Transaction) -> Transaction,
+    ) -> Result<(), reth_evm::execute::BlockExecutionError> {
+        use alloy_evm::block::BlockExecutor;
+        use alloy_primitives::Signature;
+        use reth_ethereum_primitives::TransactionSigned;
+        use reth_primitives_traits::Recovered;
+
+        let mut executor = executor();
+        let coinbase = header_at(EPOCH_BLOCK).beneficiary;
+        let deposit_call = executor.system_contracts.distribute_to_validator(coinbase, 0);
+        let tx = TransactionSigned::new_unhashed(
+            block_tx(deposit_call.clone()),
+            Signature::new(Default::default(), Default::default(), false),
+        );
+        executor
+            .execute_transaction(&Recovered::new_unchecked(tx, coinbase))
+            .expect("the block tx is queued");
+        assert_eq!(executor.system_txs.len(), 1, "the block tx must be queued as a system tx");
+
+        executor.transact_system_tx(deposit_call, coinbase)
+    }
+
+    /// go-bsc matches system txs by `p.signer.Hash`, which hashes a legacy tx with the configured
+    /// chain id even when it is unprotected, so a validator may seal the deposit pre-EIP-155.
+    #[test]
+    fn unprotected_legacy_system_tx_matches_its_eip155_template() {
+        use alloy_consensus::TxLegacy;
+
+        let unprotected = |tx| match tx {
+            Transaction::Legacy(legacy) => {
+                Transaction::Legacy(TxLegacy { chain_id: None, ..legacy })
+            }
+            other => other,
+        };
+        match_deposit_against(unprotected).expect("go-bsc accepts an unprotected system tx");
+        match_deposit_against(|tx| tx).expect("the protected form still matches");
+    }
+
+    /// Only a missing chain id is filled in: a protected tx for another chain, or the same call as
+    /// a typed tx, has a different signing hash on go-bsc too.
+    #[test]
+    fn system_tx_with_another_signing_domain_is_unexpected() {
+        use alloy_consensus::{Transaction as _, TxEip1559, TxLegacy};
+
+        let other_chain = |tx| match tx {
+            Transaction::Legacy(legacy) => {
+                Transaction::Legacy(TxLegacy { chain_id: Some(97), ..legacy })
+            }
+            other => other,
+        };
+        let typed = |tx: Transaction| {
+            Transaction::Eip1559(TxEip1559 {
+                chain_id: 56,
+                nonce: tx.nonce(),
+                gas_limit: tx.gas_limit(),
+                to: tx.kind(),
+                value: tx.value(),
+                input: tx.input().clone(),
+                ..Default::default()
+            })
+        };
+
+        let cases = [
+            ("other chain", match_deposit_against(other_chain)),
+            ("typed", match_deposit_against(typed)),
+        ];
+        for (name, result) in cases {
+            let err = result.expect_err(name);
+            assert!(err.to_string().contains("unexpected system tx"), "{name}: {err}");
+        }
+    }
+
+    type TypedTransaction = reth_ethereum_primitives::Transaction;
+
+    /// Installs `code` at `contract`, queues `call` as the block's system tx, then matches and
+    /// executes it. Returns the result and the receipt count afterwards.
+    fn run_system_tx_against(
+        contract: Address,
+        code: &'static [u8],
+        call: impl FnOnce(&SystemContract<Arc<BscChainSpec>>, Address) -> TypedTransaction,
+    ) -> (Result<(), reth_evm::execute::BlockExecutionError>, usize) {
+        use alloy_evm::block::BlockExecutor;
+        use alloy_primitives::Signature;
+        use reth_ethereum_primitives::TransactionSigned;
+        use reth_primitives_traits::Recovered;
+
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            contract,
+            AccountInfo::default().with_code(Bytecode::new_raw(Bytes::from_static(code))),
+        );
+        let mut executor = executor_over(db);
+        let coinbase = header_at(EPOCH_BLOCK).beneficiary;
+        let system_call = call(&executor.system_contracts, coinbase);
+        let tx = TransactionSigned::new_unhashed(
+            system_call.clone(),
+            Signature::new(Default::default(), Default::default(), false),
+        );
+        executor
+            .execute_transaction(&Recovered::new_unchecked(tx, coinbase))
+            .expect("the block tx is queued");
+
+        let result = executor.transact_system_tx(system_call, coinbase);
+        (result, executor.receipts().len())
+    }
+
+    /// go-bsc's `applyMessage` returns a reverting or halting mandatory system tx as an error,
+    /// which Finalize propagates, so the block is invalid. It must not commit a failed receipt.
+    #[test]
+    fn failing_mandatory_system_tx_invalidates_the_block() {
+        const REVERT: &[u8] = &[0x60, 0x00, 0x60, 0x00, 0xfd]; // PUSH1 0 PUSH1 0 REVERT
+        const HALT: &[u8] = &[0xfe]; // INVALID
+        let deposit = |contracts: &SystemContract<_>, coinbase| {
+            contracts.distribute_to_validator(coinbase, 0)
+        };
+
+        for (name, code) in [("revert", REVERT), ("halt", HALT)] {
+            let (result, receipts) = run_system_tx_against(VALIDATOR_CONTRACT, code, deposit);
+            let err = result.expect_err(name);
+            assert!(err.to_string().contains("system tx to"), "{name}: {err}");
+            assert_eq!(receipts, 0, "{name}: no receipt may be recorded");
+        }
+
+        let (result, receipts) = run_system_tx_against(VALIDATOR_CONTRACT, &[0x00], deposit);
+        result.expect("a succeeding deposit is committed");
+        assert_eq!(receipts, 1);
+    }
+
+    /// go-bsc only logs a failed slash and keeps finalizing, so a reverting slash is not an error.
+    #[test]
+    fn failing_slash_system_tx_does_not_invalidate_the_block() {
+        use crate::system_contracts::SLASH_CONTRACT;
+
+        let (result, _) = run_system_tx_against(
+            SLASH_CONTRACT,
+            &[0x60, 0x00, 0x60, 0x00, 0xfd],
+            |contracts, coinbase| contracts.slash(coinbase),
+        );
+        result.expect("a failed slash is tolerated");
     }
 }

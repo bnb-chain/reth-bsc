@@ -1,13 +1,10 @@
-
+use super::constants::EXTRA_SEAL_LEN;
+use crate::consensus::parlia::{Snapshot, DIFF_INTURN, DIFF_NOTURN};
 use alloy_consensus::Header;
-use alloy_primitives::{B256, U256, bytes::BytesMut, keccak256};
+use alloy_primitives::{bytes::BytesMut, keccak256, Address, B256, U256};
 use alloy_rlp::Encodable;
 use bytes::BufMut;
 use std::env;
-use super::constants::EXTRA_SEAL_LEN;
-use crate::consensus::parlia::Snapshot;
-use alloy_primitives::Address;
-use crate::consensus::parlia::{DIFF_NOTURN, DIFF_INTURN};
 
 const SECONDS_PER_DAY: u64 = 86400; // 24 * 60 * 60
 
@@ -26,10 +23,14 @@ pub fn is_breathe_block(last_block_time: u64, block_time: u64) -> bool {
 
 /// Print all header fields that participate for debug.
 pub fn debug_header(header: &Header, chain_id: u64, context: &str) {
-    let block_id = format!("#{}-0x{:x}", header.number, alloy_primitives::keccak256(header.parent_hash.as_slice()));
+    let block_id = format!(
+        "#{}-0x{:x}",
+        header.number,
+        alloy_primitives::keccak256(header.parent_hash.as_slice())
+    );
     let signed_extra_data =
         &header.extra_data[..header.extra_data.len().saturating_sub(EXTRA_SEAL_LEN)];
-    
+
     tracing::trace!(
         target: "bsc::parlia::util",
         context = context,
@@ -165,7 +166,8 @@ pub fn millisecond_remainder(header: &Header) -> u64 {
 
     if mix_digest != B256::ZERO {
         let bytes = mix_digest.as_slice();
-        // Convert last 8 bytes to u64 (big-endian), equivalent to Go's uint256.SetBytes32().Uint64()
+        // Convert last 8 bytes to u64 (big-endian), equivalent to Go's
+        // uint256.SetBytes32().Uint64()
         let mut result = 0u64;
         for &byte in bytes.iter().skip(24).take(8) {
             result = (result << 8) | u64::from(byte);
@@ -248,8 +250,7 @@ mod tests {
         // panicking in debug builds. (u64::MAX * 1000) mod 2^64 = 2^64 - 1000.
         let mut mix = [0u8; 32];
         mix[24..32].copy_from_slice(&123u64.to_be_bytes());
-        let header =
-            Header { timestamp: u64::MAX, mix_hash: B256::new(mix), ..Default::default() };
+        let header = Header { timestamp: u64::MAX, mix_hash: B256::new(mix), ..Default::default() };
         assert_eq!(
             calculate_millisecond_timestamp(&header),
             u64::MAX.wrapping_mul(1000).wrapping_add(123)

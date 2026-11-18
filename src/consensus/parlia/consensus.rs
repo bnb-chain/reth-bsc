@@ -1,7 +1,8 @@
 use lazy_static::lazy_static;
-use std::sync::Arc;
-use std::sync::RwLock;
-use std::time::SystemTime;
+use std::{
+    sync::{Arc, RwLock},
+    time::SystemTime,
+};
 
 use super::{
     constants::{
@@ -14,23 +15,23 @@ use super::{
     ParliaConsensusError, Snapshot, VoteAddress, VoteAttestation, BACKOFF_TIME_OF_INITIAL,
     BACKOFF_TIME_OF_WIGGLE, DEFAULT_TURN_LENGTH, LORENTZ_BACKOFF_TIME_OF_INITIAL,
 };
-use crate::consensus::parlia::constants::K_ANCESTOR_GENERATION_DEPTH;
-use crate::consensus::parlia::go_rng::{RngSource, Shuffle};
-use crate::consensus::parlia::provider::SnapshotProvider;
-use crate::consensus::parlia::util::{calculate_millisecond_timestamp, is_breathe_block};
-use crate::consensus::parlia::vote_pool::fetch_vote_by_block_hash_and_source_number;
-use crate::consensus::parlia::VoteData;
-use crate::consensus::parlia::VoteSignature;
-use crate::consensus::parlia::SYSTEM_TXS_GAS_HARD_LIMIT;
-use crate::consensus::parlia::SYSTEM_TXS_GAS_SOFT_LIMIT;
-use crate::hardforks::BscHardforks;
-use crate::node::evm::pre_execution::TURN_LENGTH_CACHE;
+use crate::{
+    consensus::parlia::{
+        constants::K_ANCESTOR_GENERATION_DEPTH,
+        go_rng::{RngSource, Shuffle},
+        provider::SnapshotProvider,
+        util::{calculate_millisecond_timestamp, is_breathe_block},
+        vote_pool::fetch_vote_by_block_hash_and_source_number,
+        VoteData, VoteSignature, SYSTEM_TXS_GAS_HARD_LIMIT, SYSTEM_TXS_GAS_SOFT_LIMIT,
+    },
+    hardforks::BscHardforks,
+    node::evm::pre_execution::TURN_LENGTH_CACHE,
+};
 use alloy_consensus::{BlockHeader, Header};
 use alloy_primitives::{Address, B256};
 use alloy_rlp::Decodable;
 use reth_chainspec::EthChainSpec;
-use schnellru::ByLength;
-use schnellru::LruMap;
+use schnellru::{ByLength, LruMap};
 use secp256k1::{
     ecdsa::{RecoverableSignature, RecoveryId},
     Message, SECP256K1,
@@ -40,13 +41,50 @@ use tracing::{debug, trace, warn};
 const RECOVERED_PROPOSER_CACHE_NUM: usize = 4096;
 const ADDRESS_LENGTH: usize = 20; // Ethereum address length in bytes
 
+/// Divisor applied to the block period to cap the last-block-in-turn build window.
+///
+/// go-bsc uses `period / 2`. reth-bsc has used `period / 5` because trie root computation was
+/// significantly slower, so the last block of a turn seals earlier and the next validator gets
+/// more network lead time. At a 450ms period that is a 90ms build window against go-bsc's 225ms.
+///
+/// The cost is measurable: the last block of every turn fills to ~20% of the gas limit where its
+/// neighbours reach 95-99%, worth roughly 5% of chain throughput at `turn_length = 16`. Whether 5
+/// is still right depends on how long the state root actually takes, and that has changed — hence
+/// the dial.
+const LAST_BLOCK_PERIOD_DIVISOR: u64 = 5;
+
+/// Effective last-block-in-turn period divisor, overridable with
+/// `BSC_MINING_LAST_BLOCK_PERIOD_DIVISOR`.
+///
+/// Clamped to `1..=20`: 1 disables the cap (the last block gets a full period, like any other
+/// block), 20 leaves a 22ms window at a 450ms period. Read once and cached, so it must be set
+/// before the first block is built.
+fn last_block_period_divisor() -> u64 {
+    static DIVISOR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *DIVISOR.get_or_init(|| {
+        let value = std::env::var("BSC_MINING_LAST_BLOCK_PERIOD_DIVISOR")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(LAST_BLOCK_PERIOD_DIVISOR)
+            .clamp(1, 20);
+        tracing::info!(
+            target: "bsc::miner",
+            divisor = value,
+            default = LAST_BLOCK_PERIOD_DIVISOR,
+            "Last-block-in-turn period divisor"
+        );
+        value
+    })
+}
+
 /// Applies left-over reservation and mining-time cap to raw delay.
 #[inline]
 fn apply_mining_delay_with_leftover(
     mut delay_ms: u64,
     period_ms: u64,
+    period_divisor: u64,
     last_block_in_turn: bool,
-    first_block_in_turn: bool,
+    enforce_min_delay: bool,
     left_over_ms: u64,
 ) -> u64 {
     if left_over_ms >= period_ms {
@@ -57,10 +95,11 @@ fn apply_mining_delay_with_leftover(
         delay_ms -= left_over_ms;
     }
 
-    // Unlike go-bsc (which uses `period / 2`), reth-bsc uses `period / 5` for the
-    // last-block-in-turn cap because trie root computation is significantly slower
-    // and needs more reserved time to avoid spilling into the next validator's slot.
-    let mut time_for_mining_ms = period_ms / 5;
+    // Unlike go-bsc (which uses `period / 2`), reth-bsc defaults to `period / 5` for the
+    // last-block-in-turn cap because trie root computation is significantly slower and needs
+    // more reserved time to avoid spilling into the next validator's slot. Tunable via
+    // `BSC_MINING_LAST_BLOCK_PERIOD_DIVISOR`; see [`LAST_BLOCK_PERIOD_DIVISOR`].
+    let mut time_for_mining_ms = period_ms / period_divisor.max(1);
     if !last_block_in_turn {
         time_for_mining_ms = period_ms;
     }
@@ -68,10 +107,15 @@ fn apply_mining_delay_with_leftover(
         delay_ms = time_for_mining_ms;
     }
 
-    // For the first block in a turn, a minimum 50ms delay is enforced so the block
-    // is not empty — validator switches require re-execution and root recomputation,
-    // leaving very little time for transaction inclusion.
-    if delay_ms == 0 && first_block_in_turn {
+    // A zero window makes the payload job return immediately with an empty candidate, and on
+    // BSC an empty block carries no system transaction, so peers reject it
+    // (`BscBlockValidationError::UnexpectedSystemTx`). This is not limited to validator
+    // switches: after any stall the parent timestamp is old enough that `delay_ms` collapses
+    // to 0 for ORDINARY in-turn blocks too, and the validator then seals invalid empty blocks
+    // that the network refuses — with `turn_length = 16` that is 15 blocks in 16, and the chain
+    // cannot restart on its own. Every locally built block therefore gets a floor; bid
+    // simulation passes `false` because it only re-executes an already-built bid.
+    if delay_ms == 0 && enforce_min_delay {
         delay_ms = 50;
     }
 
@@ -147,8 +191,8 @@ where
             }
             Some(header.extra_data[start..end].to_vec())
         } else {
-            if is_epoch
-                && !(extra_len - EXTRA_VANITY_LEN - EXTRA_SEAL_LEN)
+            if is_epoch &&
+                !(extra_len - EXTRA_VANITY_LEN - EXTRA_SEAL_LEN)
                     .is_multiple_of(VALIDATOR_BYTES_LEN_BEFORE_LUBAN)
             {
                 return None;
@@ -164,8 +208,8 @@ where
         header: &Header,
         epoch_length: u64,
     ) -> Result<Option<u8>, ParliaConsensusError> {
-        if !header.number.is_multiple_of(epoch_length)
-            || !self.spec.is_bohr_active_at_timestamp(header.number, header.timestamp)
+        if !header.number.is_multiple_of(epoch_length) ||
+            !self.spec.is_bohr_active_at_timestamp(header.number, header.timestamp)
         {
             return Ok(None);
         }
@@ -207,9 +251,9 @@ where
         } else {
             let validator_count =
                 header.extra_data[EXTRA_VANITY_LEN + VALIDATOR_NUMBER_SIZE - 1] as usize;
-            let mut start = EXTRA_VANITY_LEN
-                + VALIDATOR_NUMBER_SIZE
-                + validator_count * VALIDATOR_BYTES_LEN_AFTER_LUBAN;
+            let mut start = EXTRA_VANITY_LEN +
+                VALIDATOR_NUMBER_SIZE +
+                validator_count * VALIDATOR_BYTES_LEN_AFTER_LUBAN;
             let is_bohr_active =
                 self.spec.is_bohr_active_at_timestamp(header.number, header.timestamp);
             if is_bohr_active {
@@ -318,7 +362,8 @@ where
         if !is_epoch {
             // Keep parity with go-bsc:
             // - pre-Luban non-epoch blocks must not carry validator bytes (len must be 0)
-            // - post-Luban non-epoch blocks may contain attestation bytes, so validator bytes len is always 0
+            // - post-Luban non-epoch blocks may contain attestation bytes, so validator bytes len
+            //   is always 0
             if self.spec.is_luban_active_at_block(header.number) {
                 return Ok(0);
             }
@@ -348,10 +393,10 @@ where
 
         if self.spec.is_luban_active_at_block(header.number) {
             let count = header.extra_data[EXTRA_VANITY_LEN + VALIDATOR_NUMBER_SIZE - 1] as usize;
-            let expect = EXTRA_VANITY_LEN
-                + VALIDATOR_NUMBER_SIZE
-                + EXTRA_SEAL_LEN
-                + count * VALIDATOR_BYTES_LEN_AFTER_LUBAN;
+            let expect = EXTRA_VANITY_LEN +
+                VALIDATOR_NUMBER_SIZE +
+                EXTRA_SEAL_LEN +
+                count * VALIDATOR_BYTES_LEN_AFTER_LUBAN;
             if count == 0 || extra_len < expect {
                 tracing::warn!("Invalid header extra len, block_number: {}, extra_len: {}, expect: {}, count: {}, epoch_length: {}", 
                     header.number, extra_len, expect, count, self.get_epoch_length(header));
@@ -361,8 +406,8 @@ where
             }
         } else {
             let validator_bytes_len = extra_len - EXTRA_VANITY_LEN - EXTRA_SEAL_LEN;
-            if validator_bytes_len / VALIDATOR_BYTES_LEN_BEFORE_LUBAN == 0
-                || !validator_bytes_len.is_multiple_of(VALIDATOR_BYTES_LEN_BEFORE_LUBAN)
+            if validator_bytes_len / VALIDATOR_BYTES_LEN_BEFORE_LUBAN == 0 ||
+                !validator_bytes_len.is_multiple_of(VALIDATOR_BYTES_LEN_BEFORE_LUBAN)
             {
                 return Err(ParliaConsensusError::InvalidHeaderExtraLen {
                     header_extra_len: extra_len as u64,
@@ -507,9 +552,9 @@ where
 
             // Exclude the recently signed validators and inturn validator
             validators.retain(|addr| {
-                !(snap.sign_recently_by_counts(*addr, &counts)
-                    || self.spec.is_bohr_active_at_timestamp(header.number, header.timestamp)
-                        && *addr == inturn_addr)
+                !(snap.sign_recently_by_counts(*addr, &counts) ||
+                    self.spec.is_bohr_active_at_timestamp(header.number, header.timestamp) &&
+                        *addr == inturn_addr)
             });
 
             tracing::trace!(
@@ -569,12 +614,13 @@ where
         for (idx, val) in validators.iter().enumerate() {
             if *val == validator {
                 let result = if delay == 0 && is_parent_lorentz {
-                    // If the in-turn validator has signed recently, the expected backoff times are [0, 2, 3, ...].
+                    // If the in-turn validator has signed recently, the expected backoff times are
+                    // [0, 2, 3, ...].
                     if back_off_steps[idx] == 0 {
                         0
                     } else {
-                        LORENTZ_BACKOFF_TIME_OF_INITIAL
-                            + (back_off_steps[idx] - 1) * BACKOFF_TIME_OF_WIGGLE
+                        LORENTZ_BACKOFF_TIME_OF_INITIAL +
+                            (back_off_steps[idx] - 1) * BACKOFF_TIME_OF_WIGGLE
                     }
                 } else {
                     delay + back_off_steps[idx] * BACKOFF_TIME_OF_WIGGLE
@@ -600,19 +646,22 @@ where
 
     /// - `snap.block_interval` is used as the period (milliseconds).
     /// - Applies `left_over_ms` reservation for finalization work.
-    /// - Caps blocking time to `period / 5` when last block in turn to reserve
-    ///   time for trie root computation; otherwise a full period.
-    /// - Ensures first block in turn gets at least 50ms for transaction inclusion.
+    /// - Caps blocking time to `period / LAST_BLOCK_PERIOD_DIVISOR` (default 5, overridable with
+    ///   `BSC_MINING_LAST_BLOCK_PERIOD_DIVISOR`) when last block in turn to reserve time for trie
+    ///   root computation; otherwise a full period.
+    /// - Ensures every locally built block gets at least 50ms for transaction inclusion, so a stale
+    ///   parent can never produce an empty (and therefore invalid) block.
     pub fn delay_for_mining(&self, snap: &Snapshot, header: &Header, left_over_ms: u64) -> u64 {
         let period_ms = snap.block_interval;
         let last_block_in_turn = snap.last_block_in_one_turn(header.number);
-        let first_block_in_turn = snap.first_block_in_one_turn(header.number);
         let delay_ms = self.delay_for_ramanujan_fork(snap, header);
         apply_mining_delay_with_leftover(
             delay_ms,
             period_ms,
+            last_block_period_divisor(),
             last_block_in_turn,
-            first_block_in_turn,
+            // Locally built blocks always need a non-zero window, not just the first of a turn.
+            true,
             left_over_ms,
         )
     }
@@ -631,7 +680,16 @@ where
     ) -> u64 {
         let period_ms = snap.block_interval;
         let delay_ms = self.delay_for_ramanujan_fork(snap, header);
-        apply_mining_delay_with_leftover(delay_ms, period_ms, false, false, left_over_ms)
+        // The divisor is inert here (`last_block_in_turn = false`), so pass the default rather
+        // than reading the dial.
+        apply_mining_delay_with_leftover(
+            delay_ms,
+            period_ms,
+            LAST_BLOCK_PERIOD_DIVISOR,
+            false,
+            false,
+            left_over_ms,
+        )
     }
 
     /// Set `new_header.timestamp` (seconds) and `mix_hash` (Lorentz-era ms) based on
@@ -715,8 +773,8 @@ where
         new_header: &mut Header,
     ) -> Result<(), ParliaConsensusError> {
         let epoch_length = parent_snap.epoch_num;
-        if !new_header.number.is_multiple_of(epoch_length)
-            || !self.spec.is_bohr_active_at_timestamp(new_header.number, new_header.timestamp)
+        if !new_header.number.is_multiple_of(epoch_length) ||
+            !self.spec.is_bohr_active_at_timestamp(new_header.number, new_header.timestamp)
         {
             return Ok(());
         }
@@ -745,20 +803,23 @@ where
         current_timestamp: u64,
     ) -> u64 {
         if let Some(parent_timestamp) = parent_timestamp {
-            // Mainnet and Chapel have both passed Feynman. Now, simplify the logic before and during the Feynman hard fork.
-            if self.spec.is_feynman_active_at_timestamp(current_number, current_timestamp)
-                && !self.spec.is_feynman_transition_at_timestamp(
+            // Mainnet and Chapel have both passed Feynman. Now, simplify the logic before and
+            // during the Feynman hard fork.
+            if self.spec.is_feynman_active_at_timestamp(current_number, current_timestamp) &&
+                !self.spec.is_feynman_transition_at_timestamp(
                     current_number,
                     current_timestamp,
                     parent_timestamp,
-                )
-                && !is_breathe_block(parent_timestamp, current_timestamp)
+                ) &&
+                !is_breathe_block(parent_timestamp, current_timestamp)
             {
-                // params.SystemTxsGasSoftLimit > (depositTxGas+slashTxGas+finalityRewardTxGas)*150/100
+                // params.SystemTxsGasSoftLimit >
+                // (depositTxGas+slashTxGas+finalityRewardTxGas)*150/100
                 return SYSTEM_TXS_GAS_SOFT_LIMIT;
             }
         }
-        // params.SystemTxsGasHardLimit > (depositTxGas+slashTxGas+finalityRewardTxGas+updateValidatorTxGas)*150/100
+        // params.SystemTxsGasHardLimit >
+        // (depositTxGas+slashTxGas+finalityRewardTxGas+updateValidatorTxGas)*150/100
         SYSTEM_TXS_GAS_HARD_LIMIT
     }
 
@@ -769,8 +830,8 @@ where
         current_header: &mut Header,
         snapshot_provider: &Arc<dyn SnapshotProvider + Send + Sync>,
     ) -> Result<(), ParliaConsensusError> {
-        if !self.spec.is_luban_active_at_block(current_header.number())
-            || current_header.number() < 3
+        if !self.spec.is_luban_active_at_block(current_header.number()) ||
+            current_header.number() < 3
         {
             return Ok(());
         }
@@ -806,9 +867,9 @@ where
         for _ in 0..times {
             let parent_hash = target_header.parent_hash();
             let target_hash = target_header.hash_slow();
-            let snap = snapshot_provider.snapshot_by_hash(&parent_hash).ok_or(
-                ParliaConsensusError::SnapshotNotFound { block_hash: parent_hash },
-            )?;
+            let snap = snapshot_provider
+                .snapshot_by_hash(&parent_hash)
+                .ok_or(ParliaConsensusError::SnapshotNotFound { block_hash: parent_hash })?;
             votes = fetch_vote_by_block_hash_and_source_number(target_hash, justified_number);
             let quorum = usize::div_ceil(snap.validators.len() * 2, 3);
             if votes.len() >= quorum {
@@ -868,13 +929,15 @@ where
                 .values()
                 .any(|vi| vi.vote_addr == vote.vote_address)
             {
-                // If the same address appears multiple times, keep the first one (stable and deterministic)
+                // If the same address appears multiple times, keep the first one (stable and
+                // deterministic)
                 unique_by_addr.entry(vote.vote_address).or_insert(vote.signature);
             } else {
                 tracing::debug!(target: "parlia::consensus", "skip vote not in parent snapshot, vote_address={:?}", vote.vote_address);
             }
         }
-        // Build a stable sequence based on the index of validators in parent snapshot (although BLS aggregation order is irrelevant, it is convenient for debugging and consistency)
+        // Build a stable sequence based on the index of validators in parent snapshot (although BLS
+        // aggregation order is irrelevant, it is convenient for debugging and consistency)
         let mut ordered_unique: Vec<(u64, VoteAddress, VoteSignature)> = Vec::new();
         for info in target_header_parent_snap.validators_map.values() {
             let vote_addr = info.vote_addr;
@@ -915,10 +978,12 @@ where
         for (index, vote_addr, _) in ordered_unique.iter() {
             // index in snapshot is 1-based, the vote bitset offset is index-1
             attestation.vote_address_set |= 1 << (index - 1);
-            // Tolerance: if there are more than 64 validators in history, this needs to be changed to a larger bit set type; currently BSC limits 64
+            // Tolerance: if there are more than 64 validators in history, this needs to be changed
+            // to a larger bit set type; currently BSC limits 64
             let _ = vote_addr; // Only used for explanation
         }
-        // Strict consistency check: the number of 1s in the vote bitset must be equal to the number of aggregated signatures
+        // Strict consistency check: the number of 1s in the vote bitset must be equal to the number
+        // of aggregated signatures
         let ones = attestation.vote_address_set.count_ones() as usize;
         if ones != ordered_unique.len() {
             tracing::debug!(target: "parlia::consensus", "vote bitset count mismatch, ones={}, sigs={}", ones, ordered_unique.len());
@@ -944,8 +1009,7 @@ where
         // millisecond timestamp to when this attestation is assembled.
         // Equivalent to chain/finalized/latency/normal in geth (measured at assembly
         // time; justified_hash == source_hash == the block now being finalized).
-        if let Some(source_header) =
-            crate::shared::get_canonical_header_by_number(justified_number)
+        if let Some(source_header) = crate::shared::get_canonical_header_by_number(justified_number)
         {
             let now_ms = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -970,8 +1034,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chainspec::BscChainSpec;
-    use crate::hardforks::bsc::BscHardfork;
+    use crate::{chainspec::BscChainSpec, hardforks::bsc::BscHardfork};
     use reth_chainspec::{ChainSpecBuilder, ForkCondition};
 
     #[test]
@@ -1022,38 +1085,97 @@ mod tests {
     fn mining_delay_last_block_in_turn_caps_to_period_div_5() {
         // last_block_in_turn: left_over applied first (2500 - 2000 = 500),
         // then cap to period/5 = 600; 500 <= 600 so result is 500.
-        assert_eq!(apply_mining_delay_with_leftover(2500, 3000, true, false, 2000), 500);
+        assert_eq!(apply_mining_delay_with_leftover(2500, 3000, 5, true, false, 2000), 500);
     }
 
     #[test]
     fn mining_delay_last_block_in_turn_capped() {
         // last_block_in_turn: left_over applied first (2500 - 100 = 2400),
         // then cap to period/5 = 600; 2400 > 600 so result is 600.
-        assert_eq!(apply_mining_delay_with_leftover(2500, 3000, true, false, 100), 600);
+        assert_eq!(apply_mining_delay_with_leftover(2500, 3000, 5, true, false, 100), 600);
     }
 
     #[test]
     fn mining_delay_not_last_block_uses_full_period_cap() {
         // not last_block_in_turn: left_over applied first (3500 - 200 = 3300),
         // then cap to full period = 3000; result is 3000.
-        assert_eq!(apply_mining_delay_with_leftover(3500, 3000, false, false, 200), 3000);
+        assert_eq!(apply_mining_delay_with_leftover(3500, 3000, 5, false, false, 200), 3000);
     }
 
     #[test]
-    fn mining_delay_first_block_in_turn_gets_minimum_50ms() {
-        // first_block_in_turn: left_over (600) >= delay (500), so delay = 0,
-        // then first_block_in_turn minimum kicks in: result is 50.
-        assert_eq!(apply_mining_delay_with_leftover(500, 3000, false, true, 600), 50);
+    fn mining_delay_floor_applies_when_the_window_is_fully_consumed() {
+        // left_over (600) >= delay (500), so delay = 0, then the floor kicks in: result is 50.
+        assert_eq!(apply_mining_delay_with_leftover(500, 3000, 5, false, true, 600), 50);
+    }
+
+    #[test]
+    fn mining_delay_floor_covers_ordinary_in_turn_blocks_not_just_the_first() {
+        // Regression, observed 2026-08-26 on a 3-validator net with turn_length=16: after a
+        // stall the parent timestamp is old, so the raw delay is already 0. The floor used to
+        // be gated on `first_block_in_turn`, leaving 15 blocks in 16 with a ZERO build window;
+        // the payload job then returned an empty candidate, and an empty BSC block carries no
+        // system transaction, so peers rejected it with `UnexpectedSystemTx`. The validator
+        // re-entered the same path every ~3s, signing a different block for the same height.
+        assert_eq!(apply_mining_delay_with_leftover(0, 450, 5, false, true, 0), 50);
+        // Same for the last block of a turn, where the period/5 cap also applies.
+        assert_eq!(apply_mining_delay_with_leftover(0, 450, 5, true, true, 0), 50);
     }
 
     #[test]
     fn bid_simulation_delay_ignores_turn_position() {
-        // Bid simulation passes last/first_block_in_turn as false regardless of
+        // Bid simulation passes last_block_in_turn/enforce_min_delay as false regardless of
         // the actual turn position (go-bsc PR #3669): a last-in-turn block gets
         // the full period cap (2500 - 100 = 2400, under the 3000 cap) instead of
         // being squeezed to period/5 = 600 like local mining.
-        assert_eq!(apply_mining_delay_with_leftover(2500, 3000, false, false, 100), 2400);
-        // And no 50ms floor: fully consumed delay stays 0.
-        assert_eq!(apply_mining_delay_with_leftover(500, 3000, false, false, 600), 0);
+        assert_eq!(apply_mining_delay_with_leftover(2500, 3000, 5, false, false, 100), 2400);
+        // And no floor: bid simulation only re-executes an already-built bid, so a fully
+        // consumed delay legitimately stays 0.
+        assert_eq!(apply_mining_delay_with_leftover(500, 3000, 5, false, false, 600), 0);
+    }
+
+    #[test]
+    fn last_block_period_divisor_widens_the_build_window() {
+        // At a 450ms period the default divisor of 5 leaves a 90ms build window for the last
+        // block of a turn; go-bsc's 2 would leave 225ms. The raw delay (330 = 450 - a 120ms
+        // reserve) exceeds every cap below, so the cap is what binds.
+        assert_eq!(apply_mining_delay_with_leftover(330, 450, 5, true, false, 0), 90);
+        assert_eq!(apply_mining_delay_with_leftover(330, 450, 4, true, false, 0), 112);
+        assert_eq!(apply_mining_delay_with_leftover(330, 450, 3, true, false, 0), 150);
+        // go-bsc's value.
+        assert_eq!(apply_mining_delay_with_leftover(330, 450, 2, true, false, 0), 225);
+    }
+
+    #[test]
+    fn last_block_period_divisor_of_one_disables_the_cap() {
+        // Divisor 1 means the last block gets a full period, i.e. the same treatment as any
+        // other block: the delay passes through uncapped.
+        assert_eq!(apply_mining_delay_with_leftover(330, 450, 1, true, false, 0), 330);
+        assert_eq!(
+            apply_mining_delay_with_leftover(330, 450, 1, true, false, 0),
+            apply_mining_delay_with_leftover(330, 450, 5, false, false, 0)
+        );
+    }
+
+    #[test]
+    fn last_block_period_divisor_is_inert_for_non_last_blocks() {
+        // Only the last block of a turn is capped, so the divisor must not affect the others.
+        for divisor in [1u64, 2, 5, 20] {
+            assert_eq!(apply_mining_delay_with_leftover(330, 450, divisor, false, false, 0), 330);
+        }
+    }
+
+    #[test]
+    fn last_block_period_divisor_zero_cannot_divide_by_zero() {
+        // `last_block_period_divisor()` clamps to 1..=20, but the pure function is called
+        // directly by tests and could be called with 0 in future; `.max(1)` keeps it total.
+        assert_eq!(apply_mining_delay_with_leftover(330, 450, 0, true, false, 0), 330);
+    }
+
+    #[test]
+    fn last_block_period_divisor_still_respects_the_floor() {
+        // Widening the cap must not remove the non-zero build window guarantee.
+        for divisor in [1u64, 2, 5, 20] {
+            assert_eq!(apply_mining_delay_with_leftover(0, 450, divisor, true, true, 0), 50);
+        }
     }
 }

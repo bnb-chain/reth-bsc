@@ -1,13 +1,14 @@
 pub mod access_list;
 pub mod admin;
+pub mod blob;
 #[cfg(test)]
 mod block_overrides_tests;
-pub mod blob;
 pub mod code_overrides;
 pub mod debug_builder;
 pub mod eth_config;
 pub mod eth_ext;
 mod finality;
+pub mod health;
 pub mod mev;
 pub mod miner;
 pub mod parlia;

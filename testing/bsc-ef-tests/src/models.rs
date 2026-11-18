@@ -4,13 +4,10 @@ use alloy_consensus::Header as RethHeader;
 use alloy_eips::eip4895::Withdrawals;
 use alloy_genesis::GenesisAccount;
 use alloy_primitives::{keccak256, Address, Bloom, Bytes, B256, B64, U256};
-use reth_bsc::{
-    chainspec::BscChainSpec,
-    hardforks::bsc::BscHardfork,
-};
+use reth_bsc::{chainspec::BscChainSpec, hardforks::bsc::BscHardfork};
 use reth_chainspec::{BaseFeeParams, BaseFeeParamsKind, Chain, ChainSpec, ForkCondition, Hardfork};
-use reth_ethereum_forks::{ChainHardforks, EthereumHardfork};
 use reth_db_api::{cursor::DbDupCursorRO, tables, transaction::DbTx};
+use reth_ethereum_forks::{ChainHardforks, EthereumHardfork};
 use reth_primitives_traits::SealedHeader;
 use serde::Deserialize;
 use std::{collections::BTreeMap, ops::Deref, sync::Arc};
@@ -398,30 +395,30 @@ impl ForkSpec {
     pub const fn is_bsc_fork(&self) -> bool {
         matches!(
             self,
-            Self::Ramanujan
-                | Self::Niels
-                | Self::MirrorSync
-                | Self::Bruno
-                | Self::Euler
-                | Self::Nano
-                | Self::Moran
-                | Self::Gibbs
-                | Self::Planck
-                | Self::Luban
-                | Self::Plato
-                | Self::Hertz
-                | Self::HertzFix
-                | Self::Kepler
-                | Self::Feynman
-                | Self::FeynmanFix
-                | Self::Haber
-                | Self::HaberFix
-                | Self::Bohr
-                | Self::Pascal
-                | Self::Lorentz
-                | Self::Maxwell
-                | Self::Fermi
-                | Self::Mendel
+            Self::Ramanujan |
+                Self::Niels |
+                Self::MirrorSync |
+                Self::Bruno |
+                Self::Euler |
+                Self::Nano |
+                Self::Moran |
+                Self::Gibbs |
+                Self::Planck |
+                Self::Luban |
+                Self::Plato |
+                Self::Hertz |
+                Self::HertzFix |
+                Self::Kepler |
+                Self::Feynman |
+                Self::FeynmanFix |
+                Self::Haber |
+                Self::HaberFix |
+                Self::Bohr |
+                Self::Pascal |
+                Self::Lorentz |
+                Self::Maxwell |
+                Self::Fermi |
+                Self::Mendel
         )
     }
 }
@@ -583,7 +580,10 @@ fn create_hardforks_for_spec(fork_spec: ForkSpec) -> ChainHardforks {
         }
 
         // Post-merge (Paris)
-        ForkSpec::Merge | ForkSpec::MergeEOF | ForkSpec::MergeMeterInitCode | ForkSpec::MergePush0 => {
+        ForkSpec::Merge |
+        ForkSpec::MergeEOF |
+        ForkSpec::MergeMeterInitCode |
+        ForkSpec::MergePush0 => {
             forks.push((EthereumHardfork::Frontier.boxed(), ForkCondition::Block(0)));
             forks.push((EthereumHardfork::Homestead.boxed(), ForkCondition::Block(0)));
             forks.push((EthereumHardfork::Tangerine.boxed(), ForkCondition::Block(0)));
@@ -952,7 +952,11 @@ fn create_hardforks_for_spec(fork_spec: ForkSpec) -> ChainHardforks {
             forks.push((BscHardfork::HaberFix.boxed(), ForkCondition::Timestamp(0)));
             forks.push((BscHardfork::Bohr.boxed(), ForkCondition::Timestamp(0)));
         }
-        ForkSpec::Pascal | ForkSpec::Lorentz | ForkSpec::Maxwell | ForkSpec::Fermi | ForkSpec::Mendel => {
+        ForkSpec::Pascal |
+        ForkSpec::Lorentz |
+        ForkSpec::Maxwell |
+        ForkSpec::Fermi |
+        ForkSpec::Mendel => {
             forks.push((EthereumHardfork::Frontier.boxed(), ForkCondition::Block(0)));
             forks.push((EthereumHardfork::Homestead.boxed(), ForkCondition::Block(0)));
             forks.push((EthereumHardfork::Tangerine.boxed(), ForkCondition::Block(0)));

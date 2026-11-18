@@ -1,22 +1,24 @@
-use std::collections::HashSet;
-use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc, LazyLock, Mutex,
+use std::{
+    collections::HashSet,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, LazyLock, Mutex,
+    },
 };
 
 use alloy_consensus::{BlockHeader, Header};
 use alloy_primitives::B256;
 
-use crate::chainspec::BscChainSpec;
-use crate::consensus::parlia::constants::K_ANCESTOR_GENERATION_DEPTH;
-use crate::consensus::parlia::util::calculate_millisecond_timestamp;
-use crate::consensus::parlia::{
-    bls_signer, provider::SnapshotProvider, vote::VoteData, votes, VoteAddress,
+use crate::{
+    chainspec::BscChainSpec,
+    consensus::parlia::{
+        bls_signer, constants::K_ANCESTOR_GENERATION_DEPTH, provider::SnapshotProvider,
+        util::calculate_millisecond_timestamp, vote::VoteData, votes, VoteAddress,
+    },
+    hardforks::BscHardforks,
+    metrics::BscVoteMetrics,
+    node::{evm::util::get_cannonical_header_from_cache, vote_journal},
 };
-use crate::hardforks::BscHardforks;
-use crate::metrics::BscVoteMetrics;
-use crate::node::evm::util::get_cannonical_header_from_cache;
-use crate::node::vote_journal;
 
 /// Number of blocks to wait after mining becomes enabled before producing votes.
 /// This mirrors geth's VoteManager warm-up (blocksNumberSinceMining = 40) to avoid
@@ -62,11 +64,15 @@ pub fn maybe_produce_and_broadcast_for_head(
     snapshot_provider: &dyn SnapshotProvider,
     head: &Header,
 ) {
-    // Only vote when mining is enabled (similar to geth behavior)
-    let mining_enabled = crate::node::miner::config::get_global_mining_config()
-        .map(|c| c.is_mining_enabled())
-        .unwrap_or(false);
-    if !mining_enabled {
+    if !crate::node::startup_recovery::is_ready() {
+        BLOCKS_SINCE_MINING.store(0, Ordering::Relaxed);
+        tracing::debug!(target: "bsc::vote", reason = "startup-recovery", "skip vote production");
+        return;
+    }
+    // Only vote while mining is live (geth: `eth.IsMining()`). Read the flag miner_stop and
+    // miner_start toggle, not the startup config: a stopped primary that keeps voting can
+    // equivocate with its backup. Resetting the counter re-arms the warm-up on resume.
+    if !crate::shared::is_mining_enabled() {
         BLOCKS_SINCE_MINING.store(0, Ordering::Relaxed);
         tracing::debug!(target: "bsc::vote", reason = "mining-disabled", "skip vote production");
         return;
@@ -250,10 +256,8 @@ mod tests {
     }
 
     fn head_at(number: u64) -> Header {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         Header { number, timestamp: now, ..Default::default() }
     }
 
@@ -266,15 +270,10 @@ mod tests {
 
         let mut sk = [0u8; 32];
         sk[31] = 1;
-        bls_signer::init_global_bls_signer_from_bytes(sk).unwrap();
+        let _ = bls_signer::init_global_bls_signer_from_bytes(sk);
         let me = bls_signer::global_bls_public_key().unwrap();
-        let _ = crate::node::miner::config::set_global_mining_config(
-            crate::node::miner::config::MiningConfig {
-                enabled: true,
-                private_key_hex: Some("11".repeat(32)),
-                ..Default::default()
-            },
-        );
+        crate::shared::init_miner_dynamic_config(0, 0, Address::ZERO);
+        crate::shared::set_mining_enabled(true);
 
         let spec = Arc::new(BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet()));
         let mut snap = Snapshot::new(
@@ -312,5 +311,75 @@ mod tests {
 
         let _ = votes::drain();
         let _ = std::fs::remove_file(&dir);
+    }
+
+    // Shares process-global state (BLS signer, journal, warm-up counter) with the test above;
+    // run with --test-threads=1 as CI does.
+    #[tokio::test(flavor = "current_thread")]
+    async fn miner_stop_suppresses_votes_and_rearms_warmup() {
+        use crate::rpc::miner::{BscMinerApiImpl, BscMinerApiServer};
+
+        std::env::set_var("BSC_VOTE_JOURNAL_MEMORY_ONLY", "1");
+        std::env::set_var("BSC_VOTE_WARMUP_BLOCKS", "2");
+
+        // Generated, not hard-coded; clearing the top nibble keeps the scalar below the BLS12-381
+        // group order (see `bls_signer::random_test_signer`).
+        let mut sk: [u8; 32] = B256::random().into();
+        sk[0] &= 0x0f;
+        let _ = bls_signer::init_global_bls_signer_from_bytes(sk);
+        let me = bls_signer::global_bls_public_key().unwrap();
+        // Startup config stays enabled for the whole process, as in production; the vote
+        // gate must follow the dynamic flag instead.
+        let _ = crate::node::miner::config::set_global_mining_config(
+            crate::node::miner::config::MiningConfig {
+                enabled: true,
+                private_key_hex: Some(alloy_primitives::hex::encode(B256::random())),
+                ..Default::default()
+            },
+        );
+        crate::shared::init_miner_dynamic_config(0, 0, Address::ZERO);
+        crate::shared::set_mining_enabled(true);
+        BLOCKS_SINCE_MINING.store(0, Ordering::Relaxed);
+
+        let spec = Arc::new(BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet()));
+        let mut snap = Snapshot::new(
+            vec![Address::repeat_byte(7)],
+            40_100_000,
+            B256::repeat_byte(9),
+            200,
+            Some(vec![me]),
+        );
+        snap.vote_data = VoteData {
+            source_number: 40_099_990,
+            source_hash: B256::repeat_byte(4),
+            target_number: 40_099_990,
+            target_hash: B256::repeat_byte(4),
+        };
+        let sp = FixedSnap(snap);
+        let produce = |n: u64| {
+            let head = head_at(n);
+            maybe_produce_and_broadcast_for_head(spec.clone(), &sp, &head);
+            votes::fetch_any_vote_by_block_hash(head.hash_slow()).len()
+        };
+
+        // Mining: warm up, then vote.
+        assert_eq!(produce(40_100_001), 0);
+        assert_eq!(produce(40_100_002), 0);
+        assert_eq!(produce(40_100_003), 1, "a mining validator must vote after warm-up");
+
+        // miner_stop: no vote for new heads, and the warm-up counter is reset.
+        BscMinerApiImpl::new().stop().await.unwrap();
+        assert_eq!(produce(40_100_004), 0, "a stopped validator must not vote");
+        assert_eq!(produce(40_100_005), 0, "a stopped validator must not vote");
+        assert_eq!(BLOCKS_SINCE_MINING.load(Ordering::Relaxed), 0);
+
+        // miner_start: the full warm-up runs again before voting resumes.
+        BscMinerApiImpl::new().start().await.unwrap();
+        assert_eq!(produce(40_100_006), 0);
+        assert_eq!(produce(40_100_007), 0);
+        assert_eq!(produce(40_100_008), 1, "voting resumes once the warm-up completes");
+
+        let _ = votes::drain();
+        std::env::remove_var("BSC_VOTE_JOURNAL_MEMORY_ONLY");
     }
 }

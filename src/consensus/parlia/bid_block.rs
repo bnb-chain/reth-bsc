@@ -6,18 +6,23 @@
 //! the trailing region must have for the given header.
 //!
 //! Most of these functions are pure (no consensus state): they classify and verify transactions and
-//! so are parameterized on `(txs, header, parent)` rather than the not-yet-ported `DecodedBidBlock`.
-//! The exception is [`Parlia::block_time_upper_check`] — a stateful timestamp bound used by BidBlock
-//! pre-seal verification. The remaining stateful methods (`prepare_for_bid_block`, assembly, the
-//! `sign_system_tx` wrapper) land with the miner build path.
+//! so are parameterized on `(txs, header, parent)` rather than the not-yet-ported
+//! `DecodedBidBlock`. The exception is [`Parlia::block_time_upper_check`] — a stateful timestamp
+//! bound used by BidBlock pre-seal verification. The remaining stateful methods
+//! (`prepare_for_bid_block`, assembly, the `sign_system_tx` wrapper) land with the miner build
+//! path.
 
 use crate::{
-    consensus::parlia::{consensus::Parlia, util::is_breathe_block, util::calculate_millisecond_timestamp, Snapshot},
+    consensus::parlia::{
+        consensus::Parlia,
+        util::{calculate_millisecond_timestamp, is_breathe_block},
+        Snapshot,
+    },
     hardforks::BscHardforks,
     node::evm::error::{BscBlockExecutionError, BscBlockValidationError},
     system_contracts::{is_invoke_system_contract, VALIDATOR_CONTRACT},
 };
-use alloy_consensus::{Header, Transaction};
+use alloy_consensus::{Header, Transaction, TxType};
 use alloy_primitives::U256;
 use reth_chainspec::EthChainSpec;
 use reth_ethereum_primitives::TransactionSigned;
@@ -91,8 +96,11 @@ fn has_signable_selector(data: &[u8]) -> bool {
 }
 
 /// Reports whether `tx` looks like an unsigned BidBlock system tx (does not recover the sender):
-/// it targets a system contract, has zero gas price, and carries the all-zero signature.
+/// it is legacy, targets a system contract, has zero gas price, and carries the all-zero signature.
 pub fn is_unsigned_system_tx_candidate(tx: &TransactionSigned) -> bool {
+    if tx.tx_type() != TxType::Legacy {
+        return false;
+    }
     let Some(to) = tx.to() else { return false };
     if !is_invoke_system_contract(&to) {
         return false;
@@ -106,9 +114,9 @@ pub fn is_unsigned_system_tx_candidate(tx: &TransactionSigned) -> bool {
 /// Reports whether `tx` may be blind-signed for a BidBlock: an unsigned candidate targeting the
 /// Validator contract with a signable selector.
 pub fn is_signable_system_tx(tx: &TransactionSigned) -> bool {
-    is_unsigned_system_tx_candidate(tx)
-        && tx.to() == Some(VALIDATOR_CONTRACT)
-        && has_signable_selector(tx.input())
+    is_unsigned_system_tx_candidate(tx) &&
+        tx.to() == Some(VALIDATOR_CONTRACT) &&
+        has_signable_selector(tx.input())
 }
 
 /// The expected trailing system-tx order for an accepted BidBlock:
@@ -168,9 +176,9 @@ pub fn extract_bid_block_deposit_value(txs: &[TransactionSigned]) -> (usize, U25
         system_tx_start = i;
     }
 
-    if system_tx_start > 0
-        && system_tx_start < txs.len()
-        && txs[system_tx_start].input().starts_with(&DEPOSIT_SELECTOR)
+    if system_tx_start > 0 &&
+        system_tx_start < txs.len() &&
+        txs[system_tx_start].input().starts_with(&DEPOSIT_SELECTOR)
     {
         return (system_tx_start, txs[system_tx_start].value());
     }
@@ -229,7 +237,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_consensus::TxLegacy;
+    use alloy_consensus::{TxEip1559, TxEip2930, TxLegacy};
     use alloy_primitives::{Address, Bytes, Signature, TxKind};
 
     fn mk_header(number: u64, timestamp: u64) -> Header {
@@ -262,6 +270,85 @@ mod tests {
 
     fn system_tx(selector: [u8; 4], value: u64) -> TransactionSigned {
         unsigned_tx(VALIDATOR_CONTRACT, 0, selector.to_vec(), value)
+    }
+
+    fn typed_deposit_txs(value: u64) -> [TransactionSigned; 2] {
+        let signature = Signature::new(U256::ZERO, U256::ZERO, false);
+        let access_list_tx = TxEip2930 {
+            chain_id: 56,
+            gas_price: 0,
+            gas_limit: 1_000_000,
+            to: TxKind::Call(VALIDATOR_CONTRACT),
+            value: U256::from(value),
+            input: Bytes::from(DEPOSIT_SELECTOR.to_vec()),
+            ..Default::default()
+        };
+        let dynamic_fee_tx = TxEip1559 {
+            chain_id: 56,
+            max_fee_per_gas: 0,
+            max_priority_fee_per_gas: 0,
+            gas_limit: 1_000_000,
+            to: TxKind::Call(VALIDATOR_CONTRACT),
+            value: U256::from(value),
+            input: Bytes::from(DEPOSIT_SELECTOR.to_vec()),
+            ..Default::default()
+        };
+        [
+            TransactionSigned::new_unhashed(access_list_tx.into(), signature),
+            TransactionSigned::new_unhashed(dynamic_fee_tx.into(), signature),
+        ]
+    }
+
+    #[test]
+    fn typed_deposits_are_not_unsigned_system_tx_candidates() {
+        let txs = typed_deposit_txs(5_000);
+        assert_eq!(txs.each_ref().map(is_unsigned_system_tx_candidate), [false, false]);
+    }
+
+    #[test]
+    fn typed_deposits_are_not_signable_system_txs() {
+        let txs = typed_deposit_txs(5_000);
+        assert_eq!(txs.each_ref().map(is_signable_system_tx), [false, false]);
+    }
+
+    #[test]
+    fn typed_deposits_are_rejected_by_bid_block_verification() {
+        let header = mk_header(101, 1_000);
+        let parent = mk_header(100, 1_000);
+        let results = typed_deposit_txs(5_000).map(|deposit| {
+            let user_tx = unsigned_tx(Address::repeat_byte(0x11), 1, vec![], 0);
+            verify_bid_block_system_txs(&[user_tx, deposit], &header, &parent, 1)
+        });
+        assert_eq!(
+            results,
+            [
+                Err(BidBlockSystemTxError::NotSignable { index: 1 }),
+                Err(BidBlockSystemTxError::NotSignable { index: 1 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn typed_deposits_do_not_advertise_bid_block_deposit_value() {
+        let results = typed_deposit_txs(5_000).map(|deposit| {
+            let user_tx = unsigned_tx(Address::repeat_byte(0x11), 1, vec![], 0);
+            extract_bid_block_deposit_value(&[user_tx, deposit])
+        });
+        assert_eq!(results, [(2, U256::ZERO); 2]);
+    }
+
+    #[test]
+    fn unsigned_legacy_deposit_remains_accepted() {
+        let deposit = system_tx(DEPOSIT_SELECTOR, 5_000);
+        assert!(is_unsigned_system_tx_candidate(&deposit));
+        assert!(is_signable_system_tx(&deposit));
+        let user_tx = unsigned_tx(Address::repeat_byte(0x11), 1, vec![], 0);
+        let txs = [user_tx, deposit];
+        assert_eq!(extract_bid_block_deposit_value(&txs), (1, U256::from(5_000)));
+        assert_eq!(
+            verify_bid_block_system_txs(&txs, &mk_header(101, 1_000), &mk_header(100, 1_000), 1),
+            Ok(())
+        );
     }
 
     #[test]
@@ -337,7 +424,8 @@ mod tests {
             },
         ];
 
-        let ok = [system_tx(DEPOSIT_SELECTOR, 0), system_tx(DISTRIBUTE_FINALITY_REWARD_SELECTOR, 0)];
+        let ok =
+            [system_tx(DEPOSIT_SELECTOR, 0), system_tx(DISTRIBUTE_FINALITY_REWARD_SELECTOR, 0)];
         assert_eq!(verify_system_tx_shape(&ok, &shape), Ok(()));
 
         // Missing the trailing tx.
@@ -399,7 +487,8 @@ mod tests {
         assert_eq!(verify_bid_block_system_txs(&good, &header, &parent, 1), Ok(()));
 
         // A trailing tx with a non-signable selector is rejected.
-        let bad = vec![user_tx, system_tx(DEPOSIT_SELECTOR, 1), system_tx([0xaa, 0xbb, 0xcc, 0xdd], 0)];
+        let bad =
+            vec![user_tx, system_tx(DEPOSIT_SELECTOR, 1), system_tx([0xaa, 0xbb, 0xcc, 0xdd], 0)];
         assert_eq!(
             verify_bid_block_system_txs(&bad, &header, &parent, 1),
             Err(BidBlockSystemTxError::NotSignable { index: 2 })

@@ -76,9 +76,9 @@ pub fn marker_bytecode() -> Bytecode {
 
 /// byte[0:2] == 0xCA52 and byte[2:10] all zero.
 pub fn is_cas20_address(addr: Address) -> bool {
-    addr[0] == MARKER_PREFIX[0]
-        && addr[1] == MARKER_PREFIX[1]
-        && addr[2..10].iter().all(|&b| b == 0)
+    addr[0] == MARKER_PREFIX[0] &&
+        addr[1] == MARKER_PREFIX[1] &&
+        addr[2..10].iter().all(|&b| b == 0)
 }
 
 /// One entry per ordinal, so routing and feature gating cannot disagree.
@@ -142,17 +142,25 @@ pub(crate) fn is_cas20_precompile(address: Address) -> bool {
 }
 
 /// Prefix lookup enabled at Jenner. Shared stateful precompiles disable result caching.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Cas20Lookup {
-    active: Option<Arc<[DynPrecompile; 5]>>,
+    active: Option<Cas20Runner>,
     disabled: std::collections::BTreeSet<Address>,
+}
+
+impl std::fmt::Debug for Cas20Lookup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Cas20Lookup")
+            .field("active", &self.active.is_some())
+            .field("disabled", &self.disabled)
+            .finish()
+    }
 }
 
 impl Cas20Lookup {
     /// The production lookup for `spec`, with precompiles shared process-wide.
     pub fn new(spec: BscHardfork) -> Self {
-        static PRECOMPILES: LazyLock<Arc<[DynPrecompile; 5]>> =
-            LazyLock::new(|| Arc::new(precompiles(NodeObserver)));
+        static PRECOMPILES: LazyLock<Cas20Runner> = LazyLock::new(|| runner(NodeObserver));
         Self {
             active: (spec >= BscHardfork::Jenner).then(|| PRECOMPILES.clone()),
             disabled: Default::default(),
@@ -170,7 +178,7 @@ impl Cas20Lookup {
     pub fn with_metrics(spec: BscHardfork, enabled: bool) -> Self {
         Self {
             active: (spec >= BscHardfork::Jenner)
-                .then(|| Arc::new(precompiles(enabled.then(observer::MetricsObserver::register)))),
+                .then(|| runner(enabled.then(observer::MetricsObserver::register))),
             disabled: Default::default(),
         }
     }
@@ -179,7 +187,7 @@ impl Cas20Lookup {
     #[cfg(test)]
     fn with_observer<O: Cas20Observer>(spec: BscHardfork, observer: O) -> Self {
         Self {
-            active: (spec >= BscHardfork::Jenner).then(|| Arc::new(precompiles(observer))),
+            active: (spec >= BscHardfork::Jenner).then(|| runner(observer)),
             disabled: Default::default(),
         }
     }
@@ -187,20 +195,22 @@ impl Cas20Lookup {
 
 impl PrecompileLookup for Cas20Lookup {
     fn lookup(&self, address: &Address) -> Option<DynPrecompile> {
-        let entries = self.active.as_ref()?;
+        let runner = self.active.as_ref()?;
         let kind = resolve(*address)?;
         if self.disabled.contains(address) {
             return None;
         }
-        Some(entries[kind as usize].clone())
+        let runner = runner.clone();
+        Some(DynPrecompile::new_stateful(kind.id(), move |input| runner(kind, input)))
     }
 }
 
-fn precompiles<O: Cas20Observer>(observer: O) -> [DynPrecompile; 5] {
-    Kind::ALL.map(|kind| {
-        let observer = observer.clone();
-        DynPrecompile::new_stateful(kind.id(), move |input| run(kind, &observer, input))
-    })
+/// Shared CAS20 entry point. [`DynPrecompile`] is neither `Clone` nor `Sync`, so the
+/// process-wide state is this runner and each lookup wraps it in a fresh precompile.
+type Cas20Runner = Arc<dyn Fn(Kind, PrecompileInput<'_>) -> PrecompileResult + Send + Sync>;
+
+fn runner<O: Cas20Observer>(observer: O) -> Cas20Runner {
+    Arc::new(move |kind, input| run(kind, &observer, input))
 }
 
 fn run<O: Cas20Observer>(kind: Kind, observer: &O, input: PrecompileInput<'_>) -> PrecompileResult {
