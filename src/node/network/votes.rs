@@ -47,21 +47,9 @@ impl Decodable for BscCapPacket {
             return Err(alloy_rlp::Error::Custom("Invalid message ID for BscCapPacket"));
         }
 
-        // Decode RLP list: [protocol_version, extra]
-        let header = alloy_rlp::Header::decode(buf)?;
-        if !header.list {
-            return Err(alloy_rlp::Error::UnexpectedString);
-        }
-
-        let protocol_version = u64::decode(buf)?;
-
-        // Extra is raw RLP data - read remaining bytes directly
-        let remaining_len = header.payload_length - 1; // -1 for protocol_version (single byte)
-        if buf.len() < remaining_len {
-            return Err(alloy_rlp::Error::InputTooShort);
-        }
-        let extra = Bytes::copy_from_slice(&buf[..remaining_len]);
-        *buf = &buf[remaining_len..];
+        let mut body = alloy_rlp::Header::decode_bytes(buf, true)?;
+        let protocol_version = u64::decode(&mut body)?;
+        let extra = Bytes::copy_from_slice(body);
 
         Ok(Self { protocol_version, extra })
     }
@@ -119,5 +107,29 @@ pub fn handle_votes_broadcast(packet: VotesPacket) {
         use once_cell::sync::Lazy;
         static VOTE_METRICS: Lazy<BscVoteMetrics> = Lazy::new(BscVoteMetrics::default);
         VOTE_METRICS.vote_pool_size.set(votes::len() as f64);
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    #[test]
+    fn capability_extension_is_bounded_and_version_is_not_assumed_one_byte() {
+        let packet = BscCapPacket {
+            protocol_version: 128,
+            extra: alloy_rlp::encode(crate::node::network::consensus_bal::CAPABILITY).into(),
+        };
+        let mut raw = Vec::new();
+        packet.encode(&mut raw);
+        assert_eq!(BscCapPacket::decode(&mut raw.as_slice()).unwrap(), packet);
+        assert_eq!(
+            BscCapPacket::decode(&mut &[0, 0xc0][..]).unwrap_err(),
+            alloy_rlp::Error::InputTooShort
+        );
+        assert_eq!(
+            BscCapPacket::decode(&mut &[0, 0xc2, 2][..]).unwrap_err(),
+            alloy_rlp::Error::InputTooShort
+        );
     }
 }

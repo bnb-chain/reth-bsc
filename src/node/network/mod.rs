@@ -33,9 +33,7 @@ use reth_ethereum_primitives::{PooledTransactionVariant, TransactionSigned};
 use reth_network::{NetworkConfig, NetworkHandle, NetworkManager, PeersConfig, SessionsConfig};
 use reth_network_api::PeersInfo;
 use reth_network_peers::NodeRecord;
-use reth_provider::{
-    BlockNumReader, CanonStateSubscriptions, HeaderProvider, StateProviderFactory,
-};
+use reth_provider::{BalProvider, CanonStateSubscriptions, HeaderProvider, StateProviderFactory};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
@@ -51,6 +49,7 @@ pub(crate) mod data_availability;
 pub mod evn;
 pub mod evn_peers;
 pub mod handshake;
+mod status;
 mod transaction_policy;
 pub(crate) mod upgrade_status;
 pub(crate) mod votes;
@@ -64,7 +63,9 @@ pub(crate) mod bsc_protocol {
 }
 /// BSC `NewBlock` message value.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BscNewBlock(pub NewBlock<BscBlock>);
+pub struct BscNewBlock(pub NewBlock<BscBlock>, pub Option<alloy_primitives::Bytes>);
+
+pub(crate) mod consensus_bal;
 
 mod rlp {
     use super::*;
@@ -91,22 +92,26 @@ mod rlp {
         block: BlockHelper<'a>,
         td: U128,
         sidecars: Option<Cow<'a, Vec<BscBlobTransactionSidecar>>>,
+        block_access_list: Option<alloy_primitives::Bytes>,
     }
 
     impl<'a> From<&'a BscNewBlock> for BscNewBlockHelper<'a> {
         fn from(value: &'a BscNewBlock) -> Self {
-            let BscNewBlock(NewBlock {
-                block:
-                    BscBlock {
-                        header,
-                        body:
-                            BscBlockBody {
-                                inner: BlockBody { transactions, ommers, withdrawals },
-                                sidecars,
-                            },
-                    },
-                td,
-            }) = value;
+            let BscNewBlock(
+                NewBlock {
+                    block:
+                        BscBlock {
+                            header,
+                            body:
+                                BscBlockBody {
+                                    inner: BlockBody { transactions, ommers, withdrawals },
+                                    sidecars,
+                                },
+                        },
+                    td,
+                },
+                block_access_list,
+            ) = value;
 
             Self {
                 block: BlockHelper {
@@ -116,7 +121,12 @@ mod rlp {
                     withdrawals: withdrawals.as_ref().map(Cow::Borrowed),
                 },
                 td: *td,
-                sidecars: sidecars.as_ref().map(Cow::Borrowed),
+                sidecars: if block_access_list.is_some() {
+                    Some(sidecars.as_ref().map(Cow::Borrowed).unwrap_or_default())
+                } else {
+                    sidecars.as_ref().map(Cow::Borrowed)
+                },
+                block_access_list: block_access_list.clone(),
             }
         }
     }
@@ -137,22 +147,26 @@ mod rlp {
                 block: BlockHelper { header, transactions, ommers, withdrawals },
                 td,
                 sidecars,
+                block_access_list,
             } = BscNewBlockHelper::decode(buf)?;
 
-            Ok(BscNewBlock(NewBlock {
-                block: BscBlock {
-                    header: header.into_owned(),
-                    body: BscBlockBody {
-                        inner: BlockBody {
-                            transactions: transactions.into_owned(),
-                            ommers: ommers.into_owned(),
-                            withdrawals: withdrawals.map(|w| w.into_owned()),
+            Ok(BscNewBlock(
+                NewBlock {
+                    block: BscBlock {
+                        header: header.into_owned(),
+                        body: BscBlockBody {
+                            inner: BlockBody {
+                                transactions: transactions.into_owned(),
+                                ommers: ommers.into_owned(),
+                                withdrawals: withdrawals.map(|w| w.into_owned()),
+                            },
+                            sidecars: sidecars.map(|s| s.into_owned()),
                         },
-                        sidecars: sidecars.map(|s| s.into_owned()),
                     },
+                    td,
                 },
-                td,
-            }))
+                block_access_list,
+            ))
         }
     }
 }
@@ -162,6 +176,19 @@ impl NewBlockPayload for BscNewBlock {
 
     fn block(&self) -> &Self::Block {
         &self.0.block
+    }
+
+    fn for_peer(&self, peer: &alloy_primitives::B512) -> Option<Self> {
+        if bsc_protocol::registry::supports_bal(*peer) && self.length() < 16 * 1024 * 1024 - 1024 {
+            if self.1.is_some() {
+                metrics::counter!("bsc_consensus_bal_new_block_sent_total").increment(1);
+            }
+            None
+        } else if self.1.is_some() {
+            Some(Self(self.0.clone(), None))
+        } else {
+            None
+        }
     }
 
     fn td(&self) -> Option<U256> {
@@ -183,9 +210,13 @@ pub struct BscNetworkBuilder {
 }
 
 fn apply_bsc_eth_protocol_overrides(hello: &mut HelloMessageWithProtocols) {
-    // BSC eth/70 retains total difficulty and omits UpgradeStatus, unlike Ethereum eth/70.
-    // Use the supported legacy handshake until the BSC-specific wire format is implemented.
-    hello.protocols.retain(|protocol| protocol.cap.name != "eth" || protocol.cap.version <= 68);
+    // Keep eth/68 fallback for attachment-unaware BSC peers; eth/69 uses Ethereum's status.
+    hello.protocols.retain(|protocol| protocol.cap.name != "eth");
+    hello.protocols.extend([
+        reth_eth_wire::EthVersion::Eth68.into(),
+        reth_eth_wire::EthVersion::Eth70.into(),
+        reth_eth_wire::EthVersion::Eth71.into(),
+    ]);
 }
 
 /// Network CLI defaults for BSC, installed before parsing node arguments.
@@ -314,6 +345,7 @@ impl BscNetworkBuilder {
             }
         }
 
+        consensus_bal::set_store(ctx.provider().bal_store().clone());
         let network_builder = ctx.network_config_builder()?;
 
         let (to_import_net, from_network) = mpsc::channel(block_import::IMPORT_QUEUE_CAPACITY);
@@ -407,17 +439,26 @@ impl BscNetworkBuilder {
             }
         });
 
-        // TODO: update network with the latest canonical head, but has a fork id issue, can fix it
-        // later.
+        // Status and fork filtering must describe the same available database head.
+        let mut head = ctx.head();
+        head.total_difficulty =
+            ctx.provider().header_td_by_number(head.number)?.ok_or_else(|| {
+                eyre::eyre!("Missing total difficulty for network head {}", head.number)
+            })?;
         let mut network_builder = network_builder
             .boot_nodes(ctx.chain_spec().bootnodes().unwrap_or_default())
-            .set_head(ctx.chain_spec().head())
+            .set_head(head)
             .with_pow()
             .block_import(Box::new(BscBlockImport::new(handle).with_publication(publication)))
             .eth_rlpx_handshake(Arc::new(BscHandshake::default()))
             // Advertise both bsc/2 (with range messages) and bsc/1 (votes only)
             .add_rlpx_sub_protocol(bsc_protocol::protocol::handler::BscProtocolHandlerV2)
             .add_rlpx_sub_protocol(bsc_protocol::protocol::handler::BscProtocolHandlerV1);
+
+        if crate::node::bal::enabled() {
+            network_builder =
+                network_builder.add_rlpx_sub_protocol(crate::node::bal::BalProtocolHandler);
+        }
 
         // Apply proxyed peer IDs if configured
         if let Some(proxyed_peer_ids) = crate::shared::get_proxyed_peer_ids() {
@@ -452,11 +493,6 @@ impl BscNetworkBuilder {
             );
         }
 
-        let provider = ctx.provider();
-        if let Ok(number) = provider.best_block_number() {
-            let td = provider.header_td_by_number(number).unwrap_or_default();
-            network_config.status.total_difficulty = td;
-        }
         debug!(
             target: "bsc::net",
             peer_id = peer_id_to_node_id(peer_id),
@@ -715,10 +751,7 @@ async fn register_nodeids_actions<P: StateProviderFactory>(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        apply_bsc_discv4_overrides, apply_bsc_eth_protocol_overrides,
-        apply_bsc_peer_stability_overrides,
-    };
+    use super::*;
     use reth_discv4::{Discv4Config, NatResolver};
     use reth_network::{PeersConfig, SessionsConfig};
     use reth_network_peers::NodeRecord;
@@ -728,7 +761,60 @@ mod tests {
     };
 
     #[test]
-    fn negotiates_eth68_with_go_bsc_eth70_peer() {
+    fn bal_attachment_roundtrip_and_peer_negotiation() {
+        let mut block = BscBlock::default();
+        block.body.sidecars = Some(Vec::new());
+        block.header.base_fee_per_gas = Some(0);
+        block.header.withdrawals_root = Some(alloy_primitives::B256::ZERO);
+        block.header.blob_gas_used = Some(0);
+        block.header.excess_blob_gas = Some(0);
+        block.header.parent_beacon_block_root = Some(alloy_primitives::B256::ZERO);
+        block.header.requests_hash = Some(alloy_primitives::B256::ZERO);
+        block.header.block_access_list_hash = Some(alloy_primitives::keccak256([0xc0]));
+        let packet = BscNewBlock(
+            NewBlock { block, td: alloy_primitives::U128::ZERO },
+            Some(alloy_primitives::Bytes::from_static(&[0xc0])),
+        );
+        let raw = alloy_rlp::encode(&packet);
+        assert_eq!(raw.len(), packet.length());
+        assert_eq!(alloy_rlp::decode_exact::<BscNewBlock>(&raw).unwrap(), packet);
+        let peer = alloy_primitives::B512::repeat_byte(73);
+        let legacy = packet.for_peer(&peer).unwrap();
+        assert!(legacy.1.is_none());
+        assert_eq!(legacy.0, packet.0);
+        assert_eq!(
+            alloy_rlp::decode_exact::<BscNewBlock>(&alloy_rlp::encode(&legacy)).unwrap(),
+            legacy
+        );
+    }
+
+    #[test]
+    fn negotiates_supported_bsc_versions_and_preserves_extensions() {
+        use reth_eth_wire::{
+            capability::SharedCapabilities, protocol::Protocol, Capability, EthVersion,
+        };
+        for version in [EthVersion::Eth68, EthVersion::Eth70, EthVersion::Eth71] {
+            let mut hello = HelloMessageWithProtocols::builder(Default::default()).build();
+            let bsc = Protocol::new(Capability::new_static("bsc", 2), 4);
+            hello.protocols.push(bsc.clone());
+            apply_bsc_eth_protocol_overrides(&mut hello);
+            assert!(hello.protocols.contains(&bsc));
+            let versions: Vec<_> = hello
+                .protocols
+                .iter()
+                .filter(|p| p.cap.name == "eth")
+                .map(|p| p.cap.version)
+                .collect();
+            assert_eq!(versions, [68, 70, 71]);
+            let shared =
+                SharedCapabilities::try_new(hello.protocols, vec![Capability::eth(version)])
+                    .unwrap();
+            assert_eq!(shared.eth_version().unwrap(), version);
+        }
+    }
+
+    #[test]
+    fn negotiates_eth70_with_go_bsc_eth70_peer() {
         use reth_eth_wire::{
             capability::SharedCapabilities, Capability, EthVersion, HelloMessageWithProtocols,
         };
@@ -737,7 +823,7 @@ mod tests {
         apply_bsc_eth_protocol_overrides(&mut hello);
         let remote = vec![Capability::eth(EthVersion::Eth70), Capability::eth(EthVersion::Eth68)];
         let shared = SharedCapabilities::try_new(hello.protocols, remote).unwrap();
-        assert_eq!(shared.eth_version().unwrap(), EthVersion::Eth68);
+        assert_eq!(shared.eth_version().unwrap(), EthVersion::Eth70);
     }
 
     #[test]

@@ -252,6 +252,22 @@ fn add_hardforks_to_chainspec(
             chain_spec.with_fork(BscHardfork::Jenner, ForkCondition::Timestamp(jenner_time));
     }
 
+    if let Some(value) = config.get("bep732Time") {
+        let timestamp = value
+            .as_u64()
+            .ok_or_else(|| eyre::eyre!("bep732Time must be an unsigned timestamp"))?;
+        for prerequisite in ["jennerTime", "pragueTime", "bohrTime"] {
+            eyre::ensure!(
+                config
+                    .get(prerequisite)
+                    .and_then(|v| v.as_u64())
+                    .is_some_and(|time| time <= timestamp),
+                "bep732Time requires {prerequisite} at or before activation"
+            );
+        }
+        chain_spec = chain_spec.with_fork(BscHardfork::Bep732, ForkCondition::Timestamp(timestamp));
+    }
+
     Ok(chain_spec)
 }
 
@@ -279,6 +295,39 @@ mod tests {
                 "alloc": {{}}
             }}"#
         )
+    }
+
+    #[test]
+    fn bep732_activation_is_explicit_and_requires_prior_forks() {
+        let spec = parse_genesis_json(&genesis_json(
+            r#", "bohrTime": 0, "pragueTime": 0, "jennerTime": 0, "bep732Time": 100"#,
+        ))
+        .unwrap();
+        assert!(!spec.is_bep732_active_at_timestamp(1, 99));
+        assert!(spec.is_bep732_active_at_timestamp(1, 100));
+        assert!(!parse_genesis_json(&genesis_json(""))
+            .unwrap()
+            .is_bep732_active_at_timestamp(1, u64::MAX));
+        for chain in BscChainSpecParser::SUPPORTED_CHAINS {
+            assert!(!chain_value_parser(chain).unwrap().is_bep732_active_at_timestamp(1, u64::MAX));
+        }
+        let err = parse_genesis_json(&genesis_json(r#", "bep732Time": "100""#)).unwrap_err();
+        assert_eq!(err.to_string(), "bep732Time must be an unsigned timestamp");
+        for prerequisite in ["jennerTime", "pragueTime", "bohrTime"] {
+            let mut config =
+                serde_json::json!({"jennerTime":0,"pragueTime":0,"bohrTime":0,"bep732Time":100});
+            config[prerequisite] = serde_json::json!(101);
+            let extra = config
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| format!(", \"{k}\": {v}"))
+                .collect::<String>();
+            assert_eq!(
+                parse_genesis_json(&genesis_json(&extra)).unwrap_err().to_string(),
+                format!("bep732Time requires {prerequisite} at or before activation")
+            );
+        }
     }
 
     #[test]

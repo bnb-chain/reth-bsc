@@ -74,6 +74,8 @@ hardfork!(
         Pasteur,
         /// BSC `Jenner` hardfork - sequenced immediately after Pasteur
         Jenner,
+        /// Experimental BEP-732 activation, configured only by custom genesis.
+        Bep732,
     }
 );
 
@@ -305,7 +307,8 @@ impl From<BscHardfork> for SpecId {
             BscHardfork::Osaka |
             BscHardfork::Mendel |
             BscHardfork::Pasteur |
-            BscHardfork::Jenner => SpecId::OSAKA,
+            BscHardfork::Jenner |
+            BscHardfork::Bep732 => SpecId::OSAKA,
         }
     }
 }

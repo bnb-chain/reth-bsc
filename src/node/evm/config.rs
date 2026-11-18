@@ -1,5 +1,6 @@
 use super::{
     assembler::BscBlockAssembler,
+    bal::BscBalRecorder,
     builder::BscBlockBuilder,
     executor::{BscBlockExecutor, BscTxResult},
     factory::BscEvmFactory,
@@ -26,7 +27,7 @@ use reth_evm::{
     block::{BlockExecutorFactory, BlockExecutorFor},
     eth::{receipt_builder::ReceiptBuilder, EthBlockExecutionCtx},
     execute::BlockBuilder,
-    ConfigureEngineEvm, ConfigureEvm, Database, EvmEnv, EvmEnvFor, EvmFactory, EvmFor,
+    ConfigureEngineEvm, ConfigureEvm, Database, Evm, EvmEnv, EvmEnvFor, EvmFactory, EvmFor,
     ExecutableTxIterator, ExecutionCtxFor, FromRecoveredTx, FromTxWithEncoded, InspectorFor,
     IntoTxEnv, NextBlockEnvAttributes,
 };
@@ -667,10 +668,43 @@ where
         })
     }
 
+    fn create_executor<'a, DB, I>(
+        &'a self,
+        evm: EvmFor<Self, &'a mut State<DB>, I>,
+        ctx: <Self::BlockExecutorFactory as BlockExecutorFactory>::ExecutionCtx<'a>,
+    ) -> BlockExecutorFor<'a, Self::BlockExecutorFactory, &'a mut State<DB>, I>
+    where
+        DB: Database,
+        I: InspectorFor<Self, &'a mut State<DB>> + 'a,
+    {
+        self.create_executor_with_state(evm, ctx)
+    }
+
+    fn create_executor_with_state<'a, 'db, DB, I>(
+        &'a self,
+        mut evm: EvmFor<Self, &'db mut State<DB>, I>,
+        ctx: <Self::BlockExecutorFactory as BlockExecutorFactory>::ExecutionCtx<'a>,
+    ) -> BlockExecutorFor<'a, Self::BlockExecutorFactory, &'db mut State<DB>, I>
+    where
+        DB: Database,
+        I: InspectorFor<Self, &'db mut State<DB>>,
+    {
+        let record_bal = evm.db().bal_state.bal_builder.is_some() ||
+            ctx.header.as_ref().is_some_and(|header| header.block_access_list_hash.is_some());
+        evm.db_mut().bal_state.bal_builder = None;
+        let mut executor = self.executor_factory.create_executor(evm, ctx);
+        if record_bal {
+            executor.bal_recorder = Some(BscBalRecorder::new(|evm, bal| {
+                evm.db_mut().bal_state.bal_builder = Some(bal);
+            }));
+        }
+        executor
+    }
+
     // payload builder use this method to create BscBlockBuilder.
     fn create_block_builder<'a, DB, I>(
         &'a self,
-        evm: EvmFor<Self, &'a mut State<DB>, I>,
+        mut evm: EvmFor<Self, &'a mut State<DB>, I>,
         parent: &'a SealedHeader<HeaderTy<Self::Primitives>>,
         ctx: <Self::BlockExecutorFactory as BlockExecutorFactory>::ExecutionCtx<'a>,
     ) -> impl BlockBuilder<
@@ -681,9 +715,12 @@ where
         DB: Database,
         I: InspectorFor<Self, &'a mut State<DB>> + 'a,
     {
+        // The native recorder advances when body transactions are encountered. BSC executes
+        // system transactions later, in Finalize, and owns its recording boundaries instead.
+        evm.db_mut().bal_state.bal_builder = None;
         // just init a default custom ctx for mining block.
         let shared_ctx = BscExecutionSharedCtx::default();
-        let bsc_executor = BscBlockExecutor::new(
+        let mut bsc_executor = BscBlockExecutor::new(
             evm,
             ctx.clone(),
             shared_ctx.clone(),
@@ -691,6 +728,17 @@ where
             *self.executor_factory.receipt_builder(),
             SystemContract::new(self.executor_factory.spec().clone()),
         );
+
+        if crate::node::bal::enabled() ||
+            self.chain_spec().is_bep732_active_at_timestamp(
+                bsc_executor.evm.block().number.saturating_to(),
+                bsc_executor.evm.block().timestamp.saturating_to(),
+            )
+        {
+            bsc_executor.bal_recorder = Some(BscBalRecorder::new(|evm, bal| {
+                evm.db_mut().bal_state.bal_builder = Some(bal);
+            }));
+        }
 
         BscBlockBuilder::new(bsc_executor, ctx, shared_ctx, &self.block_assembler, parent)
     }
@@ -755,7 +803,9 @@ pub fn revm_spec_by_timestamp_and_block_number(
     timestamp: u64,
     block_number: u64,
 ) -> BscHardfork {
-    if chain_spec.is_jenner_active_at_timestamp(block_number, timestamp) {
+    if chain_spec.is_bep732_active_at_timestamp(block_number, timestamp) {
+        BscHardfork::Bep732
+    } else if chain_spec.is_jenner_active_at_timestamp(block_number, timestamp) {
         BscHardfork::Jenner
     } else if chain_spec.is_pasteur_active_at_timestamp(block_number, timestamp) {
         BscHardfork::Pasteur

@@ -92,6 +92,8 @@ pub struct BscBlockAssemblerInput<'a, 'b, F: BlockExecutorFactory, H = Header> {
     pub state_provider: &'b dyn StateProvider,
     /// State root for this block.
     pub state_root: alloy_primitives::B256,
+    /// Full BAL commitment for an activated BEP-732 block.
+    pub block_access_list_hash: Option<alloy_primitives::B256>,
 }
 
 /// Block assembler for BSC, mainly for support BscBlockExecutionCtx.
@@ -136,6 +138,7 @@ where
             transactions,
             output: BlockExecutionResult { receipts, requests: _, gas_used, .. },
             state_root,
+            block_access_list_hash,
             ..
         } = input;
 
@@ -221,7 +224,7 @@ where
             blob_gas_used,
             excess_blob_gas,
             requests_hash,
-            block_access_list_hash: Default::default(),
+            block_access_list_hash,
             slot_number: None,
         };
 
@@ -270,6 +273,7 @@ where
             transactions,
             output: BlockExecutionResult { receipts, requests, gas_used, .. },
             state_root,
+            block_access_list_hash,
             ..
         } = input;
 
@@ -352,7 +356,7 @@ where
             blob_gas_used,
             excess_blob_gas,
             requests_hash,
-            block_access_list_hash: Default::default(),
+            block_access_list_hash,
             slot_number: None,
         };
 

@@ -199,7 +199,7 @@ mod tests {
         };
         NewBlockMessage {
             hash: block.header.hash_slow(),
-            block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO })),
+            block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO }, None)),
         }
     }
 

@@ -105,6 +105,9 @@ pub fn encode_header_with_chain_id(header: &Header, out: &mut dyn BufMut, chain_
             // https://github.com/bnb-chain/BEPs/blob/master/BEPs/BEP-466.md
             if let Some(requests_hash) = header.requests_hash {
                 Encodable::encode(&requests_hash, out);
+                if let Some(hash) = header.block_access_list_hash {
+                    Encodable::encode(&hash, out);
+                }
             }
         }
     }
@@ -146,6 +149,9 @@ fn rlp_header(header: &Header, chain_id: u64) -> alloy_rlp::Header {
             // https://github.com/bnb-chain/BEPs/blob/master/BEPs/BEP-466.md
             if let Some(requests_hash) = header.requests_hash {
                 rlp_head.payload_length += requests_hash.length();
+                if let Some(hash) = header.block_access_list_hash {
+                    rlp_head.payload_length += hash.length();
+                }
             }
         }
     }
@@ -197,6 +203,28 @@ mod tests {
     use super::*;
     use alloy_consensus::Header;
     use alloy_primitives::B256;
+
+    #[test]
+    fn bep732_seal_binds_bal_and_has_correct_rlp_length() {
+        let mut header = Header {
+            extra_data: vec![0; 97].into(),
+            parent_beacon_block_root: Some(B256::ZERO),
+            requests_hash: Some(B256::ZERO),
+            ..Default::default()
+        };
+        let legacy = hash_with_chain_id(&header, 56);
+        header.block_access_list_hash = Some(B256::repeat_byte(1));
+        let first = hash_with_chain_id(&header, 56);
+        assert_ne!(legacy, first);
+        header.block_access_list_hash = Some(B256::repeat_byte(2));
+        assert_ne!(first, hash_with_chain_id(&header, 56));
+        let mut out = BytesMut::new();
+        encode_header_with_chain_id(&header, &mut out, 56);
+        let mut remaining = out.as_ref();
+        let prefix = alloy_rlp::Header::decode(&mut remaining).unwrap();
+        assert!(prefix.list);
+        assert_eq!(prefix.payload_length, remaining.len());
+    }
 
     /// `parent_beacon_block_root` is set but the optional fields that precede it in the RLP
     /// list are not — impossible for a header decoded from the wire, but reachable for a

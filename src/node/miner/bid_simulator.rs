@@ -331,6 +331,7 @@ where
             }
         };
         let mut mining_ctx = MiningContext {
+            pending_parent: None,
             parent_snapshot: Arc::new(parent_snapshot),
             parent_header: parent_header.clone(),
             header: None,
@@ -868,7 +869,7 @@ where
             hashed_state,
             trie_updates,
             block,
-            block_access_list: _,
+            block_access_list,
         } = out;
         let mut sealed_block = Arc::new(block.sealed_block().clone());
 
@@ -918,6 +919,11 @@ where
         let pending_turn_length = bid_turn_length_sink.lock().unwrap().take();
 
         bid_runtime.bsc_payload = Some(BscBuiltPayload {
+            block_access_list: block_access_list
+                .as_ref()
+                .filter(|_| sealed_block.header().block_access_list_hash.is_some())
+                .map(|bal| bal.as_raw().clone()),
+            bal_read_hint: block_access_list.and_then(crate::node::bal::built_bal_read_hint),
             diagnostics: None,
             block: sealed_block.clone(),
             fees: bid_runtime.gas_fee,
@@ -1560,6 +1566,7 @@ mod tests {
             sidecars: None,
         };
         BidBlockTask {
+            block_access_list: None,
             block: RecoveredBlock::new_unhashed(BscBlock { header, body }, Vec::new()),
             gas_fee: U256::from(1),
             system_tx_start: 0,
@@ -1683,6 +1690,7 @@ mod tests {
             let mut attrs = BscNextBlockEnvAttributes::build_pending_env(&parent, None);
             attrs.mode = BscExecutionMode::BidSimulation;
             let mining_ctx = MiningContext {
+                pending_parent: None,
                 header: Some(Header {
                     number: 1,
                     timestamp: attrs.inner.timestamp,

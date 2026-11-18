@@ -38,6 +38,10 @@ pub enum BuildKind {
 /// included into [`BscBlock`].
 #[derive(Debug, Clone)]
 pub struct BscBuiltPayload {
+    /// Complete consensus BAL, retained until the block is sealed.
+    pub(crate) block_access_list: Option<alloy_primitives::Bytes>,
+    /// Optional read-only BAL hint, excluded from block encoding and consensus.
+    pub(crate) bal_read_hint: Option<alloy_primitives::Bytes>,
     /// Attempt metadata; deliberately excluded from block contents and consensus.
     pub(crate) diagnostics:
         Option<Arc<crate::node::miner::build_diagnostics::CandidateDiagnostics>>,

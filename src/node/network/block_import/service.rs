@@ -23,7 +23,7 @@ use crate::{
 };
 use alloy_consensus::{BlockBody, Header};
 use alloy_eips::BlockNumberOrTag;
-use alloy_primitives::{Address, B256, U128, U256};
+use alloy_primitives::{Address, Bytes, B256, U128, U256};
 use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
 use futures::{future::Either, stream::FuturesUnordered, FutureExt, StreamExt};
 use parking_lot::RwLock;
@@ -89,10 +89,11 @@ pub(crate) type IncomingBlock = (BlockMsg, PeerId);
 pub(crate) type IncomingMinedBlock = (BscBuiltPayload, BlockMsg);
 
 /// Channel message for a selected (sealed, unexecuted) BEP-675 BidBlock:
-/// `(sealed, builder, bid_hash, gas_fee, system_tx_start)`.
+/// `(sealed, builder, bid_hash, gas_fee, system_tx_start, block_access_list)`.
 /// Unlike [`IncomingMinedBlock`] there is no executed payload: under zero-simulate the validator
 /// broadcasts first and executes on import.
-pub(crate) type IncomingBidBlock = (SealedBlock<BscBlock>, Address, B256, U256, usize);
+pub(crate) type IncomingBidBlock =
+    (SealedBlock<BscBlock>, Address, B256, U256, usize, Option<Bytes>);
 
 /// Locally produced blocks share a bounded ingress, isolated from remote announcements.
 /// The variants retain separate handlers: sharing capacity does not make a BidBlock an
@@ -167,6 +168,8 @@ where
     sync_config: Arc<BlockSyncConfig>,
     /// Near-head single-block downloads do not occupy ancestor recovery slots.
     head_fetches: super::head_fetch::HeadFetches,
+    /// Bounded, best-effort BAL fetches owned by this service and independent of import.
+    pending_bals: FuturesUnordered<futures::future::BoxFuture<'static, ()>>,
     /// Cache of processed block hashes to avoid reprocessing the same block.
     processed_blocks: LruCache<B256>,
     /// Cache of queued block hashes to avoid processing the same block.
@@ -410,6 +413,7 @@ where
             pending_local_imports: FuturesUnordered::new(),
             head_fetches: super::head_fetch::HeadFetches::new(sync_config.clone()),
             sync_config: sync_config.clone(),
+            pending_bals: FuturesUnordered::new(),
             processed_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
             queued_blocks: LruCache::new(LRU_PROCESSED_BLOCKS_SIZE),
             recovering_heads:
@@ -574,6 +578,7 @@ where
             };
 
             let header = sealed_block.header().clone();
+            let pending_parent = crate::node::miner::pending_parent::announce(&header);
             let payload = BscPayloadTypes::block_to_payload(sealed_block, None);
             let new_payload_started = std::time::Instant::now();
             let result =
@@ -598,6 +603,9 @@ where
                                     return None;
                                 }
                             } else {
+                                if let Some(guard) = &pending_parent {
+                                    guard.imported();
+                                }
                                 tracing::debug!(target: "bsc::block_import", "Succeed to update fork choice for new payload: number = {:?}, hash = {:?}", header.number, block_hash);
                             }
                             if fetched && publication.is_none() {
@@ -877,15 +885,8 @@ where
     /// Broadcast a selected BEP-675 BidBlock, then validate it through `new_payload`.
     /// `Valid` advances fork choice; `Invalid` revokes the builder unless validation failed
     /// locally.
-    fn on_new_bid_block(
-        &mut self,
-        sealed: SealedBlock<BscBlock>,
-        builder: Address,
-        bid_hash: B256,
-        gas_fee: U256,
-        system_tx_start: usize,
-        propagation: OwnedPermit<BlockMsg>,
-    ) {
+    fn on_new_bid_block(&mut self, incoming: IncomingBidBlock, propagation: OwnedPermit<BlockMsg>) {
+        let (sealed, builder, bid_hash, gas_fee, system_tx_start, block_access_list) = incoming;
         let block_hash = sealed.hash();
         let header = sealed.header().clone();
         let block_number = header.number;
@@ -900,10 +901,17 @@ where
             .unwrap_or_default();
         let new_td = parent_td + header.difficulty;
 
-        let new_block = BscNewBlock(NewBlock {
-            block: sealed.clone_block(),
-            td: U128::from(new_td.to::<u128>()),
-        });
+        if let Some(raw) = &block_access_list {
+            crate::node::network::consensus_bal::retain(
+                sealed.header(),
+                sealed.body().inner.transactions.len(),
+                raw.clone(),
+            );
+        }
+        let new_block = BscNewBlock(
+            NewBlock { block: sealed.clone_block(), td: U128::from(new_td.to::<u128>()) },
+            block_access_list,
+        );
         let mut block_msg = NewBlockMessage { hash: block_hash, block: Arc::new(new_block) };
 
         // Cache + register stats like a self-mined block so range responses and vote-delay metrics
@@ -1093,6 +1101,18 @@ where
             ),
             "network",
         );
+        if let Some(raw) = block.block.1.clone() {
+            let valid = crate::node::network::consensus_bal::retain(
+                &block.block.0.block.header,
+                block.block.0.block.body.inner.transactions.len(),
+                raw,
+            );
+            metrics::counter!("bsc_consensus_bal_new_block_received_total", "result" => if valid { "valid" } else { "invalid" }).increment(1);
+            if !valid {
+                Arc::make_mut(&mut block.block).1 = None;
+            }
+        }
+
         tracing::debug!(target: "bsc::block_import", "Receiving new block from network: number = {:?}, hash = {:?}, peer = {:?}", block.block.0.block.header.number, block.hash, peer_id);
 
         // Basic consensus validity must precede all propagation and admission markers.
@@ -1236,7 +1256,26 @@ where
         self.queued_blocks.insert(block.hash);
         self.head_fetches.cancel(&block.hash);
 
-        // Record chain delay metrics: time from block creation to first network reception
+        if block.block.0.block.header.block_access_list_hash.is_some() &&
+            crate::node::network::consensus_bal::get(block.hash).is_none()
+        {
+            if self.pending_bals.len() < 8 {
+                if let Some(network) = crate::shared::get_network_handle() {
+                    self.pending_bals.push(Box::pin(
+                        crate::node::network::consensus_bal::fetch_missing(
+                            network,
+                            peer_id,
+                            block.block.0.block.header.clone(),
+                            block.block.0.block.body.inner.transactions.len(),
+                        ),
+                    ));
+                }
+            } else {
+                metrics::counter!("bsc_consensus_bal_fetch_skipped_total").increment(1);
+            }
+        }
+
+        // Record chain delay metrics: time from block creation to first network reception.
         crate::consensus::parlia::block_stats::on_block_received(
             block.hash,
             &block.block.0.block.header,
@@ -1828,8 +1867,7 @@ where
                     this.on_new_mined_block(payload, message, permit);
                 }
                 IncomingLocalBlock::Bid(block) => {
-                    let (sealed, builder, hash, fee, system_tx_start) = *block;
-                    this.on_new_bid_block(sealed, builder, hash, fee, system_tx_start, permit);
+                    this.on_new_bid_block(*block, permit);
                 }
                 IncomingLocalBlock::Unexecuted(block) => {
                     this.head_fetches.cancel(&block.hash);
@@ -1879,6 +1917,8 @@ where
             this.on_new_block_hashes(hashes, peer_id);
         }
 
+        while let Poll::Ready(Some(())) = this.pending_bals.poll_next_unpin(cx) {}
+
         // Process completed imports and send events to network
         for n in 0..POLL_BATCH {
             if n + 1 == POLL_BATCH {
@@ -1889,7 +1929,7 @@ where
                 Ok((block, peer)) => this.on_new_block_inner(
                     NewBlockMessage {
                         hash,
-                        block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO })),
+                        block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO }, None)),
                     },
                     peer,
                     true,
@@ -2470,7 +2510,7 @@ mod tests {
         sign_test_header(&mut block.header);
         NewBlockMessage {
             hash: block.header.hash_slow(),
-            block: Arc::new(BscNewBlock(NewBlock { block, td: U128::from(102) })),
+            block: Arc::new(BscNewBlock(NewBlock { block, td: U128::from(102) }, None)),
         }
     }
 
@@ -2880,7 +2920,7 @@ mod tests {
             .expect("blob test header must pass basic consensus validation");
         let good = NewBlockMessage {
             hash,
-            block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO })),
+            block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO }, None)),
         };
         let mut missing = good.clone();
         Arc::make_mut(&mut missing.block).0.block.body.sidecars = None;
@@ -3064,7 +3104,7 @@ mod tests {
             };
             NewBlockMessage {
                 hash: block.header.hash_slow(),
-                block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO })),
+                block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO }, None)),
             }
         };
         for n in 0..1024 {
@@ -3520,7 +3560,11 @@ mod tests {
             (true, false, false, 0x7b, 900_104),
             (true, false, true, 0x7a, 900_105),
         ] {
-            let sealed = create_bid_sealed_block(block_number);
+            let raw = Bytes::from_static(&[0xc0]);
+            let mut block = create_bid_sealed_block(block_number).clone_block();
+            block.header.block_access_list_hash = Some(alloy_primitives::keccak256(&raw));
+            let hash = block.header.hash_slow();
+            let sealed = reth_primitives_traits::Block::seal_unchecked(block, hash);
             let sealed_hash = sealed.hash();
             let bid_hash = B256::repeat_byte(0xb1);
             let parent_hash = sealed.header().parent_hash;
@@ -3543,9 +3587,17 @@ mod tests {
 
             // The miner claims the slot before handing the signed block to this service.
             assert!(crate::shared::check_and_record_mined_block(block_number, parent_hash));
+            assert!(crate::node::network::consensus_bal::get(sealed_hash).is_none());
             fixture
                 .bid_tx
-                .send(IncomingLocalBlock::Bid(Box::new((sealed, builder, bid_hash, U256::ZERO, 0))))
+                .send(IncomingLocalBlock::Bid(Box::new((
+                    sealed,
+                    builder,
+                    bid_hash,
+                    U256::ZERO,
+                    0,
+                    Some(raw.clone()),
+                ))))
                 .await
                 .unwrap();
 
@@ -3554,10 +3606,10 @@ mod tests {
                     let event = futures::future::poll_fn(|cx| fixture.handle.poll_outcome(cx))
                         .await
                         .expect("import service closed before broadcast");
-                    if matches!(
-                        event,
-                        BlockImportEvent::Announcement(BlockValidation::ValidBlock { .. })
-                    ) {
+                    if let BlockImportEvent::Announcement(BlockValidation::ValidBlock { block }) =
+                        event
+                    {
+                        assert_eq!(block.block.1.as_ref(), Some(&raw));
                         break;
                     }
                 }
@@ -3622,7 +3674,14 @@ mod tests {
 
         fixture
             .bid_tx
-            .send(IncomingLocalBlock::Bid(Box::new((sealed, builder, bid_hash, U256::ZERO, 0))))
+            .send(IncomingLocalBlock::Bid(Box::new((
+                sealed,
+                builder,
+                bid_hash,
+                U256::ZERO,
+                0,
+                None,
+            ))))
             .await
             .unwrap();
 
@@ -3701,7 +3760,14 @@ mod tests {
         // system_tx_start = 1: the single receipt above is the entire non-system-tx region.
         fixture
             .bid_tx
-            .send(IncomingLocalBlock::Bid(Box::new((sealed, builder, bid_hash, U256::ZERO, 1))))
+            .send(IncomingLocalBlock::Bid(Box::new((
+                sealed,
+                builder,
+                bid_hash,
+                U256::ZERO,
+                1,
+                None,
+            ))))
             .await
             .unwrap();
 
@@ -3749,7 +3815,7 @@ mod tests {
         let gas_fee = U256::from(21_000u64) * U256::from(1_000_000_000_000u64);
         fixture
             .bid_tx
-            .send(IncomingLocalBlock::Bid(Box::new((sealed, builder, bid_hash, gas_fee, 1))))
+            .send(IncomingLocalBlock::Bid(Box::new((sealed, builder, bid_hash, gas_fee, 1, None))))
             .await
             .unwrap();
 
@@ -4198,7 +4264,7 @@ mod tests {
                 sidecars: None,
             },
         };
-        let new_block = BscNewBlock(NewBlock { block, td: U128::from(1) });
+        let new_block = BscNewBlock(NewBlock { block, td: U128::from(1) }, None);
         let hash = new_block.0.block.header.hash_slow();
         NewBlockMessage { hash, block: Arc::new(new_block) }
     }
@@ -4466,7 +4532,7 @@ mod tests {
                 sidecars: None,
             },
         };
-        let new_block = BscNewBlock(NewBlock { block, td: U128::from(1) });
+        let new_block = BscNewBlock(NewBlock { block, td: U128::from(1) }, None);
         let hash = new_block.0.block.header.hash_slow();
         NewBlockMessage { hash, block: Arc::new(new_block) }
     }
@@ -4913,7 +4979,7 @@ mod tests {
         };
         let message = NewBlockMessage {
             hash: block.header.hash_slow(),
-            block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO })),
+            block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO }, None)),
         };
         service.on_new_block_inner(message.clone(), PeerId::random(), true);
         assert!(events.try_recv().is_err(), "fetched headers must await Engine validation");
@@ -5051,7 +5117,10 @@ mod tests {
             assert!(!crate::node::network::bsc_protocol::registry::is_v2_peer(peer));
             let message = NewBlockMessage {
                 hash: head.header.hash_slow(),
-                block: Arc::new(BscNewBlock(NewBlock { block: head.clone(), td: U128::ZERO })),
+                block: Arc::new(BscNewBlock(
+                    NewBlock { block: head.clone(), td: U128::ZERO },
+                    None,
+                )),
             };
             service.on_new_block_inner(message, peer, true);
             assert!(events.try_recv().is_err(), "unknown TD must not be propagated");
@@ -5221,7 +5290,7 @@ mod tests {
             );
             let message = |block: BscBlock| NewBlockMessage {
                 hash: block.header.hash_slow(),
-                block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO })),
+                block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO }, None)),
             };
             service.on_new_block_inner(message(head.clone()), peer, false);
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -5404,7 +5473,7 @@ mod tests {
         let hash = block.header.hash_slow();
         let message = NewBlockMessage {
             hash,
-            block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO })),
+            block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO }, None)),
         };
         service.on_new_block_inner(message.clone(), peer, false);
         service.on_new_block_inner(message.clone(), peer, false);
@@ -5478,7 +5547,7 @@ mod tests {
         service.on_new_block_inner(
             NewBlockMessage {
                 hash,
-                block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO })),
+                block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO }, None)),
             },
             peer,
             true,
@@ -5525,7 +5594,7 @@ mod tests {
             let block = BscBlock { header, ..Default::default() };
             let message = NewBlockMessage {
                 hash: block.header.hash_slow(),
-                block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO })),
+                block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO }, None)),
             };
             service.on_new_block_inner(message, PeerId::random(), true);
         }
@@ -5548,7 +5617,7 @@ mod tests {
         assert!(service.head_fetches.poll(&mut cx).is_pending());
         let message = NewBlockMessage {
             hash,
-            block: Arc::new(BscNewBlock(NewBlock { block, td: U128::from(1) })),
+            block: Arc::new(BscNewBlock(NewBlock { block, td: U128::from(1) }, None)),
         };
         service.on_new_block(message.clone(), PeerId::random());
         assert!(matches!(service.head_fetches.poll(&mut cx), Poll::Ready(None)));
@@ -5612,7 +5681,7 @@ mod tests {
         service.on_new_block_inner(
             NewBlockMessage {
                 hash,
-                block: Arc::new(BscNewBlock(NewBlock { block: head, td: U128::ZERO })),
+                block: Arc::new(BscNewBlock(NewBlock { block: head, td: U128::ZERO }, None)),
             },
             PeerId::random(),
             true,
@@ -5663,7 +5732,7 @@ mod tests {
         let parent_hash = block.header.parent_hash;
         let message = NewBlockMessage {
             hash,
-            block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO })),
+            block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO }, None)),
         };
         // A connected bsc/2 peer that never announced this head must not be queried.
         let unrelated = PeerId::random();

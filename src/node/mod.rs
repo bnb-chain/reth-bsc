@@ -35,6 +35,7 @@ use reth_payload_primitives::{PayloadAttributesBuilder, PayloadTypes};
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
 
+pub mod bal;
 pub mod consensus;
 pub mod engine;
 pub mod engine_api;

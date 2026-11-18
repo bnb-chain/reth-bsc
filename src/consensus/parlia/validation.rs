@@ -182,23 +182,17 @@ fn validate_requests_hash_for_bsc(
     Ok(())
 }
 
-/// go-bsc `parlia.VerifyUnsealedHeader`: reject the two trailing `rlp:"optional"` header fields
-/// `BlockAccessListHash` (EIP-7928) and `SlotNumber` (EIP-7843).
-///
-/// Both are covered by the block hash but NOT by the Parlia seal preimage —
-/// [`super::util::encode_header_with_chain_id`] stops after `requests_hash`, mirroring go-bsc's
-/// `EncodeSigHeader`. Honest blocks never set them, so without this check an unprivileged peer
-/// could append a crafted value to a validator-signed header, changing its block hash while
-/// leaving the seal (and therefore the recovered signer) valid.
-///
-/// go-bsc gates the rule on Amsterdam — absent before, required from — but BSC has not
-/// scheduled Amsterdam and reth-bsc has no such fork, so only the "must be absent" half is
-/// expressible here. The presence half lands with Amsterdam itself, at which point the fields'
-/// *content* is bound by state validation (`BlockAccessListHash` is recomputed from execution)
-/// and the slot rules rather than by the seal.
+/// Bind optional header fields to the custom-chain activation schedule.
+/// Slot numbers remain unsupported; BEP-732 does not enable Ethereum Amsterdam.
 #[inline]
-fn validate_optional_trailing_fields_for_bsc(header: &SealedHeader) -> Result<(), ConsensusError> {
-    if let Some(block_access_list_hash) = header.block_access_list_hash {
+fn validate_optional_trailing_fields_for_bsc(
+    header: &SealedHeader,
+    bep732_active: bool,
+) -> Result<(), ConsensusError> {
+    if bep732_active && header.block_access_list_hash.is_none() {
+        return Err(ConsensusError::BlockAccessListHashMissing);
+    }
+    if let Some(block_access_list_hash) = header.block_access_list_hash.filter(|_| !bep732_active) {
         return Err(ConsensusError::msg(format!(
             "invalid BlockAccessListHash, have {block_access_list_hash:#x}, expected nil"
         )));
@@ -243,7 +237,10 @@ impl<ChainSpec: EthChainSpec + BscHardforks + std::fmt::Debug + Send + Sync + 's
             self.spec.is_prague_active_at_block_and_timestamp(header.number, header.timestamp);
         validate_requests_hash_for_bsc(header, prague_active)?;
 
-        validate_optional_trailing_fields_for_bsc(header)?;
+        validate_optional_trailing_fields_for_bsc(
+            header,
+            self.spec.is_bep732_active_at_timestamp(header.number, header.timestamp),
+        )?;
 
         validate_header_base_fee(header, &self.spec)?;
 
@@ -584,23 +581,42 @@ mod tests {
     }
 
     #[test]
+    fn bep732_requires_commitment_and_still_rejects_slot_number() {
+        assert!(matches!(
+            validate_optional_trailing_fields_for_bsc(&sealed(Header::default()), true),
+            Err(ConsensusError::BlockAccessListHashMissing)
+        ));
+        let mut header = Header { block_access_list_hash: Some(B256::ZERO), ..Default::default() };
+        assert!(validate_optional_trailing_fields_for_bsc(&sealed(header.clone()), true).is_ok());
+        header.slot_number = Some(1);
+        assert!(validate_optional_trailing_fields_for_bsc(&sealed(header), true)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid SlotNumber"));
+    }
+
+    #[test]
     fn rejects_block_access_list_hash_and_slot_number() {
         // Both absent: the only shape honest BSC blocks have today.
-        assert!(validate_optional_trailing_fields_for_bsc(&sealed(Header::default())).is_ok());
+        assert!(
+            validate_optional_trailing_fields_for_bsc(&sealed(Header::default()), false).is_ok()
+        );
 
         let header = sealed(Header {
             block_access_list_hash: Some(B256::from([3u8; 32])),
             ..Default::default()
         });
-        let err = validate_optional_trailing_fields_for_bsc(&header).unwrap_err().to_string();
+        let err =
+            validate_optional_trailing_fields_for_bsc(&header, false).unwrap_err().to_string();
         assert!(err.contains("invalid BlockAccessListHash"), "unexpected error: {err}");
 
         let header = sealed(Header { slot_number: Some(7), ..Default::default() });
-        let err = validate_optional_trailing_fields_for_bsc(&header).unwrap_err().to_string();
+        let err =
+            validate_optional_trailing_fields_for_bsc(&header, false).unwrap_err().to_string();
         assert!(err.contains("invalid SlotNumber"), "unexpected error: {err}");
     }
 
-    /// Why the check has to exist: appending either field leaves the Parlia seal preimage — and
+    /// With the required Prague tail absent, appending either field leaves the seal preimage — and
     /// so the recovered signer — untouched, while changing the block hash. That is exactly the
     /// malleability go-bsc closes; without the check, a peer can mint a second valid-looking
     /// hash for a block it did not sign.

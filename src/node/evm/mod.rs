@@ -31,6 +31,7 @@ use revm::{
 };
 
 mod assembler;
+mod bal;
 mod builder;
 pub mod config;
 mod finish_metrics;

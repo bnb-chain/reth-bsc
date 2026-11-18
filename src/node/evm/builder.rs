@@ -170,6 +170,30 @@ where
         stages.enter("system_transactions");
         let (evm, result) = self.executor.finish()?;
         let (db, evm_env) = evm.finish();
+        let consensus_bal = evm_env.cfg_env.spec >= crate::hardforks::bsc::BscHardfork::Bep732;
+        let block_access_list = match db.take_built_alloy_bal() {
+            Some(bal) if consensus_bal => {
+                let raw = alloy_rlp::encode(&bal);
+                let decoded: alloy_eips::eip7928::bal::DecodedBal =
+                    alloy_eips::eip7928::bal::DecodedBal::new(bal.into(), raw.into());
+                decoded
+                    .as_bal()
+                    .validate_structure(result.receipts.len())
+                    .map_err(BlockExecutionError::other)?;
+                decoded
+                    .as_bal()
+                    .validate_gas_limit(evm_env.block_env.gas_limit)
+                    .map_err(BlockExecutionError::other)?;
+                Some(decoded)
+            }
+            Some(bal) => crate::node::bal::encode_read_hint(bal),
+            None if consensus_bal => {
+                return Err(BlockExecutionError::msg("BEP-732 recording result missing"))
+            }
+            None => None,
+        };
+        let block_access_list_hash =
+            if consensus_bal { block_access_list.as_ref().map(|bal| bal.hash()) } else { None };
 
         // Finish the sparse-trie update stream. The hook lives on the DB (which outlives the
         // executor), so it is NOT dropped by `executor.finish()`; we must clear it explicitly.
@@ -418,6 +442,7 @@ where
                 bundle_state: &db.bundle_state,
                 state_provider: &state,
                 state_root,
+                block_access_list_hash,
             };
         let assemble_start = std::time::Instant::now();
         // Assemble block body only — finalize_new_header() is deferred to pick_best_payload()
@@ -460,7 +485,7 @@ where
             hashed_state,
             trie_updates,
             block,
-            block_access_list: None,
+            block_access_list,
         })
     }
 

@@ -31,6 +31,7 @@ struct PeerEntry {
     tx: UnboundedSender<BscCommand>,
     /// Negotiated bsc subprotocol version (1 or 2).
     version: u8,
+    bal: bool,
 }
 
 /// Global registry of active BSC protocol peers.
@@ -54,7 +55,7 @@ pub fn register_peer(peer: PeerId, tx: UnboundedSender<BscCommand>, version: u8)
     let guard = REGISTRY.write();
     match guard {
         Ok(mut g) => {
-            g.insert(peer, PeerEntry { tx, version });
+            g.insert(peer, PeerEntry { tx, version, bal: false });
             inserted = true;
         }
         Err(e) => {
@@ -105,6 +106,24 @@ pub fn is_v2_peer(peer: PeerId) -> bool {
         Ok(guard) => guard.get(&peer).is_some_and(|e| e.version >= 2),
         Err(_) => false,
     }
+}
+
+/// Record support advertised on this connection's BSC capability packet.
+pub(crate) fn set_bal_support(peer: PeerId, version: u64) {
+    if let Ok(mut peers) = REGISTRY.write() {
+        if let Some(entry) = peers.get_mut(&peer) {
+            if u64::from(entry.version) == version {
+                entry.bal = true;
+            }
+        }
+    }
+}
+
+/// Full BAL attachments are sent only after an explicit support advertisement.
+pub(crate) fn supports_bal(peer: PeerId) -> bool {
+    REGISTRY
+        .read()
+        .is_ok_and(|peers| peers.get(&peer).is_some_and(|entry| entry.bal && !entry.tx.is_closed()))
 }
 
 /// Snapshot of peers that negotiated bsc/2 (i.e. support `GetBlocksByRange`).
@@ -749,6 +768,24 @@ mod version_tests {
         assert!(stalled.send(Err("late response".into())).is_err());
         assert!(receivers[3].try_recv().is_err());
         assert!(receivers[4].try_recv().is_err());
+    }
+
+    #[test]
+    fn bal_support_requires_matching_version_and_resets_on_reconnect() {
+        let peer = pid(0x73);
+        let _guard = TestPeerGuard(peer);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        register_peer(peer, tx.clone(), 2);
+        assert!(!supports_bal(peer));
+        set_bal_support(peer, 1);
+        assert!(!supports_bal(peer));
+        set_bal_support(peer, 2);
+        assert!(supports_bal(peer));
+        register_peer(peer, tx, 2);
+        assert!(!supports_bal(peer));
+        set_bal_support(peer, 2);
+        drop(rx);
+        assert!(!supports_bal(peer));
     }
 
     #[tokio::test]

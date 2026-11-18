@@ -612,14 +612,35 @@ where
         if let Some(control) = &build_control {
             control.check_active(std::time::Instant::now()).map_err(std::io::Error::other)?;
         }
+        let candidate_state = match super::bal_state::prepare(
+            &self.client,
+            &parent_header,
+            self.ctx.pending_parent.as_ref().map(|parent| &parent.raw),
+        ) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                if self.ctx.pending_parent.is_some() {
+                    return Err(error.into());
+                }
+                metrics::counter!("bsc_bal_parent_state_total", "result" => "fallback")
+                    .increment(1);
+                warn!(target: "payload_builder", %parent_hash, %error, "BAL parent state unavailable; using executed parent");
+                None
+            }
+        };
+        if candidate_state.is_some() {
+            // Cached reads must not mask errors in the new parent view during rollout.
+            cached_reads = CachedReads::default();
+        }
 
         // Each candidate owns its root task; all candidates reuse the miner's dedicated
         // executor. `None` keeps the synchronous path when sparse-trie building is disabled.
         let root_setup =
             super::perf_tuning::Phase::new(kind.label(), self.ctx.is_inturn, "root_setup");
         let trie_handle: Arc<Mutex<Option<reth_engine_tree::tree::StateRootHandle>>> = {
-            let use_sparse_trie = crate::node::miner::config::get_global_mining_config()
-                .is_some_and(|c| c.use_sparse_trie_state_root);
+            let use_sparse_trie = candidate_state.is_none() &&
+                crate::node::miner::config::get_global_mining_config()
+                    .is_some_and(|c| c.use_sparse_trie_state_root);
             Arc::new(Mutex::new(if use_sparse_trie {
                 crate::shared::spawn_sparse_trie_state_root(parent_header.as_ref().clone())
             } else {
@@ -637,10 +658,28 @@ where
         parent_setup.complete();
         let provider_setup =
             super::perf_tuning::Phase::new(kind.label(), self.ctx.is_inturn, "state_provider_open");
-        let state_provider = parent_state.open()?;
+        let state_provider =
+            if self.ctx.pending_parent.is_none() { Some(parent_state.open()?) } else { None };
+        let read_provider = candidate_state
+            .as_ref()
+            .map(|(base, _)| base)
+            .or(state_provider.as_ref())
+            .ok_or_else(|| std::io::Error::other("Missing early parent state"))?;
+        if let Some(parent) = &self.ctx.pending_parent {
+            if !parent.viable() {
+                return Err(std::io::Error::other("Early parent no longer viable").into());
+            }
+            metrics::counter!("bsc_parallel_build_total", "phase" => if parent.ready() { "after_import" } else { "before_import" }).increment(1);
+        }
         provider_setup.complete();
-        let state = StateProviderDatabase::new(EvmStateProviderAdapter(&state_provider));
-        let prewarm_cache = super::prewarm::cache_for_attempt(parent_hash);
+        let state = super::bal_state::BalParentDatabase {
+            base: StateProviderDatabase::new(EvmStateProviderAdapter(read_provider)),
+            overlay: candidate_state.as_ref().map(|(_, overlay)| overlay),
+        };
+        let prewarm_cache = candidate_state
+            .is_none()
+            .then(|| super::prewarm::cache_for_attempt(parent_hash))
+            .flatten();
         let (state, read_phase) =
             ObservedStateDb::new(&mut cached_reads, state, kind, self.ctx.is_inturn);
         let state = state.with_shared_prewarm(parent_hash, prewarm_cache.clone());
@@ -833,6 +872,7 @@ where
             work.selection_stage(SelectionStage::Control);
             let iteration_started = std::time::Instant::now();
             if cancel.is_cancelled() ||
+                self.ctx.pending_parent.as_ref().is_some_and(|parent| !parent.viable()) ||
                 build_control
                     .as_ref()
                     .is_some_and(|control| control.stop_transactions(std::time::Instant::now()))
@@ -1139,6 +1179,16 @@ where
                 );
             }
 
+            if self
+                .ctx
+                .pending_parent
+                .as_ref()
+                .is_some_and(|parent| !parent.ready() && parent.viable())
+            {
+                metrics::counter!("bsc_parallel_transaction_total").increment(1);
+                debug!(target: "bsc::miner", %parent_hash, tx_hash = %tx.hash(), "Executed child transaction before parent import");
+            }
+
             // Add blob tx sidecar to the payload.
             if let Some(sidecar) = blob_tx_sidecar {
                 sidecars_map.insert(*tx.hash(), sidecar);
@@ -1186,6 +1236,21 @@ where
             control.check_active(std::time::Instant::now()).map_err(std::io::Error::other)?;
         }
 
+        let imported_provider = if let Some(parent) = &self.ctx.pending_parent {
+            if !parent.wait(&cancel, self.ctx.end_mining_timestamp_ms) {
+                metrics::counter!("bsc_parallel_parent_total", "result" => "cancelled")
+                    .increment(1);
+                return Err(std::io::Error::other("Early parent failed import gate").into());
+            }
+            Some(self.client.state_by_block_hash(parent_header.hash_slow())?)
+        } else {
+            None
+        };
+        let final_provider = imported_provider
+            .as_ref()
+            .or(state_provider.as_ref())
+            .ok_or_else(|| std::io::Error::other("Missing imported parent state"))?;
+
         // add system txs to payload.
         let finalize_start = std::time::Instant::now();
 
@@ -1210,8 +1275,8 @@ where
             hashed_state,
             trie_updates,
             block,
-            block_access_list: _,
-        } = builder.finish(&state_provider, None)?;
+            block_access_list,
+        } = builder.finish(final_provider, None)?;
 
         if let Some(control) = build_control.as_ref().filter(|control| control.allows_late_finish())
         {
@@ -1318,6 +1383,11 @@ where
         let pending_turn_length = turn_length_sink.lock().unwrap().take();
 
         let payload = BscBuiltPayload {
+            block_access_list: block_access_list
+                .as_ref()
+                .filter(|_| sealed_block.header().block_access_list_hash.is_some())
+                .map(|bal| bal.as_raw().clone()),
+            bal_read_hint: block_access_list.and_then(crate::node::bal::built_bal_read_hint),
             diagnostics: None,
             block: sealed_block.clone(),
             fees: total_fees,
@@ -1344,7 +1414,7 @@ where
         let BscBuildArguments {
             mut cached_reads,
             config,
-            cancel: _,
+            cancel,
             trace_id,
             min_gas_tip: _,
             state_root_precomputed: _,
@@ -1356,6 +1426,11 @@ where
         let PayloadConfig { parent_header, attributes, payload_id: _, parent_block_info: _ } =
             config;
 
+        if let Some(parent) = &self.ctx.pending_parent {
+            if !parent.wait(&cancel, self.ctx.end_mining_timestamp_ms) {
+                return Err(std::io::Error::other("Early parent failed empty-build gate").into());
+            }
+        }
         // Reuse the miner's parent-overlay cache, but never a normal candidate's update
         // stream or root sink: system transactions give this empty candidate its own state.
         let use_sparse_trie = crate::node::miner::config::get_global_mining_config()
@@ -1454,7 +1529,7 @@ where
             hashed_state,
             trie_updates,
             block,
-            block_access_list: _,
+            block_access_list,
         } = builder.finish(&state_provider, None)?;
         let finalize_elapsed = finalize_start.elapsed();
 
@@ -1496,6 +1571,11 @@ where
         let pending_turn_length = turn_length_sink.lock().unwrap().take();
 
         let payload = BscBuiltPayload {
+            block_access_list: block_access_list
+                .as_ref()
+                .filter(|_| sealed_block.header().block_access_list_hash.is_some())
+                .map(|bal| bal.as_raw().clone()),
+            bal_read_hint: block_access_list.and_then(crate::node::bal::built_bal_read_hint),
             diagnostics: None,
             block: sealed_block.clone(),
             fees: total_fees,
@@ -1515,9 +1595,14 @@ where
 /// Handle for aborting a BscPayloadJob
 pub struct BscPayloadJobHandle {
     abort_tx: oneshot::Sender<()>,
+    early_parent: Option<alloy_primitives::B256>,
 }
 
 impl BscPayloadJobHandle {
+    pub(crate) fn reuses_early_parent(&self, hash: alloy_primitives::B256) -> bool {
+        self.early_parent == Some(hash) && !self.abort_tx.is_closed()
+    }
+
     /// Abort the payload job by new head.
     pub fn abort(self) {
         let _ = self.abort_tx.send(());
@@ -1677,7 +1762,10 @@ where
             final_shot_used: false,
             trace_id,
         };
-        let handle = BscPayloadJobHandle { abort_tx };
+        let handle = BscPayloadJobHandle {
+            abort_tx,
+            early_parent: job.mining_ctx.pending_parent.as_ref().map(|parent| parent.header.hash()),
+        };
 
         debug!(
             target: "bsc::miner::payload",
@@ -2686,6 +2774,24 @@ where
         Ok(())
     }
 
+    fn check_early_signing_gate(&self) -> Result<(), Box<BscPayloadJobError>> {
+        let Some(parent) = &self.mining_ctx.pending_parent else { return Ok(()) };
+        let eligible = crate::shared::get_snapshot_provider()
+            .and_then(|provider| provider.snapshot_by_hash(&parent.header.hash()))
+            .is_some_and(|snapshot| {
+                let signer = self.build_args.config.attributes.suggested_fee_recipient;
+                snapshot.validators.contains(&signer) &&
+                    !snapshot.sign_recently(signer) &&
+                    snapshot.is_inturn(signer) == self.mining_ctx.is_inturn
+            });
+        if !parent.ready() || !eligible || self.build_args.cancel.is_cancelled() {
+            metrics::counter!("bsc_parallel_parent_total", "result" => "signing_rejected")
+                .increment(1);
+            return Err(Box::new(BscPayloadJobError::JobAborted));
+        }
+        Ok(())
+    }
+
     /// Try to return the best payload to result channel
     fn try_return_best_payload(&mut self) -> Result<(), Box<BscPayloadJobError>> {
         self.collect_best_bid();
@@ -2709,6 +2815,7 @@ where
         // the wait this decision is made at t≈0 and no bid can ever be seen.
         self.wait_for_submission_deadline()?;
         self.collect_best_bid_block();
+        self.check_early_signing_gate()?;
 
         // BEP-675 zero-simulate selection (go-bsc `selectBidBlock`): if the unexecuted BidBlock's
         // deposit-derived fee beats every local / legacy-SendBid candidate, commit to it. The block
@@ -2921,6 +3028,7 @@ where
         // on the sync path would reject it. Mirror that timing with a delayed background send,
         // the same pattern `submit_payload` uses for the local path.
         let delay = bid_block_broadcast_delay(sealed.header(), now_unix_ms());
+        let block_access_list = bid.block_access_list.clone();
 
         let trace_id = self.trace_id;
         let (builder_addr, bid_hash, gas_fee, system_tx_start) =
@@ -2934,6 +3042,7 @@ where
                     bid_hash,
                     gas_fee,
                     system_tx_start,
+                    block_access_list,
                 ))),
                 delay,
             )
@@ -3096,6 +3205,7 @@ where
                 "Snapshot provider not available".to_string(),
             ))
         })?;
+        self.check_early_signing_gate()?;
         finalize_payload(
             &mut best_payload,
             self.parlia.clone(),
@@ -3359,7 +3469,7 @@ fn finalize_payload(
 mod tests {
     use tokio::sync::oneshot;
 
-    use super::{reserve_for_depth, AdaptiveReserveConfig, DELAY_LEFT_OVER};
+    use super::*;
 
     fn cfg(min_ms: u64, max_ms: u64) -> AdaptiveReserveConfig {
         AdaptiveReserveConfig {
@@ -3591,6 +3701,20 @@ mod tests {
         Parlia::new(chain_spec, 200)
     }
 
+    #[test]
+    fn imported_parent_reuses_only_a_live_early_job() {
+        let hash = alloy_primitives::B256::repeat_byte(1);
+        let (abort_tx, receiver) = oneshot::channel();
+        let handle = BscPayloadJobHandle { abort_tx, early_parent: Some(hash) };
+        assert!(handle.reuses_early_parent(hash));
+        assert!(!handle.reuses_early_parent(alloy_primitives::B256::repeat_byte(2)));
+        drop(receiver);
+        assert!(!handle.reuses_early_parent(hash));
+        let (abort_tx, _receiver) = oneshot::channel();
+        let ordinary = BscPayloadJobHandle { abort_tx, early_parent: None };
+        assert!(!ordinary.reuses_early_parent(hash));
+    }
+
     fn test_mining_context(
         parlia: &Parlia<BscChainSpec>,
         block_interval: u64,
@@ -3627,6 +3751,7 @@ mod tests {
         snapshot.block_interval = block_interval;
 
         MiningContext {
+            pending_parent: None,
             header: Some(header),
             parent_header: SealedHeader::new(parent_header.clone(), parent_header.hash_slow()),
             parent_snapshot: Arc::new(snapshot),
@@ -4021,6 +4146,8 @@ mod tests {
             let mut executed_block = block.clone();
             executed_block.body.sidecars = None;
             let mut payload = super::BscBuiltPayload {
+                block_access_list: None,
+                bal_read_hint: None,
                 diagnostics: None,
                 block: Arc::new(block.into()),
                 fees: U256::ZERO,
