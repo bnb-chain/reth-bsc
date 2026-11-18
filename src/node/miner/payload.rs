@@ -658,11 +658,8 @@ where
         parent_setup.complete();
         let provider_setup =
             super::perf_tuning::Phase::new(kind.label(), self.ctx.is_inturn, "state_provider_open");
-        let state_provider = if self.ctx.pending_parent.is_none() {
-            Some(parent_state.open()?)
-        } else {
-            None
-        };
+        let state_provider =
+            if self.ctx.pending_parent.is_none() { Some(parent_state.open()?) } else { None };
         let read_provider = candidate_state
             .as_ref()
             .map(|(base, _)| base)
@@ -679,7 +676,10 @@ where
             base: StateProviderDatabase::new(EvmStateProviderAdapter(read_provider)),
             overlay: candidate_state.as_ref().map(|(_, overlay)| overlay),
         };
-        let prewarm_cache = candidate_state.is_none().then(|| super::prewarm::cache_for_attempt(parent_hash)).flatten();
+        let prewarm_cache = candidate_state
+            .is_none()
+            .then(|| super::prewarm::cache_for_attempt(parent_hash))
+            .flatten();
         let (state, read_phase) =
             ObservedStateDb::new(&mut cached_reads, state, kind, self.ctx.is_inturn);
         let state = state.with_shared_prewarm(parent_hash, prewarm_cache.clone());

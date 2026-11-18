@@ -679,6 +679,7 @@ mod tests {
                         cost + 123,
                         17,
                         per_byte_gas,
+                        false,
                     )
                     .unwrap();
                     if recovery_id >= 4 {

@@ -7,16 +7,43 @@ Named BSC networks remain unscheduled. Early construction is disabled by default
 The sections below preserve each milestone's behavior and validation history;
 the early-construction section describes the current implementation.
 
-Cargo dependencies pin companion `bnb-chain/reth` commit
-`4453d5b620701eca966f579feb11e684ae83e3cf` (`feat/bep732-v2.8`).
-No sibling checkout is required. Earlier local tests used the identical companion
-source through path patches.
+This branch is rebased onto reth-bsc PR #629 at
+`7a369d99f83d41ca389f91f36c45b8c07556341b`. Cargo dependencies pin companion
+`bnb-chain/reth` commit `57d9274c03c49b75737264a76915122bd7954035`
+(`rebase/bep732-deps-onto-pr629`), which layers the BEP-732 engine and transport
+changes over #629's Reth dependency `8a14f2b52d934c2717bfd9869babde5155d13fb1`.
+No sibling checkout is required. The earlier milestone and cluster results below
+predate this rebase and do not establish validation of the combined branch.
+
+The integration preserves #629's bounded local ingress and propagation permits,
+remote validation/retry paths, startup recovery gate, build cancellation and
+execution diagnostics. BAL data travels through those existing queues. Early
+parent reads bypass shared canonical prewarm caches; finalization and signing
+still require independent parent import. Advertised ETH versions remain 68, 70,
+and 71, using the BSC status handshake introduced by this PR.
 
 The design follows the recording section of the
 [BEP-732 draft](https://raw.githubusercontent.com/flywukong/BEPs/bal-mev-bep/BEPs/BEP-732.md),
 which references EIP-7928 revision
 [`d4c5755`](https://github.com/ethereum/EIPs/blob/d4c575521d99ec881a444ab3af604e684b5f0743/EIPS/eip-7928.md).
 Activation must be checked against the final agreed specification.
+
+## Rebase validation — 2026-11-18
+
+Validated locally on macOS with Rust 1.99.0 against the combined dependency pin:
+
+- Serial `reth_bsc` library suite: **1,151 passed, 0 failed, 1 existing ignored**.
+- BidBlock execution harness: **7 passed, 0 failed**.
+- Companion Reth read-hint tests: **4 passed, 0 failed**.
+- Locked, offline workspace check passed for all targets.
+- Workspace/tests/all-features Clippy passed with `-D warnings`.
+- Nightly workspace formatting and `git diff --check` passed.
+- Companion Reth `zepter run check` and `make lint-toml` passed.
+- Cargo metadata resolves one Reth revision across 104 packages. The lockfiles retain
+  #629's dependency baseline plus #632's existing updates for libz-sys, Tokio,
+  webpki root packages, and zstd-sys.
+
+Activated BEP-732 cluster and cross-client tests have not been rerun on this rebase.
 
 ## Implemented
 

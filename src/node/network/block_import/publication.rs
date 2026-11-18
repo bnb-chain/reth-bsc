@@ -208,10 +208,10 @@ impl Publication {
         }
         Some(NewBlockMessage {
             hash,
-            block: Arc::new(BscNewBlock(NewBlock {
-                block: (*block).clone(),
-                td: U128::from(td.to::<u128>()),
-            })),
+            block: Arc::new(BscNewBlock(
+                NewBlock { block: (*block).clone(), td: U128::from(td.to::<u128>()) },
+                None,
+            )),
         })
     }
 }
@@ -289,7 +289,10 @@ mod tests {
     fn message(block: &BscBlock, td: u128) -> BlockMsg {
         NewBlockMessage {
             hash: block.header.hash_slow(),
-            block: Arc::new(BscNewBlock(NewBlock { block: block.clone(), td: U128::from(td) })),
+            block: Arc::new(BscNewBlock(
+                NewBlock { block: block.clone(), td: U128::from(td) },
+                None,
+            )),
         }
     }
 

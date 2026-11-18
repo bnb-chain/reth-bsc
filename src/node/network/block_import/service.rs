@@ -885,16 +885,8 @@ where
     /// Broadcast a selected BEP-675 BidBlock, then validate it through `new_payload`.
     /// `Valid` advances fork choice; `Invalid` revokes the builder unless validation failed
     /// locally.
-    fn on_new_bid_block(
-        &mut self,
-        sealed: SealedBlock<BscBlock>,
-        builder: Address,
-        bid_hash: B256,
-        gas_fee: U256,
-        system_tx_start: usize,
-        block_access_list: Option<Bytes>,
-        propagation: OwnedPermit<BlockMsg>,
-    ) {
+    fn on_new_bid_block(&mut self, incoming: IncomingBidBlock, propagation: OwnedPermit<BlockMsg>) {
+        let (sealed, builder, bid_hash, gas_fee, system_tx_start, block_access_list) = incoming;
         let block_hash = sealed.hash();
         let header = sealed.header().clone();
         let block_number = header.number;
@@ -1875,8 +1867,7 @@ where
                     this.on_new_mined_block(payload, message, permit);
                 }
                 IncomingLocalBlock::Bid(block) => {
-                    let (sealed, builder, hash, fee, system_tx_start, block_access_list) = *block;
-                    this.on_new_bid_block(sealed, builder, hash, fee, system_tx_start, block_access_list, permit);
+                    this.on_new_bid_block(*block, permit);
                 }
                 IncomingLocalBlock::Unexecuted(block) => {
                     this.head_fetches.cancel(&block.hash);
@@ -1938,7 +1929,7 @@ where
                 Ok((block, peer)) => this.on_new_block_inner(
                     NewBlockMessage {
                         hash,
-                        block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO })),
+                        block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO }, None)),
                     },
                     peer,
                     true,
@@ -2519,7 +2510,7 @@ mod tests {
         sign_test_header(&mut block.header);
         NewBlockMessage {
             hash: block.header.hash_slow(),
-            block: Arc::new(BscNewBlock(NewBlock { block, td: U128::from(102) })),
+            block: Arc::new(BscNewBlock(NewBlock { block, td: U128::from(102) }, None)),
         }
     }
 
@@ -3113,7 +3104,7 @@ mod tests {
             };
             NewBlockMessage {
                 hash: block.header.hash_slow(),
-                block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO })),
+                block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO }, None)),
             }
         };
         for n in 0..1024 {
@@ -3599,7 +3590,14 @@ mod tests {
             assert!(crate::node::network::consensus_bal::get(sealed_hash).is_none());
             fixture
                 .bid_tx
-                .send(IncomingLocalBlock::Bid(Box::new((sealed, builder, bid_hash, U256::ZERO, 0, Some(raw.clone())))))
+                .send(IncomingLocalBlock::Bid(Box::new((
+                    sealed,
+                    builder,
+                    bid_hash,
+                    U256::ZERO,
+                    0,
+                    Some(raw.clone()),
+                ))))
                 .await
                 .unwrap();
 
@@ -3676,7 +3674,14 @@ mod tests {
 
         fixture
             .bid_tx
-            .send(IncomingLocalBlock::Bid(Box::new((sealed, builder, bid_hash, U256::ZERO, 0, None))))
+            .send(IncomingLocalBlock::Bid(Box::new((
+                sealed,
+                builder,
+                bid_hash,
+                U256::ZERO,
+                0,
+                None,
+            ))))
             .await
             .unwrap();
 
@@ -3755,7 +3760,14 @@ mod tests {
         // system_tx_start = 1: the single receipt above is the entire non-system-tx region.
         fixture
             .bid_tx
-            .send(IncomingLocalBlock::Bid(Box::new((sealed, builder, bid_hash, U256::ZERO, 1, None))))
+            .send(IncomingLocalBlock::Bid(Box::new((
+                sealed,
+                builder,
+                bid_hash,
+                U256::ZERO,
+                1,
+                None,
+            ))))
             .await
             .unwrap();
 
@@ -4967,7 +4979,7 @@ mod tests {
         };
         let message = NewBlockMessage {
             hash: block.header.hash_slow(),
-            block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO })),
+            block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO }, None)),
         };
         service.on_new_block_inner(message.clone(), PeerId::random(), true);
         assert!(events.try_recv().is_err(), "fetched headers must await Engine validation");
@@ -5105,7 +5117,10 @@ mod tests {
             assert!(!crate::node::network::bsc_protocol::registry::is_v2_peer(peer));
             let message = NewBlockMessage {
                 hash: head.header.hash_slow(),
-                block: Arc::new(BscNewBlock(NewBlock { block: head.clone(), td: U128::ZERO })),
+                block: Arc::new(BscNewBlock(
+                    NewBlock { block: head.clone(), td: U128::ZERO },
+                    None,
+                )),
             };
             service.on_new_block_inner(message, peer, true);
             assert!(events.try_recv().is_err(), "unknown TD must not be propagated");
@@ -5275,7 +5290,7 @@ mod tests {
             );
             let message = |block: BscBlock| NewBlockMessage {
                 hash: block.header.hash_slow(),
-                block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO })),
+                block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO }, None)),
             };
             service.on_new_block_inner(message(head.clone()), peer, false);
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -5458,7 +5473,7 @@ mod tests {
         let hash = block.header.hash_slow();
         let message = NewBlockMessage {
             hash,
-            block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO })),
+            block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO }, None)),
         };
         service.on_new_block_inner(message.clone(), peer, false);
         service.on_new_block_inner(message.clone(), peer, false);
@@ -5532,7 +5547,7 @@ mod tests {
         service.on_new_block_inner(
             NewBlockMessage {
                 hash,
-                block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO })),
+                block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO }, None)),
             },
             peer,
             true,
@@ -5579,7 +5594,7 @@ mod tests {
             let block = BscBlock { header, ..Default::default() };
             let message = NewBlockMessage {
                 hash: block.header.hash_slow(),
-                block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO })),
+                block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO }, None)),
             };
             service.on_new_block_inner(message, PeerId::random(), true);
         }
@@ -5602,7 +5617,7 @@ mod tests {
         assert!(service.head_fetches.poll(&mut cx).is_pending());
         let message = NewBlockMessage {
             hash,
-            block: Arc::new(BscNewBlock(NewBlock { block, td: U128::from(1) })),
+            block: Arc::new(BscNewBlock(NewBlock { block, td: U128::from(1) }, None)),
         };
         service.on_new_block(message.clone(), PeerId::random());
         assert!(matches!(service.head_fetches.poll(&mut cx), Poll::Ready(None)));
@@ -5666,7 +5681,7 @@ mod tests {
         service.on_new_block_inner(
             NewBlockMessage {
                 hash,
-                block: Arc::new(BscNewBlock(NewBlock { block: head, td: U128::ZERO })),
+                block: Arc::new(BscNewBlock(NewBlock { block: head, td: U128::ZERO }, None)),
             },
             PeerId::random(),
             true,
@@ -5717,7 +5732,7 @@ mod tests {
         let parent_hash = block.header.parent_hash;
         let message = NewBlockMessage {
             hash,
-            block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO })),
+            block: Arc::new(BscNewBlock(NewBlock { block, td: U128::ZERO }, None)),
         };
         // A connected bsc/2 peer that never announced this head must not be queried.
         let unrelated = PeerId::random();

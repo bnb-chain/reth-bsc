@@ -196,7 +196,6 @@ where
         }
 
         let parlia = Arc::new(Parlia::new(Arc::new(spec.clone()), 200));
-        let spec_clone = spec.clone();
         let execution_diagnostics =
             crate::node::miner::state_read_diagnostics::ExecutionObservation::new(
                 ctx.finish_diagnostics,

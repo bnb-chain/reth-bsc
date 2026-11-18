@@ -350,7 +350,12 @@ where
                         // Resume ordinary mining immediately; do not wait for the recovery ticker.
                         watched_parent = None;
                         if let Some(tip) = self.get_tip_header_at_startup() {
-                            self.try_new_work(&tip).await;
+                            let timing = StartupTiming::new(
+                                tip.hash(),
+                                calculate_millisecond_timestamp(tip.header()),
+                                "early_parent_fallback",
+                            );
+                            self.try_new_work(&tip, timing).await;
                         }
                     }
                 }
@@ -524,7 +529,12 @@ where
         {
             return false;
         }
-        let ctx = MiningContext {
+        let mut ctx = MiningContext {
+            startup_timing: Some(StartupTiming::new(
+                parent.hash(),
+                calculate_millisecond_timestamp(parent.header()),
+                "early_parent",
+            )),
             pending_parent: Some(pending.clone()),
             header: None,
             parent_header: parent.clone(),
@@ -546,6 +556,9 @@ where
             })
         {
             return false;
+        }
+        if let Some(timing) = &mut ctx.startup_timing {
+            timing.queued();
         }
         if let Err(error) = self.mining_queue_tx.send(ctx) {
             debug!(target: "bsc::miner", %error, "Early mining queue closed");

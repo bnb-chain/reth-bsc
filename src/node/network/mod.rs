@@ -33,9 +33,7 @@ use reth_ethereum_primitives::{PooledTransactionVariant, TransactionSigned};
 use reth_network::{NetworkConfig, NetworkHandle, NetworkManager, PeersConfig, SessionsConfig};
 use reth_network_api::PeersInfo;
 use reth_network_peers::NodeRecord;
-use reth_provider::{
-    BalProvider, BlockNumReader, CanonStateSubscriptions, HeaderProvider, StateProviderFactory,
-};
+use reth_provider::{BalProvider, CanonStateSubscriptions, HeaderProvider, StateProviderFactory};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
@@ -51,8 +49,8 @@ pub(crate) mod data_availability;
 pub mod evn;
 pub mod evn_peers;
 pub mod handshake;
-mod transaction_policy;
 mod status;
+mod transaction_policy;
 pub(crate) mod upgrade_status;
 pub(crate) mod votes;
 pub(crate) mod bsc_protocol {

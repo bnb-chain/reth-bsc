@@ -58,6 +58,7 @@ fn legacy_bid_sidecars_are_checked_before_execution_and_storage() {
             let mut attrs = BscNextBlockEnvAttributes::build_pending_env(&parent, None);
             attrs.mode = BscExecutionMode::BidSimulation;
             let mining_ctx = MiningContext {
+                pending_parent: None,
                 header: Some(Header {
                     number: 10,
                     timestamp: attrs.inner.timestamp,
