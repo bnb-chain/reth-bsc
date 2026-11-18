@@ -94,6 +94,10 @@ where
         // `eth_getFinalizedHeader` can derive the probabilistic finalized height.
         let eth_api = ctx
             .eth_api_builder()
+            // Builder nonce lookups should not wait for a newly published head's overlay.
+            // Only latest nonce/balance RPCs may use its Ready canonical parent (one block max).
+            // Transaction pool validation and execution continue to read exact state.
+            .latest_account_ready(true)
             .with_current_validators_len(|| {
                 let best_block = crate::shared::get_best_canonical_block_number()?;
                 let header =
