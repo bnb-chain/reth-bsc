@@ -28,14 +28,14 @@ use reth::{
 use reth_chainspec::EthChainSpec;
 use reth_discv4::Discv4Config;
 use reth_engine_primitives::ConsensusEngineHandle;
-use reth_eth_wire::{BasicNetworkPrimitives, HelloMessageWithProtocols, NewBlock, NewBlockPayload};
+use reth_eth_wire::{
+    BasicNetworkPrimitives, EthVersion, HelloMessageWithProtocols, NewBlock, NewBlockPayload,
+};
 use reth_ethereum_primitives::{PooledTransactionVariant, TransactionSigned};
 use reth_network::{NetworkConfig, NetworkHandle, NetworkManager, PeersConfig, SessionsConfig};
 use reth_network_api::PeersInfo;
 use reth_network_peers::NodeRecord;
-use reth_provider::{
-    BlockNumReader, CanonStateSubscriptions, HeaderProvider, StateProviderFactory,
-};
+use reth_provider::{CanonStateSubscriptions, HeaderProvider, StateProviderFactory};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
@@ -51,6 +51,7 @@ pub(crate) mod data_availability;
 pub mod evn;
 pub mod evn_peers;
 pub mod handshake;
+mod status;
 mod transaction_policy;
 pub(crate) mod upgrade_status;
 pub(crate) mod votes;
@@ -183,9 +184,13 @@ pub struct BscNetworkBuilder {
 }
 
 fn apply_bsc_eth_protocol_overrides(hello: &mut HelloMessageWithProtocols) {
-    // BSC eth/70 retains total difficulty and omits UpgradeStatus, unlike Ethereum eth/70.
-    // Use the supported legacy handshake until the BSC-specific wire format is implemented.
-    hello.protocols.retain(|protocol| protocol.cap.name != "eth" || protocol.cap.version <= 68);
+    // Keep the BSC release policy independent of the upstream Ethereum defaults.
+    hello.protocols.retain(|protocol| protocol.cap.name != "eth");
+    hello.protocols.extend([
+        EthVersion::Eth68.into(),
+        EthVersion::Eth70.into(),
+        EthVersion::Eth71.into(),
+    ]);
 }
 
 /// Network CLI defaults for BSC, installed before parsing node arguments.
@@ -407,11 +412,18 @@ impl BscNetworkBuilder {
             }
         });
 
-        // TODO: update network with the latest canonical head, but has a fork id issue, can fix it
-        // later.
+        // Use the database head for both status and the fork filter. The chainspec's
+        // static head can have a zero hash and does not describe the available block
+        // range required by eth/70+. Upstream initializes TD to zero, so load Parlia's
+        // TD at the same height rather than mixing different heads in the status.
+        let mut head = ctx.head();
+        head.total_difficulty =
+            ctx.provider().header_td_by_number(head.number)?.ok_or_else(|| {
+                eyre::eyre!("Missing total difficulty for network head {}", head.number)
+            })?;
         let mut network_builder = network_builder
             .boot_nodes(ctx.chain_spec().bootnodes().unwrap_or_default())
-            .set_head(ctx.chain_spec().head())
+            .set_head(head)
             .with_pow()
             .block_import(Box::new(BscBlockImport::new(handle).with_publication(publication)))
             .eth_rlpx_handshake(Arc::new(BscHandshake::default()))
@@ -452,11 +464,6 @@ impl BscNetworkBuilder {
             );
         }
 
-        let provider = ctx.provider();
-        if let Ok(number) = provider.best_block_number() {
-            let td = provider.header_td_by_number(number).unwrap_or_default();
-            network_config.status.total_difficulty = td;
-        }
         debug!(
             target: "bsc::net",
             peer_id = peer_id_to_node_id(peer_id),
@@ -720,6 +727,10 @@ mod tests {
         apply_bsc_peer_stability_overrides,
     };
     use reth_discv4::{Discv4Config, NatResolver};
+    use reth_eth_wire::{
+        capability::SharedCapabilities, protocol::Protocol, Capability, EthVersion,
+        HelloMessageWithProtocols,
+    };
     use reth_network::{PeersConfig, SessionsConfig};
     use reth_network_peers::NodeRecord;
     use std::{
@@ -728,16 +739,62 @@ mod tests {
     };
 
     #[test]
-    fn negotiates_eth68_with_go_bsc_eth70_peer() {
-        use reth_eth_wire::{
-            capability::SharedCapabilities, Capability, EthVersion, HelloMessageWithProtocols,
-        };
-
+    fn negotiates_eth70_with_go_bsc_eth70_peer() {
         let mut hello = HelloMessageWithProtocols::builder(Default::default()).build();
         apply_bsc_eth_protocol_overrides(&mut hello);
         let remote = vec![Capability::eth(EthVersion::Eth70), Capability::eth(EthVersion::Eth68)];
         let shared = SharedCapabilities::try_new(hello.protocols, remote).unwrap();
-        assert_eq!(shared.eth_version().unwrap(), EthVersion::Eth68);
+        assert_eq!(shared.eth_version().unwrap(), EthVersion::Eth70);
+    }
+
+    #[test]
+    fn advertises_only_supported_eth_versions_and_preserves_other_capabilities() {
+        let bsc = Protocol::new(Capability::new_static("bsc", 2), 4);
+        let snap = Protocol::new(Capability::new_static("snap", 2), 8);
+        let mut hello = HelloMessageWithProtocols::builder(Default::default())
+            .protocols([bsc.clone(), snap.clone(), EthVersion::Eth72.into()])
+            .build();
+        // Applying the policy repeatedly must not duplicate capabilities.
+        apply_bsc_eth_protocol_overrides(&mut hello);
+        apply_bsc_eth_protocol_overrides(&mut hello);
+        assert_eq!(
+            hello.protocols,
+            [
+                bsc,
+                snap,
+                EthVersion::Eth68.into(),
+                EthVersion::Eth70.into(),
+                EthVersion::Eth71.into()
+            ]
+        );
+    }
+
+    #[test]
+    fn negotiates_highest_supported_eth_version() {
+        for (remote_versions, expected) in [
+            (vec![EthVersion::Eth68], EthVersion::Eth68),
+            (vec![EthVersion::Eth68, EthVersion::Eth69], EthVersion::Eth68),
+            (vec![EthVersion::Eth70], EthVersion::Eth70),
+            (vec![EthVersion::Eth71], EthVersion::Eth71),
+            (EthVersion::ALL_VERSIONS.to_vec(), EthVersion::Eth71),
+        ] {
+            let mut hello = HelloMessageWithProtocols::builder(Default::default()).build();
+            apply_bsc_eth_protocol_overrides(&mut hello);
+            let remote = remote_versions.into_iter().map(Capability::eth).collect();
+            let shared = SharedCapabilities::try_new(hello.protocols, remote).unwrap();
+            assert_eq!(shared.eth_version().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn rejects_peers_with_only_unsupported_eth_versions() {
+        for version in [EthVersion::Eth66, EthVersion::Eth67, EthVersion::Eth69, EthVersion::Eth72]
+        {
+            let mut hello = HelloMessageWithProtocols::builder(Default::default()).build();
+            apply_bsc_eth_protocol_overrides(&mut hello);
+            assert!(SharedCapabilities::try_new(hello.protocols, vec![Capability::eth(version)])
+                .is_err());
+        }
     }
 
     #[test]
