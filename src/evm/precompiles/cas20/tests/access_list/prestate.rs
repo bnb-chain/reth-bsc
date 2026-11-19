@@ -294,7 +294,37 @@ async fn include_empty_with_diff_mode_is_rejected() {
     for mux in [false, true] {
         let opts = options(json!({"includeEmpty":true,"diffMode":true}), mux);
         let err = api.debug_trace_call(request(ALICE, vec![]), None, Some(opts)).await.unwrap_err();
-        assert_eq!(err.code(), -32602);
+        assert_eq!(err.code(), -32000);
         assert_eq!(err.message(), "cannot use diffMode with includeEmpty");
+    }
+}
+
+#[tokio::test]
+async fn include_empty_retains_rejected_evm_creation_candidates() {
+    let h = Harness::new();
+    let api = debug!(h.st);
+    let creator = Address::repeat_byte(0xc3);
+    for (code, create2) in [("600060006001f05000", false), ("6000600060006001f55000", true)] {
+        let candidate =
+            if create2 { creator.create2_from_code(B256::ZERO, []) } else { creator.create(1) };
+        for mux in [false, true] {
+            let mut opts = options(json!({"includeEmpty":true}), mux);
+            opts.state_overrides = Some(
+                [(
+                    creator,
+                    AccountOverride {
+                        balance: Some(U256::ZERO),
+                        nonce: Some(1),
+                        code: Some(code.parse().unwrap()),
+                        ..Default::default()
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            );
+            let trace =
+                api.debug_trace_call(request(creator, vec![]), None, Some(opts)).await.unwrap();
+            assert_eq!(prestate(trace, mux)[format!("{candidate:#x}")], json!({"balance":"0x0"}));
+        }
     }
 }
