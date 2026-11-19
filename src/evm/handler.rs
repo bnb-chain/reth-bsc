@@ -5,8 +5,8 @@ use crate::evm::{
     blacklist, precompiles,
 };
 
+use alloy_evm::Database;
 use alloy_primitives::{hex, TxKind, U256};
-use reth_evm::Database;
 use revm::{bytecode::Bytecode, primitives::eip7702};
 
 use alloy_consensus::constants::KECCAK_EMPTY;
@@ -323,7 +323,7 @@ where
 mod tests {
     use super::*;
     use crate::{evm::transaction::BscTxEnv, hardforks::bsc::BscHardfork};
-    use reth_evm::EvmEnv;
+    use alloy_evm::EvmEnv;
     use revm::{
         context::{BlockEnv, CfgEnv, TxEnv},
         context_interface::result::InvalidTransaction,

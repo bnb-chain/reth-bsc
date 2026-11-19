@@ -16,7 +16,7 @@ pub(crate) struct PreExecutionValidationError(BlockValidationError);
 pub(crate) fn mark_pre_execution_error(error: BlockExecutionError) -> BlockExecutionError {
     match error {
         BlockExecutionError::Validation(error) => BlockExecutionError::Validation(
-            BlockValidationError::Other(Box::new(PreExecutionValidationError(error))),
+            BlockValidationError::other(PreExecutionValidationError(error)),
         ),
         internal => internal,
     }
@@ -25,7 +25,7 @@ pub(crate) fn mark_pre_execution_error(error: BlockExecutionError) -> BlockExecu
 pub(crate) fn is_execution_evidence(error: &BlockExecutionError) -> bool {
     match error {
         BlockExecutionError::Validation(BlockValidationError::Other(error)) => {
-            !error.is::<PreExecutionValidationError>()
+            error.downcast_ref::<PreExecutionValidationError>().is_none()
         }
         BlockExecutionError::Validation(_) => true,
         BlockExecutionError::Internal(_) => false,
@@ -365,5 +365,109 @@ mod tests {
                 other => panic!("expected a validation error, got {other:?}"),
             }
         }
+    }
+}
+
+use evm2::registry::HandlerError;
+use reth_evm::InvalidTxError;
+/// Retains native validation categories used by the miner's pool traversal.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub(super) struct InvalidNativeTransaction(pub HandlerError);
+
+impl InvalidTxError for InvalidNativeTransaction {
+    fn is_nonce_too_low(&self) -> bool {
+        matches!(self.0, HandlerError::InvalidNonce { expected, got } if got < expected)
+    }
+    fn is_gas_limit_too_high(&self) -> bool {
+        matches!(
+            self.0,
+            HandlerError::GasLimitMoreThanBlock { .. } |
+                HandlerError::TxGasLimitGreaterThanCap { .. }
+        )
+    }
+    fn is_gas_limit_too_low(&self) -> bool {
+        matches!(self.0, HandlerError::IntrinsicGasTooLow { .. })
+    }
+    fn as_any(&self) -> &(dyn std::any::Any + 'static) {
+        self
+    }
+}
+
+pub(super) fn with_transaction_hash(error: BlockExecutionError, hash: B256) -> BlockExecutionError {
+    match error {
+        BlockExecutionError::Validation(BlockValidationError::Other(error)) => {
+            match error.downcast_ref::<HandlerError>() {
+                Some(native) => BlockValidationError::InvalidTx {
+                    hash,
+                    error: Box::new(InvalidNativeTransaction(native.clone())),
+                }
+                .into(),
+                None => BlockValidationError::Other(error).into(),
+            }
+        }
+        error => error,
+    }
+}
+
+#[cfg(test)]
+mod native_transaction_error_tests {
+    use super::*;
+
+    #[test]
+    fn miner_validation_categories_survive_native_error_conversion() {
+        let hash = B256::repeat_byte(0x11);
+        let cases = [
+            (HandlerError::InvalidNonce { expected: 3, got: 2 }, true, false, false),
+            (HandlerError::InvalidNonce { expected: 3, got: 4 }, false, false, false),
+            (
+                HandlerError::GasLimitMoreThanBlock {
+                    gas_limit: 100,
+                    block_gas_limit: U256::from(90),
+                },
+                false,
+                true,
+                false,
+            ),
+            (
+                HandlerError::TxGasLimitGreaterThanCap { gas_limit: 100, cap: 90 },
+                false,
+                true,
+                false,
+            ),
+            (
+                HandlerError::IntrinsicGasTooLow { required: 21_000, got: 20_000 },
+                false,
+                false,
+                true,
+            ),
+        ];
+        for (error, nonce_low, gas_high, gas_low) in cases {
+            let error = with_transaction_hash(BlockValidationError::other(error).into(), hash);
+            let BlockExecutionError::Validation(BlockValidationError::InvalidTx {
+                hash: actual,
+                error,
+            }) = error
+            else {
+                panic!("native transaction category lost");
+            };
+            assert_eq!(actual, hash);
+            assert_eq!(error.is_nonce_too_low(), nonce_low);
+            assert_eq!(error.is_gas_limit_too_high(), gas_high);
+            assert_eq!(error.is_gas_limit_too_low(), gas_low);
+        }
+    }
+
+    #[test]
+    fn provider_failure_is_not_misclassified_as_invalid_transaction() {
+        let error = with_transaction_hash(
+            BlockExecutionError::msg("state provider unavailable"),
+            B256::ZERO,
+        );
+        assert!(error.as_internal().is_some());
+        assert!(error.to_string().contains("state provider unavailable"));
+        let other = BlockValidationError::other(std::io::Error::other("non-native error"));
+        let error = with_transaction_hash(other.into(), B256::ZERO);
+        assert!(matches!(error, BlockExecutionError::Validation(BlockValidationError::Other(_))));
     }
 }

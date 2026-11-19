@@ -1,8 +1,7 @@
-use crate::{evm::transaction::BscTxEnv, node::evm::config::BscEvmConfig};
-use alloy_evm::rpc::{EthTxEnvError, TryIntoTxEnv};
+use crate::node::evm::config::BscEvmConfig;
 use alloy_rpc_types_eth::TransactionRequest;
 use reth_evm::EvmEnvFor;
-use reth_rpc_convert::transaction::TxEnvConverter;
+use reth_rpc_convert::transaction::{EthTxEnvError, TryIntoTxEnv, TxEnvConverter};
 
 /// Uses the same fork environment for RPC transaction defaults and execution.
 /// A blob request without `maxFeePerBlobGas` must see the blob
@@ -18,7 +17,7 @@ impl TxEnvConverter<TransactionRequest, BscEvmConfig> for BscTxEnvConverter {
         &self,
         request: TransactionRequest,
         env: &EvmEnvFor<BscEvmConfig>,
-    ) -> Result<BscTxEnv, Self::Error> {
+    ) -> Result<reth_evm::TxEnvFor<BscEvmConfig>, Self::Error> {
         request.try_into_tx_env(&self.0.with_block_rules(env.clone()))
     }
 }

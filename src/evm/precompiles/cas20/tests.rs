@@ -1145,9 +1145,8 @@ mod evm {
         },
         hardforks::bsc::BscHardfork,
     };
-    use alloy_evm::precompiles::PrecompileLookup as _;
+    use alloy_evm::{precompiles::PrecompileLookup as _, EvmEnv};
     use alloy_primitives::{Address, Bytes, B256, U256};
-    use reth_evm::EvmEnv;
     use revm::{
         context::{
             result::{ExecutionResult, Output},
@@ -1240,6 +1239,86 @@ mod evm {
         c.extend([0x3D, 0x60, 0x00, 0xFD]); // REVERT(0, RETURNDATASIZE)
         c.extend([0x5B, 0x3D, 0x60, 0x00, 0xF3]); // JUMPDEST RETURN(0, RETURNDATASIZE)
         Bytecode::new_raw(Bytes::from(c))
+    }
+
+    #[test]
+    fn native_dispatch_matches_reference_state_gas_refunds_and_reverts() {
+        use alloy_consensus::{transaction::Recovered, TxLegacy};
+        use evm2::{
+            env::BlockEnv as NativeBlock, ethereum::TxEnvelope, evm::DynDatabase, EvmFeatures,
+        };
+        use reth_bsc_evm::{env::BscEvmEnv, evm::BscEvm as NativeEvm, types::BscEvmTypes};
+        use reth_evm::Evm as _;
+
+        let mut reference = evm_at(BscHardfork::Jenner);
+        let db = crate::node::evm::test_utils::LegacyDb(
+            reference.inner.ctx.journaled_state.database.clone(),
+        );
+        let mut env = BscEvmEnv::new(
+            BscHardfork::Jenner,
+            NativeBlock::<BscEvmTypes> {
+                timestamp: U256::from(1_800_000_000u64),
+                gas_limit: U256::from(u64::MAX),
+                ..Default::default()
+            },
+            714,
+            0,
+        );
+        env.version.features.remove(EvmFeatures::NONCE_CHECK | EvmFeatures::BALANCE_CHECK);
+        let precompiles = crate::evm::precompiles::native::BscNativePrecompiles::new(&env);
+        let mut native = NativeEvm::new(env, evm2::evm::Db::new(db), precompiles, |_| false);
+        let token = super::derive_address(VARIANT_ASSET, ALICE, w(99));
+        let calls = [
+            (
+                FACTORY_ADDRESS,
+                encode_create(
+                    VARIANT_ASSET,
+                    w(99),
+                    ALICE,
+                    &[
+                        call_data(SEL_GRANT_ROLE, &[ROLE_MINT, a(ALICE)]),
+                        call_data(SEL_MINT, &[a(ALICE), w(10)]),
+                    ],
+                ),
+                2_000_000,
+            ),
+            (token, call_data(SEL_TRANSFER, &[a(BOB), w(10)]), 200_000),
+            (token, call_data(SEL_TRANSFER, &[a(BOB), w(1)]), 200_000),
+            (token, call_data(SEL_NAME, &[]), 22_000),
+            (token, call_data(SEL_BALANCE_OF, &[a(BOB)]), 200_000),
+        ];
+        for (to, input, gas) in calls {
+            let expected = tx(&mut reference, ALICE, to, input.clone(), gas);
+            let transaction = Recovered::new_unchecked(
+                TxEnvelope::Legacy(TxLegacy {
+                    chain_id: Some(714),
+                    gas_limit: gas,
+                    to: TxKind::Call(to),
+                    input: input.into(),
+                    ..Default::default()
+                }),
+                ALICE,
+            );
+            let actual = native.transact_commit(&transaction).unwrap();
+            assert_eq!(actual.status, expected.is_success());
+            assert_eq!(actual.tx_gas_used(), expected.tx_gas_used());
+            assert_eq!(actual.output.as_ref(), expected.output().map_or(&[][..], |b| b.as_ref()));
+            assert_eq!(actual.logs.as_slice(), expected.logs());
+            assert_eq!(actual.refunded, expected.gas().inner_refunded());
+            for (address, account) in &reference.inner.ctx.journaled_state.database.cache.accounts {
+                let actual = native.account_info(address).unwrap().unwrap_or_default();
+                assert_eq!(actual.balance, account.info.balance, "balance {address}");
+                assert_eq!(actual.nonce, account.info.nonce, "nonce {address}");
+                assert_eq!(actual.code_hash, account.info.code_hash, "code {address}");
+                for (key, value) in &account.storage {
+                    assert_eq!(
+                        native.inner.overlay_db_mut().get_storage(address, key).unwrap(),
+                        *value,
+                        "storage {address}:{key}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

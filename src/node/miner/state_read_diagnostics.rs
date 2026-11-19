@@ -3,8 +3,11 @@
 
 use super::build_diagnostics::AttemptKind;
 use alloy_primitives::{Address, B256, U256};
-use reth_revm::cached::{CachedReads, CachedReadsDbMut};
-use revm::{bytecode::Bytecode, state::AccountInfo, Database, DatabaseRef};
+use evm2::{
+    bytecode::Bytecode,
+    evm::{AccountInfo, Database},
+};
+use reth_evm::cached::{CachedReads, CachedReadsDbMut};
 use std::{
     cell::Cell,
     sync::{
@@ -57,7 +60,7 @@ impl<'a, DB> ObservedStateDb<'a, DB> {
     }
 }
 
-impl<DB: DatabaseRef> ObservedStateDb<'_, DB> {
+impl<DB: Database> ObservedStateDb<'_, DB> {
     fn read<T>(
         &mut self,
         resource: usize,
@@ -76,19 +79,22 @@ impl<DB: DatabaseRef> ObservedStateDb<'_, DB> {
     }
 }
 
-impl<DB: DatabaseRef> Database for ObservedStateDb<'_, DB> {
+impl<DB: Database> Database for ObservedStateDb<'_, DB> {
     type Error = DB::Error;
-    fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        self.read(0, |db| db.basic(address))
+    fn is_fatal(error: &Self::Error) -> bool {
+        DB::is_fatal(error)
     }
-    fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
-        self.read(1, |db| db.storage(address, index))
+    fn get_account(&mut self, address: &Address) -> Result<Option<AccountInfo>, Self::Error> {
+        self.read(0, |db| db.get_account(address))
     }
-    fn code_by_hash(&mut self, hash: B256) -> Result<Bytecode, Self::Error> {
-        self.read(2, |db| db.code_by_hash(hash))
+    fn get_storage(&mut self, address: &Address, index: &U256) -> Result<U256, Self::Error> {
+        self.read(1, |db| db.get_storage(address, index))
     }
-    fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
-        self.inner.block_hash(number)
+    fn get_code_by_hash(&mut self, hash: &B256) -> Result<Bytecode, Self::Error> {
+        self.read(2, |db| db.get_code_by_hash(hash))
+    }
+    fn get_block_hash(&mut self, number: &U256) -> Result<B256, Self::Error> {
+        self.inner.get_block_hash(number)
     }
 }
 
@@ -123,7 +129,7 @@ struct ObservedProvider<DB> {
     shared: Option<Arc<super::prewarm::SharedStateCache>>,
     calls: Cell<u64>,
 }
-impl<DB: DatabaseRef> ObservedProvider<DB> {
+impl<DB: Database> ObservedProvider<DB> {
     fn shared_prewarmed<T>(
         &self,
         resource: usize,
@@ -145,52 +151,55 @@ impl<DB: DatabaseRef> ObservedProvider<DB> {
         value
     }
     fn read<T>(
-        &self,
+        &mut self,
         resource: usize,
-        f: impl FnOnce(&DB) -> Result<T, DB::Error>,
+        f: impl FnOnce(&mut DB) -> Result<T, DB::Error>,
     ) -> Result<T, DB::Error> {
         let phase = self.reads.phase.index();
         self.calls.set(self.calls.get() + 1);
         let start = Instant::now();
-        let result = f(&self.inner);
+        let result = f(&mut self.inner);
         self.reads.record(phase, resource, 0, start.elapsed(), result.is_err());
         result
     }
 }
-impl<DB: DatabaseRef> DatabaseRef for ObservedProvider<DB> {
+impl<DB: Database> Database for ObservedProvider<DB> {
     type Error = DB::Error;
-    fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        if let Some(account) = self.shared_prewarmed(0, |s| s.miner_account(address)) {
-            return Ok(account);
+    fn is_fatal(error: &Self::Error) -> bool {
+        DB::is_fatal(error)
+    }
+    fn get_account(&mut self, address: &Address) -> Result<Option<AccountInfo>, Self::Error> {
+        if let Some(value) = self.shared_prewarmed(0, |s| s.miner_account(*address)) {
+            return Ok(value)
         }
-        let value = self.read(0, |db| db.basic_ref(address))?;
+        let value = self.read(0, |db| db.get_account(address))?;
         if let Some(cache) = &self.shared {
-            cache.insert_account(address, value.clone());
+            cache.insert_account(*address, value.clone());
         }
         Ok(value)
     }
-    fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
-        if let Some(value) = self.shared_prewarmed(1, |s| s.miner_storage(address, index)) {
-            return Ok(value);
+    fn get_storage(&mut self, address: &Address, slot: &U256) -> Result<U256, Self::Error> {
+        if let Some(value) = self.shared_prewarmed(1, |s| s.miner_storage(*address, *slot)) {
+            return Ok(value)
         }
-        let value = self.read(1, |db| db.storage_ref(address, index))?;
+        let value = self.read(1, |db| db.get_storage(address, slot))?;
         if let Some(cache) = &self.shared {
-            cache.insert_storage(address, index, value);
+            cache.insert_storage(*address, *slot, value);
         }
         Ok(value)
     }
-    fn code_by_hash_ref(&self, hash: B256) -> Result<Bytecode, Self::Error> {
-        if let Some(code) = self.shared_prewarmed(2, |s| s.miner_code(hash)) {
-            return Ok(code);
+    fn get_code_by_hash(&mut self, hash: &B256) -> Result<Bytecode, Self::Error> {
+        if let Some(value) = self.shared_prewarmed(2, |s| s.miner_code(*hash)) {
+            return Ok(value)
         }
-        let value = self.read(2, |db| db.code_by_hash_ref(hash))?;
+        let value = self.read(2, |db| db.get_code_by_hash(hash))?;
         if let Some(cache) = &self.shared {
-            cache.insert_code(hash, value.clone());
+            cache.insert_code(*hash, value.clone());
         }
         Ok(value)
     }
-    fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
-        self.inner.block_hash_ref(number)
+    fn get_block_hash(&mut self, number: &U256) -> Result<B256, Self::Error> {
+        self.inner.get_block_hash(number)
     }
 }
 
@@ -323,27 +332,27 @@ mod tests {
         absent: bool,
         fail: bool,
     }
-    impl DatabaseRef for TestDb {
+    impl Database for TestDb {
         type Error = TestError;
-        fn basic_ref(&self, _: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        fn get_account(&mut self, _: &Address) -> Result<Option<AccountInfo>, Self::Error> {
             if self.fail {
                 return Err(TestError("account read failed"));
             }
             Ok((!self.absent).then(AccountInfo::default))
         }
-        fn storage_ref(&self, _: Address, _: U256) -> Result<U256, Self::Error> {
+        fn get_storage(&mut self, _: &Address, _: &U256) -> Result<U256, Self::Error> {
             if self.fail {
                 return Err(TestError("storage read failed"));
             }
             Ok(U256::from(7))
         }
-        fn code_by_hash_ref(&self, _: B256) -> Result<Bytecode, Self::Error> {
+        fn get_code_by_hash(&mut self, _: &B256) -> Result<Bytecode, Self::Error> {
             if self.fail {
                 return Err(TestError("code read failed"));
             }
             Ok(Bytecode::default())
         }
-        fn block_hash_ref(&self, _: u64) -> Result<B256, Self::Error> {
+        fn get_block_hash(&mut self, _: &U256) -> Result<B256, Self::Error> {
             Ok(B256::ZERO)
         }
     }
@@ -355,9 +364,9 @@ mod tests {
             ObservedStateDb::new(&mut cache, TestDb::default(), AttemptKind::Regular, true);
         phase.selection();
         for _ in 0..2 {
-            assert_eq!(db.basic(Address::ZERO).unwrap(), Some(AccountInfo::default()));
-            assert_eq!(db.storage(Address::ZERO, U256::ZERO).unwrap(), U256::from(7));
-            assert_eq!(db.code_by_hash(B256::ZERO).unwrap(), Bytecode::default());
+            assert_eq!(db.get_account(&Address::ZERO).unwrap(), Some(AccountInfo::default()));
+            assert_eq!(db.get_storage(&Address::ZERO, &U256::ZERO).unwrap(), U256::from(7));
+            assert_eq!(db.get_code_by_hash(&B256::ZERO).unwrap(), Bytecode::default());
         }
         assert_eq!(db.inner.db.calls.get(), 3);
         for resource in 0..3 {
@@ -366,13 +375,13 @@ mod tests {
             assert_eq!(db.inner.db.reads.totals[1][resource][0].get().calls, 1);
         }
         // BLOCKHASH remains delegated, outside account/storage/code accounting.
-        assert_eq!(db.block_hash(1).unwrap(), B256::ZERO);
+        assert_eq!(db.get_block_hash(&U256::from(1)).unwrap(), B256::ZERO);
         assert_eq!(db.inner.db.calls.get(), 3);
         drop(db);
         // Reusing the cache must not carry observations into a new attempt.
         let (mut db, _) =
             ObservedStateDb::new(&mut cache, TestDb::default(), AttemptKind::Rebuild, true);
-        db.basic(Address::ZERO).unwrap();
+        db.get_account(&Address::ZERO).unwrap();
         assert_eq!(db.inner.db.calls.get(), 0);
         assert_eq!(db.reads.totals[0][0][0].get().calls, 1);
     }
@@ -385,7 +394,7 @@ mod tests {
         cache.insert_account(Address::repeat_byte(1), None);
         cache.insert_code(
             B256::repeat_byte(2),
-            Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x00])),
+            Bytecode::new_legacy(alloy_primitives::Bytes::from_static(&[0x00])),
         );
         cache
     }
@@ -403,11 +412,14 @@ mod tests {
         );
         let mut db = db.with_shared_prewarm(parent, Some(shared.clone()));
         phase.selection();
-        assert_eq!(db.basic(Address::ZERO).unwrap(), Some(AccountInfo::default()));
-        assert_eq!(db.storage(Address::ZERO, U256::ZERO).unwrap(), U256::from(7));
-        assert_eq!(db.storage(Address::ZERO, U256::from(1)).unwrap(), U256::ZERO);
-        assert_eq!(db.basic(Address::repeat_byte(1)).unwrap(), None);
-        assert_eq!(db.code_by_hash(B256::repeat_byte(2)).unwrap().bytes().as_ref(), &[0x00]);
+        assert_eq!(db.get_account(&Address::ZERO).unwrap(), Some(AccountInfo::default()));
+        assert_eq!(db.get_storage(&Address::ZERO, &U256::ZERO).unwrap(), U256::from(7));
+        assert_eq!(db.get_storage(&Address::ZERO, &U256::from(1)).unwrap(), U256::ZERO);
+        assert_eq!(db.get_account(&Address::repeat_byte(1)).unwrap(), None);
+        assert_eq!(
+            db.get_code_by_hash(&B256::repeat_byte(2)).unwrap().original_bytes().as_ref(),
+            &[0x00]
+        );
         assert_eq!(db.inner.db.reads.totals[1][0][0].get().calls, 0);
         assert_eq!(db.inner.db.prewarm_reads.totals[1][0][0].get().calls, 2);
         assert_eq!(db.inner.db.prewarm_reads.totals[1][1][0].get().calls, 2);
@@ -437,9 +449,9 @@ mod tests {
             let mut db = db.with_shared_prewarm(requested, Some(populated_cache(parent)));
             assert_eq!(db.inner.db.shared.is_some(), requested == parent);
             let address = if requested == parent { Address::repeat_byte(9) } else { Address::ZERO };
-            assert_eq!(db.basic(address).unwrap_err().to_string(), "account read failed");
+            assert_eq!(db.get_account(&address).unwrap_err().to_string(), "account read failed");
             assert_eq!(
-                db.code_by_hash(B256::repeat_byte(9)).unwrap_err().to_string(),
+                db.get_code_by_hash(&B256::repeat_byte(9)).unwrap_err().to_string(),
                 "code read failed"
             );
             assert!(db.inner.cached.accounts.is_empty());
@@ -456,12 +468,18 @@ mod tests {
         let (warm, _) =
             ObservedStateDb::new(&mut warm_cache, TestDb::default(), AttemptKind::Regular, true);
         let mut warm = warm.with_shared_prewarm(parent, Some(populated_cache(parent)));
-        assert_eq!(cold.basic(Address::ZERO).unwrap(), warm.basic(Address::ZERO).unwrap());
         assert_eq!(
-            cold.storage(Address::ZERO, U256::ZERO).unwrap(),
-            warm.storage(Address::ZERO, U256::ZERO).unwrap()
+            cold.get_account(&Address::ZERO).unwrap(),
+            warm.get_account(&Address::ZERO).unwrap()
         );
-        assert_eq!(cold.block_hash(1).unwrap(), warm.block_hash(1).unwrap());
+        assert_eq!(
+            cold.get_storage(&Address::ZERO, &U256::ZERO).unwrap(),
+            warm.get_storage(&Address::ZERO, &U256::ZERO).unwrap()
+        );
+        assert_eq!(
+            cold.get_block_hash(&U256::from(1)).unwrap(),
+            warm.get_block_hash(&U256::from(1)).unwrap()
+        );
         assert_eq!(warm.inner.db.reads.totals[0][0][0].get().calls, 0);
         assert_eq!(cold.inner.db.reads.totals[0][0][0].get().calls, 1);
     }
@@ -479,7 +497,7 @@ mod tests {
         );
         let mut db = db.with_shared_prewarm(parent, Some(shared.clone()));
         // Attach an empty cache, then establish that the backing provider cannot serve it.
-        assert!(db.basic(Address::ZERO).is_err());
+        assert!(db.get_account(&Address::ZERO).is_err());
         std::thread::spawn(move || {
             shared.insert_account(Address::ZERO, Some(AccountInfo::default()));
             shared.insert_storage(Address::ZERO, U256::ZERO, U256::from(7));
@@ -487,8 +505,8 @@ mod tests {
         .join()
         .unwrap();
         // No refresh, re-attachment or new attempt: this same DB sees the later worker reads.
-        assert_eq!(db.basic(Address::ZERO).unwrap(), Some(AccountInfo::default()));
-        assert_eq!(db.storage(Address::ZERO, U256::ZERO).unwrap(), U256::from(7));
+        assert_eq!(db.get_account(&Address::ZERO).unwrap(), Some(AccountInfo::default()));
+        assert_eq!(db.get_storage(&Address::ZERO, &U256::ZERO).unwrap(), U256::from(7));
         assert_eq!(db.inner.db.reads.totals[0][0][0].get().calls, 1);
         assert_eq!(db.inner.db.prewarm_reads.totals[0][0][0].get().calls, 1);
     }
@@ -498,7 +516,7 @@ mod tests {
         let mut cache = CachedReads::default();
         let (mut db, _) =
             ObservedStateDb::new(&mut cache, TestDb::default(), AttemptKind::Regular, true);
-        assert_eq!(db.storage(Address::ZERO, U256::ZERO).unwrap(), U256::from(7));
+        assert_eq!(db.get_storage(&Address::ZERO, &U256::ZERO).unwrap(), U256::from(7));
         assert_eq!(db.reads.totals[0][1][1].get().calls, 1);
         assert_eq!(db.inner.db.reads.totals[0][0][0].get().calls, 1);
         assert_eq!(db.inner.db.reads.totals[0][1][0].get().calls, 1);
@@ -511,10 +529,10 @@ mod tests {
             AttemptKind::Empty,
             false,
         );
-        assert_eq!(db.storage(Address::ZERO, U256::ZERO).unwrap(), U256::ZERO);
+        assert_eq!(db.get_storage(&Address::ZERO, &U256::ZERO).unwrap(), U256::ZERO);
         assert_eq!(db.inner.db.calls.get(), 1);
         assert_eq!(db.inner.db.reads.totals[0][1][0].get().calls, 0);
-        assert_eq!(db.basic(Address::ZERO).unwrap(), None);
+        assert_eq!(db.get_account(&Address::ZERO).unwrap(), None);
         assert_eq!(db.reads.totals[0][0][0].get().calls, 1);
     }
 
@@ -530,12 +548,15 @@ mod tests {
         );
         let missing = Address::repeat_byte(1);
         for _ in 0..2 {
-            assert_eq!(db.basic(missing).unwrap_err().to_string(), "account read failed");
+            assert_eq!(db.get_account(&missing).unwrap_err().to_string(), "account read failed");
             assert_eq!(
-                db.storage(Address::ZERO, U256::ZERO).unwrap_err().to_string(),
+                db.get_storage(&Address::ZERO, &U256::ZERO).unwrap_err().to_string(),
                 "storage read failed"
             );
-            assert_eq!(db.code_by_hash(B256::ZERO).unwrap_err().to_string(), "code read failed");
+            assert_eq!(
+                db.get_code_by_hash(&B256::ZERO).unwrap_err().to_string(),
+                "code read failed"
+            );
         }
         for resource in 0..3 {
             let cached = db.reads.totals[0][resource][1].get();
@@ -559,12 +580,12 @@ mod tests {
                 AttemptKind::Speculative,
                 false,
             );
-            db.basic(Address::ZERO).unwrap();
+            db.get_account(&Address::ZERO).unwrap();
             phase.selection();
-            db.basic(Address::ZERO).unwrap();
+            db.get_account(&Address::ZERO).unwrap();
             phase.finish();
             db.inner.db.inner.fail = true;
-            assert!(db.code_by_hash(B256::ZERO).is_err());
+            assert!(db.get_code_by_hash(&B256::ZERO).is_err());
             // Error/drop path: no explicit finish/flush call.
         });
         let rendered = handle.render();

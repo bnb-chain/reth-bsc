@@ -146,3 +146,25 @@ pub fn insert_header_to_cache_with_hash(header: Header, block_hash: Option<Block
 pub fn insert_header_to_cache_hash_only(header: Header, block_hash: BlockHash) {
     lock_header_cache().insert_header_hash_only(header, block_hash);
 }
+
+/// Block accessors shared by Parlia's validation and finalization helpers.
+pub(crate) trait NativeBlockEnv {
+    fn number(&self) -> alloy_primitives::U256;
+    fn timestamp(&self) -> alloy_primitives::U256;
+    fn beneficiary(&self) -> alloy_primitives::Address;
+    fn gas_limit(&self) -> u64;
+}
+impl NativeBlockEnv for evm2::env::BlockEnv<reth_bsc_evm::types::BscEvmTypes> {
+    fn number(&self) -> alloy_primitives::U256 {
+        self.number
+    }
+    fn timestamp(&self) -> alloy_primitives::U256 {
+        self.timestamp
+    }
+    fn beneficiary(&self) -> alloy_primitives::Address {
+        self.beneficiary
+    }
+    fn gas_limit(&self) -> u64 {
+        self.gas_limit.saturating_to()
+    }
+}

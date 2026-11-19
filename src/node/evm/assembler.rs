@@ -1,3 +1,4 @@
+use super::util::NativeBlockEnv;
 use crate::{
     chainspec::BscChainSpec,
     consensus::{
@@ -15,17 +16,16 @@ use alloy_consensus::{proofs, BlockBody, Header, Transaction, TxReceipt, EMPTY_O
 use alloy_eips::merge::BEACON_NONCE;
 use alloy_primitives::{keccak256, Bloom, Bytes, B256};
 use alloy_rpc_types::Withdrawals;
+use reth_bsc_evm::env::BscEvmEnv;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_ethereum_primitives::{Receipt, TransactionSigned};
 use reth_evm::{
-    block::{BlockExecutionError, BlockExecutorFactory},
-    env::BlockEnvironment,
     execute::{BlockAssembler, BlockAssemblerInput},
-    EvmEnv,
+    BlockExecutionError, BlockExecutorFactory,
 };
 use reth_primitives_traits::{logs_bloom, SealedHeader};
 use reth_provider::{BlockExecutionResult, StateProvider};
-use revm::{context_interface::block::Block, database::BundleState};
+use reth_trie_common::bundle_state::BundleState;
 use std::sync::{Arc, LazyLock};
 
 // Independent, bounded workers: finite body-root work must not queue behind a streaming
@@ -72,12 +72,9 @@ fn body_roots_and_bloom(
 ///
 /// This allows us to construct the input in external crates without being limited by
 /// the #[non_exhaustive] attribute on the original BlockAssemblerInput.
-pub struct BscBlockAssemblerInput<'a, 'b, F: BlockExecutorFactory, H = Header> {
+pub struct BscBlockAssemblerInput<'a, 'b, F: BlockExecutorFactory + 'a, H = Header> {
     /// Configuration of EVM used when executing the block.
-    pub evm_env: EvmEnv<
-        <F::EvmFactory as reth_evm::EvmFactory>::Spec,
-        <F::EvmFactory as reth_evm::EvmFactory>::BlockEnv,
-    >,
+    pub evm_env: F::EvmEnv,
     /// BlockExecutorFactory::ExecutionCtx used to execute the block.
     pub execution_ctx: F::ExecutionCtx<'a>,
     /// Parent block header.
@@ -87,7 +84,7 @@ pub struct BscBlockAssemblerInput<'a, 'b, F: BlockExecutorFactory, H = Header> {
     /// Output of block execution.
     pub output: &'b BlockExecutionResult<F::Receipt>,
     /// BundleState after the block execution.
-    pub bundle_state: &'a BundleState,
+    pub bundle_state: &'b BundleState,
     /// Provider with access to state.
     pub state_provider: &'b dyn StateProvider,
     /// State root for this block.
@@ -140,10 +137,10 @@ where
         } = input;
 
         let eth_ctx = ctx.as_eth_context();
-        let timestamp = evm_env.block_env.timestamp().saturating_to();
+        let timestamp = evm_env.block.timestamp().saturating_to();
         let (transactions_root, receipts_root, logs_bloom) =
             body_roots_and_bloom(&transactions, receipts);
-        let block_number = evm_env.block_env.number().saturating_to();
+        let block_number = evm_env.block.number().saturating_to();
 
         let mut withdrawals_root = None;
         let mut withdrawals = None;
@@ -184,7 +181,7 @@ where
         }
 
         let base_fee_per_gas = if self.chain_spec.is_london_active_at_block(block_number) {
-            Some(evm_env.block_env.basefee())
+            Some(evm_env.block.basefee.saturating_to())
         } else {
             None
         };
@@ -201,7 +198,7 @@ where
         let header = Header {
             parent_hash: eth_ctx.parent_hash,
             ommers_hash: EMPTY_OMMER_ROOT_HASH,
-            beneficiary: evm_env.block_env.beneficiary(),
+            beneficiary: evm_env.block.beneficiary(),
             state_root,
             transactions_root,
             receipts_root,
@@ -209,12 +206,12 @@ where
             logs_bloom,
             timestamp,
             // Header fields are distinct from the RPC opcode-0x44 view.
-            mix_hash: evm_env.block_env.inner.prevrandao.unwrap_or_default(),
+            mix_hash: evm_env.header_mix_hash,
             nonce: BEACON_NONCE.into(),
             base_fee_per_gas,
             number: block_number,
-            gas_limit: evm_env.block_env.gas_limit(),
-            difficulty: evm_env.block_env.inner.difficulty,
+            gas_limit: evm_env.block.gas_limit(),
+            difficulty: evm_env.header_difficulty,
             gas_used: *gas_used,
             extra_data,
             parent_beacon_block_root,
@@ -244,11 +241,13 @@ where
 
 impl<F, ChainSpec> BlockAssembler<F> for BscBlockAssembler<ChainSpec>
 where
-    F: for<'a> BlockExecutorFactory<
-        ExecutionCtx<'a> = BscBlockExecutionCtx<'a>,
-        Transaction = TransactionSigned,
-        Receipt = Receipt,
-    >,
+    F: 'static
+        + for<'a> BlockExecutorFactory<
+            ExecutionCtx<'a> = BscBlockExecutionCtx<'a>,
+            Transaction = TransactionSigned,
+            Receipt = Receipt,
+            EvmEnv = BscEvmEnv,
+        >,
     ChainSpec: EthChainSpec + EthereumHardforks + crate::hardforks::BscHardforks + 'static,
 {
     type Block = crate::node::primitives::BscBlock;
@@ -264,7 +263,7 @@ where
             .ok_or_else(|| BlockExecutionError::msg("Snapshot provider not available"))?;
 
         let BlockAssemblerInput {
-            mut evm_env,
+            evm_env,
             execution_ctx: ctx,
             parent,
             transactions,
@@ -275,11 +274,11 @@ where
 
         // Use the base EthBlockExecutionCtx for compatibility
         let eth_ctx = ctx.as_eth_context();
-        let timestamp = evm_env.block_env.timestamp().saturating_to();
+        let timestamp = evm_env.block.timestamp().saturating_to();
         let transactions_root = proofs::calculate_transaction_root(&transactions);
         let receipts_root = Receipt::calculate_receipt_root_no_memo(receipts);
         let logs_bloom = logs_bloom(receipts.iter().flat_map(|r| &r.logs));
-        let block_number = evm_env.block_env.number().saturating_to();
+        let block_number = evm_env.block.number().saturating_to();
 
         let withdrawals: Option<Withdrawals> =
             self.chain_spec.is_shanghai_active_at_timestamp(timestamp).then(|| {
@@ -311,7 +310,7 @@ where
 
         // baseFee should only be set after London fork (EIP-1559)
         let base_fee_per_gas = if self.chain_spec.is_london_active_at_block(block_number) {
-            Some(evm_env.block_env.basefee())
+            Some(evm_env.block.basefee.saturating_to())
         } else {
             None
         };
@@ -327,13 +326,13 @@ where
 
         // Serialize header fields, not an RPC-specific opcode representation.
         let (difficulty, mix_hash) = {
-            let block = evm_env.block_env.inner_mut();
-            (block.difficulty, block.prevrandao.unwrap_or_default())
+            let _block = &evm_env.block;
+            (evm_env.header_difficulty, evm_env.header_mix_hash)
         };
         let mut header = Header {
             parent_hash: eth_ctx.parent_hash,
             ommers_hash: EMPTY_OMMER_ROOT_HASH,
-            beneficiary: evm_env.block_env.beneficiary(),
+            beneficiary: evm_env.block.beneficiary(),
             state_root,
             transactions_root,
             receipts_root,
@@ -343,8 +342,8 @@ where
             mix_hash,
             nonce: BEACON_NONCE.into(),
             base_fee_per_gas,
-            number: evm_env.block_env.number().saturating_to(),
-            gas_limit: evm_env.block_env.gas_limit(),
+            number: evm_env.block.number().saturating_to(),
+            gas_limit: evm_env.block.gas_limit(),
             difficulty,
             gas_used: *gas_used,
             extra_data,
