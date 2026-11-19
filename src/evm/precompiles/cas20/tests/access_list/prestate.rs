@@ -209,3 +209,92 @@ async fn native_creation_prestate_matches_geth_with_code_disabled_and_prefunding
         }
     }
 }
+
+#[tokio::test]
+async fn empty_native_recipient_respects_include_empty() {
+    let h = Harness::new();
+    let api = debug!(h.st);
+    let recipient = Address::repeat_byte(0x91);
+    for mux in [false, true] {
+        for value in [0, 1] {
+            for include_empty in [None, Some(false), Some(true)] {
+                for disable_storage in [false, true] {
+                    let mut config = json!({"disableStorage": disable_storage});
+                    if let Some(include_empty) = include_empty {
+                        config["includeEmpty"] = include_empty.into();
+                    }
+                    let mut opts = options(config, mux);
+                    opts.state_overrides = Some(
+                        [(
+                            ALICE,
+                            AccountOverride {
+                                balance: Some(U256::from(100)),
+                                ..Default::default()
+                            },
+                        )]
+                        .into_iter()
+                        .collect(),
+                    );
+                    let mut req = request(recipient, vec![]);
+                    req.value = Some(U256::from(value));
+                    let result =
+                        prestate(api.debug_trace_call(req, None, Some(opts)).await.unwrap(), mux);
+                    let account = result.get(format!("{recipient:#x}"));
+                    assert_eq!(
+                        account.is_some(),
+                        include_empty == Some(true),
+                        "value={value}, mux={mux}, includeEmpty={include_empty:?}: {result}"
+                    );
+                    if let Some(account) = account {
+                        assert_eq!(account, &json!({"balance":"0x0"}));
+                    }
+                    assert_eq!(result[format!("{ALICE:#x}")]["balance"], "0x64");
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn include_empty_preserves_sequential_call_prestate() {
+    let h = Harness::new();
+    let api = debug!(h.st);
+    let recipient = Address::repeat_byte(0x92);
+    for mux in [false, true] {
+        let mut opts =
+            options(json!({"includeEmpty":true,"disableStorage":true,"disableCode":true}), mux);
+        opts.state_overrides = Some(
+            [(ALICE, AccountOverride { balance: Some(U256::from(100)), ..Default::default() })]
+                .into_iter()
+                .collect(),
+        );
+        let mut req = request(recipient, vec![]);
+        req.value = Some(U256::from(1));
+        let bundles = vec![
+            Bundle { transactions: vec![req.clone(), req.clone()], block_override: None },
+            Bundle { transactions: vec![req], block_override: None },
+        ];
+        let results = api.debug_trace_call_many(bundles, None, Some(opts)).await.unwrap();
+        assert_eq!(results.iter().map(Vec::len).collect::<Vec<_>>(), vec![2, 1]);
+        for (index, trace) in results.into_iter().flatten().enumerate() {
+            let result = prestate(trace, mux);
+            assert_eq!(
+                result[format!("{recipient:#x}")],
+                json!({"balance":format!("0x{index:x}")})
+            );
+            assert_eq!(result[format!("{ALICE:#x}")]["balance"], format!("0x{:x}", 100 - index));
+        }
+    }
+}
+
+#[tokio::test]
+async fn include_empty_with_diff_mode_is_rejected() {
+    let h = Harness::new();
+    let api = debug!(h.st);
+    for mux in [false, true] {
+        let opts = options(json!({"includeEmpty":true,"diffMode":true}), mux);
+        let err = api.debug_trace_call(request(ALICE, vec![]), None, Some(opts)).await.unwrap_err();
+        assert_eq!(err.code(), -32602);
+        assert_eq!(err.message(), "cannot use diffMode with includeEmpty");
+    }
+}
