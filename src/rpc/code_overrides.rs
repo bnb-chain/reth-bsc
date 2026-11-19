@@ -6,7 +6,8 @@ use crate::{
 };
 use alloy_consensus::BlockHeader;
 use alloy_evm::overrides::{apply_block_overrides, apply_state_overrides, OverrideBlockHashes};
-use alloy_primitives::{Address, Bytes, B256, U256};
+use alloy_primitives::{Address, Bytes, B256, U256, U512};
+use alloy_rpc_types::serde_helpers::WithOtherFields;
 use alloy_rpc_types_eth::{
     simulate::{SimBlock, SimulatePayload, SimulatedBlock},
     state::{EvmOverrides, StateOverride},
@@ -20,7 +21,7 @@ use reth_evm::{
     EvmFactory,
 };
 use reth_primitives_traits::BlockBody;
-use reth_provider::{BlockIdReader, EvmStateProviderAdapter, ProviderError};
+use reth_provider::{BlockIdReader, EvmStateProviderAdapter, HeaderProvider, ProviderError};
 use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_rpc_convert::RpcTypes;
 use reth_rpc_eth_api::{
@@ -70,7 +71,7 @@ pub trait BscCodeOverridesApi<B> {
         &self,
         opts: SimulatePayload<TransactionRequest>,
         block_number: Option<BlockId>,
-    ) -> RpcResult<Vec<SimulatedBlock<B>>>;
+    ) -> RpcResult<Vec<SimulatedBlock<WithOtherFields<B>>>>;
     #[method(name = "callMany")]
     async fn call_many(
         &self,
@@ -163,7 +164,7 @@ where
         &self,
         payload: SimulatePayload<TransactionRequest>,
         block: Option<BlockId>,
-    ) -> RpcResult<Vec<SimulatedBlock<RpcBlock<Eth::NetworkTypes>>>> {
+    ) -> RpcResult<Vec<SimulatedBlock<WithOtherFields<RpcBlock<Eth::NetworkTypes>>>>> {
         let _permit = self.0.tracing_task_guard().clone().acquire_owned().await;
         self.simulate(payload, block).await.map_err(Into::into)
     }
@@ -188,7 +189,7 @@ where
         &self,
         payload: SimulatePayload<TransactionRequest>,
         block: Option<BlockId>,
-    ) -> Result<Vec<SimulatedBlock<RpcBlock<Eth::NetworkTypes>>>, Eth::Error> {
+    ) -> Result<Vec<SimulatedBlock<WithOtherFields<RpcBlock<Eth::NetworkTypes>>>>, Eth::Error> {
         if payload.block_state_calls.len() > self.0.max_simulate_blocks() as usize {
             return Err(EthApiError::other(EthSimulateError::TooManyBlocks).into())
         }
@@ -223,6 +224,11 @@ where
                     .with_database(StateProviderDatabase::new(&state_provider))
                     .with_bundle_update()
                     .build();
+                let mut total_difficulty = this
+                    .provider()
+                    .header_td(&parent.hash())
+                    .map_err(EthApiError::from)?
+                    .map(U512::from);
                 let mut parent = parent;
 
                 let chain_id = this.provider().chain_spec().chain_id();
@@ -238,7 +244,7 @@ where
                     max_simulate_blocks,
                 )?;
 
-                let mut blocks: Vec<SimulatedBlock<RpcBlock<Eth::NetworkTypes>>> =
+                let mut blocks: Vec<SimulatedBlock<WithOtherFields<RpcBlock<Eth::NetworkTypes>>>> =
                     Vec::with_capacity(block_state_calls.len());
 
                 let call_gas_limit = this.call_gas_limit();
@@ -394,6 +400,9 @@ where
                         this.converter(),
                     )?;
 
+                    let difficulty = parent.difficulty();
+                    let block =
+                        with_simulated_total_difficulty(block, &mut total_difficulty, difficulty);
                     blocks.push(block);
                 }
 
@@ -519,6 +528,26 @@ where
             })
             .await
     }
+}
+
+/// Geth emits null when the base TD is unavailable, otherwise accumulates each
+/// synthetic block's difficulty, including automatically generated gap blocks.
+/// The wider accumulator preserves Go's big-integer addition beyond 256 bits.
+fn with_simulated_total_difficulty<B>(
+    block: SimulatedBlock<B>,
+    total: &mut Option<U512>,
+    difficulty: U256,
+) -> SimulatedBlock<WithOtherFields<B>> {
+    let value = match total {
+        Some(td) => {
+            *td += U512::from(difficulty);
+            serde_json::Value::String(format!("0x{td:x}"))
+        }
+        None => serde_json::Value::Null,
+    };
+    let mut inner = WithOtherFields::new(block.inner);
+    inner.other.insert("totalDifficulty".into(), value);
+    SimulatedBlock { inner, calls: block.calls }
 }
 
 #[cfg(test)]

@@ -1,49 +1,130 @@
-//! BSC fields added to the standard Ethereum RPC header.
+//! Go-BSC fields for explicit block and header queries.
 
-use alloy_consensus::Header;
-use alloy_network::Ethereum;
-use alloy_primitives::U256;
+use alloy_eips::BlockNumberOrTag;
+use alloy_primitives::B256;
 use alloy_rpc_types::serde_helpers::WithOtherFields;
-use reth_primitives_traits::SealedHeader;
-use reth_rpc_convert::{transaction::HeaderConverter, RpcTypes};
-use std::convert::Infallible;
+use alloy_rpc_types_eth::Header;
+use jsonrpsee::{core::RpcResult, proc_macros::rpc};
+use reth_rpc_convert::RpcTypes;
+use reth_rpc_eth_api::{helpers::EthBlocks, FullEthApiTypes, RpcBlock};
 
-/// RPC response types for BSC, including its additional header fields.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct BscRpcTypes;
+pub const METHODS: [&str; 6] = [
+    "eth_getBlockByNumber",
+    "eth_getBlockByHash",
+    "eth_getHeaderByNumber",
+    "eth_getHeaderByHash",
+    "eth_getFinalizedBlock",
+    "eth_getFinalizedHeader",
+];
 
-impl RpcTypes for BscRpcTypes {
-    type Header = WithOtherFields<alloy_rpc_types_eth::Header>;
-    type Receipt = <Ethereum as RpcTypes>::Receipt;
-    type Log = <Ethereum as RpcTypes>::Log;
-    type TransactionResponse = <Ethereum as RpcTypes>::TransactionResponse;
-    type TransactionRequest = <Ethereum as RpcTypes>::TransactionRequest;
+/// Go-BSC adds milliseconds to explicit queries, but not subscriptions or simulations.
+pub struct BscBlockApiImpl<Eth>(pub Eth);
+
+fn with_milliseconds<T>(value: T, header: &Header) -> WithOtherFields<T> {
+    let milliseconds =
+        crate::consensus::parlia::util::calculate_millisecond_timestamp(&header.inner);
+    let mut response = WithOtherFields::new(value);
+    response.other.insert("milliTimestamp".into(), format!("0x{milliseconds:x}").into());
+    response
 }
 
-/// Adds the millisecond timestamp used by Go-BSC block and header RPC responses.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct BscHeaderConverter;
-
-impl HeaderConverter<Header, <BscRpcTypes as RpcTypes>::Header> for BscHeaderConverter {
-    type Err = Infallible;
-
-    fn convert_header(
+#[rpc(server, namespace = "eth")]
+pub trait BscBlockApi<B> {
+    #[method(name = "getBlockByNumber")]
+    async fn block_by_number(
         &self,
-        header: SealedHeader<Header>,
-        block_size: Option<usize>,
-        total_difficulty: Option<U256>,
-    ) -> Result<<BscRpcTypes as RpcTypes>::Header, Self::Err> {
-        let milli_timestamp =
-            crate::consensus::parlia::util::calculate_millisecond_timestamp(&header);
-        let mut rpc_header = WithOtherFields::new(alloy_rpc_types_eth::Header::from_consensus(
-            header.into(),
-            total_difficulty,
-            block_size.map(U256::from),
-        ));
-        rpc_header
-            .other
-            .insert("milliTimestamp".to_owned(), format!("0x{milli_timestamp:x}").into());
-        Ok(rpc_header)
+        number: BlockNumberOrTag,
+        full: bool,
+    ) -> RpcResult<Option<WithOtherFields<B>>>;
+    #[method(name = "getBlockByHash")]
+    async fn block_by_hash(&self, hash: B256, full: bool) -> RpcResult<Option<WithOtherFields<B>>>;
+    #[method(name = "getHeaderByNumber")]
+    async fn header_by_number(
+        &self,
+        block_number: BlockNumberOrTag,
+    ) -> RpcResult<Option<WithOtherFields<Header>>>;
+    #[method(name = "getHeaderByHash")]
+    async fn header_by_hash(&self, hash: B256) -> RpcResult<Option<WithOtherFields<Header>>>;
+    #[method(name = "getFinalizedBlock")]
+    async fn finalized_block(
+        &self,
+        verified_validator_num: i64,
+        full: bool,
+    ) -> RpcResult<Option<WithOtherFields<B>>>;
+    #[method(name = "getFinalizedHeader")]
+    async fn finalized_header(
+        &self,
+        verified_validator_num: i64,
+    ) -> RpcResult<Option<WithOtherFields<Header>>>;
+}
+
+#[async_trait::async_trait]
+impl<Eth> BscBlockApiServer<RpcBlock<Eth::NetworkTypes>> for BscBlockApiImpl<Eth>
+where
+    Eth: EthBlocks + FullEthApiTypes + 'static,
+    Eth::NetworkTypes: RpcTypes<Header = Header>,
+{
+    async fn block_by_number(
+        &self,
+        number: BlockNumberOrTag,
+        full: bool,
+    ) -> RpcResult<Option<WithOtherFields<RpcBlock<Eth::NetworkTypes>>>> {
+        let result = self.0.rpc_block(number.into(), full).await.map_err(Into::into)?;
+        Ok(result.map(|value| {
+            let header = value.header.clone();
+            with_milliseconds(value, &header)
+        }))
+    }
+    async fn block_by_hash(
+        &self,
+        hash: B256,
+        full: bool,
+    ) -> RpcResult<Option<WithOtherFields<RpcBlock<Eth::NetworkTypes>>>> {
+        let result = self.0.rpc_block(hash.into(), full).await.map_err(Into::into)?;
+        Ok(result.map(|value| {
+            let header = value.header.clone();
+            with_milliseconds(value, &header)
+        }))
+    }
+    async fn header_by_number(
+        &self,
+        block_number: BlockNumberOrTag,
+    ) -> RpcResult<Option<WithOtherFields<Header>>> {
+        let result = self.0.rpc_block_header(block_number.into()).await.map_err(Into::into)?;
+        Ok(result.map(|value| {
+            let header = value.clone();
+            with_milliseconds(value, &header)
+        }))
+    }
+    async fn header_by_hash(&self, hash: B256) -> RpcResult<Option<WithOtherFields<Header>>> {
+        let result = self.0.rpc_block_header(hash.into()).await.map_err(Into::into)?;
+        Ok(result.map(|value| {
+            let header = value.clone();
+            with_milliseconds(value, &header)
+        }))
+    }
+    async fn finalized_block(
+        &self,
+        verified_validator_num: i64,
+        full: bool,
+    ) -> RpcResult<Option<WithOtherFields<RpcBlock<Eth::NetworkTypes>>>> {
+        let result =
+            self.0.rpc_finalized_block(verified_validator_num, full).await.map_err(Into::into)?;
+        Ok(result.map(|value| {
+            let header = value.header.clone();
+            with_milliseconds(value, &header)
+        }))
+    }
+    async fn finalized_header(
+        &self,
+        verified_validator_num: i64,
+    ) -> RpcResult<Option<WithOtherFields<Header>>> {
+        let result =
+            self.0.rpc_finalized_header(verified_validator_num).await.map_err(Into::into)?;
+        Ok(result.map(|value| {
+            let header = value.clone();
+            with_milliseconds(value, &header)
+        }))
     }
 }
 

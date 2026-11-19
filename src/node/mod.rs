@@ -64,12 +64,12 @@ pub struct BscEthApiBuilder;
 
 /// BSC RPC conversion uses the overridden fork environment for transaction defaults.
 pub type BscRpcConverterFor<N> = reth_rpc_convert::RpcConverter<
-    crate::rpc::header::BscRpcTypes,
+    alloy_network::Ethereum,
     evm::config::BscEvmConfig,
     reth_rpc_eth_types::receipt::EthReceiptConverter<
         <<N as FullNodeTypes>::Provider as reth_provider::ChainSpecProvider>::ChainSpec,
     >,
-    crate::rpc::header::BscHeaderConverter,
+    (),
     (),
     (),
     (),
@@ -101,11 +101,7 @@ where
                 let snapshot_provider = crate::shared::get_snapshot_provider()?;
                 Some(snapshot_provider.snapshot_by_hash(&header.hash_slow())?.validators.len())
             })
-            .map_converter(|r| {
-                r.with_network()
-                    .with_header_converter(crate::rpc::header::BscHeaderConverter)
-                    .with_tx_env_converter(tx_env_converter)
-            })
+            .map_converter(|r| r.with_network().with_tx_env_converter(tx_env_converter))
             .build();
 
         Ok(eth_api)
