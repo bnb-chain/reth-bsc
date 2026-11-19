@@ -59,6 +59,7 @@ macro_rules! rpc {
     (chain $chain:expr, header $header:expr) => {{
         let spec = Arc::new(BscChainSpec::from($chain));
         let provider = MockEthProvider::<BscPrimitives, _>::new().with_chain_spec((*spec).clone());
+        provider.enable_database_provider();
         let header = $header;
         let hash = header.hash_slow();
         crate::node::evm::util::insert_header_to_cache(header.clone());
@@ -534,9 +535,12 @@ async fn simulation_rpc_emits_total_difficulty_but_no_millisecond_field() {
             let response: serde_json::Value = serde_json::from_str(response.get()).unwrap();
             assert!(response.get("error").is_none(), "{response}");
             let block = response["result"][0].as_object().expect("simulated block");
-            // MockEthProvider has no HeaderProvider TD lookup: Go-BSC emits null in this case.
+            // No TD is populated in the mock: Go-BSC emits null when base TD is unavailable.
             assert_eq!(block.get("totalDifficulty"), Some(&serde_json::Value::Null));
             assert!(!block.contains_key("milliTimestamp"));
         }
     }
 }
+
+#[path = "td_tests.rs"]
+mod td_tests;

@@ -21,7 +21,7 @@ use reth_evm::{
     EvmFactory,
 };
 use reth_primitives_traits::BlockBody;
-use reth_provider::{BlockIdReader, EvmStateProviderAdapter, HeaderProvider, ProviderError};
+use reth_provider::{BlockIdReader, BlockReader, EvmStateProviderAdapter, ProviderError};
 use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_rpc_convert::RpcTypes;
 use reth_rpc_eth_api::{
@@ -224,11 +224,13 @@ where
                     .with_database(StateProviderDatabase::new(&state_provider))
                     .with_bundle_update()
                     .build();
+                // Resolve TD on this exact branch: a height-based lookup can read the old
+                // persisted branch while the simulation base is already canonical in memory.
                 let mut total_difficulty = this
                     .provider()
-                    .header_td(&parent.hash())
+                    .block_with_td_by_hash(parent.hash())
                     .map_err(EthApiError::from)?
-                    .map(U512::from);
+                    .map(|(_, td)| U512::from(td));
                 let mut parent = parent;
 
                 let chain_id = this.provider().chain_spec().chain_id();
