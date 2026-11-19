@@ -90,6 +90,7 @@ async fn simulate_v1_success_paths_apply_the_bsc_semantics() {
     };
 
     let provider = MockEthProvider::<BscPrimitives, _>::new().with_chain_spec((*spec).clone());
+    provider.enable_database_provider();
     let mut mix = [0u8; 32];
     mix[24..32].copy_from_slice(&HEAD_REMAINDER.to_be_bytes());
     let header = alloy_consensus::Header {
