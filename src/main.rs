@@ -642,6 +642,8 @@ fn main() -> eyre::Result<()> {
                         }
                         let block_api = BscBlockApiImpl(ctx.registry.eth_api().clone());
                         ctx.modules.merge_if_module_configured(RethRpcModule::Eth, block_api.into_rpc())?;
+                        let auth_block_api = BscBlockApiImpl(ctx.registry.eth_api().clone());
+                        ctx.auth_module.replace_auth_methods(auth_block_api.into_auth_rpc())?;
 
                         use reth_bsc::rpc::access_list::{BscAccessListApiImpl, BscAccessListApiServer};
                         ctx.modules.remove_method_from_configured("eth_createAccessList");

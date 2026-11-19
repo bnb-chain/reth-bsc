@@ -20,6 +20,25 @@ pub const METHODS: [&str; 6] = [
 /// Go-BSC adds milliseconds to explicit queries, but not subscriptions or simulations.
 pub struct BscBlockApiImpl<Eth>(pub Eth);
 
+impl<Eth> BscBlockApiImpl<Eth>
+where
+    Eth: EthBlocks + FullEthApiTypes + 'static,
+    Eth::NetworkTypes: RpcTypes<Header = Header>,
+{
+    /// Return only the block queries already exposed by the authenticated Engine RPC server.
+    pub fn into_auth_rpc(self) -> jsonrpsee::RpcModule<Self> {
+        let mut module = self.into_rpc();
+        let excluded = module
+            .method_names()
+            .filter(|method| !matches!(*method, "eth_getBlockByHash" | "eth_getBlockByNumber"))
+            .collect::<Vec<_>>();
+        for method in excluded {
+            module.remove_method(method);
+        }
+        module
+    }
+}
+
 fn with_milliseconds<T>(value: T, header: &Header) -> WithOtherFields<T> {
     let milliseconds =
         crate::consensus::parlia::util::calculate_millisecond_timestamp(&header.inner);
