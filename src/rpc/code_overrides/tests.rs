@@ -59,6 +59,7 @@ macro_rules! rpc {
     (chain $chain:expr, header $header:expr) => {{
         let spec = Arc::new(BscChainSpec::from($chain));
         let provider = MockEthProvider::<BscPrimitives, _>::new().with_chain_spec((*spec).clone());
+        provider.enable_database_provider();
         let header = $header;
         let hash = header.hash_slow();
         crate::node::evm::util::insert_header_to_cache(header.clone());
@@ -493,3 +494,53 @@ async fn time_override_across_osaka_moves_the_tx_gas_limit_cap() {
 
 #[path = "fork_tests.rs"]
 mod fork_tests;
+
+#[test]
+fn simulation_total_difficulty_accumulates_and_preserves_null() {
+    let block = || SimulatedBlock {
+        inner: serde_json::json!({"number":"0x1", "timestamp":"0x2"}),
+        calls: vec![],
+    };
+    let mut total = Some(U512::from(100));
+    for (difficulty, expected) in [(2, "0x66"), (0, "0x66"), (1, "0x67")] {
+        let response = with_simulated_total_difficulty(block(), &mut total, U256::from(difficulty));
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["totalDifficulty"], expected);
+        assert_eq!(json["number"], "0x1");
+        assert!(json.get("milliTimestamp").is_none());
+    }
+    let response = with_simulated_total_difficulty(block(), &mut None, U256::from(2));
+    let json = serde_json::to_value(response).unwrap();
+    assert!(json.as_object().unwrap().contains_key("totalDifficulty"));
+    assert!(json["totalDifficulty"].is_null());
+    let mut total = Some(U512::from(U256::MAX));
+    let response = with_simulated_total_difficulty(block(), &mut total, U256::from(1));
+    assert_eq!(
+        serde_json::to_value(response).unwrap()["totalDifficulty"],
+        format!("0x1{}", "0".repeat(64))
+    );
+}
+
+#[tokio::test]
+async fn simulation_rpc_emits_total_difficulty_but_no_millisecond_field() {
+    for full in [false, true] {
+        for trace_transfers in [false, true] {
+            let (api, _) = rpc!(NOW - 1);
+            let module = api.into_rpc();
+            let request = serde_json::json!({"jsonrpc":"2.0", "id":1, "method":"eth_simulateV1", "params":[{
+                "blockStateCalls":[{"calls":[]}], "validation":false,
+                "returnFullTransactions":full, "traceTransfers":trace_transfers
+            }, "latest"]});
+            let (response, _) = module.raw_json_request(&request.to_string(), 1).await.unwrap();
+            let response: serde_json::Value = serde_json::from_str(response.get()).unwrap();
+            assert!(response.get("error").is_none(), "{response}");
+            let block = response["result"][0].as_object().expect("simulated block");
+            // No TD is populated in the mock: Go-BSC emits null when base TD is unavailable.
+            assert_eq!(block.get("totalDifficulty"), Some(&serde_json::Value::Null));
+            assert!(!block.contains_key("milliTimestamp"));
+        }
+    }
+}
+
+#[path = "td_tests.rs"]
+mod td_tests;
