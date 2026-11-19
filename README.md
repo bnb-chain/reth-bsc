@@ -172,9 +172,16 @@ Enable detailed logging:
 --log.file.directory ./logs
 ```
 
+### ETH protocol support
+
+The node advertises only `eth/68`, `eth/70`, and `eth/71`, negotiating the highest
+version shared with each peer. Peers offering only other ETH versions cannot connect.
+The BSC `eth/70` and `eth/71` status handshake retains total difficulty and includes
+the available block range; it does not exchange `UpgradeStatus`.
+
 ### EVN Support
 
-This client implements the BSC upgrade-status handshake extension. When EVN is enabled, the node requests peers to disable transaction broadcast towards it, mirroring the Enhanced Validator Network behavior used by validator/sentry nodes.
+For `eth/68` peers, this client implements the BSC upgrade-status handshake extension. When EVN is enabled, the node requests these peers to disable transaction broadcast towards it, mirroring the Enhanced Validator Network behavior used by validator/sentry nodes. This handshake signaling is unavailable on `eth/70` and `eth/71` connections.
 
 - Enable via CLI: `--evn.enabled`
 - Or via env var: `BSC_EVN_ENABLED=true`
