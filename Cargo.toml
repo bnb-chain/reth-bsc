@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "testing/bsc-ef-tests"]
+members = [".", "testing/bsc-ef-tests", "crates/pqc-precompiles"]
 
 [workspace.dependencies]
 # Keep the node and EF tests on the cross-region Reth integration.
@@ -207,6 +207,7 @@ pbkdf2 = "0.12"
 scrypt = "0.11"
 
 # precompiles deps
+bsc-pqc-precompiles = { path = "crates/pqc-precompiles", optional = true }
 bls_on_arkworks = "0.3.0"
 blst = "0.3.15"
 curve25519-dalek = "4"
@@ -245,6 +246,9 @@ libc = "0.2"
 gmp-mpfr-sys = { version = "1.7", features = ["force-cross"] }
 
 [features]
+experimental-pqc = ["dep:bsc-pqc-precompiles"]
+experimental-pqc-openssl = ["experimental-pqc", "bsc-pqc-precompiles/openssl-backend"]
+experimental-pqc-circl = ["experimental-pqc", "bsc-pqc-precompiles/circl-backend"]
 default = ["jemalloc"]
 jemalloc = ["dep:tikv-jemallocator", "reth/jemalloc"]
 dev = ["reth-cli-commands/arbitrary", "reth/dev", "revm/dev"]
