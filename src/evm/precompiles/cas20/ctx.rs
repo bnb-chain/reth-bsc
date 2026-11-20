@@ -5,6 +5,7 @@ use super::{access_list, observer::CallStats};
 use crate::hardforks::bsc::BscHardfork;
 use alloy_evm::EvmInternals;
 use alloy_primitives::{Address, Bytes, Log, B256, U256};
+use reth_revm::native_reads;
 use revm::{
     bytecode::Bytecode,
     context_interface::cfg::GasParams,
@@ -56,6 +57,7 @@ pub trait Cas20State {
 impl Cas20State for EvmInternals<'_> {
     fn sload(&mut self, address: Address, key: U256) -> Result<StateLoad<U256>, String> {
         access_list::storage(address, key);
+        native_reads::storage(address, key);
         EvmInternals::sload(self, address, key).map_err(|e| e.to_string())
     }
 
@@ -66,17 +68,20 @@ impl Cas20State for EvmInternals<'_> {
         value: U256,
     ) -> Result<StateLoad<SStoreResult>, String> {
         access_list::storage(address, key);
+        native_reads::storage(address, key);
         EvmInternals::sstore(self, address, key, value).map_err(|e| e.to_string())
     }
 
     fn code_hash(&mut self, address: Address) -> Result<StateLoad<B256>, String> {
         access_list::account(address);
+        native_reads::account(address);
         let acc = self.load_account(address).map_err(|e| e.to_string())?;
         Ok(StateLoad::new(acc.data.info.code_hash, acc.is_cold))
     }
 
     fn set_code(&mut self, address: Address, code: Bytecode) -> Result<(), String> {
         access_list::account(address);
+        native_reads::account(address);
         self.touch_account(address).map_err(|e| e.to_string())?;
         EvmInternals::set_code(self, address, code).map_err(|e| e.to_string())
     }

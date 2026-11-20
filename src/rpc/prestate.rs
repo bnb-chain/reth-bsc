@@ -1,4 +1,4 @@
-//! CAS20 prestate compatibility. Reth already observes native journal accesses;
+//! CAS20 prestate compatibility. Reth observes explicit native reads;
 //! only its empty-account classification needs adjustment. Delegate execution to
 //! DebugApi and normalize its output without changing journal flags or state.
 
@@ -14,7 +14,10 @@ use alloy_rpc_types::{
     },
 };
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
-use reth::rpc::api::DebugApiServer;
+use reth::rpc::api::{
+    prestate::{normalize_prestate_config, with_prestate_config},
+    DebugApiServer,
+};
 
 pub const METHODS: &[&str] = &[
     "debug_traceBlock",
@@ -76,6 +79,13 @@ pub trait BscPrestateApi {
 
 pub struct BscPrestateApiImpl<Debug>(pub Debug);
 
+impl<Debug: DebugApiServer<TransactionRequest> + 'static> BscPrestateApiImpl<Debug> {
+    /// Builds the chain-specific debug module with raw prestate option decoding.
+    pub fn into_rpc(self) -> jsonrpsee::RpcModule<Self> {
+        with_prestate_config(BscPrestateApiServer::into_rpc(self))
+    }
+}
+
 #[async_trait::async_trait]
 impl<Debug: DebugApiServer<TransactionRequest> + 'static> BscPrestateApiServer
     for BscPrestateApiImpl<Debug>
@@ -86,7 +96,7 @@ impl<Debug: DebugApiServer<TransactionRequest> + 'static> BscPrestateApiServer
         opts: Option<GethDebugTracingOptions>,
     ) -> RpcResult<Vec<TraceResult>> {
         let mut opts = opts.unwrap_or_default();
-        let plan = Plan::prepare(&mut opts);
+        let plan = Plan::prepare(&mut opts)?;
         let mut result = self.0.debug_trace_block(rlp_block, Some(opts)).await?;
         for trace in &mut result {
             if let TraceResult::Success { result, .. } = trace {
@@ -101,7 +111,7 @@ impl<Debug: DebugApiServer<TransactionRequest> + 'static> BscPrestateApiServer
         opts: Option<GethDebugTracingOptions>,
     ) -> RpcResult<Vec<TraceResult>> {
         let mut opts = opts.unwrap_or_default();
-        let plan = Plan::prepare(&mut opts);
+        let plan = Plan::prepare(&mut opts)?;
         let mut result = self.0.debug_trace_block_by_hash(block, Some(opts)).await?;
         for trace in &mut result {
             if let TraceResult::Success { result, .. } = trace {
@@ -116,7 +126,7 @@ impl<Debug: DebugApiServer<TransactionRequest> + 'static> BscPrestateApiServer
         opts: Option<GethDebugTracingOptions>,
     ) -> RpcResult<Vec<TraceResult>> {
         let mut opts = opts.unwrap_or_default();
-        let plan = Plan::prepare(&mut opts);
+        let plan = Plan::prepare(&mut opts)?;
         let mut result = self.0.debug_trace_block_by_number(block, Some(opts)).await?;
         for trace in &mut result {
             if let TraceResult::Success { result, .. } = trace {
@@ -131,7 +141,7 @@ impl<Debug: DebugApiServer<TransactionRequest> + 'static> BscPrestateApiServer
         opts: Option<GethDebugTracingOptions>,
     ) -> RpcResult<GethTrace> {
         let mut opts = opts.unwrap_or_default();
-        let plan = Plan::prepare(&mut opts);
+        let plan = Plan::prepare(&mut opts)?;
         let mut result = self.0.debug_trace_transaction(tx_hash, Some(opts)).await?;
         plan.apply(&mut result);
         Ok(result)
@@ -143,7 +153,7 @@ impl<Debug: DebugApiServer<TransactionRequest> + 'static> BscPrestateApiServer
         opts: Option<GethDebugTracingCallOptions>,
     ) -> RpcResult<GethTrace> {
         let mut opts = opts.unwrap_or_default();
-        let plan = Plan::prepare(&mut opts.tracing_options);
+        let plan = Plan::prepare(&mut opts.tracing_options)?;
         let mut result = self.0.debug_trace_call(request, block_id, Some(opts)).await?;
         plan.apply(&mut result);
         Ok(result)
@@ -155,7 +165,7 @@ impl<Debug: DebugApiServer<TransactionRequest> + 'static> BscPrestateApiServer
         opts: Option<GethDebugTracingCallOptions>,
     ) -> RpcResult<Vec<Vec<GethTrace>>> {
         let mut opts = opts.unwrap_or_default();
-        let plan = Plan::prepare(&mut opts.tracing_options);
+        let plan = Plan::prepare(&mut opts.tracing_options)?;
         let mut result = self.0.debug_trace_call_many(bundles, state_context, Some(opts)).await?;
         for trace in result.iter_mut().flatten() {
             plan.apply(trace);
@@ -168,7 +178,7 @@ impl<Debug: DebugApiServer<TransactionRequest> + 'static> BscPrestateApiServer
         opts: Option<GethDebugTracingCallOptions>,
     ) -> RpcResult<Vec<TraceResult>> {
         let mut opts = opts.unwrap_or_default();
-        let plan = Plan::prepare(&mut opts.tracing_options);
+        let plan = Plan::prepare(&mut opts.tracing_options)?;
         let mut result = self.0.debug_trace_bad_block(block_hash, Some(opts)).await?;
         for trace in &mut result {
             if let TraceResult::Success { result, .. } = trace {
@@ -191,48 +201,53 @@ enum Plan {
 }
 
 impl Plan {
-    fn prepare(opts: &mut GethDebugTracingOptions) -> Self {
-        opts.tracer
-            .as_ref()
-            .map(|tracer| Self::prepare_config(tracer, &mut opts.tracer_config))
-            .unwrap_or_default()
+    fn prepare(opts: &mut GethDebugTracingOptions) -> RpcResult<Self> {
+        match &opts.tracer {
+            Some(tracer) => Self::prepare_config(tracer, &mut opts.tracer_config),
+            None => Ok(Self::None),
+        }
     }
 
-    fn prepare_config(tracer: &GethDebugTracerType, config: &mut GethDebugTracerConfig) -> Self {
+    fn prepare_config(
+        tracer: &GethDebugTracerType,
+        config: &mut GethDebugTracerConfig,
+    ) -> RpcResult<Self> {
         match tracer {
             GethDebugTracerType::BuiltInTracer(GethDebugBuiltInTracerType::PreStateTracer) => {
-                let Ok(prestate) = config.clone().into_pre_state_config() else {
-                    return Self::None;
-                };
-                let include_empty =
-                    config.0.get("includeEmpty").and_then(|v| v.as_bool()).unwrap_or(false);
-                let hide_code = !prestate.code_enabled();
-                // Go checks account emptiness before applying disableCode. Fetch
-                // code for that check and strip it only after normalizing prestate.
+                normalize_prestate_config(&mut config.0)?;
+                let include_empty = config
+                    .0
+                    .get("includeEmpty")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or_default();
+                let hide_code = config
+                    .0
+                    .get("disableCode")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or_default();
+                // Go checks emptiness before disableCode. Fetch code before filtering CAS20
+                // markers.
                 if hide_code {
                     config.0["disableCode"] = false.into();
                 }
-                Self::Prestate { hide_code, include_empty }
+                Ok(Self::Prestate { hide_code, include_empty })
             }
             GethDebugTracerType::BuiltInTracer(GethDebugBuiltInTracerType::MuxTracer) => {
                 let Ok(mut mux) = serde_json::from_value::<MuxConfig>(config.0.clone()) else {
-                    return Self::None;
+                    return Ok(Self::None);
                 };
                 let plans = mux
                     .0
                     .iter_mut()
                     .map(|(tracer, config)| {
-                        let plan = Self::prepare_config(
-                            tracer,
-                            config.get_or_insert_with(Default::default),
-                        );
-                        (tracer.clone(), plan)
+                        Self::prepare_config(tracer, config.get_or_insert_with(Default::default))
+                            .map(|plan| (tracer.clone(), plan))
                     })
-                    .collect();
+                    .collect::<RpcResult<Vec<_>>>()?;
                 config.0 = serde_json::to_value(mux).expect("serializable tracer configuration");
-                Self::Mux(plans)
+                Ok(Self::Mux(plans))
             }
-            _ => Self::None,
+            _ => Ok(Self::None),
         }
     }
 

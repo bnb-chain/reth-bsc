@@ -657,7 +657,7 @@ fn main() -> eyre::Result<()> {
                         let overrides_api = BscCodeOverridesApiImpl(ctx.registry.eth_api().clone());
                         ctx.modules.merge_if_module_configured(RethRpcModule::Eth, overrides_api.into_rpc())?;
 
-                        use reth_bsc::rpc::prestate::{BscPrestateApiImpl, BscPrestateApiServer};
+                        use reth_bsc::rpc::prestate::BscPrestateApiImpl;
                         for method in reth_bsc::rpc::prestate::METHODS {
                             ctx.modules.remove_method_from_configured(method);
                         }
