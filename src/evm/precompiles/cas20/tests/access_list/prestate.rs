@@ -358,3 +358,77 @@ async fn prestate_option_casing_preserves_bsc_code_filtering() {
         assert!(account.get("storage").is_none());
     }
 }
+
+#[tokio::test]
+async fn native_call_gas_checks_omit_unobserved_empty_recipients() {
+    let h = Harness::new();
+    let api = debug!(h.st);
+    let target = Address::with_last_byte(0x42);
+    let recipient = Address::with_last_byte(0x44);
+    for mux in [false, true] {
+        for (gas, expected) in [(40_000, false), (100_000, true)] {
+            let mut opts = options(json!({"includeEmpty":true}), mux);
+            opts.state_overrides = Some(
+                [(
+                    target,
+                    AccountOverride {
+                        nonce: Some(1),
+                        code: Some("60006000600060006001604461fffff15000".parse().unwrap()),
+                        ..Default::default()
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            );
+            let mut req = request(target, vec![]);
+            req.gas = Some(gas);
+            let result = prestate(api.debug_trace_call(req, None, Some(opts)).await.unwrap(), mux);
+            assert_eq!(
+                result.get(format!("{recipient:#x}")),
+                expected.then(|| json!({"balance":"0x0"})).as_ref(),
+                "gas={gas}: {result}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn prestate_alias_order_preserves_bsc_code_and_empty_filtering() {
+    let mut h = Harness::new();
+    let token = token(&mut h);
+    let api = debug!(h.st);
+    for mux in [false, true] {
+        for (config, hide_code) in [
+            (
+                r#"{"includeEmpty":false,"IncludeEmpty":true,"disableCode":false,"DisableCode":true}"#,
+                true,
+            ),
+            (
+                r#"{"IncludeEmpty":false,"includeEmpty":true,"DisableCode":true,"disableCode":false}"#,
+                false,
+            ),
+        ] {
+            let opts = options(serde_json::from_str(config).unwrap(), mux);
+            let result = prestate(
+                api.debug_trace_call(
+                    request(token, call_data(SEL_BALANCE_OF, &[a(ALICE)])),
+                    None,
+                    Some(opts),
+                )
+                .await
+                .unwrap(),
+                mux,
+            );
+            assert_eq!(
+                result[format!("{token:#x}")].get("code").is_none(),
+                hide_code,
+                "{config}: {result}"
+            );
+            assert_eq!(
+                result.get(format!("{ALICE:#x}")),
+                Some(&json!({"balance":"0x0"})),
+                "{config}: {result}"
+            );
+        }
+    }
+}
