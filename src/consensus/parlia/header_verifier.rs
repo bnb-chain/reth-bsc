@@ -5,21 +5,103 @@ use super::{
 };
 use crate::{
     hardforks::BscHardforks,
-    metrics::BscVoteMetrics,
+    metrics::{BscConsensusMetrics, BscVoteMetrics},
     node::evm::error::{BscBlockExecutionError, BscBlockValidationError},
 };
 use alloy_consensus::{BlockHeader, Header};
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
 use bit_set::BitSet;
 use blst::{
     min_pk::{PublicKey, Signature},
     BLST_ERROR,
 };
+use lru::LruCache;
+use parking_lot::Mutex;
 use reth_chainspec::EthChainSpec;
 use reth_evm::execute::BlockExecutionError;
 use reth_primitives_traits::GotExpected;
+use std::{num::NonZeroUsize, sync::LazyLock};
 
 const BLST_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
+
+// Match go-bsc's recent proposal retention. Relay and execution share this history.
+const RECENT_PROPOSAL_LIMIT: NonZeroUsize = NonZeroUsize::new(86_400).unwrap();
+type RecentProposals = LruCache<(B256, Address), RecentProposal>;
+static RECENT_PROPOSALS: LazyLock<Mutex<RecentProposals>> =
+    LazyLock::new(|| Mutex::new(LruCache::new(RECENT_PROPOSAL_LIMIT)));
+static CONSENSUS_METRICS: LazyLock<BscConsensusMetrics> =
+    LazyLock::new(BscConsensusMetrics::default);
+
+enum RecentProposal {
+    First(B256),
+    ConflictReported,
+}
+
+fn record_proposal(
+    proposals: &mut RecentProposals,
+    parent: B256,
+    proposer: Address,
+    hash: B256,
+) -> Option<B256> {
+    let key = (parent, proposer);
+    match proposals.get_mut(&key) {
+        Some(proposal) => {
+            let RecentProposal::First(previous) = *proposal else { return None };
+            if previous == hash {
+                return None;
+            }
+            *proposal = RecentProposal::ConflictReported;
+            Some(previous)
+        }
+        None => {
+            proposals.put(key, RecentProposal::First(hash));
+            None
+        }
+    }
+}
+
+/// Observe a header after proposer recovery, authorization and the remaining seal checks.
+pub(crate) fn observe_verified_proposal(header: &Header, hash: B256) {
+    let conflict =
+        record_proposal(&mut RECENT_PROPOSALS.lock(), header.parent_hash, header.beneficiary, hash);
+    if let Some(previous) = conflict {
+        CONSENSUS_METRICS.network_double_signs_detected_total.increment(1);
+        tracing::warn!(
+            target: "bsc::validation",
+            block_number = header.number,
+            parent_hash = %header.parent_hash,
+            proposer = %header.beneficiary,
+            previous_hash = %previous,
+            conflicting_hash = %hash,
+            "Network double sign detected"
+        );
+    }
+}
+
+#[cfg(test)]
+mod proposal_tests {
+    use super::*;
+
+    #[test]
+    fn reports_a_conflict_once_per_parent_and_proposer() {
+        let mut proposals = LruCache::new(NonZeroUsize::new(8).unwrap());
+        let parent = B256::repeat_byte(1);
+        let proposer = Address::repeat_byte(2);
+        let first = B256::repeat_byte(3);
+        let second = B256::repeat_byte(4);
+        assert_eq!(record_proposal(&mut proposals, parent, proposer, first), None);
+        // Relay and execution may verify the same proposal.
+        assert_eq!(record_proposal(&mut proposals, parent, proposer, first), None);
+        for (parent, proposer) in
+            [(B256::repeat_byte(5), proposer), (parent, Address::repeat_byte(6))]
+        {
+            assert_eq!(record_proposal(&mut proposals, parent, proposer, second), None);
+        }
+        assert_eq!(record_proposal(&mut proposals, parent, proposer, second), Some(first));
+        assert_eq!(record_proposal(&mut proposals, parent, proposer, second), None);
+        assert_eq!(record_proposal(&mut proposals, parent, proposer, first), None);
+    }
+}
 
 pub(crate) fn validate_attestation_source_target_order(
     source_number: u64,
