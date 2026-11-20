@@ -40,13 +40,13 @@ fn empty_filter_preserves_existing_code_and_non_cas20_accounts() {
 }
 
 #[test]
-fn include_empty_and_invalid_tracer_config_are_preserved() {
+fn prestate_defaults_aliases_and_validation_use_shared_parser() {
     for config in [json!(null), json!({})] {
         let mut opts: GethDebugTracingOptions =
             serde_json::from_value(json!({"tracer":"prestateTracer","tracerConfig":config}))
                 .unwrap();
         assert!(matches!(
-            Plan::prepare(&mut opts),
+            Plan::prepare(&mut opts).unwrap(),
             Plan::Prestate { hide_code: false, include_empty: false }
         ));
     }
@@ -59,8 +59,8 @@ fn include_empty_and_invalid_tracer_config_are_preserved() {
             json!({"tracer":"prestateTracer","tracerConfig":{(code_key):true,(empty_key):true}}),
         )
         .unwrap();
-        let plan = Plan::prepare(&mut opts);
-        assert_eq!(opts.tracer_config.0[code_key], false);
+        let plan = Plan::prepare(&mut opts).unwrap();
+        assert_eq!(opts.tracer_config.0["disableCode"], false);
         let mut trace = GethTrace::PreStateTracer(PreStateFrame::Default(PreStateMode(
             [(FACTORY_ADDRESS, AccountState::default())].into_iter().collect(),
         )));
@@ -70,9 +70,9 @@ fn include_empty_and_invalid_tracer_config_are_preserved() {
             .get(format!("{FACTORY_ADDRESS:#x}"))
             .is_some());
         opts.tracer_config.0 = json!({(code_key):"invalid"});
-        let original = opts.clone();
-        assert!(matches!(Plan::prepare(&mut opts), Plan::None));
-        assert_eq!(opts, original);
+        let error = Plan::prepare(&mut opts).err().unwrap();
+        assert_eq!(error.code(), -32000);
+        assert_eq!(error.message(), "json: cannot unmarshal string into Go struct field PrestateTracerConfig.disableCode of type bool");
     }
 }
 

@@ -529,3 +529,106 @@ async fn native_static_create2_bounds_empty_initcode_offset() {
         }
     }
 }
+
+#[tokio::test]
+async fn native_read_after_failed_gas() {
+    let h = Harness::new();
+    let api = debug!(h.st);
+    let parent = Address::with_last_byte(0x42);
+    let child = Address::with_last_byte(0x43);
+    let queried = "ca52000000000000000000000000000000000001".parse::<Address>().unwrap();
+    let mut mismatches = Vec::new();
+    for failed_first in [false, true] {
+        let prefix = if failed_first { "600060006000600060006043614a38f150" } else { "" };
+        let code = format!(
+            "{prefix}366000600037602060006024600073{}61fffffa5060206000f3",
+            alloy_primitives::hex::encode(FACTORY_ADDRESS)
+        );
+        let child_code =
+            format!("6000600060006000600173{}61fffff15000", alloy_primitives::hex::encode(queried));
+        for mux in [false, true] {
+            let mut opts = options(json!({"includeEmpty":true}), mux);
+            opts.state_overrides = Some(
+                [
+                    (
+                        parent,
+                        AccountOverride {
+                            nonce: Some(1),
+                            code: Some(code.parse().unwrap()),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        child,
+                        AccountOverride {
+                            nonce: Some(1),
+                            code: Some(child_code.parse().unwrap()),
+                            ..Default::default()
+                        },
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            );
+            let trace = api
+                .debug_trace_call(
+                    request(parent, call_data(SEL_IS_CAS20_INITIALIZED, &[a(queried)])),
+                    None,
+                    Some(opts),
+                )
+                .await
+                .unwrap();
+            let pre = prestate(trace, mux);
+            if pre.get(format!("{queried:#x}")) != Some(&json!({"balance":"0x0"})) {
+                mismatches.push((failed_first, mux));
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:?}");
+}
+
+#[tokio::test]
+async fn go_bsc_native_prestate_matrix() {
+    let cases: Vec<Value> = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/prestate/cases.json"
+    )))
+    .unwrap();
+    let expected: Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/prestate/expected.json"
+    )))
+    .unwrap();
+    let mut mismatches = Vec::new();
+    for case in cases {
+        let h = Harness::new();
+        let module = debug!(h.st).into_rpc();
+        let mut overrides = case["accounts"].clone();
+        for account in overrides.as_object_mut().unwrap().values_mut() {
+            account["nonce"] = json!(format!("0x{:x}", account["nonce"].as_u64().unwrap()));
+        }
+        for mux in [false, true] {
+            let name = format!("{}/mux={mux}", case["name"].as_str().unwrap());
+            let config = case["config"].as_str().unwrap();
+            let (tracer, config) = if mux {
+                ("muxTracer", format!(r#"{{"prestateTracer":{config}}}"#))
+            } else {
+                ("prestateTracer", config.to_owned())
+            };
+            let call = json!({"from":Address::ZERO,"to":Address::with_last_byte(0x42),"gas":format!("0x{:x}",case["gas"].as_u64().unwrap()),"input":case["input"]});
+            let coinbase = Address::with_last_byte(0x99);
+            let request = format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"debug_traceCall","params":[{call},"latest",{{"tracer":"{tracer}","tracerConfig":{config},"stateOverrides":{overrides},"blockOverrides":{{"coinbase":"{coinbase:#x}"}}}}]}}"#
+            );
+            let (response, _) = module.raw_json_request(&request, 1).await.unwrap();
+            let response: Value = serde_json::from_str(response.get()).unwrap();
+            assert!(response.get("error").is_none(), "{name}: {response}");
+            let actual =
+                if mux { &response["result"]["prestateTracer"] } else { &response["result"] };
+            if actual != &expected[&name] {
+                mismatches.push(format!("{name}: expected {}, got {actual}", expected[&name]));
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
