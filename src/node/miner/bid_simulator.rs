@@ -2,7 +2,7 @@ use crate::{
     chainspec::BscChainSpec,
     consensus::{
         eip4844::{calc_blob_fee, is_blob_eligible_block},
-        parlia::{provider::SnapshotProvider, util::calculate_millisecond_timestamp, Snapshot},
+        parlia::{provider::SnapshotProvider, Snapshot},
     },
     hardforks::BscHardforks,
     node::{
@@ -14,19 +14,19 @@ use crate::{
             LaneAdmission,
         },
         miner::{
-            bid_block::{simulate_bid_block, BidBlockTask, DecodedBidBlock},
+            bid_block::DecodedBidBlock,
             bsc_miner::MiningContext,
             config::{get_global_mining_config, MiningConfig},
             payload::DELAY_LEFT_OVER,
-            util::{epoch_validators_for_next_block, prepare_new_attributes},
+            util::prepare_new_attributes,
         },
         primitives::BscBlobTransactionSidecar,
     },
 };
-use alloy_consensus::{BlobTransactionSidecar, BlockHeader as _, Transaction};
+use alloy_consensus::{BlobTransactionSidecar, Transaction};
 use alloy_eips::eip4895::Withdrawals;
 use alloy_evm::{block::BlockExecutor, Evm};
-use alloy_primitives::{Address, Bytes, B256, U256};
+use alloy_primitives::{Address, B256, U256};
 use parking_lot::RwLock;
 use reth::transaction_pool::BestTransactionsAttributes;
 use reth_chainspec::EthChainSpec;
@@ -52,7 +52,7 @@ use std::{
         Arc, Mutex,
     },
 };
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 const PAY_BID_TX_GAS_LIMIT: u64 = 25000;
 const TX_GAS: u64 = 21000;
 
@@ -166,24 +166,24 @@ fn filter_bid_txs<T>(txs: Vec<T>, of: impl Fn(&T) -> (Address, u64, bool)) -> Ve
 /// Evicts entries older than `min_block_number` from the `best_bid_block` map, keyed by parent
 /// hash. Split out as a free function (from [`BidSimulator::clear`]) so it's directly testable
 /// without constructing a full `BidSimulator`.
-fn retain_recent_bid_blocks(map: &mut HashMap<B256, BidBlockTask>, min_block_number: u64) {
-    map.retain(|_, task| task.block.sealed_block().header().number() >= min_block_number);
+fn retain_recent_bid_blocks(map: &mut HashMap<B256, Arc<DecodedBidBlock>>, min_block_number: u64) {
+    map.retain(|_, bid| bid.block_number() >= min_block_number);
 }
 
 fn store_best_bid_block(
-    best: &mut HashMap<B256, BidBlockTask>,
-    parent_hash: B256,
-    task: BidBlockTask,
+    best: &mut HashMap<B256, Arc<DecodedBidBlock>>,
+    bid: DecodedBidBlock,
 ) -> Result<(), String> {
+    let parent_hash = bid.parent_hash();
     if let Some(current) = best.get(&parent_hash) {
-        if task.gas_fee <= current.gas_fee {
+        if bid.gas_fee <= current.gas_fee {
             return Err(format!(
                 "BidBlock gasFee not higher than current best: bidHash={} got {}, bestBidHash={} best {}",
-                task.bid_hash, task.gas_fee, current.bid_hash, current.gas_fee
+                bid.hash(), bid.gas_fee, current.hash(), current.gas_fee
             ));
         }
     }
-    best.insert(parent_hash, task);
+    best.insert(parent_hash, Arc::new(bid));
     Ok(())
 }
 
@@ -204,9 +204,9 @@ pub struct BidSimulator<Client, Pool> {
     best_bid_to_run: Arc<RwLock<HashMap<B256, Bid>>>,
     simulating_bid: Arc<RwLock<HashMap<B256, Bid>>>,
     best_bid: Arc<RwLock<HashMap<B256, BidRuntime<Pool, BscEvmConfig>>>>,
-    /// Best executed BEP-675 BidBlock payload per parent hash (go-bsc
-    /// `AddBidBlock`/`GetBestBidBlock`).
-    best_bid_block: Arc<RwLock<HashMap<B256, BidBlockTask>>>,
+    /// Highest-fee admitted BidBlock per parent (go-bsc `AddBidBlock`/`GetBestBidBlock`).
+    /// The selection path signs and seals only the winner.
+    best_bid_block: Arc<RwLock<HashMap<B256, Arc<DecodedBidBlock>>>>,
     pending_bid: Arc<RwLock<HashMap<String, u8>>>,
     bid_receiving: bool,
     chain_spec: Arc<BscChainSpec>,
@@ -976,117 +976,27 @@ where
         self.best_bid.read().get(&parent_hash).cloned()
     }
 
-    /// Verify, blind-sign, and seal an admitted BEP-675 BidBlock, keeping the highest-fee one per
-    /// parent hash (go-bsc `AddBidBlock`). Execution and selection against the locally-built block
-    /// happen in the build cycle (a follow-on slice); this is the intake half.
+    /// Store an RPC-validated BidBlock without signing or sealing it. The head may have advanced
+    /// while this request was queued, so recheck its height before admitting it to the store.
     pub(crate) fn commit_bid_block(&self, decoded: DecodedBidBlock) -> Result<(), String> {
         let parent_hash = decoded.parent_hash();
         let bid_hash = decoded.hash();
-        // go-bsc's `newBidBlockLoop` also re-checks `isRunning` / `receivingBid` here. We don't:
-        // `is_mev_running()` is already enforced at admission in `MevApiImpl::admit_bid_block`, and
-        // `bid_receiving` has no toggle in this codebase (no setter, no RPC) so the gate would be
-        // dead code. A bid that races past `is_mev_running` between admit and pop is harmless —
-        // the resulting payload sits in `best_bid_block` until evicted.
-        //
-        // Mirrors go-bsc `bidSimulator.newBidBlockLoop`: discard BidBlocks for a block number we
-        // have already passed. Admission only checks head-relative timing, not block number, so a
-        // bid admitted just before the head advanced can still reach here for a stale block.
+        let block_number = decoded.block_number();
+        let gas_fee = decoded.gas_fee;
         let head_number = self.client.last_block_number().unwrap_or(0);
-        if decoded.block_number() <= head_number {
+        if block_number <= head_number {
             return Err(format!(
-                "BidBlock is discarded, stale block number: {}, latest block: {head_number}, builder={}, bidHash={bid_hash}",
-                decoded.block_number(),
+                "BidBlock is discarded, stale block number: {block_number}, latest block: {head_number}, builder={}, bidHash={bid_hash}",
                 decoded.builder,
             ));
         }
-        let parent = match self.client.header(parent_hash) {
-            Ok(Some(h)) => SealedHeader::new(h, parent_hash),
-            _ => {
-                return Err(format!(
-                    "BidBlock: parent header not found: {parent_hash}, bidHash={bid_hash}"
-                ));
-            }
-        };
-        // BidBlocks must build directly on the selected parent.
-        if decoded.block_number() != parent.number() + 1 {
-            return Err(format!(
-                "BidBlock: block {} is not a child of parent {} ({parent_hash})",
-                decoded.block_number(),
-                parent.number(),
-            ));
-        }
-        let Some(parent_snap) = self.snapshot_provider.snapshot_by_hash(&parent_hash) else {
-            return Err(format!(
-                "BidBlock: no snapshot for parent {parent_hash}, bidHash={bid_hash}"
-            ));
-        };
-        let gas_ceil = crate::shared::get_miner_gas_limit().unwrap_or(parent.gas_limit);
-        let expected_gas_limit =
-            EthereumBuilderConfig::new().with_gas_limit(gas_ceil).gas_limit(parent.gas_limit);
-        // Use the operator-configured extra (`miner_setExtra`) as the block vanity, mirroring
-        // geth's `worker.extra`; pad/truncate to the Parlia vanity length, defaulting to zeros.
-        let vanity = {
-            let mut v = crate::shared::get_miner_extra().map(|e| e.to_vec()).unwrap_or_default();
-            v.resize(crate::consensus::parlia::EXTRA_VANITY_LEN, 0u8);
-            Bytes::from(v)
-        };
-        let block_timestamp_ms = calculate_millisecond_timestamp(&decoded.header);
-
-        let epoch_validators = match epoch_validators_for_next_block(
-            &self.client,
-            &self.chain_spec,
-            &parent_snap,
-            &parent,
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                // This is an infrastructure failure, not a bid-specific rejection.
-                warn!(
-                    "BidBlock: failed to resolve epoch validators for block {}, builder={}: {e}",
-                    decoded.block_number(),
-                    decoded.builder,
-                );
-                return Err(format!("BidBlock: failed to resolve epoch validators: {e}"));
-            }
-        };
-
-        let task = match simulate_bid_block(
-            self.parlia.clone(),
-            &self.chain_spec,
-            &decoded,
-            &parent,
-            &parent_snap,
-            &self.snapshot_provider,
-            self.validator_address,
-            expected_gas_limit,
-            vanity,
-            block_timestamp_ms,
-            epoch_validators,
-        ) {
-            Ok(task) => task,
-            Err(e) => {
-                // go-bsc only revokes on blob-tx validation failure here
-                // (`errInvalidBidBlockBlobTx` in `prepareBidBlockTask`); other
-                // prepare failures are plain rejections. Our KZG blob verification
-                // isn't ported yet, so there is no revoke-worthy variant to match
-                // on — the dishonest-builder revoke lives at the state-root check below.
-                return Err(format!("BidBlock rejected in prepare: bidHash={bid_hash}, err={e}"));
-            }
-        };
-
-        // Keep the highest-fee sealed BidBlock per parent. Execution is deferred.
-        let block_number = task.block.header().number();
-        let gas_fee = task.gas_fee;
-        store_best_bid_block(&mut self.best_bid_block.write(), parent_hash, task)?;
+        store_best_bid_block(&mut self.best_bid_block.write(), decoded)?;
         debug!("BidBlock stored: parentHash={parent_hash}, blockNumber={block_number}, gasFee={gas_fee}, replace=true, bidHash={bid_hash}");
         Ok(())
     }
 
-    /// The best stored (sealed, unexecuted) BidBlock for a parent hash (go-bsc `GetBestBidBlock`).
-    ///
-    /// The returned [`BidBlockTask`] is fully blind-signed and sealed but **not** executed: under
-    /// BEP-675 zero-simulate the validator verifies the state root only after broadcasting.
-    pub fn best_bid_block(&self, parent_hash: B256) -> Option<BidBlockTask> {
+    /// Read the candidate without copying its transactions or sidecars under the store lock.
+    pub fn best_bid_block(&self, parent_hash: B256) -> Option<Arc<DecodedBidBlock>> {
         self.best_bid_block.read().get(&parent_hash).cloned()
     }
 }
@@ -1487,8 +1397,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node::primitives::{BscBlock, BscBlockBody};
-    use reth_primitives_traits::RecoveredBlock;
+    use crate::node::miner::bid_block::{BidBlock, BidBlockArgs};
+    use alloy_primitives::Bytes;
 
     fn price_test_simulator() -> BidSimulator<
         reth_provider::test_utils::MockEthProvider,
@@ -1560,47 +1470,53 @@ mod tests {
         assert!(can_be_interrupted(0, 10_000, 240));
     }
 
-    fn bid_block_task_at(number: u64, parent_hash: B256) -> BidBlockTask {
-        let header = alloy_consensus::Header { number, parent_hash, ..Default::default() };
-        let body = BscBlockBody {
-            inner: reth_ethereum_primitives::BlockBody {
+    fn decoded_bid_at(number: u64, parent_hash: B256) -> DecodedBidBlock {
+        let mut decoded = BidBlockArgs {
+            bid_block: BidBlock {
+                header: alloy_consensus::Header {
+                    number,
+                    parent_hash,
+                    state_root: B256::random(),
+                    ..Default::default()
+                },
                 transactions: Vec::new(),
-                ommers: Vec::new(),
-                withdrawals: None,
+                sidecars: Vec::new(),
             },
-            sidecars: None,
-        };
-        BidBlockTask {
-            block: RecoveredBlock::new_unhashed(BscBlock { header, body }, Vec::new()),
-            gas_fee: U256::from(1),
-            system_tx_start: 0,
-            builder: Address::ZERO,
-            bid_hash: B256::random(),
+            signature: Bytes::default(),
         }
+        .to_decoded_bid_block(Address::ZERO)
+        .unwrap();
+        decoded.gas_fee = U256::from(1);
+        decoded
     }
 
     #[test]
     fn bid_block_store_replaces_only_with_a_higher_fee_for_the_same_parent() {
         let parent = B256::random();
         let mut best = HashMap::new();
-        let first = bid_block_task_at(2, parent);
-        let first_hash = first.bid_hash;
-        store_best_bid_block(&mut best, parent, first).unwrap();
-        assert_eq!(best[&parent].bid_hash, first_hash);
+        let first = decoded_bid_at(2, parent);
+        let first_hash = first.hash();
+        store_best_bid_block(&mut best, first).unwrap();
+        assert_eq!(best[&parent].hash(), first_hash);
 
-        let equal_fee = bid_block_task_at(2, parent);
-        assert!(store_best_bid_block(&mut best, parent, equal_fee).is_err());
-        assert_eq!(best[&parent].bid_hash, first_hash);
+        let equal_fee = decoded_bid_at(2, parent);
+        assert!(store_best_bid_block(&mut best, equal_fee).is_err());
+        assert_eq!(best[&parent].hash(), first_hash);
 
-        let mut second = bid_block_task_at(2, parent);
+        let mut second = decoded_bid_at(2, parent);
         second.gas_fee = U256::from(2);
-        let second_hash = second.bid_hash;
-        store_best_bid_block(&mut best, parent, second).unwrap();
-        assert_eq!(best[&parent].bid_hash, second_hash);
+        let second_hash = second.hash();
+        store_best_bid_block(&mut best, second).unwrap();
+        assert_eq!(best[&parent].hash(), second_hash);
 
-        let lower_fee = bid_block_task_at(2, parent);
-        assert!(store_best_bid_block(&mut best, parent, lower_fee).is_err());
-        assert_eq!(best[&parent].bid_hash, second_hash);
+        let lower_fee = decoded_bid_at(2, parent);
+        assert!(store_best_bid_block(&mut best, lower_fee).is_err());
+        assert_eq!(best[&parent].hash(), second_hash);
+
+        let other_parent = B256::random();
+        store_best_bid_block(&mut best, decoded_bid_at(2, other_parent)).unwrap();
+        assert_eq!(best.len(), 2);
+        assert_eq!(best[&parent].hash(), second_hash);
     }
 
     #[test]
@@ -1808,8 +1724,8 @@ mod tests {
         let mut map = HashMap::new();
         let old_parent = B256::repeat_byte(0x11);
         let recent_parent = B256::repeat_byte(0x22);
-        map.insert(old_parent, bid_block_task_at(100, B256::random()));
-        map.insert(recent_parent, bid_block_task_at(110, B256::random()));
+        map.insert(old_parent, Arc::new(decoded_bid_at(100, old_parent)));
+        map.insert(recent_parent, Arc::new(decoded_bid_at(110, recent_parent)));
 
         // min_block_number = 105: the block-100 entry is stale and must be evicted; the
         // block-110 entry is recent and must survive.
@@ -1823,7 +1739,7 @@ mod tests {
     fn retain_recent_bid_blocks_keeps_entry_at_exact_threshold() {
         let mut map = HashMap::new();
         let parent = B256::repeat_byte(0x33);
-        map.insert(parent, bid_block_task_at(105, B256::random()));
+        map.insert(parent, Arc::new(decoded_bid_at(105, parent)));
 
         retain_recent_bid_blocks(&mut map, 105);
 
@@ -1832,7 +1748,7 @@ mod tests {
 
     #[test]
     fn retain_recent_bid_blocks_is_a_noop_on_empty_map() {
-        let mut map: HashMap<B256, BidBlockTask> = HashMap::new();
+        let mut map: HashMap<B256, Arc<DecodedBidBlock>> = HashMap::new();
         retain_recent_bid_blocks(&mut map, 1_000);
         assert!(map.is_empty());
     }
