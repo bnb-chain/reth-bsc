@@ -22,7 +22,7 @@ use crate::{
             pre_execution::{EpochValidators, TURN_LENGTH_CACHE, VALIDATOR_CACHE},
         },
         miner::{
-            bid_block::{validate_bid_block_blob_kzg, BidBlockTask},
+            bid_block::{bid_must_before_ms, validate_bid_block_blob_kzg, BidBlockTask},
             bid_simulator::BidSimulator,
             block_mev_info::{set_block_mev_info, BlockMevInfoVersion},
             bsc_miner::{MiningContext, SubmitContext},
@@ -2314,9 +2314,20 @@ where
     /// Unlike the legacy/local payloads, the BidBlock is **not** pushed into `potential_payloads`:
     /// under zero-simulate it is never executed before selection, so it has no `BscBuiltPayload`.
     /// If it wins it is broadcast first and verified on import.
-    fn collect_best_bid_block(&mut self) {
+    fn collect_best_bid_block(&mut self) -> Result<(), Box<BscPayloadJobError>> {
+        let deadline_ms = bid_block_selection_deadline(
+            &self.mining_ctx,
+            self.simulator.bid_block_delay_left_over_ms,
+        );
+        let wait_started_ms = now_unix_ms();
+        let delay_ms = deadline_ms.saturating_sub(u128::from(wait_started_ms)) as u64;
+        self.wait_for_bid_selection(delay_ms)?;
+        let wait_returned_ms = now_unix_ms();
         let parent_hash = self.mining_ctx.parent_header.hash();
-        match self.simulator.best_bid_block(parent_hash) {
+        let lookup_started = std::time::Instant::now();
+        let candidate = self.simulator.best_bid_block(parent_hash);
+        let lookup_us = lookup_started.elapsed().as_micros() as u64;
+        match candidate {
             Some(task) => {
                 info!(
                     target: "bsc::miner::payload",
@@ -2324,6 +2335,10 @@ where
                     bid_fees = %task.gas_fee,
                     bid_hash = %task.bid_hash,
                     builder = ?task.builder,
+                    selection_deadline_ms = deadline_ms,
+                    wait_started_ms,
+                    wait_returned_ms,
+                    lookup_us,
                     "Found best (unexecuted) BidBlock candidate"
                 );
                 self.bid_block_candidate = Some(task);
@@ -2337,9 +2352,14 @@ where
                 trace_id = self.trace_id,
                 %parent_hash,
                 parent_number = self.mining_ctx.parent_header.number,
+                selection_deadline_ms = deadline_ms,
+                wait_started_ms,
+                wait_returned_ms,
+                lookup_us,
                 "No BidBlock candidate stored for this parent"
             ),
         }
+        Ok(())
     }
 
     /// Ensure `potential_payloads` has at least one candidate, then drain background build tasks
@@ -2636,27 +2656,11 @@ where
         Ok(())
     }
 
-    /// Sleep until this slot's submission deadline so that BidBlocks arriving later in the slot
-    /// are still visible when selection runs — go-bsc defers `selectBidBlock` to the end of the
-    /// build window for exactly this reason.
-    ///
-    /// The local path already spends this time: [`Self::submit_payload`] sleeps the same remainder
-    /// before sending. Waiting *before* selection instead of after therefore costs the no-bid case
-    /// nothing — the local payload still goes out at the same instant, because `submit_payload`
-    /// then computes `delay_ms == 0` — while giving a builder the whole slot to bid rather than
-    /// only the instant before this job first sampled the store.
-    ///
-    /// Without it, `collect_best_bid_block` runs at t≈0 of the slot and every bid that arrives
-    /// afterwards is silently ignored despite being admitted by `mev_sendBidBlock` (whose
-    /// `bidMustBefore` deadline is far later). Measured on a local 10-node cluster: the store was
-    /// read 68 ms before the bid for that very block was written, and the validator sealed an
-    /// empty block with the bid sitting unused under the correct key.
-    fn wait_for_submission_deadline(&mut self) -> Result<(), Box<BscPayloadJobError>> {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let delay_ms = self.mining_ctx.end_mining_timestamp_ms.saturating_sub(now_ms) as u64;
+    /// Keep the bid window open when local building finishes early. The selection cutoff
+    /// reserves time for preparing the winner; the broadcast path enforces its header time.
+    /// Sampling as soon as local work finished previously missed a bid by 68 ms on a ten-node
+    /// cluster.
+    fn wait_for_bid_selection(&mut self, delay_ms: u64) -> Result<(), Box<BscPayloadJobError>> {
         if delay_ms == 0 {
             return Ok(());
         }
@@ -2677,7 +2681,7 @@ where
                 trace_id = self.trace_id,
                 block_number = self.build_args.config.parent_header.number() + 1,
                 delay_ms,
-                "Abort while waiting for the submission deadline"
+                "Abort while waiting for the bid selection deadline"
             );
             self.build_args.cancel.clone().cancel();
             self.is_aborted = true;
@@ -2703,12 +2707,7 @@ where
 
         self.collect_payload_candidates()?;
 
-        // Hold the slot open before deciding, then sample the BidBlock store. Both must happen
-        // after candidate collection: `collect_payload_candidates` returns immediately when the
-        // local build finished and no background tasks remain (the empty-mempool case), so without
-        // the wait this decision is made at t≈0 and no bid can ever be seen.
-        self.wait_for_submission_deadline()?;
-        self.collect_best_bid_block();
+        self.collect_best_bid_block()?;
 
         // BEP-675 zero-simulate selection (go-bsc `selectBidBlock`): if the unexecuted BidBlock's
         // deposit-derived fee beats every local / legacy-SendBid candidate, commit to it. The block
@@ -3205,6 +3204,19 @@ fn now_unix_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// In-turn validators sample at the RPC admission cutoff, as go-bsc does in commitWork.
+fn bid_block_selection_deadline(ctx: &MiningContext, delay_left_over_ms: Option<u64>) -> u128 {
+    if let (true, Some(reserve)) = (ctx.is_inturn, delay_left_over_ms) {
+        bid_must_before_ms(
+            calculate_millisecond_timestamp(ctx.parent_header.header()),
+            ctx.parent_snapshot.block_interval,
+            reserve,
+        )
+    } else {
+        ctx.end_mining_timestamp_ms
+    }
+}
+
 /// How long to hold a won BidBlock before releasing it, so it is never announced before its own
 /// header timestamp.
 ///
@@ -3493,6 +3505,24 @@ mod tests {
             super::join_candidate(&mut tasks, &mut fallback).await.unwrap().unwrap(),
             super::BuildKind::EmptyFallback,
         );
+    }
+
+    #[test]
+    fn bid_block_selection_reserves_time_before_broadcast_only_for_enabled_in_turn_jobs() {
+        let mut ctx = test_mining_context(&test_parlia(), 450, 0, true);
+        let mut parent = Header { timestamp: 1, ..Default::default() };
+        crate::consensus::parlia::util::set_millisecond_part_of_timestamp(950, &mut parent);
+        ctx.parent_header = SealedHeader::seal_slow(parent);
+        ctx.end_mining_timestamp_ms = 2_450; // A locally adjusted target may differ from RPC.
+        for reserve in [0, 15, 30] {
+            assert_eq!(
+                super::bid_block_selection_deadline(&ctx, Some(reserve)),
+                2_400 - u128::from(reserve)
+            );
+        }
+        assert_eq!(super::bid_block_selection_deadline(&ctx, None), 2_450);
+        ctx.is_inturn = false;
+        assert_eq!(super::bid_block_selection_deadline(&ctx, Some(15)), 2_450);
     }
 
     /// A won BidBlock must not be released before its own header timestamp.

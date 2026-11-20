@@ -199,6 +199,7 @@ pub struct BidSimulator<Client, Pool> {
     /// go-bsc `Mev.NoInterruptLeftOver`: minimum raw time-to-block-target required for a new bid
     /// to preempt an in-flight simulation. See [`can_be_interrupted`].
     no_interrupt_left_over: u64,
+    pub(super) bid_block_delay_left_over_ms: Option<u64>,
     /// Simulations preempted per parent hash, so the seal path can tell whether an interrupt
     /// actually bought a better block. See [`Self::take_interrupt_count`].
     interrupt_counts: Arc<RwLock<HashMap<B256, InterruptTally>>>,
@@ -229,6 +230,7 @@ where
         validator_commission: u64,
         greedy_merge: bool,
         no_interrupt_left_over: u64,
+        bid_block_delay_left_over_ms: Option<u64>,
     ) -> Self {
         Self {
             client,
@@ -251,6 +253,7 @@ where
             validator_commission,
             greedy_merge,
             no_interrupt_left_over,
+            bid_block_delay_left_over_ms,
             interrupt_counts: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -1503,6 +1506,7 @@ mod tests {
             100,
             false,
             0,
+            None,
         )
     }
 
