@@ -297,6 +297,8 @@ async fn include_empty_with_diff_mode_is_rejected() {
             (json!({"IncludeEmpty":true,"diffMode":true}), "cannot use diffMode with includeEmpty"),
             (json!({"includeEmpty":true,"DiffMode":true}), "cannot use diffMode with includeEmpty"),
             (json!({"includeEmpty":"true"}), "json: cannot unmarshal string into Go struct field PrestateTracerConfig.includeEmpty of type bool"),
+            (json!([]), "json: cannot unmarshal array into Go value of type native.PrestateTracerConfig"),
+            (json!([true]), "json: cannot unmarshal array into Go value of type native.PrestateTracerConfig"),
         ] {
             let err = api.debug_trace_call(request(ALICE, vec![]), None, Some(options(config, mux))).await.unwrap_err();
             assert_eq!(err.code(), -32000);
@@ -428,6 +430,101 @@ async fn prestate_alias_order_preserves_bsc_code_and_empty_filtering() {
                 result.get(format!("{ALICE:#x}")),
                 Some(&json!({"balance":"0x0"})),
                 "{config}: {result}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_selfdestruct_gas_checks_omit_unobserved_beneficiaries() {
+    let h = Harness::new();
+    let api = debug!(h.st);
+    let parent = Address::with_last_byte(0x42);
+    let child = Address::with_last_byte(0x43);
+    let beneficiary = Address::with_last_byte(0x44);
+    for mux in [false, true] {
+        for (gas, expected) in [(19_000, false), (65_535, true)] {
+            let mut opts = options(json!({"includeEmpty":true}), mux);
+            opts.state_overrides = Some(
+                [
+                    (
+                        parent,
+                        AccountOverride {
+                            nonce: Some(1),
+                            code: Some(
+                                format!("60006000600060006000604361{gas:04x}f15000")
+                                    .parse()
+                                    .unwrap(),
+                            ),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        child,
+                        AccountOverride {
+                            nonce: Some(1),
+                            balance: Some(U256::from(1)),
+                            code: Some("6044ff".parse().unwrap()),
+                            ..Default::default()
+                        },
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            );
+            let result = prestate(
+                api.debug_trace_call(request(parent, vec![]), None, Some(opts)).await.unwrap(),
+                mux,
+            );
+            assert_eq!(
+                result.get(format!("{beneficiary:#x}")),
+                expected.then(|| json!({"balance":"0x0"})).as_ref(),
+                "gas={gas}: {result}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_static_create2_bounds_empty_initcode_offset() {
+    let h = Harness::new();
+    let api = debug!(h.st);
+    let parent = Address::with_last_byte(0x42);
+    let child = Address::with_last_byte(0x43);
+    let candidate = child.create2_from_code(B256::ZERO, []);
+    for mux in [false, true] {
+        for (offset, expected) in [(0x100000, true), (0x100001, false)] {
+            let mut opts = options(json!({"includeEmpty":true}), mux);
+            opts.state_overrides = Some(
+                [
+                    (
+                        parent,
+                        AccountOverride {
+                            nonce: Some(1),
+                            code: Some("60006000600060006043620f4240fa5000".parse().unwrap()),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        child,
+                        AccountOverride {
+                            nonce: Some(1),
+                            code: Some(format!("6000600062{offset:06x}6000f5").parse().unwrap()),
+                            ..Default::default()
+                        },
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            );
+            let result = prestate(
+                api.debug_trace_call(request(parent, vec![]), None, Some(opts)).await.unwrap(),
+                mux,
+            );
+            assert_eq!(
+                result.get(format!("{candidate:#x}")),
+                expected.then(|| json!({"balance":"0x0"})).as_ref(),
+                "offset={offset:x}: {result}"
             );
         }
     }
