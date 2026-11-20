@@ -170,6 +170,23 @@ fn retain_recent_bid_blocks(map: &mut HashMap<B256, BidBlockTask>, min_block_num
     map.retain(|_, task| task.block.sealed_block().header().number() >= min_block_number);
 }
 
+fn store_best_bid_block(
+    best: &mut HashMap<B256, BidBlockTask>,
+    parent_hash: B256,
+    task: BidBlockTask,
+) -> Result<(), String> {
+    if let Some(current) = best.get(&parent_hash) {
+        if task.gas_fee <= current.gas_fee {
+            return Err(format!(
+                "BidBlock gasFee not higher than current best: bidHash={} got {}, bestBidHash={} best {}",
+                task.bid_hash, task.gas_fee, current.bid_hash, current.gas_fee
+            ));
+        }
+    }
+    best.insert(parent_hash, task);
+    Ok(())
+}
+
 // bid loop receive bid from client and commit bid to simulator
 // 1. last block number check
 // 2. pack bid runtime and calculate bid value
@@ -962,8 +979,9 @@ where
     /// Verify, blind-sign, and seal an admitted BEP-675 BidBlock, keeping the highest-fee one per
     /// parent hash (go-bsc `AddBidBlock`). Execution and selection against the locally-built block
     /// happen in the build cycle (a follow-on slice); this is the intake half.
-    pub fn commit_bid_block(&self, decoded: DecodedBidBlock) {
+    pub(crate) fn commit_bid_block(&self, decoded: DecodedBidBlock) -> Result<(), String> {
         let parent_hash = decoded.parent_hash();
+        let bid_hash = decoded.hash();
         // go-bsc's `newBidBlockLoop` also re-checks `isRunning` / `receivingBid` here. We don't:
         // `is_mev_running()` is already enforced at admission in `MevApiImpl::admit_bid_block`, and
         // `bid_receiving` has no toggle in this codebase (no setter, no RPC) so the gate would be
@@ -975,33 +993,32 @@ where
         // bid admitted just before the head advanced can still reach here for a stale block.
         let head_number = self.client.last_block_number().unwrap_or(0);
         if decoded.block_number() <= head_number {
-            debug!(
-                "BidBlock: discard stale block, blockNumber={}, latestBlock={}, builder={}",
+            return Err(format!(
+                "BidBlock is discarded, stale block number: {}, latest block: {head_number}, builder={}, bidHash={bid_hash}",
                 decoded.block_number(),
-                head_number,
                 decoded.builder,
-            );
-            return;
+            ));
         }
         let parent = match self.client.header(parent_hash) {
             Ok(Some(h)) => SealedHeader::new(h, parent_hash),
             _ => {
-                debug!("BidBlock: parent header not found: {parent_hash}");
-                return;
+                return Err(format!(
+                    "BidBlock: parent header not found: {parent_hash}, bidHash={bid_hash}"
+                ));
             }
         };
         // BidBlocks must build directly on the selected parent.
         if decoded.block_number() != parent.number() + 1 {
-            debug!(
+            return Err(format!(
                 "BidBlock: block {} is not a child of parent {} ({parent_hash})",
                 decoded.block_number(),
                 parent.number(),
-            );
-            return;
+            ));
         }
         let Some(parent_snap) = self.snapshot_provider.snapshot_by_hash(&parent_hash) else {
-            debug!("BidBlock: no snapshot for parent {parent_hash}");
-            return;
+            return Err(format!(
+                "BidBlock: no snapshot for parent {parent_hash}, bidHash={bid_hash}"
+            ));
         };
         let gas_ceil = crate::shared::get_miner_gas_limit().unwrap_or(parent.gas_limit);
         let expected_gas_limit =
@@ -1029,7 +1046,7 @@ where
                     decoded.block_number(),
                     decoded.builder,
                 );
-                return;
+                return Err(format!("BidBlock: failed to resolve epoch validators: {e}"));
             }
         };
 
@@ -1048,31 +1065,21 @@ where
         ) {
             Ok(task) => task,
             Err(e) => {
-                debug!("BidBlock rejected in simulate: {e}");
                 // go-bsc only revokes on blob-tx validation failure here
                 // (`errInvalidBidBlockBlobTx` in `prepareBidBlockTask`); other
                 // prepare failures are plain rejections. Our KZG blob verification
                 // isn't ported yet, so there is no revoke-worthy variant to match
                 // on — the dishonest-builder revoke lives at the state-root check below.
-                return;
+                return Err(format!("BidBlock rejected in prepare: bidHash={bid_hash}, err={e}"));
             }
         };
 
         // Keep the highest-fee sealed BidBlock per parent. Execution is deferred.
-        let mut best = self.best_bid_block.write();
-        let replace = best.get(&parent_hash).is_none_or(|t| task.gas_fee > t.gas_fee);
-        // Log the key we store under. `collect_best_bid_block` logs the key it looks up, so a
-        // stored/looked-up pair that never matches is visible by diffing the two lines for one
-        // block height — the failure mode where a BidBlock is admitted, queued and stored, and
-        // then never selected, with nothing reporting why.
-        debug!(
-            "BidBlock stored: parentHash={parent_hash}, blockNumber={}, gasFee={}, replace={replace}",
-            task.block.header().number(),
-            task.gas_fee,
-        );
-        if replace {
-            best.insert(parent_hash, task);
-        }
+        let block_number = task.block.header().number();
+        let gas_fee = task.gas_fee;
+        store_best_bid_block(&mut self.best_bid_block.write(), parent_hash, task)?;
+        debug!("BidBlock stored: parentHash={parent_hash}, blockNumber={block_number}, gasFee={gas_fee}, replace=true, bidHash={bid_hash}");
+        Ok(())
     }
 
     /// The best stored (sealed, unexecuted) BidBlock for a parent hash (go-bsc `GetBestBidBlock`).
@@ -1570,6 +1577,30 @@ mod tests {
             builder: Address::ZERO,
             bid_hash: B256::random(),
         }
+    }
+
+    #[test]
+    fn bid_block_store_replaces_only_with_a_higher_fee_for_the_same_parent() {
+        let parent = B256::random();
+        let mut best = HashMap::new();
+        let first = bid_block_task_at(2, parent);
+        let first_hash = first.bid_hash;
+        store_best_bid_block(&mut best, parent, first).unwrap();
+        assert_eq!(best[&parent].bid_hash, first_hash);
+
+        let equal_fee = bid_block_task_at(2, parent);
+        assert!(store_best_bid_block(&mut best, parent, equal_fee).is_err());
+        assert_eq!(best[&parent].bid_hash, first_hash);
+
+        let mut second = bid_block_task_at(2, parent);
+        second.gas_fee = U256::from(2);
+        let second_hash = second.bid_hash;
+        store_best_bid_block(&mut best, parent, second).unwrap();
+        assert_eq!(best[&parent].bid_hash, second_hash);
+
+        let lower_fee = bid_block_task_at(2, parent);
+        assert!(store_best_bid_block(&mut best, parent, lower_fee).is_err());
+        assert_eq!(best[&parent].bid_hash, second_hash);
     }
 
     #[test]
