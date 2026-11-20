@@ -2,6 +2,7 @@ use crate::{
     consensus::parlia::SnapshotProvider,
     node::{
         engine_api::payload::BscPayloadTypes,
+        miner::bid_block::BidBlockRequest,
         network::{block_import::service::IncomingLocalBlock, BscNetworkPrimitives},
         primitives::BscBlock,
     },
@@ -122,12 +123,8 @@ static BID_BLOCK_PERMISSION_MANAGER: OnceLock<
 /// initialized without it stays purely in-memory (the pre-persistence behavior).
 static BID_BLOCK_REVOKES_JOURNAL: OnceLock<std::path::PathBuf> = OnceLock::new();
 
-/// Global intake queue for admitted BEP-675 BidBlocks. `mev_sendBidBlock` pushes a decoded block
-/// here after admission; the miner pops it to pre-seal verify, execute, and select against the
-/// local block (mirrors the legacy [`BID_PACKAGE_QUEUE`] SendBid intake).
-static BID_BLOCK_QUEUE: OnceLock<
-    Arc<Mutex<VecDeque<crate::node::miner::bid_block::DecodedBidBlock>>>,
-> = OnceLock::new();
+/// Bounded BidBlock intake registered by the miner before it starts accepting bids.
+static BID_BLOCK_SENDER: OnceLock<Sender<BidBlockRequest>> = OnceLock::new();
 
 /// Function type for the [`RECENT_MINED_BLOCKS`] cache: `block_number -> parent_hashes already
 /// sealed for it`.
@@ -536,11 +533,6 @@ pub fn get_bid_block_permission_manager(
         .clone()
 }
 
-fn bid_block_queue() -> &'static Arc<Mutex<VecDeque<crate::node::miner::bid_block::DecodedBidBlock>>>
-{
-    BID_BLOCK_QUEUE.get_or_init(|| Arc::new(Mutex::new(VecDeque::new())))
-}
-
 fn recent_mined_blocks() -> &'static RecentMinedBlocksCache {
     RECENT_MINED_BLOCKS.get_or_init(|| {
         Arc::new(Mutex::new(lru::LruCache::new(
@@ -587,19 +579,12 @@ pub fn forget_recorded_mined_block(block_number: u64, parent_hash: B256) {
     }
 }
 
-/// Push an admitted BidBlock onto the global intake queue for the miner to process.
-pub fn push_bid_block_package(decoded: crate::node::miner::bid_block::DecodedBidBlock) {
-    bid_block_queue().lock().push_back(decoded);
+pub(crate) fn set_bid_block_sender(sender: Sender<BidBlockRequest>) -> Result<(), &'static str> {
+    BID_BLOCK_SENDER.set(sender).map_err(|_| "BidBlock intake already initialized")
 }
 
-/// Pop the next admitted BidBlock from the global intake queue (FIFO).
-pub fn pop_bid_block_package() -> Option<crate::node::miner::bid_block::DecodedBidBlock> {
-    bid_block_queue().lock().pop_front()
-}
-
-/// Number of admitted BidBlocks waiting in the global intake queue.
-pub fn bid_block_queue_len() -> usize {
-    bid_block_queue().lock().len()
+pub(crate) fn bid_block_sender() -> Option<&'static Sender<BidBlockRequest>> {
+    BID_BLOCK_SENDER.get()
 }
 
 /// Store the reth `NetworkHandle` globally for dynamic peer actions.

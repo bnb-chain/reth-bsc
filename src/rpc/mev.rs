@@ -3,7 +3,7 @@ use crate::{
     consensus::parlia::{Snapshot, SnapshotProvider},
     hardforks::BscHardforks,
     node::miner::{
-        bid_block::{bid_must_before_ms, BidBlockArgs},
+        bid_block::{bid_must_before_ms, BidBlockArgs, BidBlockRequest, DecodedBidBlock},
         bid_simulator::{validate_bid_blob_sidecar, Bid},
         config::{keystore, MiningConfig},
     },
@@ -20,7 +20,9 @@ use reth_primitives_traits::SignerRecoverable;
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, RwLock},
+    time::Duration,
 };
+use tokio::sync::{mpsc, oneshot};
 use tracing::debug;
 
 #[cfg(test)]
@@ -248,11 +250,13 @@ const PAY_BID_TX_GAS_LIMIT: u64 = 25000;
 const INVALID_BID_PARAM_ERROR: i32 = -38001;
 const INVALID_PAY_BID_TX_ERROR: i32 = -38002;
 const MEV_NOT_RUNNING_ERROR: i32 = -38003;
+const MEV_BUSY_ERROR: i32 = -38004;
 const MEV_NOT_IN_TURN_ERROR: i32 = -38005;
 const BID_BLOCK_PERMISSION_REVOKED_ERROR: i32 = -38006;
 const BID_BLOCK_PRE_SEAL_VERIFY_ERROR: i32 = -38007;
 const BID_BLOCK_TOO_LATE_ERROR: i32 = -38008;
 const DEFAULT_ERROR: i32 = -32000;
+const BID_BLOCK_RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Reproduces go-bsc `Miner.bidBlockEnabled()`: a BidBlock is only accepted when MEV is running,
 /// the `BidBlockEnabled` flag is set, and the Pasteur fork is active at the chain head.
@@ -262,6 +266,34 @@ fn bid_block_admission_enabled(
     pasteur_active: bool,
 ) -> bool {
     mev_running && flag_enabled && pasteur_active
+}
+
+/// Like go-bsc, use one timeout for both bounded enqueue and the worker's feedback.
+async fn submit_bid_block_request(
+    sender: &mpsc::Sender<BidBlockRequest>,
+    decoded: DecodedBidBlock,
+) -> RpcResult<B256> {
+    let bid_hash = decoded.hash();
+    let block_number = decoded.block_number();
+    let builder = decoded.builder;
+    let (feedback, response) = oneshot::channel();
+    let result = tokio::time::timeout(BID_BLOCK_RESPONSE_TIMEOUT, async {
+        let permit = sender.reserve().await.map_err(|_| ())?;
+        tracing::info!(
+            "BidBlock queued: block={block_number}, builder={builder}, bidHash={bid_hash:?}"
+        );
+        permit.send(BidBlockRequest { decoded, feedback });
+        response.await.map_err(|_| ())
+    })
+    .await;
+    match result {
+        Ok(Ok(result)) => result.map(|()| bid_hash).map_err(MevApiImpl::plain_err),
+        _ => Err(jsonrpsee::types::ErrorObject::owned(
+            MEV_BUSY_ERROR,
+            "the validator is working on too many bids, try again later",
+            None::<()>,
+        )),
+    }
 }
 
 /// Why a bid failed structural validation. Ordered as the checks run.
@@ -675,9 +707,9 @@ impl MevApiImpl {
         )
         .map_err(|r| Self::structural_rejection(r, block_number, head_header.number, head_hash))?;
 
-        // Every rejection above returns before this point, so nothing structurally invalid can
-        // reach the miner queue (TC-009's `bid_block_queue_len()` invariant).
-        self.admit_bid_block(&args, &head_header)
+        let decoded = self.admit_bid_block(&args, &head_header)?;
+        let sender = crate::shared::bid_block_sender().ok_or_else(Self::mev_not_running)?;
+        submit_bid_block_request(sender, decoded).await
     }
 
     /// Miner-side BidBlock admission, mirroring go-bsc `Miner.SendBidBlock`.
@@ -685,7 +717,7 @@ impl MevApiImpl {
         &self,
         args: &BidBlockArgs,
         head_header: &alloy_consensus::Header,
-    ) -> RpcResult<B256> {
+    ) -> RpcResult<DecodedBidBlock> {
         let bid_hash = args.bid_block.hash();
 
         // bidBlockEnabled(): MEV running AND the BidBlockEnabled flag AND Pasteur active at head.
@@ -789,28 +821,7 @@ impl MevApiImpl {
             }
         }
 
-        // Decode and hand to the miner via the global intake queue.
-        //
-        // The remaining tail of go-bsc's Miner.SendBidBlock is intentionally deferred to the
-        // miner side (bid_block::simulate_bid_block, called from BidSimulator::commit_bid_block):
-        //
-        //   • Extra overwrite + SetExtraData  →  header.extra_data = vanity + finalize_new_header
-        //   • setBidMevInfo                   →  set_bid_block_mev_info
-        //   • verify_bid_block_header         →  re-run on the finalized header
-        //   • execution + state-root check    →  execute_bid_block_payload
-        //
-        // Behavioral difference vs geth: geth runs the queue handoff itself
-        // (`sendBidBlock`/`newBidBlockLoop`) with a bounded channel and returns `ErrMevBusy`
-        // (`-38004`) on a 1s enqueue timeout; reth-bsc's intake queue is unbounded, so admission
-        // can never report busy. Left as a known gap — implementing genuine backpressure here is
-        // a distinct change from surfacing the correct error codes for checks that already run.
-        crate::shared::push_bid_block_package(decoded);
-
-        tracing::info!(
-            "BidBlock queued: block={block_number}, builder={builder}, bidHash={bid_hash:?}",
-        );
-
-        Ok(bid_hash)
+        Ok(decoded)
     }
 
     /// Parse transaction from bytes with validation
@@ -1291,6 +1302,66 @@ impl BscMevApiServer for MevApiImpl {
 #[cfg(test)]
 mod bid_block_param_tests {
     use super::*;
+
+    fn decoded_bid_for_intake(number: u64) -> DecodedBidBlock {
+        use crate::node::miner::bid_block::BidBlock;
+        BidBlockArgs {
+            bid_block: BidBlock {
+                header: alloy_consensus::Header { number, ..Default::default() },
+                transactions: vec![],
+                sidecars: vec![],
+            },
+            signature: Bytes::default(),
+        }
+        .to_decoded_bid_block(Address::ZERO)
+        .unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bid_block_intake_waits_for_worker_feedback() {
+        let (sender, mut receiver) = mpsc::channel(2);
+        let first = decoded_bid_for_intake(1);
+        let second = decoded_bid_for_intake(2);
+        let first_hash = first.hash();
+        let first_response = submit_bid_block_request(&sender, first);
+        let second_response = submit_bid_block_request(&sender, second);
+        let start = tokio::time::Instant::now();
+
+        let (first, second, ()) = tokio::join!(first_response, second_response, async {
+            let first = receiver.recv().await.unwrap();
+            let second = receiver.recv().await.unwrap();
+            assert_eq!(first.decoded.block_number(), 1);
+            assert_eq!(second.decoded.block_number(), 2);
+            first.feedback.send(Ok(())).unwrap();
+            second.feedback.send(Err("BidBlock gasFee not higher".into())).unwrap();
+        });
+
+        assert_eq!(first.unwrap(), first_hash);
+        assert_eq!(second.unwrap_err().code(), DEFAULT_ERROR);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bid_block_intake_uses_one_timeout_for_enqueue_and_feedback() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let (feedback, _response) = oneshot::channel();
+        sender
+            .send(BidBlockRequest { decoded: decoded_bid_for_intake(1), feedback })
+            .await
+            .unwrap();
+        let start = tokio::time::Instant::now();
+
+        let (response, queued) =
+            tokio::join!(submit_bid_block_request(&sender, decoded_bid_for_intake(2)), async {
+                tokio::time::sleep(Duration::from_millis(700)).await;
+                assert_eq!(receiver.recv().await.unwrap().decoded.block_number(), 1);
+                receiver.recv().await.unwrap()
+            },);
+
+        assert_eq!(queued.decoded.block_number(), 2);
+        assert_eq!(response.unwrap_err().code(), MEV_BUSY_ERROR);
+        assert_eq!(start.elapsed(), BID_BLOCK_RESPONSE_TIMEOUT);
+    }
 
     #[test]
     fn mev_params_exposes_bid_block_enabled_field() {
