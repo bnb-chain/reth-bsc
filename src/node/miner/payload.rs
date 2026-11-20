@@ -22,7 +22,9 @@ use crate::{
             pre_execution::{EpochValidators, TURN_LENGTH_CACHE, VALIDATOR_CACHE},
         },
         miner::{
-            bid_block::{bid_must_before_ms, validate_bid_block_blob_kzg, BidBlockTask},
+            bid_block::{
+                bid_must_before_ms, prepare_bid_block, validate_bid_block_blob_kzg, DecodedBidBlock,
+            },
             bid_simulator::BidSimulator,
             block_mev_info::{set_block_mev_info, BlockMevInfoVersion},
             bsc_miner::{MiningContext, SubmitContext},
@@ -1553,10 +1555,10 @@ where
     result_tx: mpsc::UnboundedSender<SubmitContext>,
     /// Potential payloads vector for selecting the best one
     potential_payloads: Vec<BscBuiltPayload>,
-    /// Best (sealed, unexecuted) BEP-675 BidBlock for this parent, collected from the simulator.
+    /// Best admitted BEP-675 BidBlock for this parent, collected from the simulator.
     /// Competes against `potential_payloads` by fee; if it wins it is broadcast first and verified
     /// on import (zero-simulate), so it is intentionally kept out of `potential_payloads`.
-    bid_block_candidate: Option<BidBlockTask>,
+    bid_block_candidate: Option<Arc<DecodedBidBlock>>,
     /// Current build arguments
     build_args: BscBuildArguments<EthPayloadAttributes>,
     /// Retry count for payload building
@@ -2307,7 +2309,7 @@ where
         }
     }
 
-    /// Collect the best (sealed, unexecuted) BEP-675 BidBlock for this parent so it can compete by
+    /// Collect the best admitted BEP-675 BidBlock for this parent so it can compete by
     /// fee against the local block and any legacy SendBid in `try_return_best_payload`
     /// (go-bsc `selectBidBlock`).
     ///
@@ -2328,20 +2330,20 @@ where
         let candidate = self.simulator.best_bid_block(parent_hash);
         let lookup_us = lookup_started.elapsed().as_micros() as u64;
         match candidate {
-            Some(task) => {
+            Some(bid) => {
                 info!(
                     target: "bsc::miner::payload",
                     trace_id = self.trace_id,
-                    bid_fees = %task.gas_fee,
-                    bid_hash = %task.bid_hash,
-                    builder = ?task.builder,
+                    bid_fees = %bid.gas_fee,
+                    bid_hash = %bid.hash(),
+                    builder = ?bid.builder,
                     selection_deadline_ms = deadline_ms,
                     wait_started_ms,
                     wait_returned_ms,
                     lookup_us,
                     "Found best (unexecuted) BidBlock candidate"
                 );
-                self.bid_block_candidate = Some(task);
+                self.bid_block_candidate = Some(bid);
             }
             // Log the miss with the key we looked up. A silent miss is indistinguishable from
             // "no builder bid at all", which is what made the sample-before-wait bug above cost a
@@ -2724,31 +2726,36 @@ where
         Ok(())
     }
 
-    /// Re-assemble the vote attestation and re-seal a winning BidBlock's header at selection time
-    /// (see the call site in [`Self::try_submit_winning_bid_block`] for why). Falls back to the
-    /// block's admission-time seal — never fails the submission — if the snapshot provider is
-    /// unavailable.
-    fn refresh_bid_block_vote_attestation(
+    fn prepare_winning_bid_block(
         &self,
-        block: &RecoveredBlock<BscBlock>,
-    ) -> SealedBlock<BscBlock> {
-        let Some(snapshot_provider) = crate::shared::get_snapshot_provider().cloned() else {
-            warn!(
-                target: "bsc::miner::payload",
-                trace_id = self.trace_id,
-                "Snapshot provider unavailable; submitting BidBlock with admission-time vote attestation"
-            );
-            return block.sealed_block().clone();
-        };
-
-        refresh_and_reseal_bid_block(
-            self.parlia.clone(),
-            &self.mining_ctx.parent_snapshot,
-            self.mining_ctx.parent_header.header(),
-            &snapshot_provider,
-            block,
-            self.trace_id,
+        bid: &DecodedBidBlock,
+    ) -> Result<SealedBlock<BscBlock>, String> {
+        let snapshot_provider = crate::shared::get_snapshot_provider()
+            .ok_or_else(|| "Snapshot provider not available".to_string())?;
+        let parent_snapshot = &self.mining_ctx.parent_snapshot;
+        let parent = &self.mining_ctx.parent_header;
+        let chain_spec = &self.builder.chain_spec;
+        let epoch_validators = epoch_validators_for_next_block(
+            &self.builder.client,
+            chain_spec,
+            parent_snapshot,
+            parent,
         )
+        .map_err(|e| e.to_string())?;
+        let mut vanity = crate::shared::get_miner_extra().map(|e| e.to_vec()).unwrap_or_default();
+        vanity.resize(crate::consensus::parlia::EXTRA_VANITY_LEN, 0);
+
+        prepare_bid_block(
+            self.parlia.clone(),
+            chain_spec,
+            bid,
+            parent,
+            parent_snapshot,
+            snapshot_provider,
+            vanity.into(),
+            epoch_validators,
+        )
+        .map_err(|e| e.to_string())
     }
 
     /// If a collected BidBlock candidate out-bids every local/legacy payload by fee, hand its
@@ -2762,13 +2769,16 @@ where
     fn try_submit_winning_bid_block(&mut self) -> bool {
         let Some(bid) = self.bid_block_candidate.take() else { return false };
 
+        let bid_hash = bid.hash();
+        let block_number = bid.block_number();
+        let parent_hash = bid.parent_hash();
         let best_local_fee =
             self.potential_payloads.iter().map(|p| p.fees()).max().unwrap_or(U256::ZERO);
         if bid.gas_fee <= best_local_fee {
             info!(
                 target: "bsc::miner::payload",
                 trace_id = self.trace_id,
-                bid_hash = %bid.bid_hash,
+                bid_hash = %bid_hash,
                 bid_fees = %bid.gas_fee,
                 best_local_fee = %best_local_fee,
                 "BidBlock did not out-bid local candidates; discarding"
@@ -2776,17 +2786,51 @@ where
             return false;
         }
 
-        // Refresh the vote attestation with the freshest votes available now that this BidBlock
-        // has won selection, and re-seal — go-bsc defers `assembleVoteAttestation` + the ECDSA
-        // seal to `engine.Seal()`, called only after `selectBidBlock` picks the winner, to
-        // maximize the window for BFT votes to arrive. This BidBlock's own attestation was
-        // assembled at admission time (`simulate_bid_block`, potentially a full slot earlier);
-        // without this refresh it would carry stale votes while the local-block path (via
-        // `finalize_payload`, called at this same selection point) does not.
-        let sealed = self.refresh_bid_block_vote_attestation(&bid.block);
-        let block_number = sealed.header().number();
+        let prepare_started = std::time::Instant::now();
+        // Expensive blob KZG verification on the winning block, BEFORE broadcast (go-bsc
+        // `prepareBidBlockTask` → `validateBidBlockBlobTxs`). Cheap structural sidecar checks
+        // already ran at admission; under zero-simulate full re-execution is deferred to
+        // after broadcast, so this is the last gate that can stop a bad-blob block from
+        // being proposed. On failure revoke the builder and fall back to the local payload
+        // (go-bsc `bidBlockFallback`).
+        if let Err(e) = validate_bid_block_blob_kzg(&bid.txs, &bid.sidecars, bid.system_tx_start) {
+            warn!(
+                target: "bsc::miner::payload",
+                trace_id = self.trace_id,
+                bid_hash = %bid_hash,
+                builder = ?bid.builder,
+                error = %e,
+                "BidBlock blob KZG validation failed; revoking builder and falling back to local payload"
+            );
+            crate::shared::get_bid_block_permission_manager().revoke(
+                bid.builder,
+                format!("BidBlock blob KZG invalid: {e}"),
+                bid_hash,
+                block_number,
+            );
+            return false;
+        }
+
+        // Sign once with the votes available at selection. Sender recovery remains in Engine
+        // import, so preparing a winner does not serially recover every transaction.
+        let sealed = match self.prepare_winning_bid_block(&bid) {
+            Ok(sealed) => sealed,
+            Err(error) => {
+                warn!(
+                    target: "bsc::miner::payload",
+                    trace_id = self.trace_id,
+                    %bid_hash,
+                    block_number,
+                    %error,
+                    "Failed to prepare winning BidBlock; falling back to local payload"
+                );
+                return false;
+            }
+        };
+        let prepare_elapsed = prepare_started.elapsed();
+        metrics::histogram!("bsc.mev.bid_block_prepare_duration_seconds")
+            .record(prepare_elapsed.as_secs_f64());
         let block_hash = sealed.hash();
-        let parent_hash = sealed.header().parent_hash;
 
         // Late canonical-state re-check, mirroring the guards `ResultWorkWorker::submit_payload`
         // applies to the local/legacy path: a reorg during the build window can leave this
@@ -2799,7 +2843,7 @@ where
                 debug!(
                     target: "bsc::miner::payload",
                     trace_id = self.trace_id,
-                    bid_hash = %bid.bid_hash,
+                    bid_hash = %bid_hash,
                     block_number,
                     best_block_number,
                     "BidBlock stale: block number not greater than best block number; discarding"
@@ -2815,7 +2859,7 @@ where
                 debug!(
                     target: "bsc::miner::payload",
                     trace_id = self.trace_id,
-                    bid_hash = %bid.bid_hash,
+                    bid_hash = %bid_hash,
                     block_number,
                     parent_number,
                     expected_parent_hash = %parent_hash,
@@ -2828,7 +2872,7 @@ where
                 debug!(
                     target: "bsc::miner::payload",
                     trace_id = self.trace_id,
-                    bid_hash = %bid.bid_hash,
+                    bid_hash = %bid_hash,
                     block_number,
                     parent_number,
                     "BidBlock's parent not found in canonical chain; discarding"
@@ -2837,43 +2881,13 @@ where
             }
         }
 
-        // Expensive blob KZG verification on the winning block, BEFORE broadcast (go-bsc
-        // `prepareBidBlockTask` → `validateBidBlockBlobTxs`). Cheap structural sidecar checks
-        // already ran at admission; under zero-simulate full re-execution is deferred to
-        // after broadcast, so this is the last gate that can stop a bad-blob block from
-        // being proposed. On failure revoke the builder and fall back to the local payload
-        // (go-bsc `bidBlockFallback`).
-        let body = sealed.body();
-        let blob_sidecars = body.sidecars.as_deref().unwrap_or(&[]);
-        if let Err(e) = validate_bid_block_blob_kzg(
-            &body.inner.transactions,
-            blob_sidecars,
-            bid.system_tx_start,
-        ) {
-            warn!(
-                target: "bsc::miner::payload",
-                trace_id = self.trace_id,
-                bid_hash = %bid.bid_hash,
-                builder = ?bid.builder,
-                error = %e,
-                "BidBlock blob KZG validation failed; revoking builder and falling back to local payload"
-            );
-            crate::shared::get_bid_block_permission_manager().revoke(
-                bid.builder,
-                format!("BidBlock blob KZG invalid: {e}"),
-                bid.bid_hash,
-                block_number,
-            );
-            return false;
-        }
-
         // BidBlocks share bounded local ingress with mined/fallback blocks, isolated from
         // remote traffic. The Bid variant still selects BEP-675 broadcast-then-verify handling.
         let Some(sender) = crate::shared::get_local_block_import_sender() else {
             warn!(
                 target: "bsc::miner::payload",
                 trace_id = self.trace_id,
-                bid_hash = %bid.bid_hash,
+                bid_hash = %bid_hash,
                 "BidBlock won but import sender is not initialised; falling back to local payload"
             );
             return false;
@@ -2907,7 +2921,7 @@ where
             error!(
                 target: "bsc::miner::payload",
                 trace_id = self.trace_id,
-                bid_hash = %bid.bid_hash,
+                bid_hash = %bid_hash,
                 block_number,
                 parent_hash = %parent_hash,
                 "Reject Double Sign!! BidBlock at height already sealed on this parent; discarding"
@@ -2920,11 +2934,15 @@ where
         // own time — otherwise the wall-clock future bound peers (and our own import) enforce
         // on the sync path would reject it. Mirror that timing with a delayed background send,
         // the same pattern `submit_payload` uses for the local path.
-        let delay = bid_block_broadcast_delay(sealed.header(), now_unix_ms());
+        let ready_ms = now_unix_ms();
+        let header_ms = calculate_millisecond_timestamp(sealed.header());
+        let ready_vs_header_ms = i128::from(ready_ms) - i128::from(header_ms);
+        let delay = bid_block_broadcast_delay(sealed.header(), ready_ms);
+        let prepare_us = prepare_elapsed.as_micros();
 
         let trace_id = self.trace_id;
-        let (builder_addr, bid_hash, gas_fee, system_tx_start) =
-            (bid.builder, bid.bid_hash, bid.gas_fee, bid.system_tx_start);
+        let (builder_addr, gas_fee, system_tx_start) =
+            (bid.builder, bid.gas_fee, bid.system_tx_start);
         tokio::spawn(async move {
             send_bid_block_after_delay(
                 permit,
@@ -2953,6 +2971,8 @@ where
                 builder = ?builder_addr,
                 bid_fees = %gas_fee,
                 best_local_fee = %best_local_fee,
+                prepare_us,
+                ready_vs_header_ms,
                 "[BID BLOCK selected] submitted for broadcast before verification (zero-simulate)"
             );
         });
@@ -3186,17 +3206,6 @@ where
     }
 }
 
-/// Core of [`BscPayloadJob::refresh_bid_block_vote_attestation`], split out as a free function so
-/// it's testable without constructing a full payload job.
-///
-/// Refreshes `block`'s vote attestation and re-seals via
-/// [`crate::node::miner::util::refresh_vote_attestation_and_seal`]; on any internal failure that
-/// function restores the original attestation/seal and returns `Ok(())`, so the only externally
-/// observable outcomes are "refreshed" or "unchanged" — never a broken block. When the header
-/// hash changes (any successful re-seal changes it, since the seal is part of `extra_data`, which
-/// is part of the header hash), patches the blob sidecars' cached `block_hash` (set at admission
-/// time) before the block goes out over P2P, mirroring `finalize_payload`'s equivalent patch for
-/// the local-block path.
 /// Milliseconds since the unix epoch, for comparison against a header's millisecond timestamp.
 fn now_unix_ms() -> u64 {
     std::time::SystemTime::now()
@@ -3249,40 +3258,6 @@ async fn send_bid_block_after_delay<T>(
     permit.send(block);
 }
 
-fn refresh_and_reseal_bid_block(
-    parlia: Arc<Parlia<BscChainSpec>>,
-    parent_snapshot: &Snapshot,
-    parent_header: &alloy_consensus::Header,
-    snapshot_provider: &Arc<dyn crate::consensus::parlia::SnapshotProvider + Send + Sync>,
-    block: &RecoveredBlock<BscBlock>,
-    trace_id: u64,
-) -> SealedBlock<BscBlock> {
-    let mut plain_block = block.clone_block();
-    if let Err(e) = crate::node::miner::util::refresh_vote_attestation_and_seal(
-        parlia,
-        parent_snapshot,
-        parent_header,
-        &mut plain_block.header,
-        snapshot_provider,
-    ) {
-        warn!(
-            target: "bsc::miner::payload",
-            trace_id,
-            error = %e,
-            "Failed to refresh BidBlock vote attestation; submitting with admission-time attestation"
-        );
-        return block.sealed_block().clone();
-    }
-
-    let final_hash = plain_block.header.hash_slow();
-    if let Some(ref mut sidecars) = plain_block.body.sidecars {
-        for sidecar in sidecars.iter_mut() {
-            sidecar.block_hash = final_hash;
-        }
-    }
-    plain_block.seal_unchecked(final_hash)
-}
-
 /// Finalize a built payload in-place.
 ///
 /// This seals the header, writes pending cache entries under the final hash, and rebuilds the
@@ -3304,7 +3279,7 @@ fn finalize_payload(
     // the seal would not be covered by it. Local builds leave `requests_hash` empty, which is what
     // lets consumers read "untagged" as "locally built" — see `block_mev_info`.
     //
-    // The BEP-675 BidBlock path tags its own header in `simulate_bid_block()` instead, because
+    // The BEP-675 BidBlock path tags its own header in `prepare_bid_block()` instead, because
     // those blocks never become a `BscBuiltPayload` and so never reach this function.
     if let Some(builder) = payload.bid_builder {
         let prague_active = parlia.chain_spec().is_prague_active_at_block_and_timestamp(
@@ -3427,8 +3402,8 @@ mod tests {
 
     use super::{
         bid_block_broadcast_delay, initial_out_of_turn_build_wait, local_rebuild_action,
-        refresh_and_reseal_bid_block, send_bid_block_after_delay, validate_bsc_sidecar,
-        LocalRebuildAction, LocalRebuildPolicyInput,
+        send_bid_block_after_delay, validate_bsc_sidecar, LocalRebuildAction,
+        LocalRebuildPolicyInput,
     };
     use crate::{
         chainspec::BscChainSpec,
@@ -3929,8 +3904,6 @@ mod tests {
         assert_eq!(rebuilds, 0);
     }
 
-    // ---- refresh_and_reseal_bid_block (BEP-675 vote-attestation-at-selection fix) ----
-
     struct MockBidBlockSnapshotProvider {
         snapshot: Snapshot,
     }
@@ -3955,28 +3928,6 @@ mod tests {
                 )
                 .build(),
         ))
-    }
-
-    /// A non-epoch header (block 1, so `assemble_vote_attestation` skips — it only assembles from
-    /// block 3 onward) carrying a fake attestation in `extra_data`: Vanity (32) + Attestation (RLP)
-    /// + Seal (65). This exercises the pure strip-and-reseal path without needing a vote pool.
-    fn header_with_fake_attestation() -> Header {
-        use crate::consensus::parlia::vote::{VoteAttestation, VoteData};
-        let att = VoteAttestation {
-            vote_address_set: 0xFF,
-            agg_signature: Default::default(),
-            data: VoteData {
-                source_number: 1,
-                source_hash: B256::ZERO,
-                target_number: 0,
-                target_hash: B256::ZERO,
-            },
-            extra: bytes::Bytes::new(),
-        };
-        let mut extra = vec![0u8; crate::consensus::parlia::EXTRA_VANITY_LEN];
-        extra.extend_from_slice(alloy_rlp::encode(&att).as_ref());
-        extra.extend_from_slice(&[0u8; crate::consensus::parlia::EXTRA_SEAL_LEN]);
-        Header { number: 1, extra_data: alloy_primitives::Bytes::from(extra), ..Default::default() }
     }
 
     fn bid_block_with_sidecar(
@@ -4119,80 +4070,6 @@ mod tests {
                 assert!(recovered.body().sidecars.is_none());
             }
         }
-    }
-
-    #[test]
-    fn refresh_and_reseal_strips_stale_attestation_and_patches_sidecar_hash() {
-        ensure_bid_block_test_signer();
-        let chain_spec = luban_chain_spec();
-        let parlia = Arc::new(Parlia::new(chain_spec, 200));
-        let parent_snap =
-            Snapshot::new(vec![Address::with_last_byte(1)], 0, B256::random(), 200, None);
-        let parent_header = Header { number: 0, parent_hash: B256::random(), ..Default::default() };
-
-        let header = header_with_fake_attestation();
-        let original_hash = header.hash_slow();
-        let block = bid_block_with_sidecar(header, original_hash);
-
-        let snapshot_provider: Arc<dyn crate::consensus::parlia::SnapshotProvider + Send + Sync> =
-            Arc::new(MockBidBlockSnapshotProvider { snapshot: parent_snap.clone() });
-
-        let refreshed = refresh_and_reseal_bid_block(
-            parlia,
-            &parent_snap,
-            &parent_header,
-            &snapshot_provider,
-            &block,
-            0,
-        );
-
-        // The stale attestation was stripped (block 1 is below the vote-assembly floor of 3, so
-        // no new attestation replaces it) and the header re-sealed — vanity + seal only, and a
-        // different hash than the admission-time seal.
-        assert_eq!(
-            refreshed.header().extra_data.len(),
-            crate::consensus::parlia::EXTRA_VANITY_LEN + crate::consensus::parlia::EXTRA_SEAL_LEN
-        );
-        assert_ne!(refreshed.hash(), original_hash);
-
-        // The sidecar's cached block_hash (set at admission time, before this refresh) must be
-        // patched to the new post-reseal hash before the block goes out over P2P.
-        let sidecar = refreshed.body().sidecars.as_ref().unwrap().first().unwrap();
-        assert_eq!(sidecar.block_hash, refreshed.hash());
-    }
-
-    #[test]
-    fn refresh_and_reseal_is_a_noop_pre_luban() {
-        ensure_bid_block_test_signer();
-        // Mainnet spec without the Luban fork override: inactive at block 1.
-        let chain_spec =
-            Arc::new(BscChainSpec::from(reth_chainspec::ChainSpecBuilder::mainnet().build()));
-        let parlia = Arc::new(Parlia::new(chain_spec, 200));
-        let parent_snap =
-            Snapshot::new(vec![Address::with_last_byte(1)], 0, B256::random(), 200, None);
-        let parent_header = Header { number: 0, parent_hash: B256::random(), ..Default::default() };
-
-        let header = header_with_fake_attestation();
-        let original_hash = header.hash_slow();
-        let block = bid_block_with_sidecar(header, original_hash);
-
-        let snapshot_provider: Arc<dyn crate::consensus::parlia::SnapshotProvider + Send + Sync> =
-            Arc::new(MockBidBlockSnapshotProvider { snapshot: parent_snap.clone() });
-
-        let refreshed = refresh_and_reseal_bid_block(
-            parlia,
-            &parent_snap,
-            &parent_header,
-            &snapshot_provider,
-            &block,
-            0,
-        );
-
-        // Pre-Luban, refresh_vote_attestation_and_seal returns early without touching the header
-        // at all — the block (and its sidecar's block_hash) must come back byte-for-byte unchanged.
-        assert_eq!(refreshed.hash(), original_hash);
-        let sidecar = refreshed.body().sidecars.as_ref().unwrap().first().unwrap();
-        assert_eq!(sidecar.block_hash, original_hash);
     }
 
     #[test]
