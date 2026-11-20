@@ -201,16 +201,38 @@ impl Plan {
     fn prepare_config(tracer: &GethDebugTracerType, config: &mut GethDebugTracerConfig) -> Self {
         match tracer {
             GethDebugTracerType::BuiltInTracer(GethDebugBuiltInTracerType::PreStateTracer) => {
-                let Ok(prestate) = config.clone().into_pre_state_config() else {
-                    return Self::None;
-                };
-                let include_empty =
-                    config.0.get("includeEmpty").and_then(|v| v.as_bool()).unwrap_or(false);
-                let hide_code = !prestate.code_enabled();
-                // Go checks account emptiness before applying disableCode. Fetch
-                // code for that check and strip it only after normalizing prestate.
+                if config.0.is_null() {
+                    return Self::Prestate { hide_code: false, include_empty: false };
+                }
+                let Some(options) = config.0.as_object_mut() else { return Self::None };
+                let mut include_empty = false;
+                let mut hide_code = false;
+                for (key, value) in options.iter() {
+                    if ["includeEmpty", "disableCode", "disableStorage", "diffMode"]
+                        .iter()
+                        .any(|field| key.eq_ignore_ascii_case(field)) &&
+                        !value.is_boolean() &&
+                        !value.is_null()
+                    {
+                        return Self::None
+                    }
+                    if let Some(value) = value.as_bool() {
+                        if key.eq_ignore_ascii_case("includeEmpty") {
+                            include_empty = value;
+                        }
+                        if key.eq_ignore_ascii_case("disableCode") {
+                            hide_code = value;
+                        }
+                    }
+                }
+                // Go checks account emptiness before applying disableCode. Preserve the original
+                // field spelling for Reth's validation, and fetch code before filtering empties.
                 if hide_code {
-                    config.0["disableCode"] = false.into();
+                    for (key, value) in options.iter_mut() {
+                        if key.eq_ignore_ascii_case("disableCode") && value.is_boolean() {
+                            *value = false.into();
+                        }
+                    }
                 }
                 Self::Prestate { hide_code, include_empty }
             }

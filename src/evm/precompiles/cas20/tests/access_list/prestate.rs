@@ -292,10 +292,16 @@ async fn include_empty_with_diff_mode_is_rejected() {
     let h = Harness::new();
     let api = debug!(h.st);
     for mux in [false, true] {
-        let opts = options(json!({"includeEmpty":true,"diffMode":true}), mux);
-        let err = api.debug_trace_call(request(ALICE, vec![]), None, Some(opts)).await.unwrap_err();
-        assert_eq!(err.code(), -32000);
-        assert_eq!(err.message(), "cannot use diffMode with includeEmpty");
+        for (config, message) in [
+            (json!({"includeEmpty":true,"diffMode":true}), "cannot use diffMode with includeEmpty"),
+            (json!({"IncludeEmpty":true,"diffMode":true}), "cannot use diffMode with includeEmpty"),
+            (json!({"includeEmpty":true,"DiffMode":true}), "cannot use diffMode with includeEmpty"),
+            (json!({"includeEmpty":"true"}), "json: cannot unmarshal string into Go struct field PrestateTracerConfig.includeEmpty of type bool"),
+        ] {
+            let err = api.debug_trace_call(request(ALICE, vec![]), None, Some(options(config, mux))).await.unwrap_err();
+            assert_eq!(err.code(), -32000);
+            assert_eq!(err.message(), message);
+        }
     }
 }
 
@@ -326,5 +332,29 @@ async fn include_empty_retains_rejected_evm_creation_candidates() {
                 api.debug_trace_call(request(creator, vec![]), None, Some(opts)).await.unwrap();
             assert_eq!(prestate(trace, mux)[format!("{candidate:#x}")], json!({"balance":"0x0"}));
         }
+    }
+}
+
+#[tokio::test]
+async fn prestate_option_casing_preserves_bsc_code_filtering() {
+    let mut h = Harness::new();
+    let token = token(&mut h);
+    let api = debug!(h.st);
+    for mux in [false, true] {
+        let trace = api
+            .debug_trace_call(
+                request(token, call_data(SEL_BALANCE_OF, &[a(ALICE)])),
+                None,
+                Some(options(
+                    json!({"IncludeEmpty":true,"DisableCode":true,"DisableStorage":true}),
+                    mux,
+                )),
+            )
+            .await
+            .unwrap();
+        let pre = prestate(trace, mux);
+        let account = pre.get(format!("{token:#x}")).unwrap();
+        assert!(account.get("code").is_none());
+        assert!(account.get("storage").is_none());
     }
 }

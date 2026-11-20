@@ -41,21 +41,39 @@ fn empty_filter_preserves_existing_code_and_non_cas20_accounts() {
 
 #[test]
 fn include_empty_and_invalid_tracer_config_are_preserved() {
-    let mut opts: GethDebugTracingOptions = serde_json::from_value(
-        json!({"tracer":"prestateTracer","tracerConfig":{"disableCode":true,"includeEmpty":true}}),
-    )
-    .unwrap();
-    let plan = Plan::prepare(&mut opts);
-    assert_eq!(opts.tracer_config.0["disableCode"], false);
-    let mut trace = GethTrace::PreStateTracer(PreStateFrame::Default(PreStateMode(
-        [(FACTORY_ADDRESS, AccountState::default())].into_iter().collect(),
-    )));
-    plan.apply(&mut trace);
-    assert!(serde_json::to_value(trace).unwrap().get(format!("{FACTORY_ADDRESS:#x}")).is_some());
-    opts.tracer_config.0 = json!({"disableCode":"invalid"});
-    let original = opts.clone();
-    assert!(matches!(Plan::prepare(&mut opts), Plan::None));
-    assert_eq!(opts, original);
+    for config in [json!(null), json!({})] {
+        let mut opts: GethDebugTracingOptions =
+            serde_json::from_value(json!({"tracer":"prestateTracer","tracerConfig":config}))
+                .unwrap();
+        assert!(matches!(
+            Plan::prepare(&mut opts),
+            Plan::Prestate { hide_code: false, include_empty: false }
+        ));
+    }
+    for (empty_key, code_key) in [
+        ("includeEmpty", "disableCode"),
+        ("IncludeEmpty", "DisableCode"),
+        ("INCLUDEEMPTY", "DISABLECODE"),
+    ] {
+        let mut opts: GethDebugTracingOptions = serde_json::from_value(
+            json!({"tracer":"prestateTracer","tracerConfig":{(code_key):true,(empty_key):true}}),
+        )
+        .unwrap();
+        let plan = Plan::prepare(&mut opts);
+        assert_eq!(opts.tracer_config.0[code_key], false);
+        let mut trace = GethTrace::PreStateTracer(PreStateFrame::Default(PreStateMode(
+            [(FACTORY_ADDRESS, AccountState::default())].into_iter().collect(),
+        )));
+        plan.apply(&mut trace);
+        assert!(serde_json::to_value(trace)
+            .unwrap()
+            .get(format!("{FACTORY_ADDRESS:#x}"))
+            .is_some());
+        opts.tracer_config.0 = json!({(code_key):"invalid"});
+        let original = opts.clone();
+        assert!(matches!(Plan::prepare(&mut opts), Plan::None));
+        assert_eq!(opts, original);
+    }
 }
 
 #[tokio::test]
