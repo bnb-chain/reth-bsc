@@ -47,6 +47,27 @@ const BLOB_SIDECAR_VERSION_CELL_PROOF: u8 = 1;
 /// is past Osaka), so the cap is always in force there.
 const MAX_TX_GAS: u64 = 1 << 24;
 
+/// Mirrors go-bsc `bidutil.BidMustBefore`: the deadline after which a `mev_sendBidBlock`
+/// submission is rejected as too late.
+///
+/// `bid_must_before_ms = parent.MilliTimestamp() + block_interval_ms - delay_left_over_ms`
+///
+/// `parent_timestamp_ms` must be the parent header's *full* millisecond timestamp (seconds plus
+/// the sub-second component carried in `mixHash` post-Lorentz — see
+/// [`crate::consensus::parlia::util::calculate_millisecond_timestamp`]), not just
+/// `header.timestamp * 1000`: on sub-second block intervals (Fermi/Maxwell), truncating the
+/// parent's millisecond part shifts the deadline by up to a full block interval. The subtracted
+/// knob is `delay_left_over_ms` (go-bsc's `Config.DelayLeftOver`, default 15ms) —
+/// `no_interrupt_left_over` bounds bid *simulation* time and is a different, much larger, knob.
+pub(crate) fn bid_must_before_ms(
+    parent_timestamp_ms: u64,
+    block_interval_ms: u64,
+    delay_left_over_ms: u64,
+) -> u128 {
+    (parent_timestamp_ms as u128 + block_interval_ms as u128)
+        .saturating_sub(delay_left_over_ms as u128)
+}
+
 /// The builder-proposed block carried by [`BidBlockArgs`].
 ///
 /// JSON field names mirror go-bsc's `core/types/builder/bid.go` (`header`, `transactions`,

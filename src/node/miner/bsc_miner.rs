@@ -1273,6 +1273,7 @@ where
             mining_config.validator_commission.unwrap_or(100),
             mining_config.greedy_merge,
             mining_config.get_no_interrupt_left_over(),
+            mining_config.get_bid_block_enabled().then(|| mining_config.get_delay_left_over()),
         ));
         let main_work_worker = MainWorkWorker::new(
             validator_address,
