@@ -22,6 +22,9 @@ const MAX_SIZE_OF_RECENT_ENTRY: usize = 512;
 /// Scope in blocks for malicious vote slashing eligibility.
 const MALICIOUS_VOTE_SLASH_SCOPE: u64 = 256;
 
+const VIOLATE_RULE1_METRIC: &str = "monitor.maliciousVote.violateRule1";
+const VIOLATE_RULE2_METRIC: &str = "monitor.maliciousVote.violateRule2";
+
 /// Monitors incoming votes for rule violations and increments geth-compatible metrics
 /// (`monitor/maliciousVote/violateRule1`, `monitor/maliciousVote/violateRule2`).
 #[derive(Default)]
@@ -32,6 +35,9 @@ pub struct MaliciousVoteMonitor {
 
 impl MaliciousVoteMonitor {
     pub fn new() -> Self {
+        // Export a zero baseline so the first violation is visible to the alert evaluator.
+        metrics::counter!(VIOLATE_RULE1_METRIC).increment(0);
+        metrics::counter!(VIOLATE_RULE2_METRIC).increment(0);
         Self { cur_votes: HashMap::with_capacity(21) }
     }
 
@@ -72,7 +78,7 @@ impl MaliciousVoteMonitor {
 
                 // Rule 1: same target_number, different vote hash
                 if block_number == target_number && existing_vote.data.hash() != new_vote_hash {
-                    metrics::counter!("monitor.maliciousVote.violateRule1").increment(1);
+                    metrics::counter!(VIOLATE_RULE1_METRIC).increment(1);
                     malicious = true;
                 }
                 // Rule 2: overlapping vote spans
@@ -81,7 +87,7 @@ impl MaliciousVoteMonitor {
                     (block_number > target_number &&
                         existing_vote.data.source_number < source_number)
                 {
-                    metrics::counter!("monitor.maliciousVote.violateRule2").increment(1);
+                    metrics::counter!(VIOLATE_RULE2_METRIC).increment(1);
                     malicious = true;
                 }
 
