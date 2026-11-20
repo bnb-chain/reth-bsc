@@ -1151,8 +1151,6 @@ where
                 _ = send_bid_interval.tick() => {
                     // Attempt to send bids
                     self.get_bid_and_send();
-                    // Process any admitted BEP-675 BidBlocks.
-                    self.process_bid_block();
                 }
 
                 _ = clear_bid_interval.tick() => {
@@ -1176,19 +1174,6 @@ where
                     error!("Failed to send bid simulate request due to channel closed: {}", e);
                 }
             }
-        }
-    }
-
-    /// Pop an admitted BEP-675 BidBlock (from `mev_sendBidBlock`) and verify/blind-sign/seal it
-    /// into the simulator's best-bid-block store (go-bsc `newBidBlockLoop` → `AddBidBlock`).
-    fn process_bid_block(&self) {
-        if let Some(decoded) = crate::shared::pop_bid_block_package() {
-            debug!(
-                "Popped BidBlock from queue, block: {}, builder: {}",
-                decoded.block_number(),
-                decoded.builder
-            );
-            self.simulator.commit_bid_block(decoded);
         }
     }
 }
@@ -1320,6 +1305,21 @@ where
     }
 
     fn spawn_workers(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Match the capacity of go-bsc's newBidBlockCh.
+        let (bid_block_tx, mut bid_block_rx) = mpsc::channel(100);
+        crate::shared::set_bid_block_sender(bid_block_tx)?;
+        let simulator = self.mev_work_worker.simulator.clone();
+        self.task_executor.spawn_critical_task("bid_block_worker", async move {
+            while let Some(request) = bid_block_rx.recv().await {
+                let bid_hash = request.decoded.hash();
+                let result = simulator.commit_bid_block(request.decoded);
+                if let Err(error) = &result {
+                    debug!(%bid_hash, %error, "BidBlock discarded");
+                }
+                // A caller may have timed out while the worker was preparing its candidate.
+                let _ = request.feedback.send(result);
+            }
+        });
         self.task_executor.spawn_critical_task("mev_work_worker", self.mev_work_worker.run());
         self.task_executor.spawn_critical_task("new_work_worker", self.new_work_worker.run());
         self.task_executor.spawn_critical_task("main_work_worker", self.main_work_worker.run());
