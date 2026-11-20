@@ -2903,6 +2903,7 @@ where
         // in this function falls back to submitting the local payload for this same
         // (block_number, parent_hash), which must remain free to record and claim it.
         if !crate::shared::check_and_record_mined_block(block_number, parent_hash) {
+            CONSENSUS_METRICS.double_signs_detected_total.increment(1);
             error!(
                 target: "bsc::miner::payload",
                 trace_id = self.trace_id,
