@@ -298,6 +298,10 @@ where
             &self.vote_metrics,
         )
         .verify(&header, &parent_header, &snap)?;
+        crate::consensus::parlia::header_verifier::observe_verified_proposal(
+            &header,
+            header.hash_slow(),
+        );
 
         // Initialize before execution; validate total gas in `post_check_new_block`.
         self.init_payment_lane(&parent_header, header.gas_limit)?;

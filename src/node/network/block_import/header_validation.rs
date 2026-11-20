@@ -1,7 +1,10 @@
 //! Validation required before a peer's block may be relayed.
 use crate::{
     chainspec::BscChainSpec,
-    consensus::parlia::{header_verifier::HeaderVerifier, Parlia, SnapshotProvider},
+    consensus::parlia::{
+        header_verifier::{observe_verified_proposal, HeaderVerifier},
+        Parlia, SnapshotProvider,
+    },
     metrics::BscVoteMetrics,
     node::{consensus::BscConsensus, evm::util::get_header_by_hash_from_cache},
     BscBlock,
@@ -74,7 +77,10 @@ pub(super) fn validate_for_relay<P: HeaderProvider<Header = Header>>(
         parent.header(),
         &snapshot,
     ) {
-        Ok(()) => Ok(RelayValidation::Valid),
+        Ok(()) => {
+            observe_verified_proposal(block.header(), block.hash());
+            Ok(RelayValidation::Valid)
+        }
         Err(error) if error.as_validation().is_some() => {
             Err(BlockImportError::Other(Box::new(error)))
         }

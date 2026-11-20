@@ -51,8 +51,12 @@ pub struct BscConsensusMetrics {
     /// Current block height (equivalent to chain/head/block)
     pub current_block_height: Gauge,
 
-    /// Total number of double signs detected (equivalent to parlia/doublesign)
+    /// Local block submissions rejected by the double-sign guard.
     pub double_signs_detected_total: Counter,
+
+    /// Verified conflicting proposals from the same signer on the same parent (go-bsc
+    /// parlia/doublesign).
+    pub network_double_signs_detected_total: Counter,
 
     /// Total number of intentional mining delays (equivalent to parlia/intentionalDelayMining)
     pub intentional_mining_delays_total: Counter,
