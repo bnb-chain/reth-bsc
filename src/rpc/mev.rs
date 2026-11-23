@@ -333,8 +333,9 @@ fn validate_bid_head(
     Ok(())
 }
 
-/// Mirrors go-bsc `bidSimulator.ReservePending`; a reserved slot is never released. Entries at or
-/// below `head_number` are dropped first, like go-bsc's `clearLoop`.
+/// Atomically reserve the shared SendBid/SendBidBlock quota. BidBlock transaction decode failures
+/// release their reservation; other rejections retain it. Entries at or below `head_number` are
+/// dropped first, like go-bsc's `clearLoop`.
 fn reserve_pending_bid(
     pending: &mut PendingBids,
     head_number: u64,
@@ -758,7 +759,7 @@ impl MevApiImpl {
             ));
         }
 
-        // Like go-bsc, reserve before the remaining checks; a bid they reject keeps its slot.
+        // Reserve before the remaining checks. Only transaction decode failures release the slot.
         let block_number = args.bid_block.header.number;
         self.reserve_pending_bid(head_header.number, block_number, builder, bid_hash)
             .map_err(Self::plain_err)?;
@@ -780,9 +781,17 @@ impl MevApiImpl {
             )));
         }
 
-        let mut decoded = args
-            .to_decoded_bid_block(builder)
-            .map_err(|e| Self::invalid_bid(format!("failed to decode bid block: {e}")))?;
+        let mut decoded = args.to_decoded_bid_block(builder).map_err(|e| {
+            // A malformed BidBlock must not exhaust the builder's shared SendBid allowance.
+            // Remove only this request's successfully reserved hash, preserving concurrent bids.
+            let mut pending = self.pending_bids.write().unwrap();
+            if let Some(hashes) =
+                pending.get_mut(&block_number).and_then(|builders| builders.get_mut(&builder))
+            {
+                hashes.remove(&bid_hash);
+            }
+            Self::invalid_bid(format!("failed to decode bid block: {e}"))
+        })?;
 
         // go-bsc `preSealVerifyBidBlock`, run synchronously so a failure returns `-38007` here
         // rather than dropping the bid silently later. The builder's extra is not checked: it is
