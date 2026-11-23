@@ -78,31 +78,6 @@ pub(crate) fn observe_verified_proposal(header: &Header, hash: B256) {
     }
 }
 
-#[cfg(test)]
-mod proposal_tests {
-    use super::*;
-
-    #[test]
-    fn reports_a_conflict_once_per_parent_and_proposer() {
-        let mut proposals = LruCache::new(NonZeroUsize::new(8).unwrap());
-        let parent = B256::repeat_byte(1);
-        let proposer = Address::repeat_byte(2);
-        let first = B256::repeat_byte(3);
-        let second = B256::repeat_byte(4);
-        assert_eq!(record_proposal(&mut proposals, parent, proposer, first), None);
-        // Relay and execution may verify the same proposal.
-        assert_eq!(record_proposal(&mut proposals, parent, proposer, first), None);
-        for (parent, proposer) in
-            [(B256::repeat_byte(5), proposer), (parent, Address::repeat_byte(6))]
-        {
-            assert_eq!(record_proposal(&mut proposals, parent, proposer, second), None);
-        }
-        assert_eq!(record_proposal(&mut proposals, parent, proposer, second), Some(first));
-        assert_eq!(record_proposal(&mut proposals, parent, proposer, second), None);
-        assert_eq!(record_proposal(&mut proposals, parent, proposer, first), None);
-    }
-}
-
 pub(crate) fn validate_attestation_source_target_order(
     source_number: u64,
     target_number: u64,
@@ -448,5 +423,30 @@ impl<'a, Spec: EthChainSpec + BscHardforks + 'static> HeaderVerifier<'a, Spec> {
                 BscBlockExecutionError::UnknownHeader { block_hash: snap.vote_data.target_hash }
                     .into()
             })
+    }
+}
+
+#[cfg(test)]
+mod proposal_tests {
+    use super::*;
+
+    #[test]
+    fn reports_a_conflict_once_per_parent_and_proposer() {
+        let mut proposals = LruCache::new(NonZeroUsize::new(8).unwrap());
+        let parent = B256::repeat_byte(1);
+        let proposer = Address::repeat_byte(2);
+        let first = B256::repeat_byte(3);
+        let second = B256::repeat_byte(4);
+        assert_eq!(record_proposal(&mut proposals, parent, proposer, first), None);
+        // Relay and execution may verify the same proposal.
+        assert_eq!(record_proposal(&mut proposals, parent, proposer, first), None);
+        for (parent, proposer) in
+            [(B256::repeat_byte(5), proposer), (parent, Address::repeat_byte(6))]
+        {
+            assert_eq!(record_proposal(&mut proposals, parent, proposer, second), None);
+        }
+        assert_eq!(record_proposal(&mut proposals, parent, proposer, second), Some(first));
+        assert_eq!(record_proposal(&mut proposals, parent, proposer, second), None);
+        assert_eq!(record_proposal(&mut proposals, parent, proposer, first), None);
     }
 }
