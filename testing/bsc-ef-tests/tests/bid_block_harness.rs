@@ -1,19 +1,15 @@
 //! Integration harness for BEP-675 BidBlock execution.
 //!
-//! A BidBlock is a complete builder-proposed block that the validator must re-execute (in
-//! verify-mode, with the trailing system txs supplied to the executor), blind-sign, and seal while
-//! preserving the builder's exact block context. None of that is unit-testable — correctness is
-//! byte-exact (the re-executed state root must match the builder's), so it needs a real execution
-//! environment.
+//! The validator prepares a winning BidBlock by signing its system transactions and sealing the
+//! block while preserving the builder's block context. Import then re-executes the block in
+//! verify mode and checks that the computed state root matches the builder's.
 //!
 //! This harness builds that environment on top of the same primitives the EF blockchain-test runner
 //! uses (`create_test_provider_factory_with_chain_spec` + genesis init + a state provider), but
 //! with the BSC chain spec / genesis so the system-contract execution path is exercised.
 //!
-//! Step 1 (this file) is the scaffold: stand up the provider, initialize the BSC genesis, and
-//! confirm a state provider opens at the expected genesis. The trusted local build,
-//! `simulate_bid_block`, and the round-trip assertion (build a block → repackage as a
-//! DecodedBidBlock → simulate → assert identical hash/state root) build on this foundation.
+//! The round-trip test builds a reference block, repackages it as a BidBlock, prepares the
+//! candidate, and compares the re-executed state root with the reference.
 
 use alloy_primitives::{hex, B256};
 use reth_bsc::{
@@ -260,7 +256,7 @@ fn publish_env(chain_spec: Arc<BscChainSpec>) {
 }
 
 /// Trusted local build: drive `BscEvmConfig`'s builder to produce block 1 on the signable genesis.
-/// This is the reference the round-trip will compare `simulate_bid_block` against.
+/// The round-trip uses the same local builder for its reference block.
 #[test]
 fn trusted_local_build_produces_block() {
     use reth_bsc::node::evm::config::{BscEvmConfig, BscExecutionMode, BscNextBlockEnvAttributes};
@@ -455,7 +451,7 @@ fn round_trip_build_finalize_reexecute_agree() {
 
 /// Full execution gate: with a real block-1→block-2 chain (Kepler active), build block 2 with a
 /// fee-paying user tx (validator generates the deposit), repackage it as a BidBlock with the
-/// deposit *unsigned*, run `simulate_bid_block` (which re-signs it), execute the sealed result, and
+/// deposit *unsigned*, prepare the candidate, execute the sealed result, and
 /// assert the state root equals the reference build. This is the byte-exact verify-mode proof.
 #[test]
 fn execution_gate_round_trip() {
@@ -467,7 +463,10 @@ fn execution_gate_round_trip() {
         node::{
             evm::config::{BscEvmConfig, BscExecutionMode, BscNextBlockEnvAttributes},
             miner::{
-                bid_block::{simulate_bid_block, submitted_tx_root, BidBlock, BidBlockArgs},
+                bid_block::{
+                    prepare_bid_block, submitted_tx_root, verify_bid_block_payload, BidBlock,
+                    BidBlockArgs,
+                },
                 signer::sign_system_transaction,
                 util::finalize_new_header,
             },
@@ -640,37 +639,45 @@ fn execution_gate_round_trip() {
     // is actually sent. That is what a real builder does: since bsc #3742 the signature covers only
     // the header, so this root is the commitment binding the body, and `verify_bid_block_payload`
     // rejects a mismatch. Reusing the reference root here built a BidBlock no builder could
-    // produce. `simulate_bid_block` still overwrites the root with the re-signed set, so the
+    // produce. `prepare_bid_block` still overwrites the root with the re-signed set, so the
     // sealed header — and the state root this test compares — is unaffected.
     let mut bid_header = block2_ref.header().clone();
     bid_header.transactions_root = submitted_tx_root(&submitted_txs);
     let bid = BidBlock { header: bid_header, transactions: submitted_txs, sidecars: vec![] };
     let args =
         BidBlockArgs { bid_block: bid, signature: alloy_primitives::Bytes::from(vec![0u8; 65]) };
-    let decoded = args
+    let mut decoded = args
         .to_decoded_bid_block(alloy_primitives::Address::repeat_byte(0xbb))
         .expect("decode bid");
+    let (system_tx_start, gas_fee) = verify_bid_block_payload(
+        &chain_spec,
+        &decoded,
+        block1_sealed.header(),
+        *TEST_VALIDATOR,
+        block1_sealed.gas_limit,
+    )
+    .expect("verify bid payload");
+    decoded.system_tx_start = system_tx_start;
+    decoded.gas_fee = gas_fee;
 
-    // --- Simulate (re-signs the deposit, finalizes) and execute the sealed block. ---
-    let sim = simulate_bid_block(
+    // Prepare the winner and recover its transaction senders for import-time execution.
+    let prepared = prepare_bid_block(
         parlia,
         &chain_spec,
         &decoded,
         &block1_sealed,
         &block1_snap,
         &snapshot_provider,
-        *TEST_VALIDATOR,
-        block1_sealed.gas_limit,
         alloy_primitives::Bytes::from(vec![0u8; 32]),
-        (block1_sealed.timestamp + 3) * 1000,
         None, // not an epoch block
     )
-    .expect("simulate bid block");
+    .expect("prepare bid block");
+    let block = prepared.try_recover().expect("recover bid block senders");
 
     {
         let mut snap2 = block1_snap.clone();
         snap2.block_number = 2;
-        snap2.block_hash = sim.block.header().hash_slow();
+        snap2.block_hash = block.hash();
         snapshot_provider.insert(snap2);
     }
 
@@ -679,7 +686,7 @@ fn execution_gate_round_trip() {
     let evm_config = BscEvmConfig::new(chain_spec.clone());
     let executor = evm_config
         .batch_executor(StateProviderDatabase::new(EvmStateProviderAdapter(&state_provider)));
-    let output = executor.execute(&sim.block).expect("execute simulated block 2");
+    let output = executor.execute(&block).expect("execute prepared block 2");
     let hashed = HashedPostState::from_bundle_state::<KeccakKeyHasher>(output.state.state());
     let (computed_root, _) = <StateRoot<
         DatabaseTrieCursorFactory<_, LegacyKeyAdapter>,
