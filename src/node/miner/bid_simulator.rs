@@ -217,6 +217,7 @@ pub struct BidSimulator<Client, Pool> {
     /// to preempt an in-flight simulation. See [`can_be_interrupted`].
     no_interrupt_left_over: u64,
     pub(super) bid_block_delay_left_over_ms: Option<u64>,
+    pub(super) bid_block_signature_pool: Option<rayon::ThreadPool>,
     /// Simulations preempted per parent hash, so the seal path can tell whether an interrupt
     /// actually bought a better block. See [`Self::take_interrupt_count`].
     interrupt_counts: Arc<RwLock<HashMap<B256, InterruptTally>>>,
@@ -248,6 +249,7 @@ where
         greedy_merge: bool,
         no_interrupt_left_over: u64,
         bid_block_delay_left_over_ms: Option<u64>,
+        bid_block_signature_pool: Option<rayon::ThreadPool>,
     ) -> Self {
         Self {
             client,
@@ -271,6 +273,7 @@ where
             greedy_merge,
             no_interrupt_left_over,
             bid_block_delay_left_over_ms,
+            bid_block_signature_pool,
             interrupt_counts: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -1423,6 +1426,7 @@ mod tests {
             100,
             false,
             0,
+            None,
             None,
         )
     }

@@ -660,11 +660,14 @@ fn execution_gate_round_trip() {
     decoded.system_tx_start = system_tx_start;
     decoded.gas_fee = gas_fee;
 
+    let signature_pool =
+        rayon::ThreadPoolBuilder::new().num_threads(2).build().expect("signature pool");
     // Prepare the winner and recover its transaction senders for import-time execution.
     let prepared = prepare_bid_block(
         parlia,
         &chain_spec,
         &decoded,
+        &signature_pool,
         &block1_sealed,
         &block1_snap,
         &snapshot_provider,

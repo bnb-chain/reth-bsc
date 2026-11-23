@@ -1,8 +1,10 @@
 use alloy_primitives::Address;
 use k256::ecdsa::SigningKey;
-use std::{path::PathBuf, sync::OnceLock};
+use std::{num::NonZeroUsize, path::PathBuf, sync::OnceLock};
 
 use crate::consensus::parlia::DEFAULT_MIN_GAS_TIP;
+
+const DEFAULT_BID_BLOCK_VERIFY_THREADS: NonZeroUsize = NonZeroUsize::new(8).unwrap();
 
 /// Mining configuration for BSC PoSA
 #[derive(Clone)]
@@ -48,6 +50,8 @@ pub struct MiningConfig {
     /// Whether the `mev_sendBidBlock` RPC (BEP-675 builder-proposed blocks) is accepted.
     /// Off by default; enable with `--mining.bid-block-enabled` or `BSC_MINING_BID_BLOCK_ENABLED`.
     pub bid_block_enabled: bool,
+    /// Number of workers that verify the winning BidBlock's user signatures before sealing.
+    pub bid_block_verify_threads: NonZeroUsize,
     /// BEP-675 gRPC listener port (default 8552); zero uses the default.
     pub mev_grpc_port: u16,
     /// Explicitly disable the BEP-675 gRPC transport.
@@ -87,6 +91,7 @@ impl std::fmt::Debug for MiningConfig {
             .field("builder_fee_ceil", &self.builder_fee_ceil)
             .field("allowed_builders", &self.allowed_builders)
             .field("bid_block_enabled", &self.bid_block_enabled)
+            .field("bid_block_verify_threads", &self.bid_block_verify_threads)
             .field("mev_grpc_port", &self.mev_grpc_port)
             .field("mev_grpc_disabled", &self.mev_grpc_disabled)
             .field("mev_grpc_concurrency", &self.mev_grpc_concurrency)
@@ -134,6 +139,7 @@ impl Default for MiningConfig {
             builder_fee_ceil: Some(1_000_000_000_000_000_000), // 1 BNB
             allowed_builders: None,    // No builders by default (reject all)
             bid_block_enabled: false,  // BEP-675 BidBlock path off by default
+            bid_block_verify_threads: DEFAULT_BID_BLOCK_VERIFY_THREADS,
             mev_grpc_port: 8552,
             mev_grpc_disabled: false,
             mev_grpc_concurrency: 32,
@@ -302,6 +308,7 @@ impl MiningConfig {
                 builder_fee_ceil: Some(1_000_000_000_000_000_000),
                 allowed_builders: None,
                 bid_block_enabled: false,
+                bid_block_verify_threads: DEFAULT_BID_BLOCK_VERIFY_THREADS,
                 mev_grpc_port: 8552,
                 mev_grpc_disabled: false,
                 mev_grpc_concurrency: 32,
@@ -407,6 +414,10 @@ impl MiningConfig {
             .ok()
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(false);
+        let bid_block_verify_threads = std::env::var("BSC_MINING_BID_BLOCK_VERIFY_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_BID_BLOCK_VERIFY_THREADS);
 
         let mev_grpc_port =
             std::env::var("BSC_MEV_GRPC_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(8552);
@@ -439,6 +450,7 @@ impl MiningConfig {
             builder_fee_ceil,
             allowed_builders,
             bid_block_enabled,
+            bid_block_verify_threads,
             mev_grpc_port,
             mev_grpc_disabled,
             mev_grpc_concurrency,
@@ -616,6 +628,11 @@ mod tests {
         // go-bsc's `defaultDelayLeftOver = 15 * time.Millisecond`; distinct from and smaller than
         // `no_interrupt_left_over` (240ms default), which bounds bid simulation, not block sealing.
         assert_eq!(MiningConfig::default().get_delay_left_over(), 15);
+    }
+
+    #[test]
+    fn bid_block_signature_verification_defaults_to_eight_workers() {
+        assert_eq!(MiningConfig::default().bid_block_verify_threads.get(), 8);
     }
 
     #[test]
