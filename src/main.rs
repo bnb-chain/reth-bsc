@@ -11,7 +11,7 @@ use reth_bsc::{
     node::{consensus::BscConsensus, evm::config::BscEvmConfig, BscNode},
     BscPrimitives,
 };
-use std::{path::PathBuf, sync::Arc};
+use std::{num::NonZeroUsize, path::PathBuf, sync::Arc};
 
 // We use jemalloc for performance reasons
 #[cfg(all(feature = "jemalloc", unix))]
@@ -50,6 +50,12 @@ pub struct BscCliArgs {
     /// Env alternative: `BSC_MINING_BID_BLOCK_ENABLED=true`.
     #[arg(long = "mining.bid-block-enabled")]
     pub mining_bid_block_enabled: bool,
+
+    /// Signature verification workers for the winning BidBlock (default 8).
+    ///
+    /// Env alternative: `BSC_MINING_BID_BLOCK_VERIFY_THREADS`.
+    #[arg(long = "mining.bid-block-verify-threads")]
+    pub mining_bid_block_verify_threads: Option<NonZeroUsize>,
 
     /// Port for the BEP-675 `BidBlockService` gRPC listener (default 8552; zero uses default).
     ///
@@ -369,6 +375,9 @@ fn main() -> eyre::Result<()> {
                 // CLI takes precedence over env BSC_MINING_BID_BLOCK_ENABLED.
                 if args.mining_bid_block_enabled {
                     mining_config.bid_block_enabled = true;
+                }
+                if let Some(threads) = args.mining_bid_block_verify_threads {
+                    mining_config.bid_block_verify_threads = threads;
                 }
 
                 if let Some(port) = args.mining_mev_grpc_port {

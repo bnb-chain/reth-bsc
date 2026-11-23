@@ -31,12 +31,13 @@ use alloy_consensus::{transaction::RlpEcdsaDecodableTx, Header, Transaction, TxL
 use alloy_eips::eip2718::Decodable2718;
 use alloy_primitives::{keccak256, Address, Bytes, Signature, B256, U256};
 use alloy_rlp::{Decodable, Encodable};
+use rayon::prelude::*;
 use reth::{consensus::HeaderValidator, primitives::SealedHeader};
 use reth_chainspec::EthChainSpec;
 use reth_ethereum_primitives::{BlockBody, TransactionSigned};
 use reth_node_ethereum::engine::EthPayloadAttributes;
-use reth_primitives_traits::{Block, SealedBlock};
-use std::{fmt, sync::Arc, vec::Vec};
+use reth_primitives_traits::{Block, SealedBlock, SignerRecoverable};
+use std::{fmt, sync::Arc, time::Instant, vec::Vec};
 
 /// Sidecar version carrying EIP-7594 cell proofs (PeerDAS). BSC does not support it yet, so a
 /// BidBlock declaring it is rejected; legacy EIP-4844 blob proofs are version `0`.
@@ -960,6 +961,8 @@ pub fn bid_block_env_attributes(header: &Header) -> EthPayloadAttributes {
 /// Why preparing the winning BidBlock failed.
 #[derive(Debug)]
 pub enum PrepareBidBlockError {
+    /// A user transaction's sender could not be recovered before signing the block.
+    SenderRecovery { index: usize, error: alloy_consensus::crypto::RecoveryError },
     /// The finalized header failed verification.
     Verify(PreSealVerifyError),
     /// Blind-signing a trailing system tx failed.
@@ -971,6 +974,9 @@ pub enum PrepareBidBlockError {
 impl fmt::Display for PrepareBidBlockError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::SenderRecovery { index, error } => {
+                write!(f, "user transaction {index} signature: {error}")
+            }
             Self::Verify(e) => write!(f, "verify: {e}"),
             Self::BindSign(e) => write!(f, "bind-sign: {e}"),
             Self::Finalize(e) => write!(f, "finalize: {e}"),
@@ -997,22 +1003,34 @@ fn mev_tagged_header(chain_spec: &BscChainSpec, decoded: &DecodedBidBlock) -> He
     header
 }
 
-/// Blind-sign the system txs and seal the winning, already-admitted BidBlock.
+/// Verify user signatures, blind-sign the system txs and seal the winning BidBlock.
 ///
-/// The RPC path verifies the submitted header and its commitment to the unsigned body. Only the
-/// winner needs a new transaction root and seal. The Engine recovers senders and executes the
-/// sealed block on import, as go-bsc does after broadcasting its selected BidBlock.
+/// Check signatures before signing anything so an invalid winner can fall back to the local
+/// candidate. A dedicated pool bounds CPU use, and only the winner pays this cost.
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_bid_block(
     parlia: Arc<Parlia<BscChainSpec>>,
     chain_spec: &BscChainSpec,
     decoded: &DecodedBidBlock,
+    signature_pool: &rayon::ThreadPool,
     parent: &SealedHeader,
     parent_snap: &Snapshot,
     snapshot_provider: &Arc<dyn SnapshotProvider + Send + Sync>,
     vanity: Bytes,
     epoch_validators: Option<EpochValidators>,
 ) -> Result<SealedBlock<BscBlock>, PrepareBidBlockError> {
+    let started = Instant::now();
+    let signature_check = signature_pool.install(|| {
+        decoded.txs[..decoded.system_tx_start].par_iter().enumerate().try_for_each(|(index, tx)| {
+            tx.recover_signer()
+                .map(|_| ())
+                .map_err(|error| PrepareBidBlockError::SenderRecovery { index, error })
+        })
+    });
+    metrics::histogram!("bsc.mev.bid_block_sender_recovery_duration_seconds")
+        .record(started.elapsed().as_secs_f64());
+    signature_check?;
+
     let txs = bind_sign_bid_block_system_txs(
         &decoded.txs,
         decoded.system_tx_start,
@@ -2076,8 +2094,6 @@ mod tests {
 
     #[test]
     fn prepare_bid_block_produces_sealed_block() {
-        use reth_primitives_traits::SignerRecoverable;
-
         // Seal as the shared test validator, so this matches whatever the global signer holds.
         let validator = crate::node::miner::signer::test_validator_address();
         crate::node::miner::signer::init_test_signer();
@@ -2091,6 +2107,10 @@ mod tests {
         snap.block_interval = 3_000;
         let snapshot_provider: std::sync::Arc<dyn SnapshotProvider + Send + Sync> =
             std::sync::Arc::new(TestSnapProvider(snap.clone()));
+        let signature_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("start signature verification workers");
 
         for (user_tx_count, invalid_sig) in [(1, false), (1_300, false), (1, true)] {
             let mut txs = (0..user_tx_count).map(legacy_tx).collect::<Vec<_>>();
@@ -2122,17 +2142,25 @@ mod tests {
                 decoded.sidecars.push(sidecar_for(&decoded.txs[0], 0, 0, 0));
             }
             let started = std::time::Instant::now();
-            let block = prepare_bid_block(
+            let prepared = prepare_bid_block(
                 parlia.clone(),
                 &chain_spec,
                 &decoded,
+                &signature_pool,
                 &parent,
                 &snap,
                 &snapshot_provider,
                 Bytes::from(vec![0u8; 32]),
                 None,
-            )
-            .expect("prepare");
+            );
+            if invalid_sig {
+                assert!(matches!(
+                    prepared,
+                    Err(PrepareBidBlockError::SenderRecovery { index: 0, .. })
+                ));
+                continue;
+            }
+            let block = prepared.expect("prepare");
             eprintln!("prepared {user_tx_count} user transactions in {:?}", started.elapsed());
 
             assert_eq!(block.header().number, 1);
@@ -2150,10 +2178,6 @@ mod tests {
                 let mut expected = decoded.sidecars.clone();
                 expected[0].block_hash = block.hash();
                 assert_eq!(block.body().sidecars.as_ref().unwrap(), &expected);
-            }
-            if invalid_sig {
-                // Like Geth, admission and sealing leave user signature recovery to import.
-                assert!(block.try_recover().is_err());
             }
         }
     }

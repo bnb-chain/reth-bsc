@@ -23,7 +23,8 @@ use crate::{
         },
         miner::{
             bid_block::{
-                bid_must_before_ms, prepare_bid_block, validate_bid_block_blob_kzg, DecodedBidBlock,
+                bid_must_before_ms, prepare_bid_block, validate_bid_block_blob_kzg,
+                DecodedBidBlock, PrepareBidBlockError,
             },
             bid_simulator::BidSimulator,
             block_mev_info::{set_block_mev_info, BlockMevInfoVersion},
@@ -2732,6 +2733,11 @@ where
     ) -> Result<SealedBlock<BscBlock>, String> {
         let snapshot_provider = crate::shared::get_snapshot_provider()
             .ok_or_else(|| "Snapshot provider not available".to_string())?;
+        let signature_pool = self
+            .simulator
+            .bid_block_signature_pool
+            .as_ref()
+            .ok_or_else(|| "BidBlock signature verification pool not available".to_string())?;
         let parent_snapshot = &self.mining_ctx.parent_snapshot;
         let parent = &self.mining_ctx.parent_header;
         let chain_spec = &self.builder.chain_spec;
@@ -2745,17 +2751,26 @@ where
         let mut vanity = crate::shared::get_miner_extra().map(|e| e.to_vec()).unwrap_or_default();
         vanity.resize(crate::consensus::parlia::EXTRA_VANITY_LEN, 0);
 
-        prepare_bid_block(
+        let prepared = prepare_bid_block(
             self.parlia.clone(),
             chain_spec,
             bid,
+            signature_pool,
             parent,
             parent_snapshot,
             snapshot_provider,
             vanity.into(),
             epoch_validators,
-        )
-        .map_err(|e| e.to_string())
+        );
+        if let Err(error @ PrepareBidBlockError::SenderRecovery { .. }) = &prepared {
+            crate::shared::get_bid_block_permission_manager().revoke_for_violation(
+                bid.builder,
+                format!("BidBlock invalid before sealing: {error}"),
+                bid.hash(),
+                bid.block_number(),
+            );
+        }
+        prepared.map_err(|e| e.to_string())
     }
 
     /// If a collected BidBlock candidate out-bids every local/legacy payload by fee, hand its
@@ -2811,8 +2826,7 @@ where
             return false;
         }
 
-        // Sign once with the votes available at selection. Sender recovery remains in Engine
-        // import, so preparing a winner does not serially recover every transaction.
+        // Verify the winner's user signatures before signing with the votes available at selection.
         let sealed = match self.prepare_winning_bid_block(&bid) {
             Ok(sealed) => sealed,
             Err(error) => {

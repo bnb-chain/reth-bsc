@@ -1220,6 +1220,21 @@ where
         let signing_key =
             mining_config.signing_key.clone().ok_or(eyre::eyre!("No signing key configured"))?;
 
+        // Reuse a dedicated pool so the slot's winner does not wait for worker creation
+        // or queue behind unrelated Rayon jobs.
+        let bid_block_signature_pool = mining_config
+            .get_bid_block_enabled()
+            .then(|| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(mining_config.bid_block_verify_threads.get())
+                    .thread_name(|index| format!("bid-signature-{index}"))
+                    .build()
+            })
+            .transpose()?;
+        if let Some(pool) = &bid_block_signature_pool {
+            info!(threads = pool.current_num_threads(), "BidBlock signature verification workers");
+        }
+
         let (mining_queue_tx, mining_queue_rx) = mpsc::unbounded_channel::<MiningContext>();
         let (payload_tx, payload_rx) = mpsc::unbounded_channel::<SubmitContext>();
 
@@ -1259,6 +1274,7 @@ where
             mining_config.greedy_merge,
             mining_config.get_no_interrupt_left_over(),
             mining_config.get_bid_block_enabled().then(|| mining_config.get_delay_left_over()),
+            bid_block_signature_pool,
         ));
         let main_work_worker = MainWorkWorker::new(
             validator_address,
