@@ -3,9 +3,10 @@ use crate::rpc::miner::{BscMinerApiImpl, BscMinerApiServer};
 use alloy_consensus::{TxEip1559, TxEip4844, TxEip7702, TxLegacy};
 use alloy_primitives::{Address, Signature, TxKind, U256};
 use reth_primitives_traits::Recovered;
+use reth_rpc_eth_types::error::RpcPoolError;
 use reth_transaction_pool::{
-    blobstore::InMemoryBlobStore, noop::MockTransactionValidator, PoolConfig, TransactionPool,
-    TransactionPoolExt,
+    blobstore::InMemoryBlobStore, error::PoolErrorKind, noop::MockTransactionValidator, PoolConfig,
+    TransactionPool, TransactionPoolExt,
 };
 use tip::meets_tip_floor;
 
@@ -89,6 +90,76 @@ fn pool() -> TestPool {
         InMemoryBlobStore::default(),
         PoolConfig::default().with_disabled_protocol_base_fee(),
     )
+}
+
+fn blob_transaction(fee_cap: u128) -> EthPooledTransaction {
+    EthPooledTransaction::new(
+        Recovered::new_unchecked(
+            EthTxSigned::new_unhashed(
+                TxEip4844 {
+                    gas_limit: 21_000,
+                    max_fee_per_gas: 1000,
+                    max_priority_fee_per_gas: 10,
+                    max_fee_per_blob_gas: fee_cap,
+                    blob_versioned_hashes: vec![alloy_primitives::B256::repeat_byte(1)],
+                    ..Default::default()
+                }
+                .into(),
+                Signature::new(U256::ZERO, U256::ZERO, false),
+            ),
+            Address::repeat_byte(1),
+        ),
+        200,
+    )
+}
+
+#[tokio::test]
+async fn zero_blob_fee_cap_is_rejected_for_all_origins() {
+    let _guard = TipGuard::new(0);
+    for origin in
+        [TransactionOrigin::External, TransactionOrigin::Local, TransactionOrigin::Private]
+    {
+        let pool = pool();
+        let tx = blob_transaction(0);
+        let hash = *tx.hash();
+        let error = pool.add_transaction(origin, tx).await.unwrap_err();
+        let PoolErrorKind::InvalidTransaction(InvalidPoolTransactionError::Other(inner)) =
+            &error.kind
+        else {
+            panic!("unexpected rejection: {error:?}");
+        };
+        assert_eq!(inner.as_any().downcast_ref::<BlobFeeCapBelowMinimum>().unwrap().fee_cap, 0);
+        assert!(!error.is_bad_transaction());
+
+        let rpc_error: jsonrpsee_types::ErrorObjectOwned = RpcPoolError::from(error).into();
+        assert_eq!(rpc_error.code(), -32000);
+        assert_eq!(rpc_error.message(), "blob fee cap 0 below minimum blob gas price 1");
+        assert!(pool.get(&hash).is_none());
+        assert!(pool.all_transaction_hashes().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn minimum_blob_fee_cap_can_wait_for_lower_blob_base_fee() {
+    let _guard = TipGuard::new(0);
+    for origin in
+        [TransactionOrigin::External, TransactionOrigin::Local, TransactionOrigin::Private]
+    {
+        for fee_cap in [1, 2] {
+            let pool = pool();
+            pool.set_block_info(reth_transaction_pool::BlockInfo {
+                pending_basefee: 0,
+                pending_blob_fee: Some(2),
+                ..pool.block_info()
+            });
+            let tx = blob_transaction(fee_cap);
+            let hash = *tx.hash();
+            pool.add_transaction(origin, tx).await.unwrap();
+            assert!(pool.get(&hash).is_some());
+            assert_eq!(pool.pool_size().blob, usize::from(fee_cap < 2));
+            assert_eq!(pool.pool_size().pending, usize::from(fee_cap >= 2));
+        }
+    }
 }
 
 #[tokio::test]

@@ -4,7 +4,7 @@ use std::sync::{
 };
 
 use alloy_consensus::{BlockHeader, Transaction};
-use alloy_eips::merge::EPOCH_SLOTS;
+use alloy_eips::{eip4844::BLOB_TX_MIN_BLOB_GASPRICE, merge::EPOCH_SLOTS};
 use reth::{
     api::{FullNodeTypes, NodePrimitives, NodeTypes},
     builder::{
@@ -42,7 +42,7 @@ impl reth_transaction_pool::error::PoolTransactionError for BlacklistedAddressEr
     }
 }
 
-/// BSC transaction validator: adds blacklist validation and Osaka gas limit check
+/// BSC transaction validator: adds blacklist, minimum blob fee cap, and Osaka gas limit checks
 /// to the default Ethereum transaction validator.
 ///
 /// EthereumHardfork::Osaka is blocked in BscChainSpec to prevent EIP-7594 sidecar conversion,
@@ -107,6 +107,16 @@ where
             );
         }
 
+        if let Some(fee_cap) = transaction
+            .max_fee_per_blob_gas()
+            .filter(|fee_cap| *fee_cap < BLOB_TX_MIN_BLOB_GASPRICE)
+        {
+            return TransactionValidationOutcome::Invalid(
+                transaction,
+                InvalidPoolTransactionError::other(BlobFeeCapBelowMinimum { fee_cap }),
+            );
+        }
+
         // Delegate to internal validator
         self.inner.validate_transaction(origin, transaction).await
     }
@@ -120,7 +130,25 @@ where
     }
 }
 
-/// BSC custom transaction pool builder: add blacklist validation to the default Ethereum pool
+/// A blob fee cap below the protocol minimum can never cover the blob gas price.
+#[derive(Debug, thiserror::Error)]
+#[error("blob fee cap {fee_cap} below minimum blob gas price {BLOB_TX_MIN_BLOB_GASPRICE}")]
+struct BlobFeeCapBelowMinimum {
+    fee_cap: u128,
+}
+
+impl reth_transaction_pool::error::PoolTransactionError for BlobFeeCapBelowMinimum {
+    fn is_bad_transaction(&self) -> bool {
+        // Match the pool's protocol fee floor policy without penalizing peers.
+        false
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// BSC custom transaction pool builder: add BSC validation to the default Ethereum pool
 /// builder.
 #[derive(Debug, Default, Clone, Copy)]
 #[non_exhaustive]
