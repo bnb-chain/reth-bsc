@@ -33,6 +33,19 @@ struct PeerEntry {
     version: u8,
 }
 
+/// A failed send only invalidates the channel used for that send.
+fn remove_peer_if_same_channel(
+    registry: &mut HashMap<PeerId, PeerEntry>,
+    peer: PeerId,
+    failed_tx: &UnboundedSender<BscCommand>,
+) -> bool {
+    if registry.get(&peer).is_some_and(|entry| entry.tx.same_channel(failed_tx)) {
+        registry.remove(&peer);
+        return true;
+    }
+    false
+}
+
 /// Global registry of active BSC protocol peers.
 static REGISTRY: Lazy<RwLock<HashMap<PeerId, PeerEntry>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
@@ -264,13 +277,7 @@ pub async fn request_blocks_by_range(
         // RLPx disconnect; the resulting reconnect re-runs `into_connection`
         // and re-registers a live tx via `register_peer`.
         let evicted = match REGISTRY.write() {
-            Ok(mut g) => match g.get(&peer) {
-                Some(entry) if entry.tx.same_channel(&tx) => {
-                    g.remove(&peer);
-                    true
-                }
-                _ => false,
-            },
+            Ok(mut g) => remove_peer_if_same_channel(&mut g, peer, &tx),
             Err(e) => {
                 tracing::error!(
                     target: "bsc::registry",
@@ -339,7 +346,7 @@ pub fn broadcast_votes(votes: Vec<crate::consensus::parlia::vote::VoteEnvelope>)
             std::collections::HashMap::new()
         };
 
-        let mut to_remove: Vec<PeerId> = Vec::new();
+        let mut failed_senders = Vec::new();
         for (peer, tx) in reg_snapshot {
             let peer_best_td = peer_info_map.get(&peer).and_then(|info| info.best_td);
             let allow = should_allow_vote_broadcast(
@@ -363,16 +370,16 @@ pub fn broadcast_votes(votes: Vec<crate::consensus::parlia::vote::VoteEnvelope>)
 
             tracing::trace!(target: "bsc::vote", peer=%peer, allow=allow, is_proxyed=is_proxyed_peer(&peer), "broadcast votes to peer");
             if allow && tx.send(BscCommand::Votes(Arc::clone(&votes_arc))).is_err() {
-                tracing::trace!(target: "bsc::vote", peer=%peer, "failed to send votes to peer, remove from registry");
-                to_remove.push(peer);
+                tracing::trace!(target: "bsc::vote", peer=%peer, "failed to send votes to peer");
+                failed_senders.push((peer, tx));
             }
         }
 
-        if !to_remove.is_empty() {
+        if !failed_senders.is_empty() {
             match REGISTRY.write() {
                 Ok(mut guard) => {
-                    for peer in to_remove {
-                        guard.remove(&peer);
+                    for (peer, failed_tx) in failed_senders {
+                        remove_peer_if_same_channel(&mut guard, peer, &failed_tx);
                     }
                 }
                 Err(e) => {
@@ -659,6 +666,34 @@ mod version_tests {
 
     fn pid(byte: u8) -> PeerId {
         B512::repeat_byte(byte)
+    }
+
+    #[test]
+    fn failed_send_cleanup_preserves_reconnected_sender() {
+        let peer = pid(1);
+        let (old_tx, old_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut registry = HashMap::from([(peer, PeerEntry { tx: old_tx, version: 2 })]);
+        let snapshot_tx = registry[&peer].tx.clone();
+        drop(old_rx);
+
+        let (new_tx, mut new_rx) = tokio::sync::mpsc::unbounded_channel();
+        registry.insert(peer, PeerEntry { tx: new_tx, version: 2 });
+        assert!(!remove_peer_if_same_channel(&mut registry, peer, &snapshot_tx));
+
+        registry[&peer].tx.send(BscCommand::Votes(Arc::default())).unwrap();
+        assert!(matches!(new_rx.try_recv(), Ok(BscCommand::Votes(_))));
+    }
+
+    #[test]
+    fn failed_send_cleanup_removes_current_sender() {
+        let peer = pid(1);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut registry = HashMap::from([(peer, PeerEntry { tx, version: 2 })]);
+        let snapshot_tx = registry[&peer].tx.clone();
+        drop(rx);
+
+        assert!(remove_peer_if_same_channel(&mut registry, peer, &snapshot_tx));
+        assert!(!registry.contains_key(&peer));
     }
 
     /// Drops the test peer from the global registry on test exit so that
