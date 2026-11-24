@@ -5,8 +5,8 @@ use alloy_primitives::{Address, Signature, TxKind, U256};
 use reth_primitives_traits::Recovered;
 use reth_rpc_eth_types::error::RpcPoolError;
 use reth_transaction_pool::{
-    blobstore::InMemoryBlobStore, error::PoolErrorKind, noop::MockTransactionValidator, PoolConfig,
-    TransactionPool, TransactionPoolExt,
+    blobstore::InMemoryBlobStore, error::PoolErrorKind, noop::MockTransactionValidator,
+    CoinbaseTipOrdering, Pool, PoolConfig, TransactionPool, TransactionPoolExt,
 };
 use tip::meets_tip_floor;
 
