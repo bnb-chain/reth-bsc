@@ -9,7 +9,7 @@ use crate::{
         engine::BscBuiltPayload,
         evm::config::BscEvmConfig,
         miner::{
-            bid_simulator::{BidRuntime, BidSimulator},
+            bid_simulator::{Bid, BidSimulator},
             config::MiningConfig,
             payload::{BscBuildArguments, BscPayloadBuilder, BscPayloadJob, BscPayloadJobHandle},
             signer::init_global_signer_from_k256,
@@ -17,7 +17,9 @@ use crate::{
         },
         network::{block_import::service::IncomingLocalBlock, BscNewBlock},
     },
-    shared::get_local_block_import_sender,
+    shared::{
+        get_local_block_import_sender, BidRequest, BidSenders, BID_QUEUE_CAPACITY, BID_SENDERS,
+    },
 };
 use alloy_consensus::BlockHeader;
 use alloy_primitives::{Address, Sealable, U128};
@@ -1084,10 +1086,7 @@ where
 
 pub struct MevWorkWorker<Provider, Pool> {
     simulator: Arc<BidSimulator<Provider, Pool>>, // No outer RwLock, each map has its own lock
-    bid_simulate_req_rx: mpsc::UnboundedReceiver<BidRuntime<Pool, BscEvmConfig>>,
-    bid_simulate_req_tx: mpsc::UnboundedSender<BidRuntime<Pool, BscEvmConfig>>,
     provider: Provider,
-    mev_running: Arc<AtomicBool>,
 }
 
 impl<Provider, Pool> MevWorkWorker<Provider, Pool>
@@ -1103,77 +1102,64 @@ where
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>> + 'static,
 {
     pub fn new(simulator: Arc<BidSimulator<Provider, Pool>>, provider: Provider) -> Self {
-        let (bid_simulate_req_tx, bid_simulate_req_rx) =
-            mpsc::unbounded_channel::<BidRuntime<Pool, BscEvmConfig>>();
-        Self {
-            simulator,
-            bid_simulate_req_rx,
-            bid_simulate_req_tx,
-            provider,
-            mev_running: Arc::new(AtomicBool::new(false)),
-        }
+        Self { simulator, provider }
     }
 
-    pub async fn run(mut self) {
+    pub(super) async fn run(self, mut requests: mpsc::Receiver<BidRequest<Bid>>) {
         info!("Starting MevWorkWorker");
-        self.mev_running.store(true, Ordering::Relaxed);
-
-        // Set global MEV running status
-        if let Err(e) = crate::shared::set_mev_running(self.mev_running.clone()) {
-            warn!("MEV running status already set: {:?}", e);
-        }
-
-        let mut send_bid_interval = tokio::time::interval(Duration::from_millis(20));
-        let mut clear_bid_interval = tokio::time::interval(Duration::from_millis(1000));
+        let mut clear_bid_interval = tokio::time::interval(Duration::from_secs(1));
+        let mut running: Option<(tokio::task::JoinHandle<Option<Bid>>, Arc<AtomicBool>)> = None;
 
         loop {
-            tokio::select! {
-                bid_runtime = self.bid_simulate_req_rx.recv() => {
-                    match bid_runtime {
-                        Some(bid_runtime) => {
-                            // A finished simulation may produce a recommit request
-                            // (go-bsc simBid defer): the follow-up simulation of a
-                            // better bid that was parked during this run.
-                            if let Some(req) = self.simulator.bid_simulate(bid_runtime) {
-                                if let Err(e) = self.bid_simulate_req_tx.send(req) {
-                                    error!("Failed to send recommit bid simulate request due to channel closed: {}", e);
-                                }
-                            }
-                        }
-                        None => {
-                            warn!("Bid simulate request channel closed");
-                            break;
-                        }
+            let (admission, feedback) = tokio::select! {
+                request = requests.recv() => {
+                    let Some(request) = request else { break };
+                    (self.simulator.commit_new_bid(request.bid), Some(request.feedback))
+                }
+                completed = async {
+                    match &mut running {
+                        Some((task, _)) => task.await,
+                        None => std::future::pending().await,
                     }
+                } => {
+                    running = None;
+                    let Some(bid) = completed.expect("bid simulation task failed") else { continue };
+                    // Like go-bsc's recommit probe, yield to incoming ordinary bids.
+                    if !requests.is_empty() { continue }
+                    (self.simulator.commit_bid_inner(bid), None)
                 }
-
-                // Interval for checking bid packages
-                _ = send_bid_interval.tick() => {
-                    // Attempt to send bids
-                    self.get_bid_and_send();
-                }
-
                 _ = clear_bid_interval.tick() => {
                     let last_block_number = self.provider.last_block_number().unwrap_or(0);
                     self.simulator.clear(last_block_number);
+                    continue;
                 }
+            };
+
+            let result = match admission {
+                Ok(Some(mut runtime)) => {
+                    // Hand off one simulation at a time. A replacement supersedes the old
+                    // simulation's recommit probe, including when the parent has changed.
+                    if let Some((task, interrupt)) = running.take() {
+                        interrupt.store(true, Ordering::Relaxed);
+                        task.await.expect("bid simulation task failed");
+                    }
+                    self.simulator.start_simulation(&mut runtime);
+                    let interrupt = runtime.bid.interrupt_flag.clone();
+                    let simulator = self.simulator.clone();
+                    let task = tokio::task::spawn_blocking(move || simulator.bid_simulate(runtime));
+                    running = Some((task, interrupt));
+                    Ok(())
+                }
+                Ok(None) => Ok(()),
+                Err(error) => Err(error),
+            };
+            if let Some(feedback) = feedback {
+                let _ = feedback.send(result);
             }
         }
-    }
-
-    /// Send a bid to the miner's bid simulator (reads from global queue)
-    fn get_bid_and_send(&self) {
-        // Read bid packages from the global queue
-        if let Some(bid_package) = crate::shared::pop_bid_package() {
-            debug!(
-                "Popped bid package from queue, block: {}, committing to simulator",
-                bid_package.block_number
-            );
-            if let Some(req) = self.simulator.commit_new_bid(bid_package) {
-                if let Err(e) = self.bid_simulate_req_tx.send(req) {
-                    error!("Failed to send bid simulate request due to channel closed: {}", e);
-                }
-            }
+        if let Some((task, interrupt)) = running {
+            interrupt.store(true, Ordering::Relaxed);
+            task.await.expect("bid simulation task failed");
         }
     }
 }
@@ -1321,14 +1307,17 @@ where
     }
 
     fn spawn_workers(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Match the capacity of go-bsc's newBidBlockCh.
-        let (bid_block_tx, mut bid_block_rx) = mpsc::channel(100);
-        crate::shared::set_bid_block_sender(bid_block_tx)?;
+        // Match go-bsc's independent newBidCh and newBidBlockCh.
+        let (bid_tx, bid_rx) = mpsc::channel(BID_QUEUE_CAPACITY);
+        let (bid_block_tx, mut bid_block_rx) = mpsc::channel(BID_QUEUE_CAPACITY);
+        BID_SENDERS
+            .set(BidSenders { bid: bid_tx, bid_block: bid_block_tx })
+            .map_err(|_| "Bid intake already initialized")?;
         let simulator = self.mev_work_worker.simulator.clone();
         self.task_executor.spawn_critical_task("bid_block_worker", async move {
             while let Some(request) = bid_block_rx.recv().await {
-                let bid_hash = request.decoded.hash();
-                let result = simulator.commit_bid_block(request.decoded);
+                let bid_hash = request.bid.hash();
+                let result = simulator.commit_bid_block(request.bid);
                 if let Err(error) = &result {
                     debug!(%bid_hash, %error, "BidBlock discarded");
                 }
@@ -1336,7 +1325,10 @@ where
                 let _ = request.feedback.send(result);
             }
         });
-        self.task_executor.spawn_critical_task("mev_work_worker", self.mev_work_worker.run());
+        self.task_executor.spawn_critical_task("mev_work_worker", self.mev_work_worker.run(bid_rx));
+        if let Err(e) = crate::shared::set_mev_running(Arc::new(AtomicBool::new(true))) {
+            warn!("MEV running status already set: {:?}", e);
+        }
         self.task_executor.spawn_critical_task("new_work_worker", self.new_work_worker.run());
         self.task_executor.spawn_critical_task("main_work_worker", self.main_work_worker.run());
         self.task_executor.spawn_critical_task("result_work_worker", self.result_work_worker.run());

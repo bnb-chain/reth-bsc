@@ -251,9 +251,6 @@ fn main() -> eyre::Result<()> {
         std::env::set_var("RUST_BACKTRACE", "1");
     }
 
-    // Initialize bid package queue at startup
-    reth_bsc::shared::init_bid_package_queue();
-
     let matches = bsc_cli_command().get_matches();
     Cli::<BscChainSpecParser, BscCliArgs>::from_arg_matches(&matches)?.run_with_components::<BscNode>(
         |spec| {

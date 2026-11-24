@@ -3,10 +3,11 @@ use crate::{
     consensus::parlia::{Snapshot, SnapshotProvider},
     hardforks::BscHardforks,
     node::miner::{
-        bid_block::{bid_must_before_ms, BidBlockArgs, BidBlockRequest, DecodedBidBlock},
+        bid_block::{bid_must_before_ms, BidBlockArgs, DecodedBidBlock},
         bid_simulator::{validate_bid_blob_sidecar, Bid},
         config::{keystore, MiningConfig},
     },
+    shared::{BidRequest, BID_SENDERS},
 };
 use alloy_consensus::{
     transaction::RlpEcdsaDecodableTx, BlobTransactionSidecar, Transaction, TxEip4844WithSidecar,
@@ -256,7 +257,7 @@ const BID_BLOCK_PERMISSION_REVOKED_ERROR: i32 = -38006;
 const BID_BLOCK_PRE_SEAL_VERIFY_ERROR: i32 = -38007;
 const BID_BLOCK_TOO_LATE_ERROR: i32 = -38008;
 const DEFAULT_ERROR: i32 = -32000;
-const BID_BLOCK_RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
+const BID_RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Reproduces go-bsc `Miner.bidBlockEnabled()`: a BidBlock is only accepted when MEV is running,
 /// the `BidBlockEnabled` flag is set, and the Pasteur fork is active at the chain head.
@@ -269,20 +270,15 @@ fn bid_block_admission_enabled(
 }
 
 /// Like go-bsc, use one timeout for both bounded enqueue and the worker's feedback.
-async fn submit_bid_block_request(
-    sender: &mpsc::Sender<BidBlockRequest>,
-    decoded: DecodedBidBlock,
+async fn submit_bid_request<T>(
+    sender: &mpsc::Sender<BidRequest<T>>,
+    bid_hash: B256,
+    make_bid: impl FnOnce() -> T,
 ) -> RpcResult<B256> {
-    let bid_hash = decoded.hash();
-    let block_number = decoded.block_number();
-    let builder = decoded.builder;
     let (feedback, response) = oneshot::channel();
-    let result = tokio::time::timeout(BID_BLOCK_RESPONSE_TIMEOUT, async {
+    let result = tokio::time::timeout(BID_RESPONSE_TIMEOUT, async {
         let permit = sender.reserve().await.map_err(|_| ())?;
-        tracing::info!(
-            "BidBlock queued: block={block_number}, builder={builder}, bidHash={bid_hash:?}"
-        );
-        permit.send(BidBlockRequest { decoded, feedback });
+        permit.send(BidRequest { bid: make_bid(), feedback });
         response.await.map_err(|_| ())
     })
     .await;
@@ -708,8 +704,16 @@ impl MevApiImpl {
         .map_err(|r| Self::structural_rejection(r, block_number, head_header.number, head_hash))?;
 
         let decoded = self.admit_bid_block(&args, &head_header)?;
-        let sender = crate::shared::bid_block_sender().ok_or_else(Self::mev_not_running)?;
-        submit_bid_block_request(sender, decoded).await
+        let senders = BID_SENDERS.get().ok_or_else(Self::mev_not_running)?;
+        let bid_hash = decoded.hash();
+        submit_bid_request(&senders.bid_block, bid_hash, || {
+            tracing::info!(
+                "BidBlock queued: block={block_number}, builder={}, bidHash={bid_hash:?}",
+                decoded.builder
+            );
+            decoded
+        })
+        .await
     }
 
     /// Miner-side BidBlock admission, mirroring go-bsc `Miner.SendBidBlock`.
@@ -1222,8 +1226,8 @@ impl BscMevApiServer for MevApiImpl {
             )));
         }
 
-        crate::shared::push_bid_package(bid_obj)
-            .map_err(|e| Self::internal_err(format!("failed to queue bid: {e}")))?;
+        let senders = BID_SENDERS.get().ok_or_else(Self::mev_not_running)?;
+        submit_bid_request(&senders.bid, bid_hash, || bid_obj).await?;
         tracing::info!("Bid accepted for block {block_number}, bid_hash: {bid_hash:?}");
         Ok(bid_hash)
     }
@@ -1323,15 +1327,16 @@ mod bid_block_param_tests {
         let first = decoded_bid_for_intake(1);
         let second = decoded_bid_for_intake(2);
         let first_hash = first.hash();
-        let first_response = submit_bid_block_request(&sender, first);
-        let second_response = submit_bid_block_request(&sender, second);
+        let first_response = submit_bid_request(&sender, first_hash, || first);
+        let second_hash = second.hash();
+        let second_response = submit_bid_request(&sender, second_hash, || second);
         let start = tokio::time::Instant::now();
 
         let (first, second, ()) = tokio::join!(first_response, second_response, async {
             let first = receiver.recv().await.unwrap();
             let second = receiver.recv().await.unwrap();
-            assert_eq!(first.decoded.block_number(), 1);
-            assert_eq!(second.decoded.block_number(), 2);
+            assert_eq!(first.bid.block_number(), 1);
+            assert_eq!(second.bid.block_number(), 2);
             first.feedback.send(Ok(())).unwrap();
             second.feedback.send(Err("BidBlock gasFee not higher".into())).unwrap();
         });
@@ -1345,22 +1350,20 @@ mod bid_block_param_tests {
     async fn bid_block_intake_uses_one_timeout_for_enqueue_and_feedback() {
         let (sender, mut receiver) = mpsc::channel(1);
         let (feedback, _response) = oneshot::channel();
-        sender
-            .send(BidBlockRequest { decoded: decoded_bid_for_intake(1), feedback })
-            .await
-            .unwrap();
+        sender.send(BidRequest { bid: decoded_bid_for_intake(1), feedback }).await.unwrap();
         let start = tokio::time::Instant::now();
 
-        let (response, queued) =
-            tokio::join!(submit_bid_block_request(&sender, decoded_bid_for_intake(2)), async {
-                tokio::time::sleep(Duration::from_millis(700)).await;
-                assert_eq!(receiver.recv().await.unwrap().decoded.block_number(), 1);
-                receiver.recv().await.unwrap()
-            },);
+        let bid = decoded_bid_for_intake(2);
+        let hash = bid.hash();
+        let (response, queued) = tokio::join!(submit_bid_request(&sender, hash, || bid), async {
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            assert_eq!(receiver.recv().await.unwrap().bid.block_number(), 1);
+            receiver.recv().await.unwrap()
+        },);
 
-        assert_eq!(queued.decoded.block_number(), 2);
+        assert_eq!(queued.bid.block_number(), 2);
         assert_eq!(response.unwrap_err().code(), MEV_BUSY_ERROR);
-        assert_eq!(start.elapsed(), BID_BLOCK_RESPONSE_TIMEOUT);
+        assert_eq!(start.elapsed(), BID_RESPONSE_TIMEOUT);
     }
 
     #[test]

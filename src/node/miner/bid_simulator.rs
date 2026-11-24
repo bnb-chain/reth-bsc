@@ -39,7 +39,7 @@ use reth_evm::{
 use reth_execution_types::BlockExecutionOutput;
 use reth_node_ethereum::engine::EthPayloadAttributes;
 use reth_payload_primitives::{BuiltPayloadExecutedBlock, PayloadBuilderError};
-use reth_primitives_traits::{SealedHeader, SignerRecoverable};
+use reth_primitives_traits::{constants::MAX_TX_GAS_LIMIT_OSAKA, SealedHeader, SignerRecoverable};
 use reth_provider::{
     BlockHashReader, EvmStateProviderAdapter, HeaderProvider, StateProviderFactory,
 };
@@ -208,7 +208,6 @@ pub struct BidSimulator<Client, Pool> {
     /// The selection path signs and seals only the winner.
     best_bid_block: Arc<RwLock<HashMap<B256, Arc<DecodedBidBlock>>>>,
     pending_bid: Arc<RwLock<HashMap<String, u8>>>,
-    bid_receiving: bool,
     chain_spec: Arc<BscChainSpec>,
     min_gas_price: U256,
     validator_commission: u64,
@@ -263,7 +262,6 @@ where
             best_bid: Arc::new(RwLock::new(HashMap::new())),
             best_bid_block: Arc::new(RwLock::new(HashMap::new())),
             pending_bid: Arc::new(RwLock::new(HashMap::new())),
-            bid_receiving: true,
             min_gas_price: U256::from(get_global_mining_config().map_or_else(
                 || MiningConfig::default().get_min_gas_tip(),
                 MiningConfig::get_min_gas_tip,
@@ -312,10 +310,9 @@ where
         self.mev_metrics.pending_bids.increment(1);
     }
 
-    pub fn commit_new_bid(&self, bid: Bid) -> Option<BidRuntime<Pool, BscEvmConfig>> {
+    pub(crate) fn commit_new_bid(&self, bid: Bid) -> Result<Option<BidRuntime<Pool>>, String> {
         if !self.check_pending_bid(bid.block_number, bid.builder, bid.bid_hash) {
-            debug!("bid is already pending, ignore");
-            return None;
+            return Err("bid already exists".into());
         }
         self.add_pending_bid(bid.block_number, bid.builder, bid.bid_hash);
         self.commit_bid_inner(bid)
@@ -324,35 +321,26 @@ where
     // Admission shared by new bids and the post-simulation recommit probe (go-bsc
     // newBidLoop). The probe re-enters with a bid that is already in pending_bid, so
     // it must skip commit_new_bid's dedup — go-bsc has no dedup on the newBidCh path.
-    fn commit_bid_inner(&self, bid: Bid) -> Option<BidRuntime<Pool, BscEvmConfig>> {
-        let final_block_number = match self.client.finalized_block_number() {
-            Ok(Some(final_block_number)) => final_block_number,
-            Ok(None) => return None,
-            Err(_) => return None,
-        };
-        if bid.block_number <= final_block_number {
-            // Bid is for a block that's already finalized, ignore it
-            return None;
+    pub(crate) fn commit_bid_inner(&self, bid: Bid) -> Result<Option<BidRuntime<Pool>>, String> {
+        let latest = self.client.best_block_number().map_err(|error| error.to_string())?;
+        if bid.block_number <= latest {
+            return Err(format!(
+                "bid is discarded, stale block number: {}, latest block: {latest}",
+                bid.block_number
+            ));
         }
 
         let parent_hash = bid.parent_hash;
-        let parent_header = match self.client.header(parent_hash) {
-            Ok(Some(header)) => SealedHeader::new(header, parent_hash),
-            _ => {
-                debug!("Failed to get parent header for hash: {:?}", parent_hash);
-                return None;
-            }
-        };
-        let parent_snapshot = match self.snapshot_provider.snapshot_by_hash(&parent_hash) {
-            Some(snapshot) => snapshot,
-            None => {
-                debug!(
-                    "Skip to mine new block due to no snapshot available, validator: {}, tip: {}",
-                    self.validator_address, parent_hash
-                );
-                return None;
-            }
-        };
+        let parent_header = self
+            .client
+            .header(parent_hash)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("parent header unavailable: {parent_hash}"))?;
+        let parent_header = SealedHeader::new(parent_header, parent_hash);
+        let parent_snapshot = self
+            .snapshot_provider
+            .snapshot_by_hash(&parent_hash)
+            .ok_or_else(|| format!("parent snapshot unavailable: {parent_hash}"))?;
         let mut mining_ctx = MiningContext {
             parent_snapshot: Arc::new(parent_snapshot),
             parent_header: parent_header.clone(),
@@ -370,90 +358,67 @@ where
             self.validator_address,
         );
 
-        let mut _bid_runtime = match self.new_bid_runtime(
-            &bid,
-            self.validator_commission,
-            attributes.clone(),
-            mining_ctx.clone(),
-        ) {
-            Ok(bid_runtime) => bid_runtime,
-            Err(err) => {
-                debug!("create runtime error:{}", err);
-                return None;
+        let mut runtime = self.new_bid_runtime(&bid, attributes.clone(), mining_ctx.clone())?;
+        // go-bsc checks the Osaka per-transaction limit at admission, before simulation.
+        if let Some(gas) =
+            bid.txs.iter().map(Transaction::gas_limit).find(|gas| *gas > MAX_TX_GAS_LIMIT_OSAKA)
+        {
+            let head = self
+                .client
+                .header_by_number(latest)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("head header unavailable: {latest}"))?;
+            if BscHardforks::is_osaka_active_at_timestamp(
+                self.chain_spec.as_ref(),
+                head.number,
+                head.timestamp,
+            ) {
+                return Err(format!("bid rejected: transaction gas limit too high (cap: {MAX_TX_GAS_LIMIT_OSAKA}, tx: {gas})"));
             }
-        };
-        let mut to_commit = true;
-        let mut _bid_accepted = true;
+        }
 
-        // Acquire read lock only when needed
         let best_bid_opt = self.best_bid_to_run.read().get(&parent_hash).cloned();
         if let Some(best_bid) = best_bid_opt {
-            let best_bid_runtime = match self.new_bid_runtime(
-                &best_bid,
-                self.validator_commission,
-                attributes.clone(),
-                mining_ctx.clone(),
-            ) {
-                Ok(best_bid_runtime) => best_bid_runtime,
-                Err(err) => {
-                    debug!("create runtime error:{}", err);
-                    return None;
-                }
-            };
-            if _bid_runtime.is_expected_better_than(&best_bid_runtime) {
+            let best_bid_runtime =
+                self.new_bid_runtime(&best_bid, attributes, mining_ctx.clone())?;
+            if runtime.is_expected_better_than(&best_bid_runtime) {
                 debug!(
                     "new bid has better expectedBlockReward builder:{}, bid_hash:{}",
-                    _bid_runtime.bid.builder, _bid_runtime.bid.bid_hash,
+                    runtime.bid.builder, runtime.bid.bid_hash,
                 );
             } else if !best_bid.is_committed() {
-                _bid_runtime = best_bid_runtime;
-                _bid_accepted = false;
-                debug!("discard new bid and to simulate the non-committed bestBidToRun builder:{}, bid_hash:{}", _bid_runtime.bid.builder,"");
+                runtime = best_bid_runtime;
+                debug!("discard new bid and to simulate the non-committed bestBidToRun builder:{}, bid_hash:{}", runtime.bid.builder, runtime.bid.bid_hash);
             } else {
-                to_commit = false;
-                _bid_accepted = false;
                 debug!(
                     "new bid will be discarded builder:{}, bid_hash:{}",
-                    _bid_runtime.bid.builder, _bid_runtime.bid.bid_hash,
+                    runtime.bid.builder, runtime.bid.bid_hash,
                 );
+                return Ok(None);
             }
         }
 
-        if to_commit {
-            self.best_bid_to_run
-                .write()
-                .insert(_bid_runtime.bid.parent_hash, _bid_runtime.bid.clone());
-
-            if let Some(simulating_bid) = self.simulating_bid.read().get(&bid.parent_hash).cloned()
-            {
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
-                if can_be_interrupted(
-                    mining_ctx.block_timestamp_ms,
-                    now_ms,
-                    self.no_interrupt_left_over,
-                ) {
-                    simulating_bid.interrupt_flag.store(true, Ordering::Relaxed);
-                    self.record_interrupt(bid.parent_hash, bid.block_number);
-                    let bid_simulate_req = self.commit_bid(5, _bid_runtime);
-                    return Some(bid_simulate_req);
-                } else {
-                    debug!(
-                        "simulate in progress, no interrupt, left:{}, no_interrupt_left_over:{}, bid hash:{}",
-                        mining_ctx.block_timestamp_ms.saturating_sub(now_ms),
-                        self.no_interrupt_left_over,
-                        _bid_runtime.bid.bid_hash
-                    );
+        self.best_bid_to_run.write().insert(parent_hash, runtime.bid.clone());
+        if self.is_simulating(parent_hash) {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            if !can_be_interrupted(
+                mining_ctx.block_timestamp_ms,
+                now_ms,
+                self.no_interrupt_left_over,
+            ) {
+                // Keep the better bid parked for the post-simulation recommit probe.
+                if bid.bid_hash == runtime.bid.bid_hash {
+                    let left_ms = i128::from(mining_ctx.block_timestamp_ms) - i128::from(now_ms);
+                    return Err(format!("bid is pending as no enough time to interrupt, left:{left_ms}, NoInterruptLeftOver:{}", self.no_interrupt_left_over));
                 }
-            } else {
-                let bid_simulate_req = self.commit_bid(5, _bid_runtime);
-                return Some(bid_simulate_req);
+                return Ok(None);
             }
+            self.record_interrupt(parent_hash, bid.block_number);
         }
-
-        None
+        Ok(Some(self.commit_bid(5, runtime)))
     }
 
     /// Records that an in-flight simulation building on `parent_hash` was preempted by a
@@ -520,28 +485,31 @@ where
 
     fn new_bid_runtime(
         &self,
-        _bid: &Bid,
-        _validator_commission: u64,
+        bid: &Bid,
         attributes: EthPayloadAttributes,
         mining_ctx: MiningContext,
-    ) -> Result<BidRuntime<Pool, BscEvmConfig>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<BidRuntime<Pool>, String> {
         let mut runtime = BidRuntime::new(
-            _bid.clone(),
+            bid.clone(),
             self.pool.clone(),
             BscEvmConfig::new(self.chain_spec.clone()),
             attributes,
             self.chain_spec.clone(),
             mining_ctx,
         );
-        let expected_block_reward = _bid.gas_fee;
+        let expected_block_reward = bid.gas_fee;
         let mut expected_validator_reward =
-            expected_block_reward * U256::from(_validator_commission);
+            expected_block_reward * U256::from(self.validator_commission);
         expected_validator_reward /= U256::from(10000u64);
-        if expected_validator_reward < _bid.builder_fee {
-            debug!("BidSimulator: invalid bid, builder fee exceeds validator reward, ignore expected_validator_reward:{} builder_fee:{}", expected_validator_reward, _bid.builder_fee);
-            return Err("invalid bid: builder fee exceeds validator reward".into());
+        if expected_validator_reward < bid.builder_fee {
+            debug!("BidSimulator: invalid bid, builder fee exceeds validator reward, ignore expected_validator_reward:{} builder_fee:{}", expected_validator_reward, bid.builder_fee);
+            return Err(format!(
+                "validator reward is less than 0, value: -{}, commissionConfig: {}",
+                bid.builder_fee - expected_validator_reward,
+                self.validator_commission
+            ));
         }
-        expected_validator_reward -= _bid.builder_fee;
+        expected_validator_reward -= bid.builder_fee;
         runtime.expected_block_reward = expected_block_reward;
         runtime.expected_validator_reward = expected_validator_reward;
         Ok(runtime)
@@ -567,25 +535,25 @@ where
         bid_runtime
     }
 
+    // Register before the worker handles another admission, even if the blocking task has
+    // not started yet. Each run, including a recommit, gets its own interruption flag.
+    pub(crate) fn start_simulation(&self, runtime: &mut BidRuntime<Pool>) {
+        runtime.bid.interrupt_flag = Arc::new(AtomicBool::new(false));
+        self.simulating_bid.write().insert(runtime.bid.parent_hash, runtime.bid.clone());
+    }
+
     // sim_bid commit tx and set best bid (go-bsc simBid). On a clean simulation this
-    // returns the follow-up request produced by the recommit probe (go-bsc's simBid
-    // defer re-sends the best bid through newBidCh) — the caller must feed it back
-    // into the simulate loop.
-    pub fn bid_simulate(
+    // returns the best bid for the admission worker to reconsider when its queue is empty.
+    pub(crate) fn bid_simulate(
         &self,
         mut bid_runtime: BidRuntime<Pool, BscEvmConfig>,
-    ) -> Option<BidRuntime<Pool, BscEvmConfig>> {
-        if !self.bid_receiving {
-            return None;
-        }
-
+    ) -> Option<Bid> {
         // Track simulation start time
         let sim_start = std::time::Instant::now();
         let is_first_bid = self.best_bid.read().is_empty();
         let parent_hash = bid_runtime.bid.parent_hash;
 
-        self.simulating_bid.write().insert(parent_hash, bid_runtime.bid.clone());
-        // Counted here, alongside the in-flight insert, so it covers every simulation regardless of
+        // Count every started simulation regardless of
         // how it exits — the denominator for the interrupt-thrash ratio must include aborted runs,
         // which `bid_simulation_duration_seconds` below deliberately excludes.
         self.mev_metrics.bid_simulation_started_total.increment(1);
@@ -656,11 +624,7 @@ where
         // deliberately re-running greedy merge over the current mempool. The
         // no-time-left guard in simulate_bid_inner is what terminates this loop at
         // DELAY_LEFT_OVER before the seal deadline.
-        if crate::shared::bid_package_queue_len() > 0 {
-            return None;
-        }
-        let recommit = self.best_bid.read().get(&parent_hash).map(|rt| rt.bid.clone())?;
-        self.commit_bid_inner(recommit)
+        self.best_bid.read().get(&parent_hash).map(|rt| rt.bid.clone())
     }
 
     fn simulate_bid_inner(
@@ -986,7 +950,7 @@ where
         let bid_hash = decoded.hash();
         let block_number = decoded.block_number();
         let gas_fee = decoded.gas_fee;
-        let head_number = self.client.last_block_number().unwrap_or(0);
+        let head_number = self.client.best_block_number().map_err(|error| error.to_string())?;
         if block_number <= head_number {
             return Err(format!(
                 "BidBlock is discarded, stale block number: {block_number}, latest block: {head_number}, builder={}, bidHash={bid_hash}",
@@ -1403,14 +1367,14 @@ mod tests {
     use crate::node::miner::bid_block::{BidBlock, BidBlockArgs};
     use alloy_primitives::Bytes;
 
-    fn price_test_simulator() -> BidSimulator<
+    fn test_simulator() -> BidSimulator<
         reth_provider::test_utils::MockEthProvider,
         reth_transaction_pool::noop::NoopTransactionPool,
     > {
-        struct EmptySnapshots;
-        impl SnapshotProvider for EmptySnapshots {
-            fn snapshot_by_hash(&self, _: &B256) -> Option<Snapshot> {
-                None
+        struct TestSnapshots;
+        impl SnapshotProvider for TestSnapshots {
+            fn snapshot_by_hash(&self, hash: &B256) -> Option<Snapshot> {
+                Some(Snapshot::new(vec![Address::ZERO], 10, *hash, 200, None))
             }
             fn insert(&self, _: Snapshot) {}
         }
@@ -1422,7 +1386,7 @@ mod tests {
             spec.clone(),
             Arc::new(crate::consensus::parlia::Parlia::new(spec, 200)),
             Address::ZERO,
-            Arc::new(EmptySnapshots),
+            Arc::new(TestSnapshots),
             100,
             false,
             0,
@@ -1431,9 +1395,116 @@ mod tests {
         )
     }
 
+    fn ordinary_bid(block_number: u64, fee: u64) -> Bid {
+        Bid {
+            builder: Address::ZERO,
+            block_number,
+            parent_hash: B256::ZERO,
+            txs: vec![],
+            blob_sidecars: HashMap::new(),
+            un_revertible: vec![],
+            gas_used: 21000,
+            gas_fee: U256::from(fee),
+            builder_fee: U256::ZERO,
+            committed: false,
+            bid_hash: B256::random(),
+            interrupt_flag: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ordinary_bid_worker_returns_admission_feedback_without_polling() {
+        use crate::{node::miner::bsc_miner::MevWorkWorker, shared::BidRequest};
+        let simulator = Arc::new(test_simulator());
+        let provider = simulator.client.clone();
+        provider
+            .add_header(B256::ZERO, alloy_consensus::Header { number: 10, ..Default::default() });
+        let worker = MevWorkWorker::new(simulator, provider);
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let start = tokio::time::Instant::now();
+        let (_, ()) = tokio::join!(worker.run(receiver), async move {
+            let mut negative_reward = ordinary_bid(11, 100);
+            negative_reward.builder_fee = U256::from(2);
+            for (bid, expected) in [
+                (
+                    ordinary_bid(10, 100),
+                    Err("bid is discarded, stale block number: 10, latest block: 10".to_owned()),
+                ),
+                (
+                    negative_reward,
+                    Err("validator reward is less than 0, value: -1, commissionConfig: 100"
+                        .to_owned()),
+                ),
+                (ordinary_bid(11, 100), Ok(())),
+            ] {
+                let (feedback, response) = tokio::sync::oneshot::channel();
+                sender.send(BidRequest { bid, feedback }).await.unwrap();
+                assert_eq!(response.await.unwrap(), expected);
+            }
+            assert_eq!(start.elapsed(), std::time::Duration::ZERO);
+        });
+    }
+
+    #[test]
+    fn ordinary_bid_checks_tx_gas_at_the_current_heads_osaka_fork() {
+        use alloy_consensus::TxLegacy;
+        use alloy_primitives::Signature;
+        use reth_chainspec::{ChainSpecBuilder, EthereumHardfork, ForkCondition};
+
+        let mut simulator = test_simulator();
+        let spec = Arc::new(BscChainSpec::from(
+            ChainSpecBuilder::mainnet()
+                .with_fork(EthereumHardfork::London, ForkCondition::Block(0))
+                .with_fork(crate::hardforks::bsc::BscHardfork::Osaka, ForkCondition::Timestamp(100))
+                .build(),
+        ));
+        simulator.chain_spec = spec.clone();
+        simulator.parlia = Arc::new(crate::consensus::parlia::Parlia::new(spec, 200));
+        for (timestamp, gas, rejected) in [
+            (99, MAX_TX_GAS_LIMIT_OSAKA + 1, false),
+            (100, MAX_TX_GAS_LIMIT_OSAKA + 1, true),
+            (100, MAX_TX_GAS_LIMIT_OSAKA, false),
+        ] {
+            simulator.client.add_header(
+                B256::ZERO,
+                alloy_consensus::Header { number: 10, timestamp, ..Default::default() },
+            );
+            let mut bid = ordinary_bid(11, 100);
+            bid.txs.push(TransactionSigned::new_unhashed(
+                TxLegacy { gas_limit: gas, ..Default::default() }.into(),
+                Signature::new(U256::from(1), U256::from(1), false),
+            ));
+            let error = simulator.commit_new_bid(bid).err();
+            assert_eq!(error, rejected.then(|| format!("bid rejected: transaction gas limit too high (cap: {MAX_TX_GAS_LIMIT_OSAKA}, tx: {gas})")));
+        }
+    }
+
+    #[test]
+    fn ordinary_bid_feedback_distinguishes_parked_bid_from_lower_bid() {
+        let mut simulator = test_simulator();
+        simulator.no_interrupt_left_over = u64::MAX;
+        simulator
+            .client
+            .add_header(B256::ZERO, alloy_consensus::Header { number: 10, ..Default::default() });
+        let first = ordinary_bid(11, 100);
+        let mut running = simulator.commit_new_bid(first).unwrap().unwrap();
+        simulator.start_simulation(&mut running);
+        // A worse bid is acknowledged without dispatching another simulation, like go-bsc.
+        assert!(simulator.commit_new_bid(ordinary_bid(11, 50)).unwrap().is_none());
+        let better = ordinary_bid(11, 200);
+        let hash = better.bid_hash;
+        let err = simulator.commit_new_bid(better).err().unwrap();
+        assert!(err.starts_with("bid is pending as no enough time to interrupt, left:"));
+        assert_eq!(simulator.best_bid_to_run.read()[&B256::ZERO].bid_hash, hash);
+        assert!(!running.bid.interrupt_flag.load(Ordering::Relaxed));
+        simulator.simulating_bid.write().remove(&B256::ZERO);
+        let recommit = simulator.commit_bid_inner(running.bid).unwrap().unwrap();
+        assert_eq!(recommit.bid.bid_hash, hash);
+    }
+
     #[test]
     fn legacy_bid_price_fallback_uses_mining_configuration() {
-        let simulator = price_test_simulator();
+        let simulator = test_simulator();
         let expected = get_global_mining_config().map_or_else(
             || MiningConfig::default().get_min_gas_tip(),
             MiningConfig::get_min_gas_tip,
@@ -1444,7 +1515,7 @@ mod tests {
     #[test]
     fn legacy_bid_price_guard_observes_live_floor_updates() {
         let _guard = crate::node::pool::tests::TipGuard::new(50_000_000);
-        let simulator = price_test_simulator();
+        let simulator = test_simulator();
         let gas_used = 21_000;
         for floor in [50_000_000, 75_000_000, 25_000_000] {
             crate::shared::set_miner_gas_tip(floor);
