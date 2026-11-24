@@ -344,12 +344,6 @@ impl DecodedBidBlock {
     }
 }
 
-/// An admitted BidBlock and the miner's response after processing it.
-pub(crate) struct BidBlockRequest {
-    pub(crate) decoded: DecodedBidBlock,
-    pub(crate) feedback: tokio::sync::oneshot::Sender<Result<(), String>>,
-}
-
 /// Errors from decoding / recovering a [`BidBlockArgs`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BidBlockError {
