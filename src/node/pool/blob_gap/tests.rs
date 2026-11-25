@@ -1,6 +1,6 @@
 use super::*;
 use crate::node::pool::{tests::TipGuard, BscTxValidator};
-use alloy_consensus::{Header, TxEip4844};
+use alloy_consensus::{Header, TxEip1559, TxEip4844};
 use alloy_eips::eip4844::{
     builder::{SidecarBuilder, SimpleCoder},
     BlobTransactionSidecar,
@@ -21,6 +21,10 @@ type Validator =
 type TestPool = BscTransactionPool<Validator, InMemoryBlobStore, MockEthProvider>;
 
 fn pool() -> TestPool {
+    pool_with_config(PoolConfig::default().with_disabled_protocol_base_fee())
+}
+
+fn pool_with_config(config: PoolConfig) -> TestPool {
     let provider = MockEthProvider::default();
     let header = Header {
         number: 20_000_000,
@@ -41,7 +45,7 @@ fn pool() -> TestPool {
         BscTxValidator::new(validator, false, None),
         CoinbaseTipOrdering::default(),
         store,
-        PoolConfig::default().with_disabled_protocol_base_fee(),
+        config,
     );
     BscTransactionPool::new(inner, provider, TaskExecutor::test())
 }
@@ -370,12 +374,14 @@ struct ValidationGate {
     enabled: std::sync::atomic::AtomicBool,
     entered: Notify,
     release: Notify,
+    other_validated: Notify,
 }
 
 #[derive(Debug)]
 struct PausingValidator {
     pool: InnerPool<Validator, InMemoryBlobStore>,
     gate: Arc<ValidationGate>,
+    gate_nonce: u64,
 }
 
 impl TransactionValidator for PausingValidator {
@@ -386,11 +392,17 @@ impl TransactionValidator for PausingValidator {
         origin: TransactionOrigin,
         transaction: Self::Transaction,
     ) -> TransactionValidationOutcome<Self::Transaction> {
-        if self.gate.enabled.load(std::sync::atomic::Ordering::Relaxed) {
+        let gated = transaction.nonce() == self.gate_nonce &&
+            self.gate.enabled.load(std::sync::atomic::Ordering::Relaxed);
+        if gated {
             self.gate.entered.notify_one();
             self.gate.release.notified().await;
         }
-        self.pool.validator().validate_transaction(origin, transaction).await
+        let result = self.pool.validator().validate_transaction(origin, transaction).await;
+        if !gated {
+            self.gate.other_validated.notify_one();
+        }
+        result
     }
 }
 
@@ -401,7 +413,7 @@ async fn removal_during_revalidation_does_not_resurrect_transaction() {
     fund(&template, 1, 10);
     let gate = Arc::new(ValidationGate::default());
     let inner = Pool::new(
-        PausingValidator { pool: template.inner.clone(), gate: gate.clone() },
+        PausingValidator { pool: template.inner.clone(), gate: gate.clone(), gate_nonce: 11 },
         CoinbaseTipOrdering::default(),
         template.inner.blob_store().clone(),
         template.inner.config().clone(),
@@ -466,4 +478,175 @@ async fn transaction_mined_elsewhere_finishes_buffered_subscription() {
     assert_eq!(events.next().await, Some(TransactionEvent::Mined(tip.hash())));
     assert!(!pool.contains(&hash));
     assert!(pool.buffer.lock().is_empty());
+}
+
+fn ordinary(sender: u8, nonce: u64, tip: u128) -> EthPooledTransaction {
+    let tx = TxEip1559 {
+        chain_id: 1,
+        nonce,
+        gas_limit: 21_000,
+        max_fee_per_gas: tip,
+        max_priority_fee_per_gas: tip,
+        to: Address::repeat_byte(sender).into(),
+        ..Default::default()
+    };
+    EthPooledTransaction::new(
+        Recovered::new_unchecked(
+            TransactionSigned::new_unhashed(
+                tx.into(),
+                Signature::new(U256::from(1), U256::from(1), false),
+            ),
+            Address::repeat_byte(sender),
+        ),
+        200,
+    )
+}
+
+#[tokio::test]
+async fn batch_capacity_outcomes_match_unwrapped_pool() {
+    let _guard = TipGuard::new(0);
+    for mixed_origins in [false, true] {
+        let mut config = PoolConfig::default().with_disabled_protocol_base_fee();
+        config.pending_limit.max_txs = 1;
+        let wrapped = pool_with_config(config.clone());
+        let reference = pool_with_config(config);
+        for pool in [&wrapped, &reference] {
+            fund(pool, 1, 10);
+            fund(pool, 2, 10);
+        }
+        let txs = vec![ordinary(1, 10, 1_000_000_000), ordinary(2, 10, 2_000_000_000)];
+        let (actual, expected) = if mixed_origins {
+            let batch = vec![
+                (TransactionOrigin::Private, txs[0].clone()),
+                (TransactionOrigin::External, txs[1].clone()),
+            ];
+            (
+                wrapped.add_transactions_with_origins(batch.clone()).await,
+                reference.inner.add_transactions_with_origins(batch).await,
+            )
+        } else {
+            (
+                wrapped.add_transactions(TransactionOrigin::External, txs.clone()).await,
+                reference.inner.add_transactions(TransactionOrigin::External, txs.clone()).await,
+            )
+        };
+        // Eviction is applied after the entire batch: the first result must reflect its eviction.
+        assert!(matches!(
+            expected[0],
+            Err(PoolError { kind: PoolErrorKind::DiscardedOnInsert, .. })
+        ));
+        let normalize = |results: Vec<PoolResult<AddedTransactionOutcome>>| {
+            results
+                .into_iter()
+                .map(|result| result.map_err(|error| format!("{:?}", error.kind)))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(normalize(actual), normalize(expected));
+        assert_eq!(wrapped.all_transaction_hashes(), reference.inner.all_transaction_hashes());
+        assert_eq!(wrapped.all_transaction_hashes(), vec![*txs[1].hash()]);
+        assert!(wrapped.buffer.lock().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn batch_waits_for_validation_and_inserts_in_input_order() {
+    let _guard = TipGuard::new(0);
+    for mixed_origins in [false, true] {
+        let template = pool();
+        fund(&template, 1, 10);
+        let gate = Arc::new(ValidationGate::default());
+        gate.enabled.store(true, std::sync::atomic::Ordering::Relaxed);
+        let inner = Pool::new(
+            PausingValidator { pool: template.inner.clone(), gate: gate.clone(), gate_nonce: 10 },
+            CoinbaseTipOrdering::default(),
+            template.inner.blob_store().clone(),
+            template.inner.config().clone(),
+        );
+        let pool =
+            BscTransactionPool::new(inner, template.provider.clone(), template.tasks.clone());
+        let first = ordinary(1, 10, 1_000_000_000);
+        let second = ordinary(1, 11, 1_000_000_000);
+        let second_hash = *second.hash();
+        let submitting = pool.clone();
+        let task = tokio::spawn(async move {
+            if mixed_origins {
+                submitting
+                    .add_transactions_with_origins(vec![
+                        (TransactionOrigin::Private, first),
+                        (TransactionOrigin::External, second),
+                    ])
+                    .await
+            } else {
+                submitting.add_transactions(TransactionOrigin::External, vec![first, second]).await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), gate.entered.notified()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), gate.other_validated.notified())
+            .await
+            .unwrap();
+        // Nonce 11 finished validation, but the batch must still wait for nonce 10.
+        assert!(pool.get(&second_hash).is_none());
+        gate.release.notify_one();
+        let results = tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+        assert!(results.into_iter().all(|result| result.unwrap().is_pending()));
+        assert_eq!(pool.best_transactions().map(|tx| tx.nonce()).collect::<Vec<_>>(), [10, 11]);
+    }
+}
+
+#[tokio::test]
+async fn batch_preserves_result_positions_and_only_buffers_nonce_gaps() {
+    let _guard = TipGuard::new(0);
+    let pool = pool();
+    for sender in 1..=3 {
+        fund(&pool, sender, 10);
+    }
+    let already_buffered = blob(1, 11);
+    pool.add_transaction(TransactionOrigin::Local, already_buffered.clone()).await.unwrap();
+    let gap = blob(2, 11);
+    let mut invalid = blob(3, 11);
+    invalid.blob_sidecar = EthBlobTransactionSidecar::Missing;
+    let results = pool
+        .add_transactions_with_origins(vec![
+            (TransactionOrigin::Local, already_buffered),
+            (TransactionOrigin::External, gap.clone()),
+            (TransactionOrigin::External, gap),
+            (TransactionOrigin::Local, invalid),
+            (TransactionOrigin::Private, blob(2, 10)),
+        ])
+        .await;
+    assert_eq!(results.len(), 5);
+    assert!(matches!(&results[0], Err(PoolError { kind: PoolErrorKind::AlreadyImported, .. })));
+    assert!(results[1].as_ref().unwrap().is_queued());
+    assert!(matches!(&results[2], Err(PoolError { kind: PoolErrorKind::AlreadyImported, .. })));
+    assert!(matches!(
+        &results[3],
+        Err(PoolError {
+            kind: PoolErrorKind::InvalidTransaction(InvalidPoolTransactionError::Eip4844(
+                Eip4844PoolTransactionError::MissingEip4844BlobSidecar
+            )),
+            ..
+        })
+    ));
+    assert!(results[4].as_ref().unwrap().is_pending());
+    pool.promote().await;
+    assert!(pool.get(blob(2, 11).hash()).is_some());
+    assert_eq!(pool.buffer.lock().len(), 1); // only sender 1 still has a gap
+}
+
+#[tokio::test]
+async fn gap_already_admitted_later_in_batch_is_not_buffered() {
+    let _guard = TipGuard::new(0);
+    let pool = pool();
+    fund(&pool, 1, 10);
+    let later = blob(1, 11);
+    let results = pool
+        .add_transactions(TransactionOrigin::Local, vec![later.clone(), blob(1, 10), later.clone()])
+        .await;
+    assert!(is_nonce_gap(results[0].as_ref().unwrap_err()));
+    assert!(results[1].as_ref().unwrap().is_pending());
+    assert!(results[2].as_ref().unwrap().is_pending());
+    assert!(pool.get(later.hash()).is_some());
+    assert!(pool.buffer.lock().is_empty());
+    assert!(pool.add_transactions(TransactionOrigin::Local, vec![]).await.is_empty());
+    assert!(pool.add_transactions_with_origins(vec![]).await.is_empty());
 }

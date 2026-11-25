@@ -15,10 +15,15 @@ where
         origin: TransactionOrigin,
         transaction: Self::Transaction,
     ) -> PoolResult<AddedTransactionOutcome> {
-        match self.insert(origin, transaction, false).await? {
-            Submission::Added(outcome) => Ok(outcome),
-            Submission::Subscribed(_) => unreachable!("subscription was not requested"),
-        }
+        let original = transaction.is_eip4844().then(|| transaction.clone());
+        let tx = self.inner.validator().validate_transaction(origin, transaction).await;
+        let candidate = GapCandidate::new(original, origin, &tx);
+        let mut buffer = self.buffer.lock();
+        expire(&mut buffer);
+        ensure_not_buffered(&buffer, tx.tx_hash())?;
+        let mut results = self.inner.inner().add_transactions(origin, std::iter::once(tx));
+        let result = results.pop().expect("result length is the same as the input");
+        self.buffer_gap(result, candidate, &mut buffer, BufferedBlob::admission)
     }
 
     async fn add_transaction_and_subscribe(
@@ -26,10 +31,14 @@ where
         origin: TransactionOrigin,
         transaction: Self::Transaction,
     ) -> PoolResult<TransactionEvents> {
-        match self.insert(origin, transaction, true).await? {
-            Submission::Subscribed(events) => Ok(events),
-            Submission::Added(_) => unreachable!("subscription was requested"),
-        }
+        let original = transaction.is_eip4844().then(|| transaction.clone());
+        let tx = self.inner.validator().validate_transaction(origin, transaction).await;
+        let candidate = GapCandidate::new(original, origin, &tx);
+        let mut buffer = self.buffer.lock();
+        expire(&mut buffer);
+        ensure_not_buffered(&buffer, tx.tx_hash())?;
+        let result = self.inner.inner().add_transaction_and_subscribe(origin, tx);
+        self.buffer_gap(result, candidate, &mut buffer, BufferedBlob::subscribe)
     }
 
     async fn add_transactions(
@@ -37,21 +46,36 @@ where
         origin: TransactionOrigin,
         transactions: Vec<Self::Transaction>,
     ) -> Vec<PoolResult<AddedTransactionOutcome>> {
-        self.add_transactions_with_origins(
-            transactions.into_iter().map(|tx| (origin, tx)).collect(),
+        if transactions.is_empty() {
+            return Vec::new();
+        }
+        let originals: Vec<_> =
+            transactions.iter().map(|tx| tx.is_eip4844().then(|| tx.clone())).collect();
+        let validated =
+            self.inner.validator().validate_transactions_with_origin(origin, transactions).await;
+        self.add_validated_batch(
+            validated.into_iter().zip(originals).map(|(tx, original)| (origin, tx, original)),
         )
-        .await
     }
 
     async fn add_transactions_with_origins(
         &self,
         transactions: Vec<(TransactionOrigin, Self::Transaction)>,
     ) -> Vec<PoolResult<AddedTransactionOutcome>> {
-        // Validate concurrently as upstream does; insertion holds only a short synchronous lock.
-        futures::future::join_all(
-            transactions.into_iter().map(|(origin, tx)| self.add_transaction(origin, tx)),
+        if transactions.is_empty() {
+            return Vec::new();
+        }
+        let origins: Vec<_> = transactions.iter().map(|(origin, _)| *origin).collect();
+        let originals: Vec<_> =
+            transactions.iter().map(|(_, tx)| tx.is_eip4844().then(|| tx.clone())).collect();
+        let validated = self.inner.validator().validate_transactions(transactions).await;
+        self.add_validated_batch(
+            origins
+                .into_iter()
+                .zip(validated)
+                .zip(originals)
+                .map(|((origin, tx), original)| (origin, tx, original)),
         )
-        .await
     }
 
     fn transaction_event_listener(&self, tx_hash: TxHash) -> Option<TransactionEvents> {

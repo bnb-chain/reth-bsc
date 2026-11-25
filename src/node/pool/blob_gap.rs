@@ -40,9 +40,34 @@ const GAPPED_LIFETIME: Duration = Duration::from_secs(60);
 
 type InnerPool<V, S> = Pool<V, CoinbaseTipOrdering<EthPooledTransaction>, S>;
 
-enum Submission {
-    Added(AddedTransactionOutcome),
-    Subscribed(TransactionEvents),
+/// Retained only for a valid blob transaction that might need temporary buffering.
+struct GapCandidate {
+    transaction: EthPooledTransaction,
+    origin: TransactionOrigin,
+    state_nonce: u64,
+}
+
+impl GapCandidate {
+    fn new(
+        original: Option<EthPooledTransaction>,
+        origin: TransactionOrigin,
+        validated: &TransactionValidationOutcome<EthPooledTransaction>,
+    ) -> Option<Self> {
+        let transaction = original?;
+        match validated {
+            TransactionValidationOutcome::Valid { state_nonce, .. } => {
+                Some(Self { transaction, origin, state_nonce: *state_nonce })
+            }
+            _ => None,
+        }
+    }
+}
+
+fn ensure_not_buffered(buffer: &[BufferedBlob], hash: TxHash) -> PoolResult<()> {
+    if buffer.iter().any(|entry| entry.transaction.hash() == &hash) {
+        return Err(PoolError::new(hash, PoolErrorKind::AlreadyImported));
+    }
+    Ok(())
 }
 
 /// Adds Go-BSC-compatible blob gap admission without changing the upstream Reth pool.
@@ -82,6 +107,13 @@ struct BufferedBlob {
 }
 
 impl BufferedBlob {
+    fn admission(&mut self) -> AddedTransactionOutcome {
+        AddedTransactionOutcome {
+            hash: *self.transaction.hash(),
+            state: AddedTransactionState::Queued(QueuedReason::NonceGap),
+        }
+    }
+
     fn subscribe(&mut self) -> TransactionEvents {
         let (sender, receiver) = mpsc::unbounded_channel();
         let _ = sender.send(TransactionEvent::Queued);
@@ -146,94 +178,87 @@ where
         }
     }
 
-    async fn insert(
+    /// Preserve the upstream insertion result unless an eligible blob nonce gap can be buffered.
+    /// The caller holds the buffer lock across pool insertion and this fallback.
+    fn buffer_gap<T>(
         &self,
-        origin: TransactionOrigin,
-        transaction: EthPooledTransaction,
-        subscribe: bool,
-    ) -> PoolResult<Submission> {
-        let hash = *transaction.hash();
-        let sender = transaction.sender();
-        {
-            let mut buffer = self.buffer.lock();
-            expire(&mut buffer);
-            if buffer.iter().any(|entry| entry.transaction.hash() == &hash) {
-                return Err(PoolError::new(hash, PoolErrorKind::AlreadyImported));
-            }
-        }
-        let original = transaction.is_eip4844().then(|| transaction.clone());
-        // Includes BSC fee/blacklist checks, state/balance checks and sidecar/KZG validation.
-        let validated = self.inner.validator().validate_transaction(origin, transaction).await;
-        let state_nonce = match &validated {
-            TransactionValidationOutcome::Valid { state_nonce, .. } => Some(*state_nonce),
-            _ => None,
-        };
-        let mut buffer = self.buffer.lock();
-        expire(&mut buffer);
-        if buffer.iter().any(|entry| entry.transaction.hash() == &hash) {
-            return Err(PoolError::new(hash, PoolErrorKind::AlreadyImported));
-        }
-        let result = self.insert_validated(origin, validated, subscribe);
-        match result {
+        result: PoolResult<T>,
+        candidate: Option<GapCandidate>,
+        buffer: &mut Vec<BufferedBlob>,
+        response: impl FnOnce(&mut BufferedBlob) -> T,
+    ) -> PoolResult<T> {
+        let error = match result {
             Ok(result) => {
-                if buffer.iter().any(|entry| entry.transaction.sender() == sender) {
+                if !buffer.is_empty() {
                     self.wake.notify_one();
                 }
-                Ok(result)
+                return Ok(result);
             }
-            Err(error) if is_nonce_gap(&error) => {
-                if let (Some(transaction), Some(nonce)) = (original, state_nonce) {
-                    let sender = transaction.sender();
-                    let buffered =
-                        buffer.iter().filter(|entry| entry.transaction.sender() == sender).count();
-                    let pooled = self.inner.get_transactions_by_sender(sender).len();
-                    if buffer.len() < MAX_GAPPED && allowance(nonce, pooled, buffered) > 0 {
-                        let mut entry = BufferedBlob {
-                            transaction,
-                            origin,
-                            received: Instant::now(),
-                            listeners: Vec::new(),
-                        };
-                        let result = if subscribe {
-                            Submission::Subscribed(entry.subscribe())
-                        } else {
-                            Submission::Added(AddedTransactionOutcome {
-                                hash,
-                                state: AddedTransactionState::Queued(QueuedReason::NonceGap),
-                            })
-                        };
-                        buffer.push(entry);
-                        // Covers a filler arriving while the gapped transaction was validating.
-                        self.wake.notify_one();
-                        return Ok(result);
-                    }
-                }
-                Err(error)
+            Err(error) if is_nonce_gap(&error) => error,
+            Err(error) => return Err(error),
+        };
+        if let Some(GapCandidate { transaction, origin, state_nonce }) = candidate {
+            // Also handles duplicate gap transactions within the same batch.
+            ensure_not_buffered(buffer, *transaction.hash())?;
+            // A later occurrence in the same batch may have succeeded after its filler.
+            if self.inner.contains(transaction.hash()) {
+                return Err(error);
             }
-            Err(error) => Err(error),
+            let sender = transaction.sender();
+            let buffered =
+                buffer.iter().filter(|entry| entry.transaction.sender() == sender).count();
+            let pooled = self.inner.get_transactions_by_sender(sender).len();
+            if buffer.len() < MAX_GAPPED && allowance(state_nonce, pooled, buffered) > 0 {
+                let mut entry = BufferedBlob {
+                    transaction,
+                    origin,
+                    received: Instant::now(),
+                    listeners: Vec::new(),
+                };
+                let result = response(&mut entry);
+                buffer.push(entry);
+                // A filler may already have been inserted, including later in this same batch.
+                self.wake.notify_one();
+                return Ok(result);
+            }
         }
+        Err(error)
     }
 
-    fn insert_validated(
+    /// Insert the validated batch once, in input order, with upstream's single capacity check.
+    fn add_validated_batch(
         &self,
-        origin: TransactionOrigin,
-        validated: TransactionValidationOutcome<EthPooledTransaction>,
-        subscribe: bool,
-    ) -> PoolResult<Submission> {
-        if subscribe {
-            self.inner
-                .inner()
-                .add_transaction_and_subscribe(origin, validated)
-                .map(Submission::Subscribed)
-        } else {
-            let result = self
-                .inner
-                .inner()
-                .add_transactions(origin, std::iter::once(validated))
-                .pop()
-                .expect("one input has one result")?;
-            Ok(Submission::Added(result))
+        transactions: impl IntoIterator<
+            Item = (
+                TransactionOrigin,
+                TransactionValidationOutcome<EthPooledTransaction>,
+                Option<EthPooledTransaction>,
+            ),
+        >,
+    ) -> Vec<PoolResult<AddedTransactionOutcome>> {
+        let mut buffer = self.buffer.lock();
+        expire(&mut buffer);
+        let mut candidates = Vec::new();
+        let mut batch = Vec::new();
+        for (origin, validated, original) in transactions {
+            let duplicate = ensure_not_buffered(&buffer, validated.tx_hash()).err();
+            let candidate = GapCandidate::new(original, origin, &validated);
+            if duplicate.is_none() {
+                batch.push((origin, validated));
+            }
+            candidates.push((candidate, duplicate));
         }
+        let mut results = self.inner.inner().add_transactions_with_origins(batch).into_iter();
+        candidates
+            .into_iter()
+            .map(|(candidate, duplicate)| {
+                if let Some(error) = duplicate {
+                    return Err(error);
+                }
+                let result = results.next().expect("one result per inserted transaction");
+                self.buffer_gap(result, candidate, &mut buffer, BufferedBlob::admission)
+            })
+            .collect()
     }
 
     async fn promote(&self) {
@@ -323,10 +348,20 @@ where
                     continue;
                 }
                 let subscribe = !buffer[index].listeners.is_empty();
-                match self.insert_validated(origin, validated, subscribe) {
-                    Ok(result) => {
+                let result = if subscribe {
+                    self.inner.inner().add_transaction_and_subscribe(origin, validated).map(Some)
+                } else {
+                    self.inner
+                        .inner()
+                        .add_transactions(origin, std::iter::once(validated))
+                        .pop()
+                        .expect("one input has one result")
+                        .map(|_| None)
+                };
+                match result {
+                    Ok(events) => {
                         let entry = buffer.remove(index);
-                        if let Submission::Subscribed(mut events) = result {
+                        if let Some(mut events) = events {
                             self.tasks.spawn_task(async move {
                                 let mut listeners = entry.listeners;
                                 while let Some(event) = events.next().await {
