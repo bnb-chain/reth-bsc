@@ -544,3 +544,5 @@ async fn simulation_rpc_emits_total_difficulty_but_no_millisecond_field() {
 
 #[path = "td_tests.rs"]
 mod td_tests;
+
+mod pending_difficulty;

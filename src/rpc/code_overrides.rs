@@ -6,7 +6,7 @@ use crate::{
 };
 use alloy_consensus::BlockHeader;
 use alloy_evm::overrides::{apply_block_overrides, apply_state_overrides, OverrideBlockHashes};
-use alloy_primitives::{Address, Bytes, B256, U256, U512};
+use alloy_primitives::{Address, Bytes, U256, U512};
 use alloy_rpc_types::serde_helpers::WithOtherFields;
 use alloy_rpc_types_eth::{
     simulate::{SimBlock, SimulatePayload, SimulatedBlock},
@@ -281,14 +281,6 @@ where
                         evm_env.cfg_env.disable_base_fee = true;
                         evm_env.block_env.inner_mut().basefee = 0;
                     }
-
-                    // Parlia keeps its parent's difficulty in synthetic headers.
-                    // The opcode view is separate from mixHash, whose zero default
-                    // represents a .000 millisecond remainder. Explicit overrides
-                    // below may replace either value independently.
-                    evm_env.block_env.inner_mut().difficulty = parent.difficulty();
-                    evm_env.block_env.inner_mut().prevrandao = Some(B256::ZERO);
-                    evm_env.block_env.opcode_44_override = Some(parent.difficulty());
 
                     if let Some(block_overrides) = block_overrides {
                         // Ensure we do not allow an uncapped gas limit per block.
