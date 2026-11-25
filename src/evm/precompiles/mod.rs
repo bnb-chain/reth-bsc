@@ -16,6 +16,9 @@ use revm::{
 use std::{boxed::Box, cell::RefCell, collections::HashMap};
 
 mod bls;
+/// Experimental PQ verifiers; enabling this feature does not activate them on any network.
+#[cfg(feature = "experimental-pqc")]
+pub use bsc_pqc_precompiles as pqc;
 pub mod cas20;
 mod cometbft;
 mod dedup;

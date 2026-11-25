@@ -1,0 +1,31 @@
+[package]
+name = "bsc-pqc-precompiles"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[features]
+openssl-backend = ["dep:cc", "dep:pkg-config"]
+circl-backend = []
+
+[dependencies]
+ml-dsa = { version = "=0.1.2", default-features = false }
+slh-dsa = { version = "=0.2.0-rc.5", default-features = false }
+revm-precompile = { version = "=43.0.3", default-features = false, features = ["std"] }
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+pkg-config = { version = "0.3", optional = true }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "verification"
+harness = false
+
+[[bench]]
+name = "circl_overhead"
+harness = false
+required-features = ["circl-backend"]
