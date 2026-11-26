@@ -1723,7 +1723,7 @@ where
         .saturating_sub(std::time::Duration::from_millis(STATE_ROOT_WAIT_MARGIN_MS));
         let total_budget = (self.timeout + self.root_reserve)
             .min(std::time::Duration::from_millis(self.mining_ctx.parent_snapshot.block_interval));
-        let control = super::build_control::BuildControl::new(
+        let control = super::build_control::BuildControl::new_local_job(
             start_time,
             total_budget,
             self.root_reserve,

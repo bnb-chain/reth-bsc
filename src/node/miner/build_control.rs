@@ -9,7 +9,7 @@ use std::{
 // Bound overlap while an obsolete synchronous transaction is returning to a cancellation check.
 pub(crate) static LOCAL_BUILD_PERMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
-const MIN_LATE_TRANSACTION_WINDOW: Duration = Duration::from_millis(50);
+const MIN_TRANSACTION_WINDOW: Duration = Duration::from_millis(50);
 
 /// Separates stopping transaction selection from discarding an invalid or expired candidate.
 #[derive(Debug, Clone)]
@@ -23,6 +23,26 @@ pub struct BuildControl {
 }
 
 impl BuildControl {
+    /// Starts a local job, retaining the recovery window if the slot cap leaves no
+    /// transaction time. Call once at job start; attempts must clone this control.
+    pub(crate) fn new_local_job(
+        started: Instant,
+        total_budget: Duration,
+        reserve: Duration,
+        slot_remaining: Duration,
+        cancel: ManualCancel,
+    ) -> Self {
+        let mut control = Self::new(started, total_budget, reserve, slot_remaining, cancel);
+        if control.transactions_until == started {
+            // Match the scheduler's zero-window recovery floor after recomputing the
+            // slot budget at actual job start. Keep a finite completion deadline and
+            // the full reserve; this does not enable the QA late-finish experiment.
+            control.transactions_until = started + MIN_TRANSACTION_WINDOW;
+            control.finish_until = control.transactions_until + reserve;
+        }
+        control
+    }
+
     /// Starts a shared attempt budget, capped by the remaining slot time, with a
     /// separate reserve for system transactions and state-root completion.
     pub fn new(
@@ -54,7 +74,7 @@ impl BuildControl {
     ) -> Self {
         self.allow_late_finish = enabled;
         if enabled {
-            let minimum = started + MIN_LATE_TRANSACTION_WINDOW;
+            let minimum = started + MIN_TRANSACTION_WINDOW;
             if self.transactions_until < minimum {
                 self.transactions_until = minimum;
                 self.finish_until = minimum + reserve;
@@ -113,7 +133,7 @@ impl BuildControl {
     pub(crate) fn start_transaction_selection(&self, now: Instant) -> Result<(), &'static str> {
         if let Some(deadline) = &self.selection_deadline {
             self.check_active(now)?;
-            deadline.get_or_init(|| self.transactions_until.max(now + MIN_LATE_TRANSACTION_WINDOW));
+            deadline.get_or_init(|| self.transactions_until.max(now + MIN_TRANSACTION_WINDOW));
         }
         Ok(())
     }
@@ -133,6 +153,95 @@ impl BuildControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_job_recovers_exhausted_window_with_bounded_completion() {
+        let start = Instant::now();
+        for reserve_ms in [0, 30, 120] {
+            let reserve = Duration::from_millis(reserve_ms);
+            for slot_ms in [0, reserve_ms / 2, reserve_ms] {
+                // The upstream scheduler already granted 50ms; the job starts late.
+                let control = BuildControl::new_local_job(
+                    start,
+                    Duration::from_millis(50) + reserve,
+                    reserve,
+                    Duration::from_millis(slot_ms),
+                    ManualCancel::default(),
+                )
+                .with_late_finish(false, start, reserve);
+                assert!(!control.allows_late_finish());
+                assert_eq!(control.transactions_until(), start + Duration::from_millis(50));
+                assert_eq!(control.finish_until(), start + Duration::from_millis(50) + reserve);
+                assert!(!control.stop_transactions(start));
+                assert!(control.check_active(start).is_ok());
+                assert!(control.root_wait(start).unwrap() > Duration::ZERO);
+                assert!(control.stop_transactions(start + Duration::from_millis(50)));
+                assert!(control
+                    .check_active(control.finish_until() - Duration::from_nanos(1))
+                    .is_ok());
+                assert_eq!(
+                    control.root_wait(control.finish_until()),
+                    Err("payload build completion deadline exceeded")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn local_job_preserves_nonzero_slot_and_total_budget_caps() {
+        let start = Instant::now();
+        let reserve = Duration::from_millis(120);
+        // A positive window, even below 50ms, keeps the existing slot/turn/period cap.
+        for (budget_ms, slot_ms, transaction_ms) in
+            [(170, 121, 1), (170, 169, 49), (170, 170, 50), (170, 450, 50), (450, 500, 330)]
+        {
+            let control = BuildControl::new_local_job(
+                start,
+                Duration::from_millis(budget_ms),
+                reserve,
+                Duration::from_millis(slot_ms),
+                ManualCancel::default(),
+            );
+            assert_eq!(control.transactions_until() - start, Duration::from_millis(transaction_ms));
+            assert_eq!(
+                control.finish_until() - start,
+                Duration::from_millis(budget_ms.min(slot_ms))
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_window_is_shared_by_retries_and_never_overrides_cancellation() {
+        let start = Instant::now();
+        let cancel = ManualCancel::default();
+        let reserve = Duration::from_millis(120);
+        let control = BuildControl::new_local_job(
+            start,
+            Duration::from_millis(50) + reserve,
+            reserve,
+            Duration::ZERO,
+            cancel.clone(),
+        );
+        let retry = control.clone();
+        let later = start + Duration::from_millis(200);
+        retry.start_transaction_selection(later).unwrap();
+        assert_eq!(retry.transactions_until(), control.transactions_until());
+        assert_eq!(retry.finish_until(), control.finish_until());
+        assert_eq!(retry.check_active(later), Err("payload build completion deadline exceeded"));
+        cancel.clone().cancel();
+        for attempt in [&control, &retry] {
+            assert!(attempt.stop_transactions(start));
+            assert_eq!(attempt.root_wait(start), Err("payload build canceled"));
+        }
+        let canceled = BuildControl::new_local_job(
+            start,
+            Duration::from_millis(170),
+            reserve,
+            Duration::ZERO,
+            cancel,
+        );
+        assert_eq!(canceled.check_active(start), Err("payload build canceled"));
+    }
 
     #[test]
     fn backoff_and_retries_do_not_extend_the_budget() {
@@ -293,7 +402,7 @@ mod tests {
             // Preparation and its prewarmer must not consume the pending floor.
             assert!(!prewarm.stop_transactions(entry));
             attempt.start_transaction_selection(entry).unwrap();
-            let deadline = entry + MIN_LATE_TRANSACTION_WINDOW;
+            let deadline = entry + MIN_TRANSACTION_WINDOW;
             assert_eq!(job.transactions_until(), deadline);
             assert_eq!(prewarm.transactions_until(), deadline);
             assert_eq!(job.finish_until(), deadline + reserve);
