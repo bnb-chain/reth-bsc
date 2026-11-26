@@ -4,6 +4,7 @@ pub mod blob;
 #[cfg(test)]
 mod block_overrides_tests;
 pub mod code_overrides;
+pub mod debug;
 pub mod debug_builder;
 pub mod eth_config;
 pub mod eth_ext;

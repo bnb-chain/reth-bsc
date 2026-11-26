@@ -111,6 +111,13 @@ To enable RPC services, add these parameters to your node command:
 
 ### Available API Modules
 
+`debug_traceBlock` and `debug_traceBadBlock` are temporarily disabled on HTTP and
+WebSocket, including localhost bindings, pending fixes for unvalidated-block
+tracing resource limits. They return JSON-RPC `-32601` (method not found), even
+when the `debug` module is enabled. Both methods remain available over IPC.
+`debug_traceBlockByHash`, `debug_traceBlockByNumber`, and the other debug methods
+remain available on configured transports.
+
 - `eth`: Ethereum JSON-RPC API (block info, transactions, etc.)
 - `net`: Network information (peer count, network ID)
 - `web3`: Web3 standard APIs (client version, sha3)

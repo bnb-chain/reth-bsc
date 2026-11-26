@@ -715,6 +715,7 @@ fn main() -> eyre::Result<()> {
                         ctx.modules.merge_if_module_configured(RethRpcModule::Eth, eth_config.into_rpc())?;
                         tracing::info!("Succeed to register eth_config (EIP-7910) API");
 
+                        reth_bsc::rpc::debug::restrict_block_tracing(ctx.modules);
                         rpc_health.instrument(ctx.modules, metrics_enabled)?;
 
                         // Bind only after all RPC module registration succeeded, so a later merge
