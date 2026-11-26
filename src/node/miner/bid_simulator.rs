@@ -59,6 +59,15 @@ const TX_GAS: u64 = 21000;
 #[cfg(test)]
 mod sidecar_tests;
 
+/// Returns the gas available to legacy bid transactions after both reservations, provided the
+/// declared gas usage fits. An unfunded reservation must reject even a bid declaring zero gas.
+fn legacy_bid_gas_limit(gas_limit: u64, system_txs_gas: u64, bid_gas_used: u64) -> Option<u64> {
+    gas_limit
+        .checked_sub(system_txs_gas)?
+        .checked_sub(PAY_BID_TX_GAS_LIMIT)
+        .filter(|available| bid_gas_used <= *available)
+}
+
 #[derive(Clone)]
 pub struct Bid {
     pub builder: Address,
@@ -681,10 +690,20 @@ where
             parent_header.number + 1,
             attributes.timestamp,
         );
-        if bid_runtime.bid.gas_used > gas_limit - system_txs_gas - PAY_BID_TX_GAS_LIMIT {
-            debug!("bidSimulator: gas limit exceeded, ignore");
+        let Some(mut block_gas_limit) =
+            legacy_bid_gas_limit(gas_limit, system_txs_gas, bid_runtime.bid.gas_used)
+        else {
+            debug!(
+                bid_hash = %bid_runtime.bid.bid_hash,
+                block_number = bid_runtime.bid.block_number,
+                gas_limit,
+                system_txs_gas,
+                pay_bid_tx_gas = PAY_BID_TX_GAS_LIMIT,
+                bid_gas_used = bid_runtime.bid.gas_used,
+                "bidSimulator: insufficient gas for bid and reserved transactions, ignore"
+            );
             return Err(());
-        }
+        };
 
         // Sinks transport current_validators / turn_length from the builder so that
         // pick_best_payload() can write to VALIDATOR_CACHE / TURN_LENGTH_CACHE with the
@@ -735,10 +754,6 @@ where
                 return Err(());
             }
         };
-        let mut block_gas_limit: u64 =
-            builder.evm_mut().block().gas_limit().saturating_sub(system_txs_gas);
-        block_gas_limit = block_gas_limit.saturating_sub(PAY_BID_TX_GAS_LIMIT);
-
         // todo: prefetch transactions
         if let Err(e) = builder.apply_pre_execution_changes().map_err(PayloadBuilderError::other) {
             debug!("Failed to apply pre-execution changes: {:?}", e);
@@ -1531,6 +1546,38 @@ mod tests {
         assert!(simulator.validate_bid_gas_price(U256::ZERO, 0).is_ok());
         crate::shared::set_miner_gas_tip(0);
         assert!(simulator.validate_bid_gas_price(U256::ZERO, gas_used).is_ok());
+    }
+
+    #[test]
+    fn legacy_bid_gas_limit_rejects_system_reserve_underflow() {
+        // Reported RPC reproduction: the system reserve alone exceeds the candidate block.
+        assert_eq!(legacy_bid_gas_limit(15_383_990, 20_000_000, TX_GAS), None);
+        assert_eq!(legacy_bid_gas_limit(15_383_990, 20_000_000, 0), None);
+    }
+
+    #[test]
+    fn legacy_bid_gas_limit_rejects_payment_reserve_underflow() {
+        let system_txs_gas = 20_000_000;
+        for gas_limit in [system_txs_gas, system_txs_gas + PAY_BID_TX_GAS_LIMIT - 1] {
+            assert_eq!(legacy_bid_gas_limit(gas_limit, system_txs_gas, 0), None);
+        }
+    }
+
+    #[test]
+    fn legacy_bid_gas_limit_checks_exact_boundaries() {
+        let system_txs_gas = 20_000_000;
+        let reserved = system_txs_gas + PAY_BID_TX_GAS_LIMIT;
+        assert_eq!(legacy_bid_gas_limit(reserved, system_txs_gas, 0), Some(0));
+        assert_eq!(legacy_bid_gas_limit(reserved, system_txs_gas, 1), None);
+        assert_eq!(legacy_bid_gas_limit(reserved + TX_GAS, system_txs_gas, TX_GAS), Some(TX_GAS));
+        assert_eq!(legacy_bid_gas_limit(reserved + TX_GAS, system_txs_gas, TX_GAS + 1), None);
+    }
+
+    #[test]
+    fn legacy_bid_gas_limit_handles_maximum_values() {
+        assert_eq!(legacy_bid_gas_limit(u64::MAX, u64::MAX, 0), None);
+        assert_eq!(legacy_bid_gas_limit(u64::MAX, 0, u64::MAX), None);
+        assert_eq!(legacy_bid_gas_limit(u64::MAX, 0, 0), Some(u64::MAX - PAY_BID_TX_GAS_LIMIT));
     }
 
     #[test]
