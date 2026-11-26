@@ -897,6 +897,7 @@ pub(crate) fn reset_vote_warmup() {
 }
 
 /// Skip the first `threshold` notifications of each run, without writing back after admission.
+#[allow(deprecated, reason = "AtomicU64::try_update is newer than the Reth v2.8 MSRV")]
 pub(crate) fn vote_ready_on_head(threshold: u64) -> bool {
     let Some(state) = MINING_VOTE_PROGRESS.get() else { return false };
     match state.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
