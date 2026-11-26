@@ -16,6 +16,7 @@ use reth_primitives_traits::{AlloyBlockHeader, Block as _};
 use reth_provider::{BlockHashReader, BlockNumReader, HeaderProvider};
 
 use crate::{
+    hardforks::BscHardforks,
     node::{consensus::BscForkChoiceEngine, engine_api::payload::BscPayloadTypes},
     BscBlock,
 };
@@ -87,6 +88,9 @@ pub enum ForkRecoverError {
 
     #[error("fork base {base} is below the finalized block {finalized}")]
     BelowFinalized { base: u64, finalized: u64 },
+
+    #[error("finality unavailable at local head {head}")]
+    FinalityUnavailable { head: u64 },
 
     #[error("local provider error: {0}")]
     Provider(#[from] reth_provider::ProviderError),
@@ -614,9 +618,9 @@ async fn discover_fork_blocks_after<
 /// A fork may build on the finalized block, but cannot replace it or an older block.
 fn ensure_fork_above_finalized(
     fork_blocks: &[BscBlock],
-    finalized: Option<u64>,
+    finalized: u64,
 ) -> Result<(), ForkRecoverError> {
-    let (Some(oldest), Some(finalized)) = (fork_blocks.last(), finalized) else {
+    let Some(oldest) = fork_blocks.last() else {
         return Ok(());
     };
     let base = oldest.header.number.saturating_sub(1);
@@ -762,10 +766,6 @@ where
         outcome = ?discovery.outcome,
         "Phase 1 complete"
     );
-    ensure_fork_above_finalized(
-        &discovery.fork_blocks,
-        forkchoice_engine.finalized_number_at_head(provider.best_block_number()?)?,
-    )?;
 
     import_discovered_header(
         RecoverTarget {
@@ -827,13 +827,17 @@ where
         + 'static,
 {
     let RecoverTarget { fcu_target_hash, fcu_target_num, fcu_target_header, .. } = target;
-    // Finality may advance while discovery waits for peers. Recheck at the shared import
-    // boundary so neither network recovery nor startup callers bypass the floor.
+    // Finality can advance during discovery. After Plato, require the current finalized
+    // height before submitting any fork blocks. An empty range skips straight to fork choice.
     let local_tip = provider.best_block_number()?;
-    ensure_fork_above_finalized(
-        &discovery.fork_blocks,
-        forkchoice_engine.finalized_number_at_head(local_tip)?,
-    )?;
+    if !discovery.fork_blocks.is_empty() &&
+        forkchoice_engine.chain_spec().is_plato_active_at_block(local_tip)
+    {
+        let finalized = forkchoice_engine
+            .finalized_number_at_head(local_tip)?
+            .ok_or(ForkRecoverError::FinalityUnavailable { head: local_tip })?;
+        ensure_fork_above_finalized(&discovery.fork_blocks, finalized)?;
+    }
     // ---- Phase 2: import oldest → newest via new_payload ----
     let mut to_import = discovery.fork_blocks;
     to_import.reverse();
@@ -1455,12 +1459,11 @@ mod tests {
         let (chain, _) = linear_chain(129, 2, B256::ZERO, 0xD);
         let fork: Vec<_> = chain.into_iter().rev().map(make_block).collect();
         assert!(matches!(
-            ensure_fork_above_finalized(&fork, Some(9_900)),
+            ensure_fork_above_finalized(&fork, 9_900),
             Err(ForkRecoverError::BelowFinalized { base: 128, finalized: 9_900 })
         ));
-        ensure_fork_above_finalized(&fork, Some(128)).unwrap();
-        ensure_fork_above_finalized(&fork, None).unwrap();
-        ensure_fork_above_finalized(&[], Some(9_900)).unwrap();
+        ensure_fork_above_finalized(&fork, 128).unwrap();
+        ensure_fork_above_finalized(&[], 9_900).unwrap();
     }
 
     // ---- Spec test #1: head already on canonical (pre-hop short-circuit) ----
@@ -1715,14 +1718,13 @@ mod tests {
             ]
         };
 
-        let err = ensure_fork_above_finalized(&fork(129), Some(9_900)).unwrap_err();
+        let err = ensure_fork_above_finalized(&fork(129), 9_900).unwrap_err();
         assert!(
             matches!(err, ForkRecoverError::BelowFinalized { base: 128, finalized: 9_900 }),
             "{err}"
         );
-        ensure_fork_above_finalized(&fork(129), Some(128)).expect("a fork may start at finality");
-        ensure_fork_above_finalized(&fork(129), None).expect("no floor before fast finality");
-        ensure_fork_above_finalized(&[], Some(9_900)).expect("nothing to import");
+        ensure_fork_above_finalized(&fork(129), 128).expect("a fork may start at finality");
+        ensure_fork_above_finalized(&[], 9_900).expect("nothing to import");
     }
 
     // ---- RecoverTarget constructor tests ----
@@ -2351,6 +2353,63 @@ mod tests {
             fn insert(&self, snapshot: crate::consensus::parlia::Snapshot) {
                 self.0.lock().unwrap().insert(snapshot.block_hash, snapshot);
             }
+        }
+
+        #[tokio::test]
+        async fn recovery_waits_for_local_finality_before_submitting_a_fork() {
+            use crate::consensus::parlia::{Snapshot, VoteData};
+
+            // A short, post-Plato fixture with a fork off the parent of the local tip.
+            let height = 40_000_000;
+            let parent = make_header(height - 1, B256::ZERO, 0x75);
+            let tip = make_header(height, parent.hash_slow(), 0x75);
+            let fork = make_header(height, parent.hash_slow(), 0x76);
+            let mut provider = FakeProvider::default();
+            provider.insert_canonical(parent);
+            provider.insert_canonical(tip.clone());
+            let (engine, submissions, fcus) = recording_engine(provider.clone(), vec![]);
+            let fce = BscForkChoiceEngine::new(provider.clone(), engine.clone(), chain_spec());
+            let import = || {
+                import_discovered_header(
+                    RecoverTarget::single_pair(fork.hash_slow(), height),
+                    Discovery {
+                        fork_blocks: vec![make_block(fork.clone())],
+                        outcome: DiscoveryOutcome::AncestorFound,
+                    },
+                    provider.clone(),
+                    engine.clone(),
+                    fce.clone(),
+                    &(),
+                )
+            };
+
+            assert!(
+                matches!(import().await, Err(ForkRecoverError::FinalityUnavailable { head }) if head == height)
+            );
+            assert!(submissions.lock().unwrap().is_empty());
+            assert!(fcus.lock().unwrap().is_empty());
+
+            let _ = crate::shared::set_snapshot_provider(Arc::new(RecoverySnapshots::default()));
+            let snapshots = crate::shared::get_snapshot_provider().unwrap();
+            let set_finalized = |source_number, source_hash| {
+                snapshots.insert(Snapshot {
+                    block_number: height,
+                    block_hash: tip.hash_slow(),
+                    vote_data: VoteData { source_number, source_hash, ..Default::default() },
+                    ..Default::default()
+                })
+            };
+
+            set_finalized(height - 1, tip.parent_hash);
+            import().await.unwrap();
+            assert_eq!(*submissions.lock().unwrap(), vec![(height, fork.hash_slow())]);
+
+            set_finalized(height, tip.hash_slow());
+            assert!(
+                matches!(import().await, Err(ForkRecoverError::BelowFinalized { base, finalized })
+                if base == height - 1 && finalized == height)
+            );
+            assert_eq!(submissions.lock().unwrap().len(), 1);
         }
 
         async fn assert_losing_segment_progress(use_justification: bool) {

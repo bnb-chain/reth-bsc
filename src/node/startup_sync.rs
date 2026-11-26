@@ -384,7 +384,11 @@ where
     .await?
     {
         Ok(()) => {}
-        Err(ForkRecoverError::ImportHalted { .. }) => return Ok(Assessment::Retry),
+        Err(
+            ForkRecoverError::ImportHalted { .. } | ForkRecoverError::FinalityUnavailable { .. },
+        ) => {
+            return Ok(Assessment::Retry);
+        }
         Err(error) => return Err(error.into()),
     }
     let current = provider.chain_info()?;
