@@ -3,9 +3,11 @@
 
 use crate::evm::precompiles::cas20::access_list::capture;
 use alloy_eips::{eip2930::AccessListResult, BlockId};
-use alloy_evm::overrides::apply_state_overrides;
 use alloy_primitives::U256;
-use alloy_rpc_types_eth::{state::StateOverride, TransactionRequest};
+use alloy_rpc_types_eth::{
+    state::{EvmOverrides, StateOverride},
+    TransactionRequest,
+};
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use reth_evm::{BlockEnvFor, EvmFactory, TransactionEnvMut};
 use reth_provider::EvmStateProviderAdapter;
@@ -15,9 +17,11 @@ use reth_rpc_eth_api::{
     helpers::{EthCall, Trace},
     FromEvmError,
 };
-use reth_rpc_eth_types::{error::FromEthApiError, BlockOverridesExt};
-use revm::{context::Block, context_interface::Transaction};
+use reth_rpc_eth_types::BlockOverridesExt;
 use revm_inspectors::access_list::AccessListInspector;
+
+#[cfg(test)]
+mod tests;
 
 #[rpc(server, namespace = "eth")]
 pub trait BscAccessListApi {
@@ -50,27 +54,20 @@ where
             self.0.evm_env_at(block.unwrap_or_default()).await.map_err(Into::into)?;
         env.block_env.disabled_cas20 =
             super::code_overrides::code_overridden_addresses(state_override.as_ref());
-        // Keep reth's request preparation and second execution for accurate gasUsed.
         self.0
             .spawn_blocking_io_with_state(at, move |eth, state| {
                 let mut db = State::builder()
                     .with_database(StateProviderDatabase::new(EvmStateProviderAdapter(state)))
                     .build();
-                if let Some(overrides) = state_override {
-                    apply_state_overrides(overrides, &mut db).map_err(Eth::Error::from_eth_err)?;
-                }
-                let has_gas = request.gas.is_some();
                 let initial = request.access_list.clone().unwrap_or_default();
-                let mut tx = eth.create_txn_env(&env, request, &mut db)?;
-                env.cfg_env.disable_block_gas_limit = true;
-                env.cfg_env.disable_base_fee = true;
-                env.cfg_env.disable_eip3607 = true;
-                env.cfg_env.disable_fee_charge = true;
-                env.cfg_env.tx_gas_limit_cap = Some(u64::MAX);
-                if !has_gas && tx.gas_price() > 0 {
-                    let cap = eth.caller_gas_allowance(&mut db, &env, &tx)?;
-                    tx.set_gas_limit(cap.min(env.block_env.gas_limit()));
-                }
+                // Apply the RPC gas and memory limits to both executions, including
+                // omitted-gas requests whose caller allowance exceeds the RPC cap.
+                let (env, mut tx) = eth.prepare_call_env(
+                    env,
+                    request,
+                    &mut db,
+                    EvmOverrides::state(state_override),
+                )?;
 
                 let mut inspector = AccessListInspector::new(initial);
                 let (result, native) =
