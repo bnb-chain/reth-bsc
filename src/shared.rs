@@ -173,8 +173,9 @@ static MINER_ETHERBASE: OnceLock<RwLock<alloy_primitives::Address>> = OnceLock::
 static MINER_EXTRA: OnceLock<RwLock<alloy_primitives::Bytes>> = OnceLock::new();
 /// Dynamic recommit interval in milliseconds (set by miner_setRecommitInterval)
 static MINER_RECOMMIT_INTERVAL_MS: OnceLock<AtomicU64> = OnceLock::new();
-/// Mining enabled flag (set by miner_start / miner_stop)
-static MINING_ENABLED: OnceLock<AtomicBool> = OnceLock::new();
+/// Zero when stopped. While running, one plus the number of skipped vote notifications.
+/// Keeping both in one atomic makes stop/reset a single transition.
+static MINING_VOTE_PROGRESS: OnceLock<AtomicU64> = OnceLock::new();
 
 /// Global proxyed peer IDs list
 static PROXYED_PEER_IDS: OnceLock<Vec<PeerId>> = OnceLock::new();
@@ -845,7 +846,7 @@ pub fn init_miner_dynamic_config(
     let _ = MINER_ETHERBASE.set(RwLock::new(validator_address));
     let _ = MINER_EXTRA.set(RwLock::new(alloy_primitives::Bytes::new()));
     let _ = MINER_RECOMMIT_INTERVAL_MS.set(AtomicU64::new(0));
-    let _ = MINING_ENABLED.set(AtomicBool::new(true));
+    let _ = MINING_VOTE_PROGRESS.set(AtomicU64::new(1));
 }
 
 // --- gas limit ---
@@ -921,13 +922,38 @@ pub fn get_miner_recommit_interval_ms() -> Option<u64> {
 // --- mining enabled ---
 
 pub fn set_mining_enabled(val: bool) {
-    if let Some(v) = MINING_ENABLED.get() {
-        v.store(val, Ordering::Relaxed);
+    if let Some(state) = MINING_VOTE_PROGRESS.get() {
+        if val {
+            // Repeated starts preserve the progress of the current run.
+            let _ = state.compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed);
+        } else {
+            state.store(0, Ordering::Relaxed);
+        }
     }
 }
 
 pub fn is_mining_enabled() -> bool {
-    MINING_ENABLED.get().map(|v| v.load(Ordering::Relaxed)).unwrap_or(false)
+    MINING_VOTE_PROGRESS.get().is_some_and(|state| state.load(Ordering::Relaxed) != 0)
+}
+
+pub(crate) fn reset_vote_warmup() {
+    if let Some(state) = MINING_VOTE_PROGRESS.get() {
+        state.fetch_min(1, Ordering::Relaxed);
+    }
+}
+
+/// Skip the first `threshold` notifications of each run, without writing back after admission.
+pub(crate) fn vote_ready_on_head(threshold: u64) -> bool {
+    let Some(state) = MINING_VOTE_PROGRESS.get() else { return false };
+    match state.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+        (next != 0 && next <= threshold).then(|| next.saturating_add(1))
+    }) {
+        Ok(next) => {
+            tracing::debug!(target: "bsc::vote", reason = "warmup", count = next, threshold, "skip vote production");
+            false
+        }
+        Err(next) => next > threshold,
+    }
 }
 
 // ============= IPC client ===============

@@ -250,14 +250,14 @@ where
                     let tip_header = tip.clone_sealed_header();
 
                     // Produce and broadcast a local vote for this new canonical head, if eligible
-                    if let Some(sp) = crate::shared::get_snapshot_provider() {
-                        let sp = Arc::clone(sp);
+                    if crate::node::vote_producer::vote_ready_on_head() {
+                        let sp = Arc::clone(&self.snapshot_provider);
                         let spec = self.consensus.spec.clone();
                         match self.provider.header(tip_header.hash()) {
                             Ok(Some(h)) => {
                                 tracing::debug!(target: "bsc::vote", "Succeed to get header for tip block, validator: {}, tip: {}", self.validator_address, tip_header.number());
                                 tokio::spawn(async move {
-                                    crate::node::vote_producer::maybe_produce_and_broadcast_for_head(
+                                    crate::node::vote_producer::produce_vote_for_head(
                                         spec,
                                         sp.as_ref(),
                                         &h,
@@ -268,7 +268,7 @@ where
                                 if let Some(h) = crate::node::evm::util::get_header_by_hash_from_cache(&tip_header.hash()) {
                                     tracing::debug!(target: "bsc::vote", "Succeed to get header for tip block from cache, validator: {}, tip: {}", self.validator_address, tip_header.number());
                                     tokio::spawn(async move {
-                                        crate::node::vote_producer::maybe_produce_and_broadcast_for_head(
+                                        crate::node::vote_producer::produce_vote_for_head(
                                             spec,
                                             sp.as_ref(),
                                             &h,

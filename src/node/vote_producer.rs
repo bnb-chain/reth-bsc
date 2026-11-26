@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc, LazyLock, Mutex,
     },
 };
@@ -32,7 +32,6 @@ static PRODUCED_TARGETS: LazyLock<Mutex<schnellru::LruMap<B256, (), schnellru::B
     LazyLock::new(|| Mutex::new(schnellru::LruMap::new(schnellru::ByLength::new(2048))));
 
 static START_VOTE: AtomicBool = AtomicBool::new(true);
-static BLOCKS_SINCE_MINING: AtomicU64 = AtomicU64::new(0);
 static VOTEADDR_INDEX: LazyLock<
     Mutex<schnellru::LruMap<B256, HashSet<VoteAddress>, schnellru::ByLength>>,
 > = LazyLock::new(|| Mutex::new(schnellru::LruMap::new(schnellru::ByLength::new(1024))));
@@ -52,6 +51,15 @@ fn warmup_blocks() -> u64 {
         .unwrap_or(DEFAULT_WARMUP_BLOCKS)
 }
 
+/// Count in canonical notification order, before scheduling signing or checking vote targets.
+pub(crate) fn vote_ready_on_head() -> bool {
+    if !crate::node::startup_recovery::is_ready() {
+        crate::shared::reset_vote_warmup();
+        return false;
+    }
+    START_VOTE.load(Ordering::Relaxed) && crate::shared::vote_ready_on_head(warmup_blocks())
+}
+
 /// Attempt to produce and broadcast a vote for the given canonical head.
 ///
 /// Safety checks:
@@ -64,23 +72,18 @@ pub fn maybe_produce_and_broadcast_for_head(
     snapshot_provider: &dyn SnapshotProvider,
     head: &Header,
 ) {
-    if !crate::node::startup_recovery::is_ready() {
-        BLOCKS_SINCE_MINING.store(0, Ordering::Relaxed);
-        tracing::debug!(target: "bsc::vote", reason = "startup-recovery", "skip vote production");
-        return;
+    if vote_ready_on_head() {
+        produce_vote_for_head(chain_spec, snapshot_provider, head);
     }
-    // Only vote while mining is live (geth: `eth.IsMining()`). Read the flag miner_stop and
-    // miner_start toggle, not the startup config: a stopped primary that keeps voting can
-    // equivocate with its backup. Resetting the counter re-arms the warm-up on resume.
-    if !crate::shared::is_mining_enabled() {
-        BLOCKS_SINCE_MINING.store(0, Ordering::Relaxed);
-        tracing::debug!(target: "bsc::vote", reason = "mining-disabled", "skip vote production");
-        return;
-    }
+}
 
-    // Respect downloader gating
-    if !START_VOTE.load(Ordering::Relaxed) {
-        tracing::debug!(target: "bsc::vote", reason = "downloader-active", "skip vote production");
+pub(crate) fn produce_vote_for_head(
+    chain_spec: Arc<BscChainSpec>,
+    snapshot_provider: &dyn SnapshotProvider,
+    head: &Header,
+) {
+    // Mining or sync can change while the admitted task is queued.
+    if !crate::shared::is_mining_enabled() || !START_VOTE.load(Ordering::Relaxed) {
         return;
     }
     // Only vote post-Luban
@@ -116,16 +119,6 @@ pub fn maybe_produce_and_broadcast_for_head(
             }
         }
     }
-
-    // Enforce warm-up delay since mining started
-    let threshold = warmup_blocks();
-    let cnt = BLOCKS_SINCE_MINING.fetch_add(1, Ordering::Relaxed) + 1;
-    if cnt <= threshold {
-        tracing::debug!(target: "bsc::vote", reason = "warmup", count=cnt, threshold=threshold, "skip vote production");
-        return;
-    }
-    // Clamp to threshold to avoid unbounded growth
-    BLOCKS_SINCE_MINING.store(threshold, Ordering::Relaxed);
 
     // Use current header's snapshot to determine source (last justified)
     let snap = match snapshot_provider.snapshot_by_hash(&target_hash) {
@@ -261,6 +254,27 @@ mod tests {
         Header { number, timestamp: now, ..Default::default() }
     }
 
+    #[test]
+    fn concurrent_notifications_consume_exactly_the_configured_warmup() {
+        crate::shared::init_miner_dynamic_config(0, 0, Address::ZERO);
+        crate::shared::set_mining_enabled(false);
+        crate::shared::set_mining_enabled(true);
+        let barrier = std::sync::Barrier::new(8);
+        let admitted = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        crate::shared::vote_ready_on_head(2)
+                    })
+                })
+                .collect();
+            workers.into_iter().map(|worker| usize::from(worker.join().unwrap())).sum::<usize>()
+        });
+        assert_eq!(admitted, 6);
+        crate::shared::set_mining_enabled(false);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn journal_error_blocks_pool_and_broadcast() {
         let dir = std::env::temp_dir().join(format!("vote_producer_{}", uuid::Uuid::new_v4()));
@@ -339,7 +353,7 @@ mod tests {
         );
         crate::shared::init_miner_dynamic_config(0, 0, Address::ZERO);
         crate::shared::set_mining_enabled(true);
-        BLOCKS_SINCE_MINING.store(0, Ordering::Relaxed);
+        crate::shared::reset_vote_warmup();
 
         let spec = Arc::new(BscChainSpec::from(crate::chainspec::bsc::bsc_mainnet()));
         let mut snap = Snapshot::new(
@@ -371,13 +385,32 @@ mod tests {
         BscMinerApiImpl::new().stop().await.unwrap();
         assert_eq!(produce(40_100_004), 0, "a stopped validator must not vote");
         assert_eq!(produce(40_100_005), 0, "a stopped validator must not vote");
-        assert_eq!(BLOCKS_SINCE_MINING.load(Ordering::Relaxed), 0);
+        assert!(!vote_ready_on_head());
 
         // miner_start: the full warm-up runs again before voting resumes.
         BscMinerApiImpl::new().start().await.unwrap();
         assert_eq!(produce(40_100_006), 0);
         assert_eq!(produce(40_100_007), 0);
         assert_eq!(produce(40_100_008), 1, "voting resumes once the warm-up completes");
+
+        // No head arrives during this stop. A redundant start must preserve progress.
+        let miner = BscMinerApiImpl::new();
+        miner.stop().await.unwrap();
+        miner.start().await.unwrap();
+        set_downloader_active(true);
+        assert_eq!(produce(40_100_009), 0);
+        set_downloader_active(false);
+
+        // A height jump consumes one notification. A replacement at the same height
+        // consumes the second, even though the numerical height hasn't advanced.
+        let first = head_at(40_100_500);
+        let replacement = Header { extra_data: vec![1].into(), ..first.clone() };
+        maybe_produce_and_broadcast_for_head(spec.clone(), &sp, &first);
+        assert!(votes::fetch_any_vote_by_block_hash(first.hash_slow()).is_empty());
+        miner.start().await.unwrap();
+        maybe_produce_and_broadcast_for_head(spec.clone(), &sp, &replacement);
+        assert!(votes::fetch_any_vote_by_block_hash(replacement.hash_slow()).is_empty());
+        assert_eq!(produce(40_100_501), 1);
 
         let _ = votes::drain();
         std::env::remove_var("BSC_VOTE_JOURNAL_MEMORY_ONLY");
