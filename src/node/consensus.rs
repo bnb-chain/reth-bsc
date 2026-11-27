@@ -1330,7 +1330,7 @@ where
         self.finality_metrics.finalized_block_height.set(prepared.finalized_number as f64);
         let fcu_roundtrip =
             crate::node::miner::startup_diagnostics::HandoffStage::new("fcu_roundtrip", source);
-        let outcome = match self.engine_handle.fork_choice_updated(state, None).await {
+        let outcome = match self.engine_handle.fork_choice_updated_preserving_finality(state).await {
             Ok(response) => match response.payload_status.status {
                 PayloadStatusEnum::Invalid { validation_error } => {
                     Err(ParliaConsensusErr::ForkChoiceUpdateError(validation_error))
