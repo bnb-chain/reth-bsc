@@ -2618,10 +2618,10 @@ mod tests {
         tx.send(Ok(PayloadStatus::new(PayloadStatusEnum::Valid, None))).unwrap();
         assert!(Pin::new(&mut service).poll(&mut cx).is_pending());
         assert!(events.try_recv().is_err(), "forkchoice must complete before deferred diffusion");
-        let BeaconEngineMessage::ForkchoiceUpdated { tx, .. } =
+        let BeaconEngineMessage::ForkchoiceUpdated { tx, preserve_finalized: true, .. } =
             poll_until_engine_request(&mut service, &mut engine).await
         else {
-            panic!("forkchoice expected")
+            panic!("expected an import forkchoice preserving finality")
         };
         tx.send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::new(PayloadStatusEnum::Valid, None))))
             .unwrap();
