@@ -136,8 +136,12 @@ impl<H: BlockHeader> BuildPendingEnv<H> for BscNextBlockEnvAttributes {
         parent: &SealedHeader<H>,
         block_overrides: Option<&alloy_rpc_types_eth::BlockOverrides>,
     ) -> Self {
+        let mut inner = NextBlockEnvAttributes::build_pending_env(parent, block_overrides);
+        // BSC exposes difficulty through opcode 0x44, not Ethereum's random fallback.
+        // Without a pending header, inherit the parent's difficulty as go-bsc does.
+        inner.prev_randao = parent.difficulty().into();
         Self {
-            inner: NextBlockEnvAttributes::build_pending_env(parent, block_overrides),
+            inner,
             // This is the RPC-side entry point (`eth_simulateV1`, local pending block), not
             // the miner. Simulation must not run Parlia finalization or sign system txs.
             mode: BscExecutionMode::Simulation,
@@ -521,6 +525,8 @@ where
         attributes: &Self::NextBlockEnvCtx,
     ) -> Result<EvmEnv<BscHardfork, BscBlockEnv>, Self::Error> {
         let milli_remainder = attributes.milli_remainder;
+        let simulation_difficulty =
+            (attributes.mode == BscExecutionMode::Simulation).then_some(parent.difficulty());
         let attributes = &attributes.inner;
         // ensure we're not missing any timestamp based hardforks
         let spec_id = revm_spec_by_timestamp_and_block_number(
@@ -599,7 +605,15 @@ where
         // Millisecond remainder for the next block, threaded through the attributes:
         // the miner/bid-simulator's planned `block_timestamp_ms % 1000`, or `0` on the
         // RPC pending/simulate paths (go-bsc synthetic-header semantics).
-        let block_env = BscBlockEnv::new(block_env, milli_remainder);
+        let mut block_env = BscBlockEnv::new(block_env, milli_remainder);
+        if let Some(difficulty) = simulation_difficulty {
+            // Parlia synthetic headers inherit the parent's difficulty. Keep the opcode
+            // view separate from mixHash, whose zero default means .000 milliseconds.
+            // RPC block overrides are applied afterwards and may replace these values.
+            block_env.inner.difficulty = difficulty;
+            block_env.inner.prevrandao = Some(Default::default());
+            block_env.opcode_44_override = Some(difficulty);
+        }
 
         Ok(EvmEnv { cfg_env, block_env })
     }
@@ -1006,3 +1020,6 @@ mod tests {
         assert_eq!(ctx.mode, BscExecutionMode::Mining, "mining must still run Parlia finalization");
     }
 }
+
+#[cfg(test)]
+mod pending_difficulty_tests;
