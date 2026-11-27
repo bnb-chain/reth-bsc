@@ -8,7 +8,9 @@ use alloy_eips::{eip4844::BLOB_TX_MIN_BLOB_GASPRICE, merge::EPOCH_SLOTS};
 use reth::{
     api::{FullNodeTypes, NodePrimitives, NodeTypes},
     builder::{
-        components::{create_blob_store_with_cache, PoolBuilder, TxPoolBuilder},
+        components::{
+            create_blob_store_with_cache, spawn_maintenance_tasks, PoolBuilder, TxPoolBuilder,
+        },
         BuilderContext,
     },
 };
@@ -18,15 +20,18 @@ use reth_evm::ConfigureEvm;
 use reth_payload_primitives::PayloadTypes;
 use reth_primitives_traits::{constants::MAX_TX_GAS_LIMIT_OSAKA, SignedTransaction};
 use reth_transaction_pool::{
-    blobstore::DiskFileBlobStore, error::InvalidPoolTransactionError, CoinbaseTipOrdering,
-    EthPooledTransaction, EthTransactionValidator, Pool, PoolTransaction, TransactionOrigin,
-    TransactionValidationOutcome, TransactionValidationTaskExecutor, TransactionValidator,
+    blobstore::DiskFileBlobStore, error::InvalidPoolTransactionError, EthPooledTransaction,
+    EthTransactionValidator, PoolTransaction, TransactionOrigin, TransactionValidationOutcome,
+    TransactionValidationTaskExecutor, TransactionValidator,
 };
 
 use crate::{
     evm::blacklist::{self, BlacklistedAddressError},
     hardforks::bsc::BscHardfork,
 };
+
+mod blob_gap;
+pub use blob_gap::BscTransactionPool;
 
 pub(crate) mod tip;
 use crate::node::evm::config::EIP1559_INITIAL_BASE_FEE;
@@ -175,12 +180,12 @@ where
         + Sync
         + 'static,
 {
-    type Pool = Pool<
+    type Pool = BscTransactionPool<
         TransactionValidationTaskExecutor<
             BscTxValidator<EthTransactionValidator<Node::Provider, EthPooledTransaction, Evm>>,
         >,
-        CoinbaseTipOrdering<EthPooledTransaction>,
         DiskFileBlobStore,
+        Node::Provider,
     >;
 
     async fn build_pool(
@@ -246,9 +251,18 @@ where
         // Build txpool and start maintenance task
         let transaction_pool = TxPoolBuilder::new(ctx)
             .with_validator(validator)
-            .build_and_spawn_maintenance_task(blob_store, pool_config)?;
+            .build(blob_store, pool_config.clone());
 
-        tracing::info!(target: "bsc::txpool", "Transaction pool with blacklist validation initialized");
+        let transaction_pool = BscTransactionPool::new(
+            transaction_pool,
+            ctx.provider().clone(),
+            ctx.task_executor().clone(),
+        );
+        spawn_maintenance_tasks(ctx, transaction_pool.clone(), &pool_config)?;
+        ctx.task_executor()
+            .spawn_critical_task("bsc-blob-gap-buffer", transaction_pool.clone().run());
+
+        tracing::info!(target: "bsc::txpool", "Transaction pool with BSC validation and blob gap buffer initialized");
         Ok(transaction_pool)
     }
 }
