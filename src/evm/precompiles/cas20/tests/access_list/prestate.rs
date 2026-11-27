@@ -78,6 +78,39 @@ async fn debug_calls_run_cas20_code_overrides() {
     assert_eq!(U256::from_be_slice(&output), U256::from(123));
 }
 
+const CAS20_CODE_HASH: &str = "0x309b8896ee4c1ff7ec1966155373dee42663b6b40c3fedc70ba501684848d2a3";
+
+#[tokio::test]
+async fn existing_token_prestate_reports_code_hash() {
+    let mut h = Harness::new();
+    let token = token(&mut h);
+    let api = debug!(h.st);
+    let address = format!("{token:#x}");
+    for mux in [false, true] {
+        for config in [
+            json!({}),
+            json!({"includeEmpty":true}),
+            json!({"diffMode":true}),
+            json!({"diffMode":true,"disableCode":true}),
+            json!({"disableCode":true}),
+        ] {
+            let trace = api
+                .debug_trace_call(
+                    request(token, call_data(SEL_TRANSFER, &[a(BOB), w(7)])),
+                    None,
+                    Some(options(config.clone(), mux)),
+                )
+                .await
+                .unwrap();
+            let frame = prestate(trace, mux);
+            let pre = if config["diffMode"] == true { &frame["pre"] } else { &frame };
+            assert_eq!(pre[&address]["codeHash"], CAS20_CODE_HASH, "{config}: {frame}");
+            assert_eq!(pre[&address].get("code").is_none(), config["disableCode"] == true);
+            assert!(frame["post"][&address].get("codeHash").is_none());
+        }
+    }
+}
+
 #[tokio::test]
 async fn native_reads_writes_and_reverted_slots_reach_prestate_and_mux() {
     let mut h = Harness::new();
@@ -195,6 +228,7 @@ async fn native_creation_prestate_matches_geth_with_code_disabled_and_prefunding
                     if diff_mode {
                         let post = &result["post"][format!("{created:#x}")];
                         assert!(post["storage"].is_object());
+                        assert_eq!(post["codeHash"], CAS20_CODE_HASH);
                         if hide_code {
                             assert!(post.get("code").is_none());
                         } else {

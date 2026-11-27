@@ -1,18 +1,17 @@
-//! CAS20 prestate compatibility. Reth observes explicit native reads;
-//! only its empty-account classification needs adjustment. Delegate execution to
-//! DebugApi and normalize its output without changing journal flags or state.
+//! Go-BSC prestate response compatibility for account code and empty CAS20 accounts.
 
 use crate::evm::precompiles::cas20::is_cas20_precompile;
 use alloy_eips::{BlockId, BlockNumberOrTag};
-use alloy_primitives::{Bytes, B256};
+use alloy_primitives::{keccak256, Bytes, B256};
 use alloy_rpc_types::{
     eth::{Bundle, StateContext, TransactionRequest},
     trace::geth::{
-        mux::MuxConfig, AccountState, GethDebugBuiltInTracerType, GethDebugTracerConfig,
-        GethDebugTracerType, GethDebugTracingCallOptions, GethDebugTracingOptions, GethTrace,
-        PreStateFrame, TraceResult,
+        mux::MuxConfig, GethDebugBuiltInTracerType, GethDebugTracerConfig, GethDebugTracerType,
+        GethDebugTracingCallOptions, GethDebugTracingOptions, GethTrace, PreStateFrame,
+        TraceResult,
     },
 };
+use alloy_rpc_types_trace::geth::AccountState;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use reth::rpc::api::{
     prestate::{normalize_prestate_config, with_prestate_config},
@@ -263,14 +262,12 @@ impl Plan {
                         !is_cas20_precompile(*address) || !empty_account(state)
                     });
                 }
-                if *hide_code {
-                    for account in pre.values_mut() {
-                        account.code = None;
-                    }
-                    if let PreStateFrame::Diff(diff) = frame {
-                        for account in diff.post.values_mut() {
-                            account.code = None;
-                        }
+                for account in pre.values_mut() {
+                    apply_code_hash(account, *hide_code);
+                }
+                if let PreStateFrame::Diff(diff) = frame {
+                    for account in diff.post.values_mut() {
+                        apply_code_hash(account, *hide_code);
                     }
                 }
             }
@@ -283,6 +280,15 @@ impl Plan {
             }
             _ => {}
         }
+    }
+}
+
+fn apply_code_hash(account: &mut AccountState, hide_code: bool) {
+    if let Some(code) = account.code.as_ref().filter(|code| !code.is_empty()) {
+        account.code_hash = Some(keccak256(code));
+    }
+    if hide_code {
+        account.code = None;
     }
 }
 
