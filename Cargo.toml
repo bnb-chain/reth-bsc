@@ -140,6 +140,7 @@ alloy-rpc-types = { version = "2.5.0", features = ["eth", "trace"] }
 alloy-rpc-types-eth = "2.5.0"
 alloy-rpc-types-engine = "2.5.0"
 alloy-rpc-types-mev = "2.5.0"
+alloy-rpc-types-trace = "2.6.1"
 alloy-signer = "2.5.0"
 
 alloy-chains = "0.2.34"
