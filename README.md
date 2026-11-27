@@ -89,6 +89,15 @@ To run on BSC Testnet instead of Mainnet, simply replace `--chain bsc` with `--c
 ./target/${profile}/reth-bsc node --full --chain bsc-testnet --datadir ./data_dir
 ```
 
+### Validator vote journal
+
+A node with a BLS signing key reads its complete vote journal before starting services.
+Set `BSC_VOTE_JOURNAL_DIR` to the directory containing `votes.jsonl`. The fallback
+is `$RETH_DATADIR/voteJournal`, or `./voteJournal` when that environment variable is unset.
+For a new key that has never voted, provision an empty `votes.jsonl` before first start.
+For an existing key, restore its vote history when moving or restarting the validator.
+A missing file, unreadable record or incomplete last line stops startup and reports the path.
+
 ### RPC Configuration
 
 To enable RPC services, add these parameters to your node command:

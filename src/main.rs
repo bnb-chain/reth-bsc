@@ -422,6 +422,10 @@ fn main() -> eyre::Result<()> {
                 bls_signer::init_from_env_if_present();
             }
 
+            if bls_signer::is_bls_signer_initialized() {
+                reth_bsc::node::vote_journal::initialize()?;
+            }
+
             // Initialize EVN configuration (CLI overrides env)
             {
                 let enabled_from_env = std::env::var("BSC_EVN_ENABLED")

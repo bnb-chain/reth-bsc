@@ -279,6 +279,7 @@ mod tests {
     async fn journal_error_blocks_pool_and_broadcast() {
         let dir = std::env::temp_dir().join(format!("vote_producer_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
+        std::fs::File::create_new(dir.join("votes.jsonl")).unwrap();
         std::env::set_var("BSC_VOTE_JOURNAL_DIR", &dir);
         std::env::set_var("BSC_VOTE_WARMUP_BLOCKS", "1");
 
@@ -333,6 +334,10 @@ mod tests {
     async fn miner_stop_suppresses_votes_and_rearms_warmup() {
         use crate::rpc::miner::{BscMinerApiImpl, BscMinerApiServer};
 
+        let dir = std::env::temp_dir().join(format!("vote_producer_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::File::create_new(dir.join("votes.jsonl")).unwrap();
+        std::env::set_var("BSC_VOTE_JOURNAL_DIR", &dir);
         std::env::set_var("BSC_VOTE_JOURNAL_MEMORY_ONLY", "1");
         std::env::set_var("BSC_VOTE_WARMUP_BLOCKS", "2");
 
@@ -414,5 +419,6 @@ mod tests {
 
         let _ = votes::drain();
         std::env::remove_var("BSC_VOTE_JOURNAL_MEMORY_ONLY");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
