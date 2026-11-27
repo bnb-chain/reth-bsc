@@ -1,8 +1,8 @@
 use std::{
     collections::{HashMap, VecDeque},
-    fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, Write},
-    path::{Path, PathBuf},
+    fs::{File, OpenOptions},
+    io::{self, BufRead, BufReader, Write},
+    path::PathBuf,
     sync::{LazyLock, Mutex},
 };
 
@@ -71,52 +71,37 @@ impl VoteJournal {
         PathBuf::from("voteJournal").join("votes.jsonl")
     }
 
-    fn ensure_parent_dir(path: &Path) {
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
+    fn new(path: PathBuf) -> io::Result<Self> {
+        let mut recent = VecDeque::with_capacity(MAX_RECENT_ENTRIES);
+        let mut reader = BufReader::new(File::open(&path)?);
+        let mut line = String::new();
+        for number in 1_u64.. {
+            line.clear();
+            let bytes = reader.read_line(&mut line).map_err(|err| {
+                io::Error::new(err.kind(), format!("reading line {number}: {err}"))
+            })?;
+            if bytes == 0 {
+                break;
+            }
+            if !line.ends_with('\n') {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("incomplete vote journal record at line {number}"),
+                ));
+            }
+            let env: VoteEnvelope = serde_json::from_str(&line).map_err(|err| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("line {number}: {err}"))
+            })?;
+            if recent.len() == MAX_RECENT_ENTRIES {
+                recent.pop_front();
+            }
+            recent.push_back(env.data);
         }
-    }
-
-    fn open_file_append(path: &Path) -> std::io::Result<File> {
-        Self::ensure_parent_dir(path);
-        OpenOptions::new().create(true).append(true).open(path)
-    }
-
-    fn open_file_read(path: &Path) -> std::io::Result<File> {
-        OpenOptions::new().read(true).open(path)
-    }
-
-    fn load_from_disk(path: &Path) -> VoteDataLru {
         let mut lru = VoteDataLru::new(MAX_RECENT_ENTRIES);
-        if let Ok(file) = Self::open_file_read(path) {
-            let reader = BufReader::new(file);
-            let mut buf: Vec<VoteData> = Vec::with_capacity(MAX_RECENT_ENTRIES);
-            for line in reader.lines().map_while(Result::ok) {
-                if line.is_empty() {
-                    continue;
-                }
-                match serde_json::from_str::<VoteEnvelope>(&line) {
-                    Ok(env) => {
-                        buf.push(env.data);
-                        if buf.len() > MAX_RECENT_ENTRIES {
-                            buf.remove(0);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(target: "bsc::vote", error=%e, "Unparsable line in vote journal, skipping")
-                    }
-                }
-            }
-            for vd in buf {
-                lru.add(vd.target_number, vd);
-            }
+        for vote in recent {
+            lru.add(vote.target_number, vote);
         }
-        lru
-    }
-
-    fn new(path: PathBuf) -> Self {
-        let lru = Self::load_from_disk(&path);
-        Self { path, lru }
+        Ok(Self { path, lru })
     }
 
     /// Check vote rules against the in-memory buffer.
@@ -173,22 +158,15 @@ impl VoteJournal {
             .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"));
         let mut written = Ok(());
         if !mem_only {
-            let is_new_file = !self.path.exists();
             let mut line = serde_json::to_string(env).map_err(std::io::Error::other)?;
             line.push('\n');
-            let mut file = Self::open_file_append(&self.path)?;
+            let mut file = OpenOptions::new().append(true).open(&self.path)?;
             // Roll back partial appends on error.
             let len_before = file.metadata()?.len();
             // Persist before the vote can leave the node.
             written = file.write_all(line.as_bytes()).and_then(|()| file.sync_all());
             if written.is_err() {
                 let _ = file.set_len(len_before);
-            }
-            if is_new_file {
-                // Best-effort directory sync for the first journal file.
-                if let Some(dir) = self.path.parent() {
-                    let _ = File::open(dir).and_then(|d| d.sync_all());
-                }
             }
         }
         // Claim the height once a write was attempted.
@@ -197,11 +175,18 @@ impl VoteJournal {
     }
 }
 
-/// Global vote journal instance, initialized lazily on first use.
-static GLOBAL_JOURNAL: LazyLock<Mutex<VoteJournal>> = LazyLock::new(|| {
+/// Cache recovery errors as well as success: no caller may use partial vote history.
+static GLOBAL_JOURNAL: LazyLock<io::Result<Mutex<VoteJournal>>> = LazyLock::new(|| {
     let path = VoteJournal::resolve_default_path();
-    Mutex::new(VoteJournal::new(path))
+    VoteJournal::new(path.clone()).map(Mutex::new).map_err(|err| {
+        io::Error::new(err.kind(), format!("cannot recover vote journal {}: {err}", path.display()))
+    })
 });
+
+/// Recover the same journal used by the producer before node services start.
+pub fn initialize() -> io::Result<()> {
+    global().map(drop)
+}
 
 /// Get a guard to the global vote journal.
 ///
@@ -213,13 +198,15 @@ static GLOBAL_JOURNAL: LazyLock<Mutex<VoteJournal>> = LazyLock::new(|| {
 /// Poisoning panics rather than recovering: a panic mid-`write_vote` can leave the in-memory
 /// height claim and the on-disk journal disagreeing, and silently continuing with that is how
 /// a double sign gets through.
-pub fn global() -> std::sync::MutexGuard<'static, VoteJournal> {
-    GLOBAL_JOURNAL.lock().expect("vote journal poisoned")
+pub fn global() -> io::Result<std::sync::MutexGuard<'static, VoteJournal>> {
+    let journal =
+        GLOBAL_JOURNAL.as_ref().map_err(|err| io::Error::new(err.kind(), err.to_string()))?;
+    Ok(journal.lock().expect("vote journal poisoned"))
 }
 
 /// Helper for external modules to check the rules via global journal.
 pub fn under_rules(source_number: u64, target_number: u64) -> bool {
-    global().under_rules(source_number, target_number)
+    global().is_ok_and(|journal| journal.under_rules(source_number, target_number))
 }
 
 /// Helper for external modules to persist a signed vote via global journal.
@@ -227,7 +214,7 @@ pub fn under_rules(source_number: u64, target_number: u64) -> bool {
 /// `io::Error` as-is: `AlreadyExists` = violates the journal rules (benign during a reorg),
 /// anything else = storage fault. A `String` would make those indistinguishable.
 pub fn persist_vote(env: &VoteEnvelope) -> std::io::Result<()> {
-    global().write_vote(env)
+    global()?.write_vote(env)
 }
 
 #[cfg(test)]
@@ -238,7 +225,9 @@ mod tests {
     fn tmp_path(name: &str) -> PathBuf {
         let ts =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        std::env::temp_dir().join(format!("{}_{}.jsonl", name, ts))
+        let path = std::env::temp_dir().join(format!("{}_{}.jsonl", name, ts));
+        File::create_new(&path).unwrap();
+        path
     }
 
     fn mk_env(src_n: u64, src_h: B256, tgt_n: u64, tgt_h: B256) -> VoteEnvelope {
@@ -256,7 +245,7 @@ mod tests {
 
     #[test]
     fn rule1_duplicate_height_disallowed() {
-        let mut j = VoteJournal::new(tmp_path("journal_rule1"));
+        let mut j = VoteJournal::new(tmp_path("journal_rule1")).unwrap();
         let env = mk_env(90, B256::from([1u8; 32]), 100, B256::from([2u8; 32]));
         let dup = mk_env(90, B256::from([1u8; 32]), 100, B256::from([3u8; 32]));
         j.write_vote(&env).unwrap();
@@ -269,21 +258,20 @@ mod tests {
 
     #[test]
     fn open_failure_is_reported_and_not_recorded() {
-        // Parent is a regular file, so create_dir_all + open cannot succeed. Only failures
+        // A journal removed after recovery cannot be opened for append. Only failures
         // *before* any byte is written leave the journal untouched; a write or fsync that
         // fails afterwards still claims the height (see `lru.add` in `write_vote`).
-        let blocker = tmp_path("journal_blocker");
-        std::fs::write(&blocker, b"x").unwrap();
-        let mut j = VoteJournal::new(blocker.join("votes.jsonl"));
+        let path = tmp_path("journal_removed");
+        let mut j = VoteJournal::new(path.clone()).unwrap();
+        std::fs::remove_file(&path).unwrap();
         assert!(j.write_vote(&mk_env(90, B256::ZERO, 100, B256::ZERO)).is_err());
         assert!(j.under_rules(95, 100), "failed write must leave the journal untouched");
-        let _ = std::fs::remove_file(&blocker);
     }
 
     #[test]
     fn rule2_backward_across_span_disallowed() {
         let path = tmp_path("journal_rule2_back");
-        let mut j = VoteJournal::new(path);
+        let mut j = VoteJournal::new(path).unwrap();
         // Previous vote with target 125 and source 120
         let env = mk_env(120, B256::from([3u8; 32]), 125, B256::from([4u8; 32]));
         j.write_vote(&env).unwrap();
@@ -295,7 +283,7 @@ mod tests {
     #[test]
     fn rule2_forward_within_span_disallowed() {
         let path = tmp_path("journal_rule2_forward");
-        let mut j = VoteJournal::new(path);
+        let mut j = VoteJournal::new(path).unwrap();
         // Previous vote with target 110 and lower source 90
         let env = mk_env(90, B256::from([5u8; 32]), 110, B256::from([6u8; 32]));
         j.write_vote(&env).unwrap();
@@ -307,7 +295,7 @@ mod tests {
     #[test]
     fn allowed_vote_when_no_conflict() {
         let path = tmp_path("journal_ok");
-        let mut j = VoteJournal::new(path);
+        let mut j = VoteJournal::new(path).unwrap();
         // Old vote far behind
         let env = mk_env(80, B256::from([7u8; 32]), 90, B256::from([8u8; 32]));
         j.write_vote(&env).unwrap();
@@ -315,17 +303,31 @@ mod tests {
     }
 
     #[test]
+    fn recovery_rejects_an_incomplete_or_unreadable_history() {
+        let path = tmp_path("journal_recovery");
+        let good = serde_json::to_string(&mk_env(10, B256::ZERO, 20, B256::ZERO)).unwrap();
+        for tail in [b"{bad}\n".as_slice(), b"\xff\n", good.as_bytes()] {
+            std::fs::write(&path, [good.as_bytes(), b"\n", tail].concat()).unwrap();
+            let err = VoteJournal::new(path.clone()).err().unwrap();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert!(err.to_string().contains("line 2"), "{err}");
+        }
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(VoteJournal::new(path).err().unwrap().kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
     fn persistence_reloads_buffer() {
         let path = tmp_path("journal_persist");
         {
-            let mut j = VoteJournal::new(path.clone());
+            let mut j = VoteJournal::new(path.clone()).unwrap();
             let env1 = mk_env(10, B256::from([9u8; 32]), 20, B256::from([10u8; 32]));
             let env2 = mk_env(30, B256::from([11u8; 32]), 40, B256::from([12u8; 32]));
             j.write_vote(&env1).unwrap();
             j.write_vote(&env2).unwrap();
         }
         // Reopen
-        let j2 = VoteJournal::new(path);
+        let j2 = VoteJournal::new(path).unwrap();
         // Rule1: contains 40
         assert!(!j2.under_rules(35, 40));
         // Rule2 forward: with source 35 target 33, forward window includes 34..44; 40 present with
