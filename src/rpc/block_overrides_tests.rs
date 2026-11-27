@@ -39,9 +39,10 @@ const HEAD_MS: u64 = HEAD_SECS * 1000 + HEAD_REMAINDER;
 
 fn spec(jenner: Option<u64>) -> Arc<BscChainSpec> {
     let mut cs = bsc_mainnet();
-    if let Some(t) = jenner {
-        cs.hardforks.insert(BscHardfork::Jenner, ForkCondition::Timestamp(t));
-    }
+    cs.hardforks.insert(
+        BscHardfork::Jenner,
+        jenner.map_or(ForkCondition::Never, ForkCondition::Timestamp),
+    );
     Arc::new(BscChainSpec::from(cs))
 }
 
