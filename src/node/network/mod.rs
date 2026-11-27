@@ -33,9 +33,7 @@ use reth_ethereum_primitives::{PooledTransactionVariant, TransactionSigned};
 use reth_network::{NetworkConfig, NetworkHandle, NetworkManager, PeersConfig, SessionsConfig};
 use reth_network_api::PeersInfo;
 use reth_network_peers::NodeRecord;
-use reth_provider::{
-    BlockNumReader, CanonStateSubscriptions, HeaderProvider, StateProviderFactory,
-};
+use reth_provider::{CanonStateSubscriptions, HeaderProvider, StateProviderFactory};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
@@ -407,8 +405,8 @@ impl BscNetworkBuilder {
             }
         });
 
-        // TODO: update network with the latest canonical head, but has a fork id issue, can fix it
-        // later.
+        // Keep the chain-spec head for BSC fork ID compatibility. The handshake's block hash
+        // and total difficulty are set from the canonical startup head below.
         let mut network_builder = network_builder
             .boot_nodes(ctx.chain_spec().bootnodes().unwrap_or_default())
             .set_head(ctx.chain_spec().head())
@@ -452,11 +450,10 @@ impl BscNetworkBuilder {
             );
         }
 
-        let provider = ctx.provider();
-        if let Ok(number) = provider.best_block_number() {
-            let td = provider.header_td_by_number(number).unwrap_or_default();
-            network_config.status.total_difficulty = td;
-        }
+        let head = ctx.head();
+        network_config.status.blockhash = head.hash;
+        network_config.status.total_difficulty =
+            ctx.provider().header_td_by_number(head.number).unwrap_or_default();
         debug!(
             target: "bsc::net",
             peer_id = peer_id_to_node_id(peer_id),
